@@ -491,7 +491,6 @@ _TRANSCRIPT_FIELDS_EXTRA = """
     calendar_id
     meeting_info {
       fred_joined
-      silent_meeting
     }"""
 
 _TRANSCRIPTS_QUERY = """
@@ -510,7 +509,6 @@ query Transcripts($limit: Int, $skip: Int, $fromDate: DateTime, $toDate: DateTim
     calendar_id
     meeting_info {
       fred_joined
-      silent_meeting
     }
     summary {
       overview

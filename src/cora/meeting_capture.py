@@ -85,6 +85,13 @@ DWD_DOMAINS: frozenset[str] = frozenset({
     "bigd.media",
 })
 
+#: The legacy invite habit: a Fireflies bot invited directly onto an event. Until
+#: Harrison retires that habit (plan of record, one-mechanism rule) an event may
+#: already carry it. Adding the capture identity on TOP of it dispatches a SECOND
+#: bot to the same meeting -- precisely the duplicate-capture pattern this lane
+#: exists to remove -- so its presence counts as already-covered.
+LEGACY_NOTETAKER = "notetaker@fireflies.ai"
+
 #: Google eventTypes that are not meetings. "Office" renders as workingLocation and
 #: "Dentist Appointment" as outOfOffice -- both were live on the roster on
 #: 2026-08-27 and both would otherwise be swept as capture candidates.
@@ -129,6 +136,23 @@ class CaptureConfig:
     @property
     def active_members(self) -> tuple[RosterMember, ...]:
         return tuple(m for m in self.members if m.enabled)
+
+
+def _as_bool(val: Any) -> bool:
+    """Tolerant boolean for a hand-edited roster.
+
+    `enabled: false` parses as a real bool, but `enabled: "false"` is a STRING and
+    `bool("false")` is True -- so a quoted value would silently keep someone in the
+    sweep after Harrison had switched them off. A missing value stays True (the
+    documented default); an unrecognised one is treated as False, because in a
+    capture roster the safe reading of "I do not understand this" is "do not
+    record this person".
+    """
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return True
+    return str(val).strip().lower() in ("true", "yes", "on", "1")
 
 
 class MeetingCaptureConfigError(Exception):
@@ -187,32 +211,50 @@ def load_config(*, path: Path | None = None, force: bool = False) -> CaptureConf
         members.append(RosterMember(
             name=(entry.get("name") or email).strip(),
             calendar_email=email,
-            enabled=bool(entry.get("enabled", True)),
+            enabled=_as_bool(entry.get("enabled", True)),
         ))
 
     carve = raw.get("carve_outs") or {}
     if not isinstance(carve, dict):
-        carve = {}
+        raise MeetingCaptureConfigError(
+            "carve_outs must be a mapping -- refusing to run with no carve-outs. "
+            "Silently treating a malformed carve_outs block as empty would capture "
+            "every meeting the list was written to protect."
+        )
 
     return _finish_config(identity, members, carve, path is None, now)
+
+
+def _as_list(carve: dict, key: str) -> list[str]:
+    """Read a carve-out list, refusing anything that is not a list.
+
+    A bare string here is the dangerous shape: `no_record_title_patterns: counsel`
+    is valid YAML and iterating it yields the CHARACTERS "c","o","u",... -- which
+    as whole-word patterns match nothing, so the carve-out silently stops
+    protecting anyone. Fail closed instead.
+    """
+    val = carve.get(key)
+    if val is None:
+        return []
+    if not isinstance(val, list):
+        raise MeetingCaptureConfigError(
+            f"carve_outs.{key} must be a list, got {type(val).__name__} -- "
+            "refusing to run rather than silently dropping a carve-out."
+        )
+    return [str(v).strip() for v in val if str(v).strip()]
 
 
 def _finish_config(identity, members, carve, cacheable, now) -> CaptureConfig:
     cfg = CaptureConfig(
         capture_identity=identity,
         members=tuple(members),
-        skip_title_markers=tuple(
-            str(m).strip().lower() for m in (carve.get("skip_title_markers") or []) if str(m).strip()
-        ),
+        skip_title_markers=tuple(m.lower() for m in _as_list(carve, "skip_title_markers")),
         no_record_title_patterns=tuple(
-            str(p).strip().lower() for p in (carve.get("no_record_title_patterns") or []) if str(p).strip()
+            p.lower() for p in _as_list(carve, "no_record_title_patterns")
         ),
-        no_record_emails=frozenset(
-            str(e).strip().lower() for e in (carve.get("no_record_emails") or []) if str(e).strip()
-        ),
+        no_record_emails=frozenset(e.lower() for e in _as_list(carve, "no_record_emails")),
         no_record_attendee_domains=tuple(
-            str(d).strip().lower().lstrip("@") for d in (carve.get("no_record_attendee_domains") or [])
-            if str(d).strip()
+            d.lower().lstrip("@") for d in _as_list(carve, "no_record_attendee_domains")
         ),
     )
     if cacheable:
@@ -262,6 +304,24 @@ def event_time_label(event: dict[str, Any]) -> str:
     return datetime.fromtimestamp(ts, _AZ).strftime("%H:%M")
 
 
+def starts_on_day(event: dict[str, Any], day: str) -> bool:
+    """True when the event's START falls inside the given AZ day.
+
+    Google's events.list returns everything OVERLAPPING [timeMin, timeMax], so a
+    23:30-00:30 meeting comes back on BOTH days. Counting it twice makes the second
+    day report a permanent false miss -- the transcript can only ever match one of
+    them. A meeting belongs to the day it starts.
+    """
+    ts = event_start_ts(event)
+    if not ts:
+        return False
+    try:
+        start = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=_AZ)
+    except ValueError:
+        return True
+    return int(start.timestamp()) <= ts < int((start + timedelta(days=1)).timestamp())
+
+
 def meeting_key(event: dict[str, Any]) -> tuple:
     """Identity of the MEETING, which is not the identity of the calendar event.
 
@@ -290,6 +350,17 @@ def meeting_key(event: dict[str, Any]) -> tuple:
     return ("event", (event.get("id") or "").strip())
 
 
+def _norm_ws(text: str) -> str:
+    """Collapse every run of whitespace (incl. NBSP) to a single space.
+
+    A multi-word carve-out like "estate planning" is matched against a title a human
+    typed or pasted. A double space, a newline, or a non-breaking space from a paste
+    would otherwise defeat the pattern silently -- and a carve-out that fails to fire
+    records a meeting somebody ruled must never be recorded.
+    """
+    return re.sub(r"[\s ]+", " ", text or "").strip()
+
+
 def _word_pattern(term: str) -> re.Pattern[str]:
     """Whole-word matcher for a carve-out phrase.
 
@@ -306,11 +377,12 @@ _word_cache: dict[str, re.Pattern[str]] = {}
 
 
 def _matches_word(text: str, term: str) -> bool:
-    pat = _word_cache.get(term)
+    key = _norm_ws(term)
+    pat = _word_cache.get(key)
     if pat is None:
-        pat = _word_pattern(term)
-        _word_cache[term] = pat
-    return bool(pat.search(text))
+        pat = _word_pattern(key)
+        _word_cache[key] = pat
+    return bool(pat.search(_norm_ws(text)))
 
 
 # ── LEX / PHI display rail ───────────────────────────────────────────────────
@@ -392,7 +464,12 @@ def display_title(event: dict[str, Any]) -> str:
         except Exception:  # noqa: BLE001
             redact = True
     if redact:
-        return f"LEX/PHI meeting, {event_time_label(event)}, organizer {who}"
+        # Deliberately NOT naming the organiser here. An earlier cut rendered
+        # "LEX/PHI meeting, 11:00, organizer vreese@azdes.gov", which redacts the
+        # title and then re-identifies the meeting on the same line -- the agency
+        # address alone tells the channel which client programme it was. Shape and
+        # time only; the event id is in the ledger if anyone needs to find it.
+        return f"LEX/PHI meeting, {event_time_label(event)}"
     return title
 
 
@@ -431,6 +508,12 @@ def qualify_event(
     if not link:
         return Qualification(False, "no-meeting-link")
 
+    # An all-day entry has `date` rather than `dateTime`. Even when one carries a
+    # link there is no start time for a notetaker to join at, and copying it
+    # produces an all-day event on the capture calendar that no bot can act on.
+    if not (event.get("start") or {}).get("dateTime"):
+        return Qualification(False, "all-day")
+
     # The roster user declining is a consent signal, not a scheduling detail.
     for att in (event.get("attendees") or []):
         if not isinstance(att, dict):
@@ -441,9 +524,9 @@ def qualify_event(
             return Qualification(False, "roster-user-declined")
 
     title = (event.get("summary") or "")
-    lowered = title.lower()
+    lowered = _norm_ws(title).lower()
     for marker in cfg.skip_title_markers:
-        if marker in lowered:
+        if _norm_ws(marker) in lowered:
             return Qualification(False, f"title-marker:{marker}")
 
     for term in cfg.no_record_title_patterns:
@@ -514,6 +597,8 @@ class EnsureResult:
     applied: bool
     actions: list[EnsureAction] = field(default_factory=list)
     failed_calendars: list[tuple[str, str]] = field(default_factory=list)
+    #: capture copies whose source meeting no longer exists at that time
+    stale_copies: list[tuple[str, str]] = field(default_factory=list)  # (event_id, why)
 
     @property
     def qualifying(self) -> int:
@@ -548,7 +633,7 @@ def plan_ensure(
     -- which is what makes this safe to run alongside the manual habit during the
     Phase-2 overlap instead of duplicating it.
     """
-    from cora.tools.calendar_client import extract_meeting_link
+    from cora.tools.calendar_client import CAPTURE_COPY_MARKER, extract_meeting_link
 
     if list_events is None:
         from cora.tools.calendar_client import list_events_for_day
@@ -559,12 +644,18 @@ def plan_ensure(
     result = EnsureResult(day=day, mode=ensure_mode(), applied=False)
 
     # What the capture identity can already see.
-    covered_links: set[str] = set()
+    # Keyed (link, start) exactly like meeting_key -- NOT by link alone. A person's
+    # static personal room link is reused for every 1:1 they host, so a link-only
+    # set marks the SECOND meeting of the day on that link as already-covered and
+    # it is then never ensured: a silent capture miss, the one failure this lane
+    # exists to prevent.
+    covered_meetings: set[tuple] = set()
+    capture_events: list[dict[str, Any]] = []
     try:
         for ev in list_events(cfg.capture_identity, day):
-            link = extract_meeting_link(ev)
-            if link:
-                covered_links.add(link.strip().lower())
+            capture_events.append(ev)
+            if extract_meeting_link(ev):
+                covered_meetings.add(meeting_key(ev))
     except Exception as exc:  # noqa: BLE001
         # Honest degrade: without this read we cannot tell covered from uncovered,
         # so we refuse to plan writes rather than risk duplicating every meeting.
@@ -574,7 +665,14 @@ def plan_ensure(
 
     # Collect first, decide second. One meeting can surface as several calendar
     # events (see meeting_key), and we must act on it exactly once.
+    #
+    # CARVE-OUTS VETO THE MEETING, NOT ONE CALENDAR'S VIEW OF IT. Qualifying
+    # per-event and grouping only the survivors would mean a `[no-bot]` Harrison
+    # typed on HIS copy is ignored because Hannah's copy of the same meeting has
+    # the original title -- the lane would record a meeting somebody explicitly
+    # opted out of. So every copy is qualified, and ONE veto kills the meeting.
     candidates: dict[tuple, list[tuple[RosterMember, dict[str, Any]]]] = {}
+    vetoed: dict[tuple, tuple[RosterMember, dict[str, Any], str]] = {}
     for member in cfg.active_members:
         try:
             events = list_events(member.calendar_email, day)
@@ -586,15 +684,24 @@ def plan_ensure(
         for ev in events:
             if not (ev.get("id") or "").strip():
                 continue
+            if not starts_on_day(ev, day):
+                continue   # belongs to the adjacent day; acted on there
+            key = meeting_key(ev)
             q = qualify_event(ev, cfg, roster_email=member.calendar_email)
             if not q.qualifies:
-                result.actions.append(EnsureAction(
-                    member=member.name, calendar_email=member.calendar_email,
-                    event_id=(ev.get("id") or ""), title=display_title(ev),
-                    start_label=event_time_label(ev), action="skip", reason=q.reason,
-                ))
+                if key not in vetoed:
+                    vetoed[key] = (member, ev, q.reason)
                 continue
-            candidates.setdefault(meeting_key(ev), []).append((member, ev))
+            candidates.setdefault(key, []).append((member, ev))
+
+    # A veto on ANY copy removes the meeting from consideration entirely.
+    for key, (member, ev, reason) in vetoed.items():
+        candidates.pop(key, None)
+        result.actions.append(EnsureAction(
+            member=member.name, calendar_email=member.calendar_email,
+            event_id=(ev.get("id") or ""), title=display_title(ev),
+            start_label=event_time_label(ev), action="skip", reason=reason,
+        ))
 
     for _key, entries in candidates.items():
         # Prefer to act through a copy whose organiser we can impersonate -- that is
@@ -611,36 +718,65 @@ def plan_ensure(
         link = extract_meeting_link(ev).strip().lower()
         safe = display_title(ev)
 
-        already = (
-            cfg.capture_identity in event_emails(ev)
-            or (link and link in covered_links)
-        )
-        if already:
+        emails = event_emails(ev)
+        if cfg.capture_identity in emails:
+            covered_reason = "already-covered"
+        elif LEGACY_NOTETAKER in emails:
+            covered_reason = "legacy notetaker already invited -- not adding a second bot"
+        elif meeting_key(ev) in covered_meetings:
+            covered_reason = "already-covered"
+        else:
+            covered_reason = ""
+        if covered_reason:
             result.actions.append(EnsureAction(
                 member=member.name, calendar_email=member.calendar_email, event_id=eid,
                 title=safe, start_label=event_time_label(ev),
-                action="none", reason="already-covered", meeting_link=link,
+                action="none", reason=covered_reason, meeting_link=link,
             ))
             continue
 
         organizer = (ev.get("organizer") or {}) if isinstance(ev.get("organizer"), dict) else {}
         org_email = (organizer.get("email") or "").strip().lower()
+        # If the title was withheld the organiser must be too, on THIS row as well:
+        # the reason is printed to the console and persisted to the ledger, so
+        # naming an agency address here would undo the redaction two fields away.
+        who = "withheld" if safe.startswith("LEX/PHI") else (org_email or "unknown")
         if org_email and _is_dwd_domain(org_email):
-            action, reason = "guest-add", f"in-domain organizer {org_email}"
+            action, reason = "guest-add", f"in-domain organizer {who}"
         else:
-            action, reason = "copy", f"external organizer {org_email or 'unknown'}"
+            action, reason = "copy", f"external organizer {who}"
         if len(entries) > 1:
             reason = f"{reason}; {len(entries)} calendar copies of this meeting, acting once"
 
-        # Claim the link immediately so a second meeting that somehow shares it
-        # within this run cannot be planned twice.
-        if link:
-            covered_links.add(link)
+        # Claim the meeting immediately so it cannot be planned twice in one run.
+        covered_meetings.add(meeting_key(ev))
 
         result.actions.append(EnsureAction(
             member=member.name, calendar_email=member.calendar_email, event_id=eid,
             title=safe, start_label=event_time_label(ev),
             action=action, reason=reason, meeting_link=link,
+        ))
+
+    # RECONCILE OUR OWN COPIES. A copy is a snapshot: when the source meeting is
+    # moved or cancelled the copy stays behind, and the plan of record promises
+    # re-sync rather than a growing pile of ghosts on the capture calendar. A ghost
+    # is not merely clutter -- it sends the notetaker to that Meet link at a time
+    # nobody agreed to, which is a capture nobody consented to.
+    #
+    # Only copies THIS LANE created are ever touched: they are identified by the
+    # marker written into their description, so a human-created event on the
+    # capture calendar is never a candidate for deletion.
+    live_keys = {meeting_key(ev) for _m, ev in
+                 [(m, e) for entries in candidates.values() for m, e in entries]}
+    for ev in capture_events:
+        desc = ev.get("description") or ""
+        if CAPTURE_COPY_MARKER not in desc:
+            continue
+        if meeting_key(ev) in live_keys:
+            continue
+        result.stale_copies.append((
+            (ev.get("id") or ""),
+            "source meeting no longer scheduled at this time (moved, cancelled, or carved out)",
         ))
 
     return result
@@ -702,6 +838,17 @@ def execute_ensure(
             act.error = str(exc)[:200]
             log.error("ensure: %s failed for event %s: %s", act.action, act.event_id, exc)
 
+    # Remove ghosts, under the same gates as every other write. Deleting only ever
+    # touches an event on the capture identity's OWN calendar that carries this
+    # lane's marker -- never a human's event, and never anything on a roster
+    # member's calendar.
+    for event_id, why in list(result.stale_copies):
+        try:
+            cc.delete_event(user_email=cfg.capture_identity, event_id=event_id)
+            log.info("ensure: removed stale capture copy %s (%s)", event_id, why)
+        except Exception as exc:  # noqa: BLE001
+            log.error("ensure: could not remove stale capture copy %s: %s", event_id, exc)
+
     return result
 
 
@@ -749,10 +896,19 @@ class AuditReport:
     misses: list[AuditedMeeting] = field(default_factory=list)
     duplicates: list[AuditedMeeting] = field(default_factory=list)
     unmatched_transcripts: list[dict[str, Any]] = field(default_factory=list)
-    skipped: list[tuple[str, str]] = field(default_factory=list)   # (safe title, reason)
+    skipped: list[tuple[str, str]] = field(default_factory=list)
+    #: A meeting a carve-out removed from scope that WAS captured anyway. The most
+    #: serious thing this auditor can find: a recording exists of a meeting somebody
+    #: ruled must not be recorded. Suppress the TITLE, never the FACT.
+    carve_out_breaches: list[tuple[str, str]] = field(default_factory=list)   # (safe title, reason)
     failed_calendars: list[tuple[str, str]] = field(default_factory=list)
     transcript_error: str = ""
     seat_note: str = ""
+
+
+#: Marks an index key claimed by more than one meeting. Such a key can never
+#: identify anything, so it must not resolve to the first claimant.
+_AMBIGUOUS = ("__ambiguous__",)
 
 
 def _norm_title(text: str) -> str:
@@ -794,9 +950,13 @@ def audit_day(
     # each invitee's calendar with its own event id, and counting those separately
     # would inflate `scheduled` and report a captured meeting as a miss (measured
     # live 2026-08-26). See meeting_key.
-    meetings: dict[tuple, AuditedMeeting] = {}
-    raw_events: dict[tuple, dict[str, Any]] = {}
-    skipped_seen: set[tuple] = set()
+    #
+    # COLLECT THEN DECIDE, exactly as the ensure lane does. A carve-out on ANY copy
+    # vetoes the whole meeting -- otherwise a `[no-bot]` Harrison typed on his copy
+    # is ignored because Hannah's copy still has the original title, and the
+    # meeting is then reported as a MISS, which is both wrong and a nag to "fix"
+    # a gap he created on purpose.
+    grouped: dict[tuple, list[tuple[RosterMember, dict[str, Any]]]] = {}
     for member in cfg.active_members:
         try:
             events = list_events(member.calendar_email, day)
@@ -806,34 +966,59 @@ def audit_day(
         for ev in events:
             if not (ev.get("id") or "").strip():
                 continue
-            key = meeting_key(ev)
-            if key in meetings:
-                if member.name not in meetings[key].members:
-                    meetings[key].members.append(member.name)
-                eid_other = (ev.get("id") or "").strip()
-                if eid_other and eid_other not in meetings[key].event_ids:
-                    meetings[key].event_ids.append(eid_other)
-                continue
+            if not starts_on_day(ev, day):
+                continue   # audited on the day it starts, never on both
+            grouped.setdefault(meeting_key(ev), []).append((member, ev))
+
+    meetings: dict[tuple, AuditedMeeting] = {}
+    raw_events: dict[tuple, dict[str, Any]] = {}
+    #: meetings a carve-out removed from scope, kept so we can still notice if one
+    #: of them was recorded anyway.
+    carved: dict[tuple, tuple[dict[str, Any], str]] = {}
+
+    for key, entries in grouped.items():
+        veto: tuple[dict[str, Any], str] | None = None
+        qualifying: list[tuple[RosterMember, dict[str, Any]]] = []
+        for member, ev in entries:
             q = qualify_event(ev, cfg, roster_email=member.calendar_email)
-            if not q.qualifies:
-                # Only report skips that reflect a DECISION. Structural non-meetings
-                # (an out-of-office block, a focus-time hold) are noise in an ops
-                # channel and would bury the carve-outs a human should actually see.
-                if not q.reason.startswith(("not-a-meeting", "no-meeting-link", "cancelled")):
-                    if key not in skipped_seen:
-                        skipped_seen.add(key)
-                        report.skipped.append((display_title(ev), q.reason))
-                continue
-            organizer = (ev.get("organizer") or {}) if isinstance(ev.get("organizer"), dict) else {}
-            meetings[key] = AuditedMeeting(
-                event_id=(ev.get("id") or "").strip(),
-                title=display_title(ev),
-                start_label=event_time_label(ev),
-                organizer=(organizer.get("email") or "unknown"),
-                members=[member.name],
-                event_ids=[(ev.get("id") or "").strip()],
-            )
-            raw_events[key] = ev
+            if q.qualifies:
+                qualifying.append((member, ev))
+            elif veto is None:
+                veto = (ev, q.reason)
+
+        if veto is not None:
+            ev, reason = veto
+            carved[key] = (ev, reason)
+            # Only report skips that reflect a DECISION. Structural non-meetings
+            # (an out-of-office block, a focus-time hold) are noise in an ops
+            # channel and would bury the carve-outs a human should actually see.
+            if not reason.startswith(("not-a-meeting", "no-meeting-link", "cancelled", "all-day")):
+                # SHAPE, never the title. A no-record meeting is by definition one
+                # somebody ruled must not be recorded; printing "Call with counsel"
+                # into a shared ops channel publishes the very thing the carve-out
+                # exists to keep out. The count and the reason are what is needed.
+                report.skipped.append((f"a meeting at {event_time_label(ev)}", reason))
+            continue
+
+        if not qualifying:
+            continue
+
+        member, ev = qualifying[0]
+        organizer = (ev.get("organizer") or {}) if isinstance(ev.get("organizer"), dict) else {}
+        safe_title = display_title(ev)
+        # When the title is withheld the organiser must be too: an agency address
+        # alone ("organizer vreese@azdes.gov") names the client programme the title
+        # was redacted to protect.
+        redacted = safe_title.startswith("LEX/PHI")
+        meetings[key] = AuditedMeeting(
+            event_id=(ev.get("id") or "").strip(),
+            title=safe_title,
+            start_label=event_time_label(ev),
+            organizer=("withheld" if redacted else (organizer.get("email") or "unknown")),
+            members=[m.name for m, _ in qualifying],
+            event_ids=[(e.get("id") or "").strip() for _m, e in qualifying],
+        )
+        raw_events[key] = ev
 
     report.scheduled = len(meetings)
     #: every calendar event id belonging to a meeting, so a transcript whose cal_id
@@ -875,17 +1060,27 @@ def audit_day(
 
     # Fallback A: meeting link. About half of live transcripts carry no cal_id at
     # all, so without this the auditor would report most captured meetings missed.
+    # AMBIGUITY IS NOT A MATCH. setdefault would silently bind a shared link (a
+    # static personal room used for several meetings a day) to whichever meeting
+    # was seen first -- attaching the transcript to the WRONG meeting, which reads
+    # as a duplicate on one row and a miss on another. A key claimed by more than
+    # one meeting is dropped from the index instead: the transcript falls through
+    # to a weaker join, or is reported unmatched, which is honest.
     link_index: dict[str, tuple] = {}
     for key, ev in raw_events.items():
         link = extract_meeting_link(ev).strip().lower()
-        if link:
+        if not link:
+            continue
+        if link in link_index and link_index[link] != key:
+            link_index[link] = _AMBIGUOUS
+        else:
             link_index.setdefault(link, key)
     for t in same_day:
         if (t.get("id") or "") in used:
             continue
         link = (t.get("meeting_link") or "").strip().lower()
         key = link_index.get(link) if link else None
-        if key is not None:
+        if key is not None and key is not _AMBIGUOUS:
             by_meeting.setdefault(key, []).append(t)
             used.add(t.get("id") or "")
 
@@ -895,13 +1090,17 @@ def audit_day(
     title_index: dict[str, tuple] = {}
     for key, ev in raw_events.items():
         nt = _norm_title(ev.get("summary") or "")
-        if nt:
+        if not nt:
+            continue
+        if nt in title_index and title_index[nt] != key:
+            title_index[nt] = _AMBIGUOUS
+        else:
             title_index.setdefault(nt, key)
     for t in same_day:
         if (t.get("id") or "") in used:
             continue
         key = title_index.get(_norm_title(t.get("title") or ""))
-        if key is not None:
+        if key is not None and key is not _AMBIGUOUS:
             by_meeting.setdefault(key, []).append(t)
             used.add(t.get("id") or "")
 
@@ -915,16 +1114,64 @@ def audit_day(
             if len(hits) > 1:
                 report.duplicates.append(meeting)
 
+    # ── 3b. was anything captured that a carve-out excluded? ──
+    # Dropping carved meetings from the diff entirely would hide this: a bot
+    # recording a no-record meeting is exactly what the carve-out exists to
+    # prevent, so it is surfaced -- as a shape, never as a title.
+    carved_event_ids: dict[str, tuple] = {}
+    carved_links: dict[str, tuple] = {}
+    for c_key, (c_ev, _c_reason) in carved.items():
+        c_eid = (c_ev.get("id") or "").strip()
+        if c_eid:
+            carved_event_ids[c_eid] = c_key
+        c_link = extract_meeting_link(c_ev).strip().lower()
+        if c_link:
+            carved_links[c_link] = c_key
+    for t in same_day:
+        if (t.get("id") or "") in used:
+            continue
+        hit = carved_event_ids.get((t.get("cal_id") or "").strip())
+        if hit is None:
+            t_link = (t.get("meeting_link") or "").strip().lower()
+            hit = carved_links.get(t_link) if t_link else None
+        if hit is None:
+            continue
+        used.add(t.get("id") or "")
+        b_ev, b_reason = carved[hit]
+        report.carve_out_breaches.append(
+            (f"a meeting at {event_time_label(b_ev)}", b_reason)
+        )
+
     # ── 4. captured but not on any roster calendar ──
     for t in same_day:
         if (t.get("id") or "") in used:
             continue
+        safe_t = _transcript_display_title(t)
         report.unmatched_transcripts.append({
             "id": t.get("id") or "",
-            "title": _transcript_display_title(t),
-            "organizer": t.get("organizer_email") or t.get("host_email") or "unknown",
+            "title": safe_t,
+            "organizer": (
+                "withheld" if safe_t.startswith("LEX/PHI")
+                else (t.get("organizer_email") or t.get("host_email") or "unknown")
+            ),
             "fred_joined": bool(((t.get("meeting_info") or {}) or {}).get("fred_joined") is True),
         })
+
+    # ── 4b. is the exact join even available? ──
+    # If the connector fell back to the legacy selection set, no transcript carries
+    # cal_id and the whole diff is running on link/title fallbacks. That degrades
+    # accuracy invisibly unless the report says so.
+    try:
+        from cora.connectors import fireflies_connector as _ffc
+
+        if getattr(_ffc, "_extended_query_unavailable", False):
+            report.transcript_error = (
+                report.transcript_error
+                or "Fireflies rejected the extended fields; running without the exact "
+                   "cal_id join (link/title fallbacks only)"
+            )
+    except Exception:  # noqa: BLE001
+        pass
 
     # ── 5. seat posture: the one-mechanism rule, watched ──
     if fetch_seats is None:
@@ -950,11 +1197,18 @@ def _transcript_display_title(t: dict[str, Any]) -> str:
     display_title's event path does not apply. Route it through the same shared LEX
     detector in its native shape.
     """
+    when = (
+        datetime.fromtimestamp(_transcript_ts(t), _AZ).strftime("%H:%M")
+        if _transcript_ts(t) else "?"
+    )
     try:
         from cora.connectors.fireflies_connector import classify_lex_meeting
 
-        if classify_lex_meeting(t).is_lex:
-            when = datetime.fromtimestamp(_transcript_ts(t), _AZ).strftime("%H:%M") if _transcript_ts(t) else "?"
+        # The client-domain screen must apply on BOTH rails. It was added to
+        # display_title and not here, which left the transcript side -- the one that
+        # renders captures with NO calendar event, i.e. the least-known meetings --
+        # weaker than the event side.
+        if classify_lex_meeting(t).is_lex or _transcript_has_client_domain(t):
             return f"LEX/PHI meeting, {when}"
     except Exception:  # noqa: BLE001
         return "LEX/PHI meeting (classification failed)"
@@ -967,6 +1221,25 @@ def _transcript_display_title(t: dict[str, Any]) -> str:
     except Exception:  # noqa: BLE001
         return "LEX/PHI meeting"
     return title
+
+
+def _transcript_has_client_domain(t: dict[str, Any]) -> bool:
+    """Client-agency domain on a TRANSCRIPT's attendees (the event rail's twin)."""
+    try:
+        from cora.connectors.fireflies_connector import (
+            _load_lex_detect_cfg,
+            _transcript_emails,
+        )
+
+        suffixes = tuple(_load_lex_detect_cfg().get("client_domain_suffixes") or ())
+        if not suffixes:
+            return False
+        return any(
+            addr.rsplit("@", 1)[-1].endswith(suffixes)
+            for addr in _transcript_emails(t) if "@" in addr
+        )
+    except Exception:  # noqa: BLE001
+        return True   # fail toward redaction
 
 
 def _default_fetch_transcripts(from_date: str, to_date: str) -> list[dict[str, Any]]:
@@ -1036,6 +1309,16 @@ def render_report(report: AuditReport) -> str:
         + (" _(partial -- see above)_" if degraded else "")
     )
 
+    if report.carve_out_breaches:
+        lines.append(
+            f"\n*:rotating_light: RECORDED DESPITE A CARVE-OUT "
+            f"({len(report.carve_out_breaches)})*"
+        )
+        for shape, reason in report.carve_out_breaches[:10]:
+            lines.append(f"  - {_esc(shape)}  _({_esc(reason)})_")
+        if len(report.carve_out_breaches) > 10:
+            lines.append(f"  _...and {len(report.carve_out_breaches) - 10} more_")
+
     if report.misses:
         lines.append(f"\n*:red_circle: Not captured ({len(report.misses)})*")
         # Chronological. Meetings are collected per roster member, so insertion
@@ -1049,6 +1332,8 @@ def render_report(report: AuditReport) -> str:
         lines.append(f"\n*:heavy_multiplication_x: Captured more than once ({len(report.duplicates)})*")
         for m in sorted(report.duplicates, key=lambda x: x.start_label)[:10]:
             lines.append(f"  - {m.start_label}  {_esc(m.title)}  ({len(m.transcript_ids)} transcripts)")
+        if len(report.duplicates) > 10:
+            lines.append(f"  _...and {len(report.duplicates) - 10} more_")
 
     if report.unmatched_transcripts:
         lines.append(
@@ -1058,13 +1343,18 @@ def render_report(report: AuditReport) -> str:
         for t in report.unmatched_transcripts[:10]:
             flag = " _[fred]_" if t.get("fred_joined") else ""
             lines.append(f"  - {_esc(t['title'])}  _(organizer {_esc(t['organizer'])})_{flag}")
+        if len(report.unmatched_transcripts) > 10:
+            lines.append(f"  _...and {len(report.unmatched_transcripts) - 10} more_")
 
     if report.skipped:
         lines.append(f"\n*:no_entry_sign: Carve-outs applied ({len(report.skipped)})*")
         for title, reason in report.skipped[:10]:
             lines.append(f"  - {_esc(title)}  _({_esc(reason)})_")
+        if len(report.skipped) > 10:
+            lines.append(f"  _...and {len(report.skipped) - 10} more_")
 
-    if not (report.misses or report.duplicates or report.unmatched_transcripts) and not degraded:
+    if not (report.misses or report.duplicates or report.unmatched_transcripts
+            or report.carve_out_breaches) and not degraded:
         # A weekend has no meetings, and "captured exactly once" over a denominator
         # of zero reads as a success it did not earn. This report posts every day.
         lines.append(

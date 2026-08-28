@@ -1061,6 +1061,17 @@ def add_attendee(
         raise CalendarClientError(f"add_attendee needs a real email, got {attendee_email!r}")
 
     event = get_event(user_email=user_email, event_id=event_id)
+
+    # Google sets attendeesOmitted when the guest list it returned is INCOMPLETE.
+    # Writing that truncated list back would delete every guest it left out -- a
+    # read-modify-write is only safe when the read is whole. Refuse instead; the
+    # caller falls back to an event copy, which touches nobody else's event.
+    if event.get("attendeesOmitted"):
+        raise CalendarClientError(
+            f"add_attendee refused for {event_id}: Google reported attendeesOmitted, "
+            "so the guest list read back is incomplete and patching it would drop guests."
+        )
+
     existing = [a for a in (event.get("attendees") or []) if isinstance(a, dict)]
     for att in existing:
         if (att.get("email") or "").strip().lower() == target:

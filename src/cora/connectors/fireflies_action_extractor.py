@@ -36,9 +36,8 @@ import httpx
 import yaml
 
 from cora.connectors.fireflies_connector import (
-    _TRANSCRIPTS_QUERY,
+    _query_transcripts,
     _classify_entity,
-    _graphql_query,
     _is_phi_meeting,
     _parse_date,
     _tag_fireflies_sub_entity,
@@ -790,7 +789,13 @@ def run_action_capture(dry_run: bool = False) -> dict[str, Any]:
             "toDate": to_date,
         }
         try:
-            data = _graphql_query(_TRANSCRIPTS_QUERY, variables)
+            # Use the fallback-wrapped runner, NOT _graphql_query directly. The
+            # shared _TRANSCRIPTS_QUERY gained capture-lane fields on 2026-08-27,
+            # and Fireflies fails the WHOLE query on one unknown field -- so a
+            # vendor-side schema change would take THIS lane dark while the KB
+            # ingest degraded gracefully. Protecting only the new caller of a
+            # shared function is how that asymmetry gets shipped.
+            data = _query_transcripts(variables)
         except FirefliesConnectorError as exc:
             msg = f"Fireflies query failed at skip={skip}: {exc}"
             log.error(msg)

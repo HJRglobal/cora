@@ -203,7 +203,7 @@ class TestLexRunBehavior:
 
         with (
             patch.object(fae, "_WATERMARK_PATH", wpath),
-            patch("cora.connectors.fireflies_action_extractor._graphql_query",
+            patch("cora.connectors.fireflies_action_extractor._query_transcripts",
                   return_value={"transcripts": [transcript]}),
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "k", "SLACK_BOT_TOKEN": "x"}),
             patch("anthropic.Anthropic") as mock_anth,
@@ -238,7 +238,7 @@ class TestLexRunBehavior:
 
         with (
             patch.object(fae, "_WATERMARK_PATH", wpath),
-            patch("cora.connectors.fireflies_action_extractor._graphql_query",
+            patch("cora.connectors.fireflies_action_extractor._query_transcripts",
                   return_value={"transcripts": [transcript]}),
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "k"}),
             patch("anthropic.Anthropic") as mock_anth,
@@ -274,7 +274,7 @@ class TestLexRunBehavior:
 
         with (
             patch.object(fae, "_WATERMARK_PATH", wpath),
-            patch("cora.connectors.fireflies_action_extractor._graphql_query",
+            patch("cora.connectors.fireflies_action_extractor._query_transcripts",
                   return_value={"transcripts": [transcript]}),
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "k"}),
             patch("anthropic.Anthropic") as mock_anth,
@@ -307,7 +307,7 @@ class TestLexRunBehavior:
 
         with (
             patch.object(fae, "_WATERMARK_PATH", wpath),
-            patch("cora.connectors.fireflies_action_extractor._graphql_query",
+            patch("cora.connectors.fireflies_action_extractor._query_transcripts",
                   return_value={"transcripts": [transcript]}),
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "k"}),
             patch("anthropic.Anthropic") as mock_anth,

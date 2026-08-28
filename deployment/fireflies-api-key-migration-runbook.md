@@ -78,18 +78,28 @@ That must print `1`. (Related: the 2026-06-11 duplicate-`HEALTH_PING_URL` incide
    ```bash
    .venv/Scripts/python.exe scripts/incremental_sync_fireflies.py
    ```
-   Expect a `sweep complete` / `Fireflies sync complete` line and an advanced
-   watermark in `data/cache/` or the run log under `logs/kb-sync-fireflies-*.log`.
-   **Note the watermark advances on success**, so a failed run followed by a
-   successful one is fine, but a *silently empty* run is not -- check the transcript
-   count in the log rather than the exit code alone.
-6. **Re-auth the Cowork Fireflies connector** to cora@ (separate credential from
+   Expect a `Fireflies sync complete` line in `logs/kb-sync-fireflies-<date>.log`
+   with a non-zero transcript count. **The watermark is NOT a file** -- it lives in
+   the KB's `sync_state` table (`kb.get_sync_state("fireflies")`,
+   `scripts/incremental_sync_fireflies.py:81`); there has never been a Fireflies
+   watermark under `data/cache/`. Check the transcript count in the log rather than
+   the exit code alone: the watermark advances on success, so a *silently empty*
+   run still looks clean from the outside.
+6. **Restart the bot.** `_token()` reads the environment, and the always-on process
+   loaded `.env` at ITS startup -- so it keeps serving the OLD key until restarted.
+   This matters because the bot really does hold a Fireflies consumer:
+   `tool_dispatch.py:1069` imports `fireflies_action_extractor`. Scheduled scripts
+   are unaffected (each fire is a fresh process and reads the new value straight
+   away), which is exactly why this step is easy to forget.
+   Elevated: `.\deployment\restart-cora.ps1`, then confirm a NEW pid in
+   `logs/cora-instances.jsonl`.
+7. **Re-auth the Cowork Fireflies connector** to cora@ (separate credential from
    `.env`; it is an interactive OAuth in the Cowork app).
-7. **Only then** deactivate the other seats -- **"Deactivate and KEEP data"**, never
+8. **Only then** deactivate the other seats -- **"Deactivate and KEEP data"**, never
    "Deactivate and delete data" (which purges after 30 days) and never "Remove"
    (which is for out-of-domain users). Per the Fireflies help centre, deactivate-and-
    keep leaves all their meetings in the workspace and searchable, and is reversible.
-8. **Reduce the purchased seat count on the Billing page.** Deactivation alone does
+9. **Reduce the purchased seat count on the Billing page.** Deactivation alone does
    not lower the bill; the docs only promise automatic billing relief on Remove.
 
 ## Rollback

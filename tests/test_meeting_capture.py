@@ -29,7 +29,11 @@ DAY = "2026-08-26"
 
 
 def _ts(hh: int, mm: int = 0) -> str:
-    return datetime(2026, 8, 26, hh, mm, tzinfo=AZ).isoformat()
+    """Timestamp on the audited day, tolerating hh >= 24 so a caller can express an
+    end time that rolls past midnight (a 23:30 meeting ends at 00:30 the next day)."""
+    return (
+        datetime(2026, 8, 26, 0, mm, tzinfo=AZ) + timedelta(hours=hh)
+    ).isoformat()
 
 
 def _ev(
@@ -793,3 +797,326 @@ class TestScriptsAndDeployment:
 
     def test_ops_channel_is_pinned_by_id(self):
         assert mc.OPS_CHANNEL == "C0BCUBUDHAR"
+
+
+# ── D-051 remediation regressions ────────────────────────────────────────────
+# One test per confirmed defect. Each names the failure it prevents, because a
+# regression test whose purpose is not written down gets deleted by the next
+# person who finds it inconvenient.
+
+class TestReviewRemediations:
+    def test_carve_out_on_one_copy_vetoes_the_whole_meeting(self):
+        """CONSENT. A [no-bot] Harrison types on HIS copy must not be defeated by
+        Hannah's copy of the same meeting still carrying the original title."""
+        link = "https://meet.google.com/vet-oooo-aaa"
+        res = mc.plan_ensure(DAY, _cfg(), list_events=_lister({
+            "cora@hjrglobal.com": [],
+            "harrison@hjrglobal.com": [_ev("mine", summary="[no-bot] private", link=link)],
+            "hannah@hjrglobal.com": [_ev("theirs", summary="Weekly Sync", link=link)],
+        }))
+        assert [a.action for a in res.actions] == ["skip"]
+        assert res.actions[0].reason.startswith("title-marker")
+
+    def test_second_meeting_on_a_shared_room_link_is_still_ensured(self):
+        """A static personal room link is reused all day. Keying coverage on the
+        link alone marked the second meeting already-covered -- a silent miss."""
+        link = "https://meet.google.com/static-room-xyz"
+        res = mc.plan_ensure(DAY, _cfg(), list_events=_lister({
+            "cora@hjrglobal.com": [_ev("cov", link=link, hh=9)],
+            "harrison@hjrglobal.com": [_ev("later", link=link, hh=15)],
+        }))
+        acting = [a for a in res.actions if a.action in ("guest-add", "copy")]
+        assert len(acting) == 1 and acting[0].event_id == "later"
+
+    def test_legacy_notetaker_invite_blocks_a_second_bot(self):
+        """The one-mechanism rule. Adding cora@ on top of an already-invited
+        notetaker dispatches TWO bots -- the exact duplicate this build removes."""
+        ev = _ev("e1", attendees=["harrison@hjrglobal.com", mc.LEGACY_NOTETAKER])
+        res = mc.plan_ensure(DAY, _cfg(), list_events=_lister({
+            "cora@hjrglobal.com": [], "harrison@hjrglobal.com": [ev],
+        }))
+        act = [a for a in res.actions if a.action != "skip"][0]
+        assert act.action == "none" and "legacy notetaker" in act.reason
+
+    def test_carve_out_titles_are_never_published(self):
+        """A no-record meeting is one somebody ruled must not be recorded; printing
+        its title into a shared ops channel publishes what the rule protects."""
+        r = _audit({"harrison@hjrglobal.com": [
+            _ev("e1", summary="Strategy call with counsel re: Acme dispute")]}, [])
+        out = mc.render_report(r)
+        assert "Acme" not in out
+        assert "Strategy call" not in out
+        assert "a meeting at" in out
+
+    def test_redacted_meeting_does_not_name_its_organizer(self):
+        """An agency address beside a redacted title re-identifies the client
+        programme that the redaction existed to protect."""
+        ev = _ev("e1", summary="P. B. 90 day", organizer="vreese@azdes.gov",
+                 attendees=["vreese@azdes.gov"])
+        r = _audit({"harrison@hjrglobal.com": [ev]}, [])
+        out = mc.render_report(r)
+        assert "azdes.gov" not in out and "P. B." not in out
+        assert "withheld" in out
+
+    def test_transcript_rail_applies_the_client_domain_screen_too(self):
+        """It was on the event rail only, leaving the transcript rail -- which
+        renders captures with NO calendar event -- the weaker of the two."""
+        t = _t("t1", title="P. B. 90 day review", organizer="vreese@azdes.gov")
+        t["meeting_attendees"] = [{"email": "vreese@azdes.gov", "displayName": "V"}]
+        assert mc._transcript_display_title(t).startswith("LEX/PHI meeting")
+
+    def test_two_meetings_sharing_a_link_do_not_cross_match(self):
+        """setdefault bound a shared link to whichever meeting was seen first --
+        a false duplicate on one row and a false miss on another."""
+        link = "https://meet.google.com/shared-room"
+        r = _audit(
+            {"harrison@hjrglobal.com": [
+                _ev("m1", summary="Morning", hh=9, link=link),
+                _ev("m2", summary="Afternoon", hh=15, link=link),
+            ]},
+            [_t("t1", title="Something else", hh=9, cal_id=None, link=link)],
+        )
+        assert r.duplicates == []
+        assert len(r.unmatched_transcripts) == 1
+
+    def test_two_meetings_sharing_a_title_do_not_cross_match(self):
+        r = _audit(
+            {"harrison@hjrglobal.com": [
+                _ev("m1", summary="Standup", hh=9, link="https://meet.google.com/a-a-a"),
+                _ev("m2", summary="Standup", hh=15, link="https://meet.google.com/b-b-b"),
+            ]},
+            [_t("t1", title="Standup", hh=9, cal_id=None, link="https://meet.google.com/z-z-z")],
+        )
+        assert r.duplicates == []
+        assert len(r.unmatched_transcripts) == 1
+
+    def test_add_attendee_refuses_a_truncated_guest_list(self):
+        """Google sets attendeesOmitted when the list it returned is INCOMPLETE.
+        Patching it back would delete every guest it left out."""
+        import unittest.mock as um
+
+        from cora.tools import calendar_client as cc
+
+        with um.patch.object(cc, "get_event", return_value={
+            "id": "e1", "attendeesOmitted": True,
+            "attendees": [{"email": "one@hjrglobal.com"}],
+        }):
+            with pytest.raises(cc.CalendarClientError, match="attendeesOmitted"):
+                cc.add_attendee(user_email="h@hjrglobal.com", event_id="e1",
+                                attendee_email="cora@hjrglobal.com")
+
+    def test_carve_out_survives_odd_whitespace(self):
+        cfg = _cfg(no_record_title_patterns=("estate planning",))
+        for title in ("Estate  Planning sync", "Estate Planning sync", "Estate\nPlanning"):
+            assert not mc.qualify_event(_ev("e1", summary=title), cfg).qualifies
+        assert mc.qualify_event(_ev("e2", summary="Real estate plans"), cfg).qualifies
+
+    def test_malformed_carve_out_block_refuses_to_run(self, tmp_path):
+        """Treating a broken carve_outs block as empty would capture every meeting
+        the list was written to protect."""
+        f = tmp_path / "r.yaml"
+        f.write_text(
+            'capture_identity: "cora@hjrglobal.com"\n'
+            "roster:\n  - {name: A, calendar_email: a@hjrglobal.com}\n"
+            "carve_outs: not-a-mapping\n", encoding="utf-8")
+        with pytest.raises(mc.MeetingCaptureConfigError):
+            mc.load_config(path=f)
+
+    def test_scalar_where_a_carve_out_list_belongs_refuses_to_run(self, tmp_path):
+        """A bare string is valid YAML; iterating it yields CHARACTERS, so the
+        carve-out silently protects nobody."""
+        f = tmp_path / "r.yaml"
+        f.write_text(
+            'capture_identity: "cora@hjrglobal.com"\n'
+            "roster:\n  - {name: A, calendar_email: a@hjrglobal.com}\n"
+            "carve_outs:\n  no_record_title_patterns: counsel\n", encoding="utf-8")
+        with pytest.raises(mc.MeetingCaptureConfigError, match="must be a list"):
+            mc.load_config(path=f)
+
+    def test_quoted_false_actually_disables_a_roster_member(self, tmp_path):
+        """bool of the string "false" is True -- a quoted value would keep someone
+        in the sweep after Harrison had switched them off."""
+        f = tmp_path / "r.yaml"
+        f.write_text(
+            'capture_identity: "cora@hjrglobal.com"\n'
+            'roster:\n  - {name: A, calendar_email: a@hjrglobal.com, enabled: "false"}\n',
+            encoding="utf-8")
+        cfg = mc.load_config(path=f)
+        assert cfg.active_members == ()
+
+    def test_degraded_fireflies_join_is_announced(self, monkeypatch):
+        """Without cal_id the whole diff runs on fallbacks; that must not be silent."""
+        from cora.connectors import fireflies_connector as ffc
+
+        monkeypatch.setattr(ffc, "_extended_query_unavailable", True)
+        r = _audit({"harrison@hjrglobal.com": [_ev("e1")]}, [])
+        assert "exact" in r.transcript_error and "cal_id" in r.transcript_error
+        assert "NOT trustworthy" in mc.render_report(r)
+
+    def test_action_extractor_shares_the_query_fallback(self):
+        """Protecting only the NEW caller of a shared function leaves the sibling
+        lane to go dark on the same vendor change."""
+        text = (_REPO_ROOT / "src" / "cora" / "connectors"
+                / "fireflies_action_extractor.py").read_text(encoding="utf-8")
+        assert "_query_transcripts(variables)" in text
+        assert "_graphql_query(_TRANSCRIPTS_QUERY" not in text
+
+
+class TestReviewRemediationsRoundTwo:
+    def test_all_day_event_is_not_a_capturable_meeting(self):
+        """No start time for a notetaker to join at, and copying it puts an all-day
+        event on the capture calendar that no bot can act on."""
+        ev = _ev("e1")
+        ev["start"] = {"date": "2026-08-26"}
+        ev["end"] = {"date": "2026-08-27"}
+        q = mc.qualify_event(ev, _cfg())
+        assert not q.qualifies and q.reason == "all-day"
+
+    def test_cross_midnight_meeting_belongs_to_the_day_it_starts(self):
+        """events.list returns everything OVERLAPPING the window, so a 23:30-00:30
+        meeting comes back on BOTH days; counting it twice makes the second day a
+        permanent false miss."""
+        late = _ev("late", hh=23, mm=30)
+        assert mc.starts_on_day(late, "2026-08-26") is True
+        assert mc.starts_on_day(late, "2026-08-27") is False
+
+    def test_audit_does_not_double_count_a_cross_midnight_meeting(self):
+        late = _ev("late", hh=23, mm=30)
+        r_start = _audit({"harrison@hjrglobal.com": [late]}, [])
+        assert r_start.scheduled == 1
+        r_next = mc.audit_day(
+            "2026-08-27", _cfg(),
+            list_events=_lister({"harrison@hjrglobal.com": [late]}),
+            fetch_transcripts=lambda a, b: [],
+            fetch_seats=lambda: [],
+        )
+        assert r_next.scheduled == 0
+
+    def test_stale_capture_copy_is_detected(self):
+        """A copy is a snapshot. When the source moves or is cancelled the copy
+        stays behind and sends the notetaker to that link at a time nobody agreed
+        to -- a capture nobody consented to."""
+        from cora.tools.calendar_client import CAPTURE_COPY_MARKER
+
+        ghost = _ev("ghost", link="https://meet.google.com/gone-aaaa-bbb", hh=9)
+        ghost["description"] = f"Capture copy ... ({CAPTURE_COPY_MARKER})\nsource_event_id: x"
+        res = mc.plan_ensure(DAY, _cfg(), list_events=_lister({
+            "cora@hjrglobal.com": [ghost],
+            "harrison@hjrglobal.com": [],      # source is gone
+        }))
+        assert [e for e, _ in res.stale_copies] == ["ghost"]
+
+    def test_a_live_capture_copy_is_not_treated_as_stale(self):
+        from cora.tools.calendar_client import CAPTURE_COPY_MARKER
+
+        link = "https://meet.google.com/still-here-xx"
+        copy = _ev("copy", link=link, hh=9)
+        copy["description"] = f"({CAPTURE_COPY_MARKER})"
+        src = _ev("src", link=link, hh=9, organizer="ext@vendor.com")
+        res = mc.plan_ensure(DAY, _cfg(), list_events=_lister({
+            "cora@hjrglobal.com": [copy],
+            "harrison@hjrglobal.com": [src],
+        }))
+        assert res.stale_copies == []
+
+    def test_a_human_event_on_the_capture_calendar_is_never_touched(self):
+        """Only events carrying this lane's own marker are ever deletion
+        candidates."""
+        human = _ev("human-made", link="https://meet.google.com/human-xxx", hh=9)
+        human["description"] = "Harrison put this here on purpose"
+        res = mc.plan_ensure(DAY, _cfg(), list_events=_lister({
+            "cora@hjrglobal.com": [human],
+            "harrison@hjrglobal.com": [],
+        }))
+        assert res.stale_copies == []
+
+    def test_stale_copies_are_only_deleted_under_both_write_gates(self, monkeypatch):
+        from cora.tools import calendar_client as cc
+        from cora.tools.calendar_client import CAPTURE_COPY_MARKER
+
+        ghost = _ev("ghost", link="https://meet.google.com/gone-x", hh=9)
+        ghost["description"] = f"({CAPTURE_COPY_MARKER})"
+        res = mc.plan_ensure(DAY, _cfg(), list_events=_lister({
+            "cora@hjrglobal.com": [ghost], "harrison@hjrglobal.com": [],
+        }))
+        deleted: list = []
+        monkeypatch.setattr(cc, "delete_event", lambda **k: deleted.append(k))
+
+        mc.execute_ensure(res, _cfg(), apply=True)          # flag off
+        assert deleted == []
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        mc.execute_ensure(res, _cfg(), apply=False)         # no --apply
+        assert deleted == []
+        mc.execute_ensure(res, _cfg(), apply=True)          # both gates
+        assert [d["event_id"] for d in deleted] == ["ghost"]
+
+
+class TestCarveOutBreachAlarm:
+    """A carve-out that was recorded anyway is the most serious thing this auditor
+    can find. Dropping carved meetings from the diff entirely would hide it."""
+
+    def _carved_and_captured(self):
+        ev = _ev("e1", summary="[no-bot] private chat",
+                 link="https://meet.google.com/carve-out-x")
+        t = _t("t1", title="private chat", cal_id="e1",
+               link="https://meet.google.com/carve-out-x")
+        return _audit({"harrison@hjrglobal.com": [ev]}, [t])
+
+    def test_a_carved_out_meeting_that_was_recorded_is_alarmed(self):
+        r = self._carved_and_captured()
+        assert len(r.carve_out_breaches) == 1
+        out = mc.render_report(r)
+        assert "RECORDED DESPITE A CARVE-OUT" in out
+
+    def test_the_breach_line_shows_shape_not_title(self):
+        r = self._carved_and_captured()
+        out = mc.render_report(r)
+        assert "private chat" not in out
+        assert "a meeting at" in out
+
+    def test_a_breach_is_not_counted_as_an_unmatched_transcript(self):
+        """It is not an unexplained capture -- we know exactly which meeting it is."""
+        r = self._carved_and_captured()
+        assert r.unmatched_transcripts == []
+
+    def test_a_carved_out_meeting_is_not_scheduled_and_not_a_miss(self):
+        """Reporting it as a miss would nag Harrison to close a gap he created."""
+        r = _audit({"harrison@hjrglobal.com": [
+            _ev("e1", summary="[no-bot] private chat")]}, [])
+        assert r.scheduled == 0 and r.misses == [] and len(r.skipped) == 1
+
+    def test_a_breach_suppresses_the_clean_day_line(self):
+        r = self._carved_and_captured()
+        assert "captured exactly once" not in mc.render_report(r)
+
+    def test_audit_applies_the_cross_copy_veto_like_the_ensure_lane(self):
+        """A [no-bot] on one copy must veto the meeting on every calendar, or the
+        auditor reports a deliberately-excluded meeting as a miss."""
+        link = "https://meet.google.com/two-copies-x"
+        r = _audit({
+            "harrison@hjrglobal.com": [_ev("mine", summary="[no-bot] private", link=link)],
+            "hannah@hjrglobal.com": [_ev("theirs", summary="Weekly Sync", link=link)],
+        }, [])
+        assert r.scheduled == 0 and r.misses == []
+        assert len(r.skipped) == 1
+
+    def test_ensure_reason_withholds_the_organizer_of_a_redacted_meeting(self):
+        """The reason is printed and persisted, so naming an agency address there
+        would undo the redaction two fields away."""
+        ev = _ev("e1", summary="P. B. 90 day", organizer="vreese@azdes.gov",
+                 attendees=["vreese@azdes.gov"])
+        res = mc.plan_ensure(DAY, _cfg(), list_events=_lister({
+            "cora@hjrglobal.com": [], "harrison@hjrglobal.com": [ev],
+        }))
+        act = [a for a in res.actions if a.action in ("guest-add", "copy")][0]
+        assert "azdes.gov" not in act.reason and "withheld" in act.reason
+        assert act.title.startswith("LEX/PHI")
+
+    def test_audit_docstring_time_matches_the_registered_task(self):
+        doc = (_REPO_ROOT / "scripts" / "run_meeting_capture_audit.py").read_text(
+            encoding="utf-8")
+        ps1 = (_REPO_ROOT / "deployment" / "setup-meeting-capture-audit-task.ps1").read_text(
+            encoding="ascii")
+        import re as _re
+        hh = _re.search(r'\$HourMin\s*=\s*"(\d\d:\d\d)"', ps1).group(1)
+        assert hh in doc, f"docstring does not mention the registered time {hh}"

@@ -485,7 +485,7 @@ class TestRunActionCapture:
 
         with (
             patch.object(fae, "_WATERMARK_PATH", watermark_path),
-            patch("cora.connectors.fireflies_action_extractor._graphql_query", return_value=mock_ff_data),
+            patch("cora.connectors.fireflies_action_extractor._query_transcripts", return_value=mock_ff_data),
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
             patch("anthropic.Anthropic") as mock_anth,
             patch("cora.connectors.fireflies_action_extractor.create_task") as mock_create,
@@ -520,7 +520,7 @@ class TestRunActionCapture:
                 "included_sub_entities": ["LEX", "LEX-LLC", "LEX-LLA", "LEX-LTS"],
                 "excluded_sub_entities": ["LEX-LBHS"],
             }),
-            patch("cora.connectors.fireflies_action_extractor._graphql_query", return_value=mock_ff_data),
+            patch("cora.connectors.fireflies_action_extractor._query_transcripts", return_value=mock_ff_data),
             patch("anthropic.Anthropic") as mock_anth,
             patch("cora.connectors.fireflies_action_extractor.create_task") as mock_create,
         ):
@@ -540,7 +540,7 @@ class TestRunActionCapture:
         with (
             patch.object(fae, "_WATERMARK_PATH", watermark_path),
             patch.object(fae, "_lex_scope_cfg", {"enabled": False}),
-            patch("cora.connectors.fireflies_action_extractor._graphql_query", return_value=mock_ff_data),
+            patch("cora.connectors.fireflies_action_extractor._query_transcripts", return_value=mock_ff_data),
             patch("anthropic.Anthropic") as mock_anth,
             patch("cora.connectors.fireflies_action_extractor.create_task") as mock_create,
         ):
@@ -558,7 +558,7 @@ class TestRunActionCapture:
 
         with (
             patch.object(fae, "_WATERMARK_PATH", watermark_path),
-            patch("cora.connectors.fireflies_action_extractor._graphql_query", return_value=mock_ff_data),
+            patch("cora.connectors.fireflies_action_extractor._query_transcripts", return_value=mock_ff_data),
             patch("anthropic.Anthropic") as mock_anth,
         ):
             result = fae.run_action_capture(dry_run=True)
@@ -571,7 +571,7 @@ class TestRunActionCapture:
         watermark_path = tmp_path / "watermark.json"
         with (
             patch.object(fae, "_WATERMARK_PATH", watermark_path),
-            patch("cora.connectors.fireflies_action_extractor._graphql_query", return_value={"transcripts": []}),
+            patch("cora.connectors.fireflies_action_extractor._query_transcripts", return_value={"transcripts": []}),
         ):
             result = fae.run_action_capture(dry_run=True)
 
@@ -585,7 +585,7 @@ class TestRunActionCapture:
         with (
             patch.object(fae, "_WATERMARK_PATH", watermark_path),
             patch(
-                "cora.connectors.fireflies_action_extractor._graphql_query",
+                "cora.connectors.fireflies_action_extractor._query_transcripts",
                 side_effect=FirefliesConnectorError("API down"),
             ),
         ):
@@ -603,7 +603,7 @@ class TestRunActionCapture:
 
         with (
             patch.object(fae, "_WATERMARK_PATH", watermark_path),
-            patch("cora.connectors.fireflies_action_extractor._graphql_query", return_value=mock_ff_data),
+            patch("cora.connectors.fireflies_action_extractor._query_transcripts", return_value=mock_ff_data),
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
             patch("anthropic.Anthropic") as mock_anth,
             patch("cora.connectors.fireflies_action_extractor.create_task",
@@ -627,7 +627,7 @@ class TestRunActionCapture:
 
         with (
             patch.object(fae, "_WATERMARK_PATH", watermark_path),
-            patch("cora.connectors.fireflies_action_extractor._graphql_query", return_value=mock_ff_data),
+            patch("cora.connectors.fireflies_action_extractor._query_transcripts", return_value=mock_ff_data),
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
             patch("anthropic.Anthropic") as mock_anth,
             patch("cora.connectors.fireflies_action_extractor.create_task") as mock_create,
@@ -671,7 +671,7 @@ class TestDedupHardening:
         def _run():
             with (
                 patch.object(fae, "_WATERMARK_PATH", watermark_path),
-                patch("cora.connectors.fireflies_action_extractor._graphql_query", return_value=mock_ff_data),
+                patch("cora.connectors.fireflies_action_extractor._query_transcripts", return_value=mock_ff_data),
                 patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
                 patch("anthropic.Anthropic") as mock_anth,
                 patch("cora.connectors.fireflies_action_extractor.create_task") as mock_create,
@@ -701,7 +701,7 @@ class TestDedupHardening:
 
         with (
             patch.object(fae, "_WATERMARK_PATH", watermark_path),
-            patch("cora.connectors.fireflies_action_extractor._graphql_query", return_value=mock_ff_data),
+            patch("cora.connectors.fireflies_action_extractor._query_transcripts", return_value=mock_ff_data),
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
             patch("anthropic.Anthropic") as mock_anth,
             patch("cora.connectors.fireflies_action_extractor.create_task") as mock_create,
@@ -723,7 +723,7 @@ class TestDedupHardening:
 
         with (
             patch.object(fae, "_WATERMARK_PATH", watermark_path),
-            patch("cora.connectors.fireflies_action_extractor._graphql_query", return_value=mock_ff_data),
+            patch("cora.connectors.fireflies_action_extractor._query_transcripts", return_value=mock_ff_data),
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
             patch("anthropic.Anthropic") as mock_anth,
             patch("cora.connectors.fireflies_action_extractor.create_task") as mock_create,
@@ -785,7 +785,7 @@ class TestProjectRouting:
 
         with (
             patch.object(fae, "_WATERMARK_PATH", wpath),
-            patch("cora.connectors.fireflies_action_extractor._graphql_query", return_value=mock_ff),
+            patch("cora.connectors.fireflies_action_extractor._query_transcripts", return_value=mock_ff),
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
             patch("anthropic.Anthropic") as mock_anth,
             patch("cora.connectors.fireflies_action_extractor.create_task") as mock_create,
@@ -987,7 +987,7 @@ class TestProjectGuard:
         wpath = tmp_path / "wm.json"
         with (
             patch.object(fae, "_WATERMARK_PATH", wpath),
-            patch("cora.connectors.fireflies_action_extractor._graphql_query", return_value={"transcripts": [transcript]}),
+            patch("cora.connectors.fireflies_action_extractor._query_transcripts", return_value={"transcripts": [transcript]}),
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "k"}),
             patch("anthropic.Anthropic") as mock_anth,
             patch("cora.connectors.fireflies_action_extractor._resolve_project_smart", return_value=None),
@@ -1009,7 +1009,7 @@ class TestProjectGuard:
         wpath = tmp_path / "wm.json"
         with (
             patch.object(fae, "_WATERMARK_PATH", wpath),
-            patch("cora.connectors.fireflies_action_extractor._graphql_query", return_value={"transcripts": [transcript]}),
+            patch("cora.connectors.fireflies_action_extractor._query_transcripts", return_value={"transcripts": [transcript]}),
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "k"}),
             patch("anthropic.Anthropic") as mock_anth,
             patch("cora.connectors.fireflies_action_extractor._resolve_project_smart", return_value="PROJ"),

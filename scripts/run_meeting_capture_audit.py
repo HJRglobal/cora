@@ -20,7 +20,7 @@ READ-ONLY BY CONSTRUCTION: this script calls only calendar list + Fireflies quer
 Dry-run is the DEFAULT: prints the report, posts nothing. `--post` sends it.
 
 Run:  python scripts/run_meeting_capture_audit.py [--day YYYY-MM-DD] [--post]
-Schedule: daily, 07:20 AZ (after the 03:30 Fireflies KB sync, before the workday).
+Schedule: daily, 07:22 AZ (see deployment/setup-meeting-capture-audit-task.ps1).
 Exit codes: 0 = ran (with or without findings), 1 = could not run.
 """
 
@@ -124,6 +124,10 @@ def main() -> int:
         "duplicated": len(report.duplicates),
         "unmatched": len(report.unmatched_transcripts),
         "skipped": len(report.skipped),
+        # The most serious finding this auditor can produce: a recording exists of
+        # a meeting a carve-out excluded. Counted here so a breach is durable even
+        # if the Slack post fails.
+        "carve_out_breaches": len(report.carve_out_breaches),
         "failed_calendars": [e for e, _ in report.failed_calendars],
         "transcript_error": report.transcript_error,
         # Event ids only -- never titles. A LEX title must not reach an at-rest
