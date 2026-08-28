@@ -474,6 +474,26 @@ def _graphql_query(query: str, variables: dict | None = None) -> dict:
 
 
 # GraphQL query — pulls everything we need for a Document
+# Fields added 2026-08-27 for the One Cora capture lane (cq-ffcf6e4ffe7c), each
+# VERIFIED against the live schema by introspection before being added here --
+# `__type(name:"Transcript")` for cal_id/calendar_id and `__type(name:"MeetingInfo")`
+# for fred_joined. That verification is not optional ceremony: Fireflies fails the
+# ENTIRE query on one unknown field, so a wrong guess here takes the nightly KB
+# ingest dark rather than degrading. `_TRANSCRIPTS_QUERY_LEGACY` below is the
+# pre-2026-08-27 selection set, kept as a runtime fallback for the same reason --
+# if Fireflies ever retires one of these fields, ingest drops back to the old
+# shape and keeps running instead of going silent.
+#
+# NOTE ON `fred_joined`: it is NOT a top-level Transcript field (a natural
+# assumption, and wrong). It lives on the nested `meeting_info` object.
+_TRANSCRIPT_FIELDS_EXTRA = """
+    cal_id
+    calendar_id
+    meeting_info {
+      fred_joined
+      silent_meeting
+    }"""
+
 _TRANSCRIPTS_QUERY = """
 query Transcripts($limit: Int, $skip: Int, $fromDate: DateTime, $toDate: DateTime) {
   transcripts(limit: $limit, skip: $skip, fromDate: $fromDate, toDate: $toDate) {
@@ -486,6 +506,12 @@ query Transcripts($limit: Int, $skip: Int, $fromDate: DateTime, $toDate: DateTim
     organizer_email
     host_email
     participants
+    cal_id
+    calendar_id
+    meeting_info {
+      fred_joined
+      silent_meeting
+    }
     summary {
       overview
       keywords
@@ -508,6 +534,51 @@ query Transcripts($limit: Int, $skip: Int, $fromDate: DateTime, $toDate: DateTim
   }
 }
 """
+
+#: The pre-2026-08-27 selection set, with the capture-lane fields stripped back out.
+#: Used ONLY as a runtime fallback (see `_query_transcripts`).
+_TRANSCRIPTS_QUERY_LEGACY = _TRANSCRIPTS_QUERY.replace(_TRANSCRIPT_FIELDS_EXTRA + "\n", "")
+
+#: Set once per process when the extended query has been rejected by the API, so a
+#: paginated backfill does not re-attempt (and re-fail) the extended shape on every
+#: page. Reset only by a process restart -- deliberately, so the fallback is visible
+#: in one run's logs rather than flapping.
+_extended_query_unavailable = False
+
+
+def _query_transcripts(variables: dict) -> dict:
+    """Run the transcripts query, degrading to the legacy selection set on rejection.
+
+    Fireflies fails the WHOLE query on a single unknown field, so a vendor-side
+    schema change to any capture-lane field would otherwise take the nightly KB
+    ingest dark. Here it degrades instead: the extended fields go missing (dedup
+    falls back to completeness ranking, which is exactly the pre-2026-08-27
+    behaviour) and ingest keeps running. Any error that is NOT a field-validation
+    error -- auth, network, rate limit -- is re-raised untouched, because silently
+    swallowing those would hide a real outage behind a degraded-but-green run.
+    """
+    global _extended_query_unavailable
+    if _extended_query_unavailable:
+        return _graphql_query(_TRANSCRIPTS_QUERY_LEGACY, variables)
+    try:
+        return _graphql_query(_TRANSCRIPTS_QUERY, variables)
+    except FirefliesConnectorError as exc:
+        msg = str(exc).lower()
+        # GraphQL validation errors name the offending field; transport/auth errors
+        # do not. Only the former is safe to retry with a smaller selection set.
+        if not any(
+            marker in msg
+            for marker in ("cannot query field", "unknown field", "graphql_validation_failed", "did you mean")
+        ):
+            raise
+        _extended_query_unavailable = True
+        log.error(
+            "Fireflies rejected the extended transcript fields (%s) -- falling back to "
+            "the legacy selection set for the rest of this process. fred_joined-based "
+            "dedup is INACTIVE until this is fixed.",
+            exc,
+        )
+        return _graphql_query(_TRANSCRIPTS_QUERY_LEGACY, variables)
 
 
 def _parse_date(date_field) -> int | None:
@@ -678,6 +749,89 @@ def _meeting_dedup_keys(transcript: dict) -> list[tuple]:
     return keys
 
 
+#: A `fred_joined` copy must retain at least this fraction of the best copy's
+#: sentence count to be chosen as canonical. MEASURED, not guessed: across the 25
+#: real duplicate clusters in 2026-07-01..08-28, the fred copy's sentence ratio to
+#: the best alternative was never below 0.89 in the normal case -- except for one
+#: cluster ("Harrison x Finance Weekly", 2026-08-10) where the fred copy had ZERO
+#: sentences against 1,158. A floor of 0.5 sits far below every real case and far
+#: above the pathological one, so it only ever fires on a genuinely empty or
+#: truncated capture. See `_pick_canonical`.
+_FRED_MIN_SENTENCE_RATIO = 0.5
+
+
+def _fred_joined(transcript: dict) -> bool:
+    """True only when Fireflies affirmatively reports its bot joined the meeting.
+
+    `meeting_info.fred_joined` is `None` on roughly half of all transcripts (the
+    invited-bot / non-calendar-dispatched copies), so this deliberately tests for
+    `is True` rather than truthiness -- a missing field must never read as a claim.
+    """
+    mi = transcript.get("meeting_info")
+    if not isinstance(mi, dict):
+        return False
+    return mi.get("fred_joined") is True
+
+
+def _pick_canonical(members: list[dict]) -> tuple[dict, str]:
+    """Choose the canonical copy of one meeting. Returns (winner, reason).
+
+    Rule of record (D-247 amendment, Harrison 2026-08-27): when a duplicate pair
+    exists, the `fred_joined: true` copy is canonical. That copy is the one the
+    calendar-dispatched bot produced -- the only kind that will still exist after
+    the single-seat collapse -- and it is usually the better capture: on 2026-08-26
+    the completeness rule kept an 8-minute copy of "Big D Media x HJR Weekly
+    Connect" over the 20-minute fred copy.
+
+    The rule is NOT applied blind. Taken literally it would, on real August data,
+    have chosen a transcript with 0 sentences over one with 1,158 for
+    "Harrison x Finance Weekly" -- silently emptying that meeting out of the KB.
+    So a fred copy wins only if it carries at least `_FRED_MIN_SENTENCE_RATIO` of
+    the best copy's sentences. Provenance decides between two real captures; it
+    does not get to discard the content.
+
+    With no fred copy (or none that clears the floor) this is exactly the
+    pre-2026-08-27 behaviour: most sentences, then longest summary, then longest
+    title, then smallest id.
+
+    FORWARD-ONLY, deliberately. `_dedup_transcripts` drops any id already recorded
+    in the ledger's `collapsed_ids`, so a meeting whose fred copy was collapsed by
+    the old completeness rule stays as it is -- the new rule does not re-point
+    already-ingested meetings and produces no KB churn. It governs meetings
+    deduped from here on. Re-pointing the ~29 historical pairs would be a separate,
+    explicitly-scoped retro pass.
+    """
+    def _completeness_key(t: dict):
+        comp = _transcript_completeness(t)
+        return (-comp[0], -comp[1], -comp[2], (t.get("id") or ""))
+
+    by_completeness = sorted(members, key=_completeness_key)
+    best = by_completeness[0]
+    best_sentences = len(best.get("sentences") or [])
+
+    freds = [m for m in members if _fred_joined(m)]
+    if not freds:
+        return best, "completeness"
+
+    # >1 fred copy is not expected (0 occurrences in the measured window) but is
+    # structurally possible during the Phase-2 overlap; rank among them.
+    fred = sorted(freds, key=_completeness_key)[0]
+    if fred.get("id") == best.get("id"):
+        return best, "fred+completeness"
+
+    fred_sentences = len(fred.get("sentences") or [])
+    if best_sentences > 0 and (fred_sentences / best_sentences) < _FRED_MIN_SENTENCE_RATIO:
+        log.warning(
+            "Fireflies dedup: fred_joined copy %s of %r has %d sentences vs %d in %s "
+            "-- below the %.0f%% content floor, keeping the fuller copy",
+            fred.get("id"), (fred.get("title") or "")[:60], fred_sentences,
+            best_sentences, best.get("id"), _FRED_MIN_SENTENCE_RATIO * 100,
+        )
+        return best, "completeness-over-empty-fred"
+
+    return fred, "fred_joined"
+
+
 def _transcript_completeness(transcript: dict) -> tuple[int, int, int]:
     """Completeness proxy: (sentence count, summary length, title length).
 
@@ -782,11 +936,6 @@ def _dedup_transcripts(transcripts: list[dict], ledger: dict) -> tuple[list[dict
         if not placed:
             clusters.append({"keys": set(keys), "anchor": ts, "members": [t]})
 
-    def _winner_sort_key(t: dict):
-        comp = _transcript_completeness(t)
-        # most-complete first; deterministic smallest-id tiebreak
-        return (-comp[0], -comp[1], -comp[2], (t.get("id") or ""))
-
     winners: list[dict] = []
     collapsed_count = 0
     new_ledger = dict(ledger)
@@ -794,7 +943,7 @@ def _dedup_transcripts(transcripts: list[dict], ledger: dict) -> tuple[list[dict
 
     for c in clusters:
         members = c["members"]
-        winner = min(members, key=_winner_sort_key)
+        winner, win_reason = _pick_canonical(members)
         winner_id = winner.get("id") or ""
         winners.append(winner)
         losers = [m for m in members if (m.get("id") or "") != winner_id]
@@ -810,10 +959,11 @@ def _dedup_transcripts(transcripts: list[dict], ledger: dict) -> tuple[list[dict
             merged.add(m.get("id") or "")
         entry["collapsed_ids"] = sorted(merged)
         entry["updated"] = now
+        entry["reason"] = win_reason
         new_ledger[lkey] = entry
         log.info(
-            "Fireflies dedup: meeting %r -> kept %s, collapsed %d copy(ies): %s",
-            (winner.get("title") or "")[:60], winner_id, len(losers),
+            "Fireflies dedup: meeting %r -> kept %s (%s), collapsed %d copy(ies): %s",
+            (winner.get("title") or "")[:60], winner_id, win_reason, len(losers),
             ",".join(m.get("id") or "" for m in losers),
         )
 
@@ -937,7 +1087,7 @@ def backfill(since: datetime) -> Iterator[Document]:
         }
         log.info("Fireflies query: skip=%d limit=%d", skip, _BATCH_SIZE)
         try:
-            data = _graphql_query(_TRANSCRIPTS_QUERY, variables)
+            data = _query_transcripts(variables)
         except FirefliesConnectorError as exc:
             log.error("Fireflies query failed at skip=%d: %s", skip, exc)
             raise
@@ -1067,6 +1217,20 @@ def backfill(since: datetime) -> Iterator[Document]:
                 ],
                 "participant_slack_ids": _resolve_participant_slack_ids(meeting_attendees),
                 "participants": t.get("participants") or [],
+                # Capture-lane identity (2026-08-27, cq-ffcf6e4ffe7c). `cal_id` is
+                # the Google Calendar event id VERBATIM -- verified live against the
+                # DWD calendar read: Fireflies cal_id "e2n2n35b61sieue9j6fcns66rs"
+                # is byte-identical to that event's `id`, and the recurring form
+                # "<master>_20260827T190000Z" matches Google's instance id exactly.
+                # That makes calendar<->transcript joins deterministic instead of
+                # title-matched. Stored (rather than only used in-flight) so a later
+                # retro pass has a meeting identity to join on -- the absence of
+                # `meeting_link` in metadata is precisely why the ~85 pre-dedup
+                # duplicate groups already in the KB cannot be retro-collapsed today.
+                "meeting_link": t.get("meeting_link") or "",
+                "calendar_event_id": t.get("cal_id") or "",
+                "calendar_series_id": t.get("calendar_id") or "",
+                "fred_joined": _fred_joined(t),
                 **diarization_meta,
             },
         )

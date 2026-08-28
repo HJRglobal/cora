@@ -265,3 +265,167 @@ class TestBackfillDedup:
 
         assert [d.source_id for d in docs1] == ["b"]   # canonical only
         assert [d.source_id for d in docs2] == ["b"]   # idempotent: no resurrection of 'a'
+
+
+# ── fred_joined canonical selection (2026-08-27, cq-ffcf6e4ffe7c) ────────────
+# D-247 amendment: when a duplicate pair exists the `fred_joined: true` copy --
+# the one the calendar-dispatched bot produced -- is canonical. Guarded by a
+# content floor, because on real August data the literal rule would have chosen a
+# 0-sentence transcript over an 1,158-sentence one for "Harrison x Finance Weekly".
+
+def _fred(t, value=True):
+    """Attach the nested meeting_info shape Fireflies actually returns.
+
+    fred_joined lives on `meeting_info`, NOT at the top level of Transcript
+    (verified by live schema introspection 2026-08-27).
+    """
+    t["meeting_info"] = {"fred_joined": value, "silent_meeting": False}
+    return t
+
+
+class TestFredJoinedCanonical:
+    def test_fred_flag_reads_only_literal_true(self):
+        assert ffc._fred_joined(_fred(_t("a", date_ts=BASE), True)) is True
+        assert ffc._fred_joined(_fred(_t("a", date_ts=BASE), False)) is False
+        # None is the COMMON case (~half of live transcripts) and must not read
+        # as a claim that the bot joined.
+        assert ffc._fred_joined(_fred(_t("a", date_ts=BASE), None)) is False
+        assert ffc._fred_joined(_t("a", date_ts=BASE)) is False          # key absent
+        assert ffc._fred_joined({"meeting_info": None}) is False          # explicit null
+
+    def test_fred_copy_wins_over_more_complete_copy(self):
+        """The headline rule, and the real 'Big D Media' case: on 2026-08-26 the
+        completeness rule kept an 8-minute copy over the 20-minute fred copy."""
+        fred = _fred(_t("fred", date_ts=BASE, link="L", n_sentences=129,
+                        action_items="short"))
+        other = _t("other", date_ts=BASE, link="L", n_sentences=129,
+                   action_items="a much longer action item list " * 40)
+        winner, reason = ffc._pick_canonical([other, fred])
+        assert winner["id"] == "fred"
+        assert reason == "fred_joined"
+
+    def test_empty_fred_copy_never_beats_a_real_transcript(self):
+        """The measured pathological case -- 0 sentences vs 1,158. Selecting the
+        fred copy here would silently empty the meeting out of the KB."""
+        fred = _fred(_t("fred", date_ts=BASE, link="L", n_sentences=0))
+        full = _t("full", date_ts=BASE, link="L", n_sentences=1158)
+        winner, reason = ffc._pick_canonical([full, fred])
+        assert winner["id"] == "full"
+        assert reason == "completeness-over-empty-fred"
+
+    def test_slightly_shorter_fred_copy_still_wins(self):
+        """Real clusters sat at 0.89-1.00 sentence ratio; the floor must not fire
+        there or the rule would be dead on arrival for the normal case."""
+        fred = _fred(_t("fred", date_ts=BASE, link="L", n_sentences=810))
+        other = _t("other", date_ts=BASE, link="L", n_sentences=907)
+        winner, reason = ffc._pick_canonical([other, fred])
+        assert winner["id"] == "fred"
+        assert reason == "fred_joined"
+
+    def test_no_fred_copy_falls_back_to_completeness_unchanged(self):
+        a = _t("a", date_ts=BASE, link="L", n_sentences=5)
+        b = _t("b", date_ts=BASE, link="L", n_sentences=9)
+        winner, reason = ffc._pick_canonical([a, b])
+        assert winner["id"] == "b"
+        assert reason == "completeness"
+
+    def test_multiple_fred_copies_rank_among_themselves(self):
+        f1 = _fred(_t("f1", date_ts=BASE, link="L", n_sentences=10))
+        f2 = _fred(_t("f2", date_ts=BASE, link="L", n_sentences=40))
+        plain = _t("p", date_ts=BASE, link="L", n_sentences=41)
+        winner, reason = ffc._pick_canonical([f1, plain, f2])
+        assert winner["id"] == "f2"
+        assert reason == "fred_joined"
+
+    def test_single_member_cluster_is_returned_as_is(self):
+        solo = _fred(_t("solo", date_ts=BASE, link="L", n_sentences=3))
+        winner, _ = ffc._pick_canonical([solo])
+        assert winner["id"] == "solo"
+
+    def test_dedup_end_to_end_prefers_fred_and_records_reason(self):
+        fred = _fred(_t("fred", date_ts=BASE, link="L", n_sentences=100))
+        other = _t("other", date_ts=BASE, link="L", n_sentences=140)
+        winners, ledger, collapsed = ffc._dedup_transcripts([other, fred], {})
+        assert collapsed == 1
+        assert [w["id"] for w in winners] == ["fred"]
+        entry = next(iter(ledger.values()))
+        assert entry["canonical_id"] == "fred"
+        assert entry["collapsed_ids"] == ["other"]
+        assert entry["reason"] == "fred_joined"
+
+    def test_all_completeness_dimensions_zero_does_not_divide_by_zero(self):
+        """Both copies empty: the ratio guard divides by best_sentences, so it must
+        be skipped rather than raising. fred still wins; the reason here is
+        'fred+completeness' because with equal (zero) content the id tiebreak also
+        lands on it, i.e. the two rules agree."""
+        fred = _fred(_t("fred", date_ts=BASE, link="L", n_sentences=0))
+        other = _t("other", date_ts=BASE, link="L", n_sentences=0)
+        winner, reason = ffc._pick_canonical([other, fred])
+        assert winner["id"] == "fred"
+        assert reason.startswith("fred")
+
+    def test_zero_sentence_guard_still_fires_when_fred_loses_the_tiebreak(self):
+        """Same empty-fred hazard, but with an id that sorts AFTER the full copy --
+        so the winner cannot come from the tiebreak and the floor is what saves it."""
+        fred = _fred(_t("zzz", date_ts=BASE, link="L", n_sentences=0))
+        full = _t("aaa", date_ts=BASE, link="L", n_sentences=900)
+        winner, reason = ffc._pick_canonical([fred, full])
+        assert winner["id"] == "aaa"
+        assert reason == "completeness-over-empty-fred"
+
+
+class TestExtendedTranscriptQuery:
+    """The extended selection set must never be able to take the nightly KB
+    ingest dark -- Fireflies fails the WHOLE query on one unknown field."""
+
+    def test_extended_query_requests_the_capture_lane_fields(self):
+        q = ffc._TRANSCRIPTS_QUERY
+        assert "cal_id" in q and "calendar_id" in q
+        assert "meeting_info" in q and "fred_joined" in q
+
+    def test_legacy_query_is_a_real_stripped_query_not_a_copy(self):
+        legacy = ffc._TRANSCRIPTS_QUERY_LEGACY
+        assert legacy != ffc._TRANSCRIPTS_QUERY
+        for tok in ("cal_id", "calendar_id", "meeting_info", "fred_joined"):
+            assert tok not in legacy, f"{tok} survived the strip -- fallback is a no-op"
+        # still a usable query
+        assert "meeting_link" in legacy and "sentences" in legacy
+        assert legacy.count("{") == legacy.count("}")
+
+    def test_validation_error_falls_back_to_legacy(self, monkeypatch):
+        monkeypatch.setattr(ffc, "_extended_query_unavailable", False)
+        seen: list[str] = []
+
+        def fake(query, variables=None):
+            seen.append(query)
+            if query is ffc._TRANSCRIPTS_QUERY:
+                raise ffc.FirefliesConnectorError(
+                    'Fireflies 400: Cannot query field "cal_id" on type "Transcript". '
+                    'code: GRAPHQL_VALIDATION_FAILED'
+                )
+            return {"transcripts": [{"id": "x"}]}
+
+        monkeypatch.setattr(ffc, "_graphql_query", fake)
+        out = ffc._query_transcripts({"limit": 1})
+        assert out["transcripts"][0]["id"] == "x"
+        assert len(seen) == 2 and seen[1] is ffc._TRANSCRIPTS_QUERY_LEGACY
+        # sticky: the next call must not re-attempt the extended shape
+        seen.clear()
+        ffc._query_transcripts({"limit": 1})
+        assert seen == [ffc._TRANSCRIPTS_QUERY_LEGACY]
+
+    def test_auth_and_transport_errors_are_re_raised_not_swallowed(self, monkeypatch):
+        """A 401 or a timeout is a real outage. Degrading on it would hide the
+        outage behind a green, quietly-wrong run."""
+        monkeypatch.setattr(ffc, "_extended_query_unavailable", False)
+        calls: list[str] = []
+
+        def fake(query, variables=None):
+            calls.append(query)
+            raise ffc.FirefliesConnectorError("Fireflies 401: Unauthorized")
+
+        monkeypatch.setattr(ffc, "_graphql_query", fake)
+        with pytest.raises(ffc.FirefliesConnectorError, match="401"):
+            ffc._query_transcripts({"limit": 1})
+        assert len(calls) == 1, "must not retry a non-validation failure"
+        assert ffc._extended_query_unavailable is False
