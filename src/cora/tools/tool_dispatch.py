@@ -5015,6 +5015,14 @@ def _peek_pending_lexicon(slack_user: str, channel: str) -> dict | None:
     return None
 
 
+def has_pending_lexicon(slack_user: str, channel: str) -> bool:
+    """Read-only freshness probe. cora_lexicon_add was the ONE staged-write kind
+    with no has_pending_* wrapper (only _peek_pending_lexicon), so app.py's
+    assume_confirm gate could not see it and a truthful lexicon-teach success on a
+    bare "yes" was clobbered by the phantom-destructive correction (session #11 S1)."""
+    return _peek_pending_lexicon(slack_user, channel) is not None
+
+
 def _lexicon_slug(term: str) -> str:
     from ..lexicon import norm_term
     return "-".join(norm_term(term).replace("&", "and").split()).upper() or "TERM"

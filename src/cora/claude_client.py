@@ -966,19 +966,36 @@ _PHANTOM_CONFIRM_CLAIM_RE = re.compile(
 # the presence of a sentinel, so a sentinel from a non-member tool is inert there and
 # this set is still exactly what keeps such a tool's real success from being clobbered.
 #
-# Measured-incomplete in the OTHER direction too, and deliberately left alone: six write
-# tools outside _CONTRACT_WRITE_TOOLS emit a sentinel and are absent here
-# (hubspot_update_deal_stage / hubspot_add_note / slack_send_dm / cora_remember /
-# cora_forget_note / the decision-close path), five of them since long before this
-# change. Today that is harmless because a DIFFERENT control keeps assume_confirm False
-# on those turns (app.py gates it on `not has_pending_classb(...)`), which is the kind of
-# coupling that breaks quietly later -- but correcting membership changes phantom-guard
-# behaviour for tools this bundle does not test, so it is flagged in the cascade report
-# as its own item rather than folded in here. Renaming the constant was also left alone:
-# it is referenced by name in tests and prior review notes.
+# MEMBERSHIP IS NOW DERIVED, NOT HAND-MAINTAINED (session #11 S1, cq-b75ff2802764).
+# The functional criterion is exactly "a staged-write tool the narration net does NOT
+# handle", i.e. {tools whose TOOL_DEFINITIONS input_schema carries `confirmed`} minus
+# _CONTRACT_WRITE_TOOLS. That is 14 tools; this set listed FOUR. The 10 that were missing
+# each had a real success narration exposed to _guard_phantom_destructive.
+#
+# The prior note here claimed the gap "is harmless today because a DIFFERENT control keeps
+# assume_confirm False on those turns (app.py gates it on `not has_pending_classb(...)`)".
+# That was MEASURED FALSE in session #11: app.py's assume_confirm gate enumerated five
+# pending kinds, and cora_remember / cora_forget_note / cora_lexicon_add /
+# cora_queue_code_session were in none of them -- so both controls missed the same four
+# tools and a truthful "Done." on their confirm turn was replaced with the Asana
+# correction. Both halves are fixed (app.py gate + this set). Do not re-derive safety
+# here from a control in another module; test_write_sentinel_contract.py pins this set
+# against the registration point so a 23rd staged-write tool fails the suite instead of
+# quietly joining the hole (D-232).
+#
+# The name is not literal -- every member emits a WRITE_CONFIRMED sentinel. What matters
+# for _should_broaden is whether the NARRATION NET handles the tool, and the net gates on
+# tool-NAME membership in _CONTRACT_WRITE_TOOLS (see _last_shopify_write_result), NOT on
+# sentinel presence, so a sentinel from a non-member is inert there. Renaming was left
+# alone: the constant is referenced by name in tests and prior review notes.
 _NON_SENTINEL_WRITE_TOOLS = frozenset({
+    # calendar (3) + gmail draft: present before session #11
     "calendar_create_event", "calendar_delete_event", "calendar_schedule_meeting",
     "gmail_create_draft",
+    # added session #11 -- the 10 that were exposed
+    "hubspot_update_deal_stage", "hubspot_add_note", "slack_send_dm",
+    "influencer_add_handle", "influencer_log_deliverable", "meeting_action_items",
+    "cora_remember", "cora_forget_note", "cora_lexicon_add", "cora_queue_code_session",
 })
 
 

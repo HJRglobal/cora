@@ -1659,6 +1659,20 @@ def _dispatch_qa(
             # "Done -- DM sent to Tommy" replaced with "I didn't actually change
             # anything in Asana" -- inviting a re-ask that sends it twice.
             or _tool_dispatch.has_pending_classb(user_id, channel_name)
+            # Session #11 S1 (cq-b75ff2802764): this gate enumerated FIVE pending
+            # kinds while the Sonnet-escalation gate 30 lines below enumerated NINE.
+            # The four in that list but not this one -- plus cora_lexicon_add, which
+            # had no has_pending_* probe at all -- fell through BOTH this control and
+            # _NON_SENTINEL_WRITE_TOOLS, so a bare "yes" confirming a real
+            # remember/forget/lexicon/code-queue/schedule write had its truthful
+            # success ("Done.", "Deleted it.") replaced by "I didn't actually change
+            # anything in Asana just now" -- inviting a re-ask that double-writes.
+            # Verified live against the _PHANTOM_CONFIRM_CLAIM_RE regexes.
+            or _tool_dispatch.has_pending_remember(user_id, channel_name)
+            or _tool_dispatch.has_pending_forget_note(user_id, channel_name)
+            or _tool_dispatch.has_pending_lexicon(user_id, channel_name)
+            or _tool_dispatch.has_pending_code_queue(user_id, channel_name)
+            or _tool_dispatch.has_pending_schedule_meeting(user_id, channel_name)
         )
     )
     # Staged-WRITE escalation (2026-07-10 hotfix): a pending DTC inventory/calendar/

@@ -3,7 +3,16 @@
 Enforces the voice/style contract in design/system-prompts/fndr.md mechanically,
 because prompt-only enforcement is unreliable (same doctrine as the cross-entity
 and sibling guards). Applied in app.py immediately before posting, in the same
-place WRITE_CONFIRMED and the [CORA_KNOWLEDGE_GAP: ...] marker are stripped.
+place the [CORA_KNOWLEDGE_GAP: ...] marker is stripped.
+
+CORRECTED 2026-08-30 (session #11 S1): this line used to claim WRITE_CONFIRMED was
+stripped here too. It never was -- app.py contained zero occurrences of the token,
+and format_reply itself returns text UNTOUCHED when is_tool_output=True, which is
+set on exactly the tool-heavy turns most likely to echo a contract directive. The
+write-sentinel scrub now lives at the universal egress boundary instead
+(slack_egress.scrub_write_sentinels), which covers every WebClient send from the
+bot AND from scripts, including the paths that never reach format_reply
+(streaming mid-frames, the confirm interceptor, semantic-cache replay).
 
 Conversational replies get (Slack-native mrkdwn -- 2026-06-30 format standard):
   - markdown bold (**x** / __x__) CONVERTED to Slack bold (*x*), not stripped

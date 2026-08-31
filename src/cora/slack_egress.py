@@ -32,6 +32,24 @@ formatted update). normalize_slack_bold is fence-/table-/Slack-token-safe and
 idempotent, so applying it universally fixes both without touching structure
 (format_reply already converts bold on the conversational path -> a no-op there).
 
+Write-sentinel scrub added to the boundary 2026-08-30 (session #11 S1): the
+WRITE_CONFIRMED / WRITE_BLOCKED contract tokens are MODEL-FACING directives that
+ride in tool_result payloads. Thirteen staged-write tools emit them while only
+eight are handled by the narration net, so on the other five the model is merely
+TRUSTED to obey the English directive and not echo it -- with nothing downstream
+removing it. reply_formatter's docstring claimed app.py stripped them; app.py
+never contained a strip (verified: zero occurrences of the token). This scrub is
+deliberately weaker than tool_dispatch._strip_write_sentinel, which INVENTS
+replacement prose ("Done.") on a bare sentinel -- safe on a known confirm payload,
+unsafe on arbitrary content. Here the scrub only ever DELETES the token, never
+substitutes, and returns input byte-identical when no token is present.
+
+NOT covered (documented residual): `blocks=` payloads. The boundary sanitizes the
+`text=`/`markdown_text=` kwargs only, so code-built Block Kit cards (e.g. the
+meeting-item cards) sit outside it. Those are code-composed rather than model-
+authored, so they are not a sentinel-echo surface; a card that ever interpolates
+model prose must sanitize at its own build site.
+
 NOT covered (documented residual, Phase 3): a handful of scheduled senders that
 POST raw JSON to slack.com/api via httpx/requests bypass slack_sdk.WebClient and
 thus this patch -- those wrap text with slack_egress.sanitize_text at the POST
@@ -44,6 +62,8 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
+import re
 
 from .reply_formatter import normalize_slack_bold, redact_links_and_ids
 
@@ -94,6 +114,65 @@ def repair_mojibake(text: str) -> str:
     return text
 
 
+# -- Write-sentinel scrub (session #11 S1) ------------------------------------
+# The contract tokens are model-facing and must never reach a human. Kept in sync
+# with claude_client._SHOPIFY_SENTINELS by tests/test_write_sentinel_contract.py.
+_WRITE_SENTINELS = ("WRITE_CONFIRMED", "WRITE_BLOCKED")
+# A leading sentinel carries a trailing directive clause ("WRITE_CONFIRMED: post
+# this verbatim -- ..."). Strip the token plus an immediately-following colon/dash
+# separator, nothing more; the human-meaningful remainder is preserved verbatim.
+_SENTINEL_ANY_RE = re.compile(r"\b(?:WRITE_CONFIRMED|WRITE_BLOCKED)\b")
+_SENTINEL_LEAD_RE = re.compile(
+    r"^\s*(?:WRITE_CONFIRMED|WRITE_BLOCKED)\b[ \t]*[:\-–—]*[ \t]*"
+)
+
+# observe (default) = a leak is a WARNING; enforce = a leak is an ERROR, which the
+# nightly health check's ERROR-volume triage escalates. THE SCRUB ITSELF IS ALWAYS
+# ON in both modes -- gating a leak-prevention behind a flag would ship the leak.
+# The flag governs how loudly a leak is reported, so "enforce after a clean week"
+# stays a real ritual (observe = count them; enforce = one is an alarm) with no
+# mode in which the token is allowed through to a human.
+_ENFORCE_ENV = "CORA_SENTINEL_ENFORCE"
+
+
+def _sentinel_mode() -> str:
+    return (os.environ.get(_ENFORCE_ENV) or "observe").strip().lower()
+
+
+def scrub_write_sentinels(text):
+    """Delete WRITE_CONFIRMED / WRITE_BLOCKED tokens from outbound prose.
+
+    DELETES ONLY -- never substitutes replacement prose (that is
+    tool_dispatch._strip_write_sentinel's job on a known confirm payload, and it
+    is unsafe on arbitrary content). Returns the input unchanged, byte for byte,
+    when no sentinel is present, so this is a no-op on every ordinary send.
+
+    Pathological case -- the body is NOTHING but a sentinel: scrubbing would yield
+    an empty body and Slack rejects an empty send. Rather than fabricate filler,
+    the original is returned and the event is logged at ERROR regardless of mode.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    if _SENTINEL_ANY_RE.search(text) is None:
+        return text  # byte-identical fast path -- the overwhelmingly common case
+    scrubbed = _SENTINEL_ANY_RE.sub("", _SENTINEL_LEAD_RE.sub("", text))
+    scrubbed = re.sub(r"[ \t]{2,}", " ", scrubbed).strip()
+    if not scrubbed:
+        log.error(
+            "sentinel-egress-leak mode=%s UNSCRUBBABLE (body was sentinel-only, "
+            "%d chars) -- sending original rather than fabricating a body",
+            _sentinel_mode(), len(text),
+        )
+        return text
+    emit = log.error if _sentinel_mode() == "enforce" else log.warning
+    emit(
+        "sentinel-egress-leak mode=%s removed=%d chars -- a write-tool directive "
+        "reached the outbound seam (the model echoed a contract token)",
+        _sentinel_mode(), len(text) - len(scrubbed),
+    )
+    return scrubbed
+
+
 # ── The single sanitizer ──────────────────────────────────────────────────────
 def sanitize_text(text):
     """Universal SAFETY transforms applied to EVERY outbound Slack message body.
@@ -107,6 +186,7 @@ def sanitize_text(text):
     if not isinstance(text, str) or not text:
         return text
     text = repair_mojibake(text)
+    text = scrub_write_sentinels(text)
     text = redact_links_and_ids(text)
     text = normalize_slack_bold(text)
     return text
