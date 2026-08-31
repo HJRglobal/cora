@@ -463,23 +463,6 @@ _REVENUE_CONTEXT_RE = re.compile(
 _PRICE_CONTEXT_CHARS = 200
 
 # rail 2 -- clean/natural language is Pure-EXCLUSIVE.
-# cq-85b35413b020 (session #11 S7): "F3 Energy works with the Clean Label Project."
-# tripped R2 -- the rail lowercases every token and intersects with _CLEAN_TOKENS,
-# so a proper NOUN containing "Clean" is indistinguishable from the adjective. A
-# capitalised Clean/Cleaner heading a Title-Case phrase is a NAME, not a claim
-# about the product.
-#
-# Implemented as a REDACTION so it composes with the rail's existing exemption
-# mechanism (_NATURAL_OCCURRENCE_RES) instead of adding a second code path, and so
-# the rest of the sentence is still scanned: "F3 Energy works with the Clean Label
-# Project and is all-natural" still trips on "all-natural".
-#
-# Bounded repetition throughout -- no nested unbounded quantifier.
-_CLEAN_PROPER_NOUN_RES = (
-    re.compile(r"\bClean(?:er)?\b(?:\s{1,3}[A-Z][A-Za-z]{1,20}){1,3}"),
-)
-
-
 _CLEAN_TOKENS = frozenset({
     "clean", "cleaner", "cleanest", "clean-label", "cleanlabel",
     "natural", "naturally", "all-natural", "clean-sweetened",
@@ -562,23 +545,6 @@ _DISEASE_OBJECT_RE = re.compile(
     re.IGNORECASE,
 )
 _MEDICAL_CLEARED_RES = (
-    # cq-85b35413b020 (session #11 S7): the patterns below require the claim verb
-    # within 1-3 SPACES of the negation, so a perfectly ordinary disclaimer --
-    # "F3 Energy is not about eliminating jitters or preventing a crash" -- left
-    # "preventing" uncleared and tripped R1's claim-verb-sufficiency rule (D-238).
-    # This widens the negation's SCOPE to the rest of its CLAUSE rather than
-    # adding another literal.
-    #
-    # Bounded on BOTH ends deliberately. The negated class excludes , ; : and
-    # dashes as well as sentence terminators, so the scope cannot bridge a clause
-    # boundary and clear a REAL claim ("We are not shy -- F3 prevents migraines").
-    # No nested quantifier over a delimiter-rich string (the repo has found seven
-    # ReDoS bugs); this is one bounded lazy negated class.
-    re.compile(
-        r"\b(?:not|never|no)\b[^.!?\n,;:\-–—]{0,60}?"
-        r"\b(?:treat|cure|prevent|heal|diagnose|manage)\w*",
-        re.IGNORECASE,
-    ),
     re.compile(
         r"\b(?:not|never|no)\s{1,3}(?:intended\s{1,3}to\s{1,3})?"
         r"(?:treat|cure|prevent|heal|diagnose|manage)\b",
@@ -837,7 +803,7 @@ def run_preflight(
             lines = brand_lines_in(sent)
             if not (lines & {"ENERGY", "MOOD"}):
                 continue
-            scan_sent = _redact(sent, _NATURAL_OCCURRENCE_RES + _CLEAN_PROPER_NOUN_RES)
+            scan_sent = _redact(sent, _NATURAL_OCCURRENCE_RES)
             toks = {w.lower().strip("'&/-") for w in _words(scan_sent)}
             hit = toks & _CLEAN_TOKENS
             if hit:

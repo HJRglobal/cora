@@ -7,8 +7,17 @@ THE C10b RULING, implemented as ruled:
     NEVER auto-expire.
 
 READ-PATH ONLY. Nothing here mutates the store. The transform is applied to the
-text on its way into context, so a withheld figure is withheld everywhere the
-helper is called and the file on Drive is untouched. That is deliberate: the
+text on its way into context, and the file on Drive is untouched.
+
+SCOPE OF THE WITHHOLD, STATED HONESTLY (D-051 review). This helper withholds the
+figure wherever it is CALLED -- the always-injected known-answers block and the
+MCP read surface. It does NOT withhold the same figure from KB RETRIEVAL: the
+static_md chunks of the very same file are still returned by _try_kb_retrieve,
+carrying no as-of date and no staleness label. So a withheld cash figure can
+still reach a reply by the other route. Closing that needs either a
+known-answers exclusion in retrieval or the same labelling applied to static_md
+chunks; it is a NAMED FOLLOW-ON, not a property of this module. Do not read the
+withhold as an end-to-end guarantee. That is deliberate: the
 ruling asks for withholding, not deletion, and a destructive sweep already
 exists for a DIFFERENT axis (knowledge_check's D-089 7-day Tier-1 expiry, which
 is marker-scoped and only ever touches blocks that module wrote).
@@ -148,7 +157,13 @@ def apply_staleness(content: str, today: date | None = None) -> str:
     if not content or _KNOWN_FACTS_HEADER not in content:
         return content
     today = today or date.today()
-    lines = content.splitlines()
+    # D-051 review: splitlines() does NOT round-trip. It drops the trailing
+    # newline AND silently eats \r, so on this store -- which lives on a WINDOWS
+    # DRIVE MOUNT and is written CRLF by the bot's own writer -- every read would
+    # have rewritten the whole document to LF. split("\n") round-trips exactly:
+    # \r stays attached to each line (harmless, all patterns anchor at ^ or match
+    # before it) and the trailing empty element preserves the final newline.
+    lines = content.split("\n")
 
     # locate the section body
     try:
@@ -189,9 +204,9 @@ def apply_staleness(content: str, today: date | None = None) -> str:
             out.insert(insert_at, label)
 
     rebuilt = "\n".join(lines[:head + 1] + out + lines[tail:])
-    # splitlines()/join() drops a trailing newline. This transform runs over
-    # ALWAYS-INJECTED context, and its contract is that untouched content comes
-    # back byte-identical -- so restore the terminator the input carried.
-    if content.endswith("\n") and not rebuilt.endswith("\n"):
-        rebuilt += "\n"
+    # Belt: if nothing in the section actually changed, hand back the ORIGINAL
+    # object so "returns the input unchanged" is literally true rather than
+    # merely equal-looking.
+    if rebuilt == content:
+        return content
     return rebuilt

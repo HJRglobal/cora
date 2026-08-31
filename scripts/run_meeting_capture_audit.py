@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-from cora import run_marker
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -50,6 +49,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
 
+from cora import run_marker  # noqa: E402
 from cora import meeting_capture as mc  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -148,13 +148,23 @@ def main() -> int:
             return 1
     else:
         log.info("dry-run (no --post): nothing sent to Slack")
-    # S4 run marker. `outputs` counts what this run actually PRODUCED: the ledger
-    # row it appended, plus the Slack post when one was sent. A dry run writes the
-    # ledger row but sends nothing, which is a legitimate 1.
+    # S4 run marker.
+    #
+    # D-051 review: the first cut used `1 + (1 if args.post else 0)`, a function
+    # of the CLI FLAG and never of what the run produced -- so outputs could
+    # never be 0 and the FIRED-BUT-WROTE-NOTHING alarm was structurally UNFIRABLE
+    # for the only daily expects_output lane. That is the "headline feature
+    # shipped dead in prod" shape this whole session exists to retire, committed
+    # inside the fix for it. The count is now derived from the AUDIT RESULT.
+    findings_count = (
+        len(report.misses) + len(report.duplicates)
+        + len(report.carve_out_breaches) + len(report.unmatched_transcripts)
+    )
     run_marker.write("cowork-cora-meeting-capture-audit",
                      script="run_meeting_capture_audit.py", ok=True,
-                     outputs=1 + (1 if args.post else 0),
-                     outcome="posted" if args.post else "dry_run")
+                     outputs=findings_count,
+                     outcome="posted" if args.post else "dry_run",
+                     detail="scheduled=%s captured=%s" % (report.scheduled, report.captured))
     return 0
 
 

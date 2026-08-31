@@ -415,12 +415,36 @@ def _source_weight(source: str, attribution_unreliable: bool = False) -> float:
     return _SOURCE_WEIGHTS.get(source, 0.55)
 
 
-_SPEAKER_PREFIX_RE = re.compile(r"^\s*\[[^\]\n]{1,60}\]\s*")
-_SPEAKER_UNKNOWN = "[speaker unknown -- diarization collapsed] "
+# A bracketed token ANYWHERE, not just leading: a source_evidence excerpt carries
+# a median of ~7 speaker tokens, and neutralising only the first left the rest
+# attributed while the card implied all of them were handled (D-051 review).
+_SPEAKER_TOKEN_RE = re.compile(r"\[([^\]\n]{1,60})\]")
+_SPEAKER_UNKNOWN = "[speaker unknown -- diarization collapsed]"
+# Bracketed tokens that are NOT speaker labels and must survive untouched.
+_NOT_A_SPEAKER = ("fireflies meeting", "fireflies", "transcript", "meeting")
+
+
+def _is_speaker_token(inner: str, following: str) -> bool:
+    """Whether a bracketed token is a SPEAKER label rather than structure.
+
+    Excludes the '[Fireflies Meeting]' structural header, markdown links (a '('
+    immediately follows the closing bracket), and purely numeric/citation
+    tokens -- each of which the first cut rewrote into a speaker disclaimer.
+    """
+    token = (inner or "").strip()
+    if not token:
+        return False
+    if following.startswith("("):        # markdown link: [text](url)
+        return False
+    if token.lower() in _NOT_A_SPEAKER:
+        return False
+    if token.replace(".", "").replace(",", "").isdigit():   # [1], [2.3]
+        return False
+    return True
 
 
 def _neutralize_speaker(text: str, attribution_unreliable: bool) -> str:
-    """Replace a leading "[Name]" token when attribution is not trustworthy.
+    """Replace EVERY "[Name]" speaker token when attribution is untrustworthy.
 
     The downweight alone does not fix the reported harm: the cards QUOTE the
     sentence verbatim, so a mis-attributed speaker is still rendered to Harrison
@@ -429,9 +453,14 @@ def _neutralize_speaker(text: str, attribution_unreliable: bool) -> str:
     """
     if not attribution_unreliable or not text:
         return text
-    if not _SPEAKER_PREFIX_RE.match(text):
-        return text
-    return _SPEAKER_UNKNOWN + _SPEAKER_PREFIX_RE.sub("", text, count=1)
+
+    def _sub(m: "re.Match[str]") -> str:
+        following = text[m.end():m.end() + 1]
+        if not _is_speaker_token(m.group(1), following):
+            return m.group(0)
+        return _SPEAKER_UNKNOWN
+
+    return _SPEAKER_TOKEN_RE.sub(_sub, text)
 
 
 def _confidence_from_ratio(
@@ -1118,9 +1147,13 @@ def pass4_stale_open_tasks(
 
             # Confidence: use semantic scoring when semantic match was used
             if used_semantic:
-                confidence = _confidence_from_sim(match_score, chunk["source"])
+                confidence = _confidence_from_sim(
+                    match_score, chunk["source"],
+                    bool(chunk.get("attribution_unreliable")))
             else:
-                confidence = _confidence_from_ratio(match_score, chunk["source"])
+                confidence = _confidence_from_ratio(
+                    match_score, chunk["source"],
+                    bool(chunk.get("attribution_unreliable")))
 
             if confidence == "LOW":
                 continue

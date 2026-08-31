@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-from cora import run_marker
 import sys
 from pathlib import Path
 
@@ -30,6 +29,7 @@ from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(_REPO_ROOT / ".env", override=True)
 
+from cora import run_marker  # noqa: E402
 from cora.f3e_blog import pipeline, publish_cards  # noqa: E402
 
 
@@ -110,8 +110,15 @@ def main() -> int:
     # week with no publishable draft is a legitimate quiet run, not a defect --
     # so the count is recorded for visibility rather than alarmed on.
     failed = bool(report.failed or report.gate_closed)
+    # SELF-INFLICTED DEFECT, caught in the D-051 pass: the first cut read
+    # getattr(report, "staged", []) -- RunReport has staged_gid and staged_title,
+    # never a `staged` attribute, so this reported 0 FOREVER. The whole point of
+    # `outputs` is an honest count; a constant defeats the contract exactly as
+    # run_marker.write's own docstring warns. RunReport exposes what actually
+    # happened: one card staged (staged_gid) plus the drafts proposed.
+    staged_count = (1 if report.staged_gid else 0) + int(report.proposed or 0)
     run_marker.write("Cora - F3E Blog Pipeline", script="run_f3e_blog_pipeline.py",
-                     ok=not failed, outputs=len(getattr(report, "staged", []) or []),
+                     ok=not failed, outputs=staged_count,
                      outcome="gate_closed" if report.gate_closed else
                              ("failed" if report.failed else "ok"))
     return 1 if failed else 0

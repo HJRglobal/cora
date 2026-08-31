@@ -53,6 +53,31 @@ from pathlib import Path
 
 _REPO = Path(__file__).resolve().parents[1]
 
+
+def _safe_write(path: Path, text: str) -> None:
+    """Atomic write + timestamped backup.
+
+    D-051 review: the first cut used a bare truncating open() on LIVE Drive
+    canon. A crash or a G: blip mid-write would leave the file TRUNCATED, and
+    there was no backup to restore from. Every other writer in this repo uses
+    temp+os.replace; a one-shot destructive script is the last place to abandon
+    that. The backup also gives Harrison a trivial undo.
+
+    Newline handling is deliberate: the live files are CRLF (the bot's writer
+    goes through Path.write_text, which platform-translates), so writing with
+    newline="" preserves whatever terminators the caller assembled rather than
+    silently normalising the whole file to LF on the way through a purge.
+    """
+    backup = path.with_suffix(path.suffix + ".bak-2026-08-30")
+    if path.exists() and not backup.exists():
+        backup.write_bytes(path.read_bytes())
+        print("   backup: %s" % backup)
+    tmp = path.with_suffix(path.suffix + ".tmp-purge")
+    with io.open(tmp, "w", encoding="utf-8", newline="") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+_NL = "\n"   # per-file line terminator, set when the file is read
 FIXTURE_HEADER = "**[2026-08-25] terms** _(gap autofill -- teammate DM)_"
 FIXTURE_Q = "Q: What are the payment terms?"
 FIXTURE_A = "A: Payment terms are Net 30."
@@ -87,7 +112,10 @@ def purge_known_answer(apply: bool) -> tuple[int, list[str]]:
     notes = ["target: %s" % path]
     if not path.exists():
         return 0, notes + ["  SKIP: file not found"]
-    lines = io.open(path, encoding="utf-8").read().splitlines()
+    raw = io.open(path, encoding="utf-8", newline="").read()
+    global _NL
+    _NL = "\r\n" if "\r\n" in raw else "\n"
+    lines = raw.split(_NL)
     try:
         start = next(i for i, ln in enumerate(lines) if ln.strip() == FIXTURE_HEADER)
     except StopIteration:
@@ -109,7 +137,7 @@ def purge_known_answer(apply: bool) -> tuple[int, list[str]]:
     cut_from = start - 1 if start and not lines[start - 1].strip() else start
     if apply:
         rest = lines[:cut_from] + lines[end:]
-        io.open(path, "w", encoding="utf-8", newline="\n").write("\n".join(rest) + "\n")
+        _safe_write(path, _NL.join(rest) + _NL)
     return 1, notes
 
 
@@ -120,7 +148,10 @@ def purge_eval_case(apply: bool) -> tuple[int, list[str]]:
     notes = ["target: %s" % path]
     if not path.exists():
         return 0, notes + ["  SKIP: file not found"]
-    lines = io.open(path, encoding="utf-8").read().splitlines()
+    raw = io.open(path, encoding="utf-8", newline="").read()
+    global _NL
+    _NL = "\r\n" if "\r\n" in raw else "\n"
+    lines = raw.split(_NL)
     try:
         start = next(i for i, ln in enumerate(lines) if ln.strip() == "- id: auto-ka-1")
     except StopIteration:
@@ -131,9 +162,7 @@ def purge_eval_case(apply: bool) -> tuple[int, list[str]]:
     for ln in lines[start:end]:
         notes.append("  - " + ln)
     if apply:
-        io.open(path, "w", encoding="utf-8", newline="\n").write(
-            "\n".join(lines[:start] + lines[end:]) + "\n"
-        )
+        _safe_write(path, _NL.join(lines[:start] + lines[end:]) + _NL)
     return 1, notes
 
 
@@ -156,7 +185,7 @@ def _purge_jsonl(path: Path, predicate, label: str, apply: bool) -> tuple[int, l
     for raw in dropped:
         notes.append("  - " + raw.strip()[:200])
     if apply and dropped:
-        io.open(path, "w", encoding="utf-8", newline="\n").write("".join(kept))
+        _safe_write(path, "".join(kept))
     if not dropped:
         notes.append("  clean: no %s rows" % label)
     return len(dropped), notes

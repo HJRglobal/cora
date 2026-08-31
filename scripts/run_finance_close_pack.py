@@ -40,7 +40,6 @@ import argparse
 import datetime
 import json
 import logging
-from cora import run_marker
 import os
 import re
 import sys
@@ -51,6 +50,8 @@ from dotenv import load_dotenv
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(_REPO_ROOT / ".env", override=True)
 sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+from cora import run_marker  # noqa: E402
 
 # Windows consoles default to cp1252, which cannot encode several characters the
 # pack renders -- so `--dry-run` died with UnicodeEncodeError on real data (any
@@ -618,6 +619,11 @@ def main() -> int:
     if (not args.dry_run and not args.worksheet_only and not args.force
             and _already_sent(week)):
         log.info("close-pack: already sent for %s -- skipping (use --force to override)", week)
+        # Deliberate no-op, but it must still leave a dated trace: without one,
+        # the cadence check cannot tell "already delivered" from "never fired".
+        run_marker.write("cowork-cora-finance-close-pack",
+                         script="run_finance_close_pack.py", ok=True, outputs=0,
+                         outcome="already_sent_this_week")
         return 0
 
     entities = [e.strip().upper() for e in args.entities.split(",") if e.strip()] or None
@@ -635,6 +641,12 @@ def main() -> int:
         log.exception("close-pack: build FAILED: %s", exc)
         if not args.dry_run:
             _alert_build_failure(type(exc).__name__)
+        # D-051 review: this reachable failure path wrote NO marker, so a build
+        # crash was indistinguishable from a run that never happened -- the exact
+        # class S4 exists to close, left open inside S4 itself.
+        run_marker.write("cowork-cora-finance-close-pack",
+                         script="run_finance_close_pack.py", ok=False, outputs=0,
+                         outcome="build_failed", detail=type(exc).__name__)
         return 1
 
     full = pack.render()
@@ -746,10 +758,17 @@ def main() -> int:
     # the pack. A run where every target FAILED previously wrote no marker of any
     # kind (_mark_sent is only called on success), leaving it indistinguishable
     # from a run that never happened -- which is the whole class this closes.
+    # `delivered` is SEEDED with targets a previous killed attempt already sent
+    # (line ~717: delivered = set(already)), so counting it whole would credit a
+    # retry that delivered NOTHING with the earlier run's successes -- a
+    # false-positive in the metric whose entire job is catching zero-output runs.
+    # Count only what THIS run sent.
+    sent_now = len(set(delivered) - set(already))
     run_marker.write("cowork-cora-finance-close-pack",
                      script="run_finance_close_pack.py", ok=bool(delivered),
-                     outputs=len(delivered) if hasattr(delivered, "__len__") else int(bool(delivered)),
-                     outcome="delivered" if delivered else "no_targets_delivered")
+                     outputs=sent_now,
+                     outcome="delivered" if sent_now else (
+                         "nothing_new_this_run" if delivered else "no_targets_delivered"))
     return 1 if not delivered else 0
 
 

@@ -203,8 +203,14 @@ _CRITICAL_RE = re.compile("|".join(_CRITICAL_LOG_PATTERNS), re.IGNORECASE)
 # and script "2026-08-28 03:30:15,081 ERROR n: msg". Deliberately NOT IGNORECASE:
 # the level field is upper-case by construction, and case-insensitivity would
 # re-admit ordinary prose containing the word "error".
+# D-051 review: the first cut said "both live formats" and there are THREE --
+# a bracketed [%(levelname)s] form is used elsewhere in the estate, and its ERROR
+# lines were invisible to the anchor. A volume metric that silently under-counts
+# is the same silent-failure class this slice exists to close, so the bracket is
+# optional now. Still deliberately NOT IGNORECASE: the level field is upper-case
+# by construction, and case-insensitivity would re-admit prose containing "error".
 _ERROR_LINE_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:,\d+)?\s+ERROR\b"
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:,\d+)?\s+\[?ERROR\]?\b"
 )
 
 log = logging.getLogger("health-check")
@@ -639,9 +645,16 @@ def check_run_markers(now: datetime | None = None) -> CheckResult:
         return CheckResult("Task run markers", "warn",
                            f"run-marker evaluation failed: {exc}")
     if not findings:
-        return CheckResult(
-            "Task run markers", "ok",
-            f"{len(registry)} task(s) tracked; all fired in-window with output.")
+        # D-051 review: the first cut reported "all fired in-window with output"
+        # even when ZERO markers existed and every task was merely inside its
+        # registration grace -- a false OK, which is precisely the defect class
+        # this check exists to surface. Say what was actually evaluated.
+        seen = sum(1 for e in registry if markers.get(str(e.get("name") or "")))
+        awaiting = len(registry) - seen
+        detail = f"{len(registry)} task(s) tracked; {seen} with markers, all in-window"
+        if awaiting:
+            detail += f"; {awaiting} awaiting a first marker (registration grace)"
+        return CheckResult("Task run markers", "ok", detail + ".")
     return CheckResult(
         "Task run markers", "warn",
         "%d issue(s): %s" % (len(findings), " | ".join(m for _sev, m in findings)))

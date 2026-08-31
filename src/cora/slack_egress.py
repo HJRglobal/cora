@@ -181,8 +181,14 @@ def sanitize_text(text):
     links preserved) + markdown-bold normalization (**x** -> *x*, fence-/table-/
     token-safe, idempotent -- F-04). NO broader voice/emoji/whitespace flattening
     and NO named-source redaction -- those are conversational-only (see module
-    docstring). Pure; non-string / empty input passes through untouched; never
-    raises (the wrapper also guards)."""
+    docstring). Non-string / empty input passes through untouched; never raises
+    (the wrapper also guards).
+
+    NOT PURE since 2026-08-30 (D-051 review): scrub_write_sentinels reads
+    CORA_SENTINEL_ENFORCE and emits a log record on any send carrying a contract
+    token. The old docstring said "Pure", which stopped being true the moment
+    the scrub was inserted -- exactly the docstring-claims-behaviour-that-is-not-
+    there class S1 was fixing."""
     if not isinstance(text, str) or not text:
         return text
     text = repair_mojibake(text)

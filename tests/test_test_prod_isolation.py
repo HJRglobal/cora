@@ -84,9 +84,27 @@ def _redirected_env_vars() -> set[str]:
 
 
 class TestEveryWritePathIsClassified:
+    """SCOPE, STATED HONESTLY (D-051 review of this very file): this rail covers
+    ENV-VAR path resolvers ONLY. It is structurally BLIND to plain module
+    constants -- and the incident constant that started S2,
+    knowledge_review._PROPOSED_UPDATES_PATH, IS a plain module constant with no
+    env var. Had this rail existed on 2026-08-24 it would have been GREEN
+    through the incident it is named after.
+
+    That is the "a bar that cannot fail on the regression it guards" defect, in
+    the test written to retire that defect. It is recorded here rather than
+    papered over. The env-var half is genuine and worth keeping; the
+    module-constant half is a NAMED FOLLOW-ON, and until it exists the
+    _LEDGER_CONSTS list in conftest is maintained by hand.
+
+    Three live leaks the review found by hand are now redirected (photoroom
+    _SPEND_LOG_PATH, revops _AUDIT_PATH, main _HEARTBEAT_FILE); a full scan
+    reported ~10 unredirected write constants, so more remain.
+    """
+
     def test_no_unclassified_env_path_resolver(self):
-        """The rail. Every path-shaped env var in src/cora is either redirected to
-        tmp by the autouse fixture, or explicitly declared read-only above."""
+        """Every path-shaped ENV VAR in src/cora is either redirected to tmp by
+        the autouse fixture, or explicitly declared read-only above."""
         found = _env_path_vars()
         redirected = _redirected_env_vars()
         unclassified = {
@@ -109,6 +127,36 @@ class TestEveryWritePathIsClassified:
     def test_declared_and_redirected_do_not_overlap(self):
         overlap = sorted(set(_DECLARED_UNREDIRECTED) & _redirected_env_vars())
         assert not overlap, "both redirected AND declared read-only: %s" % overlap
+
+
+class TestNamedLiveLeaksAreRedirected:
+    """Concrete instances the D-051 review caught by hand, pinned so a future
+    conftest edit cannot silently reopen them."""
+
+    def test_photoroom_spend_log_is_not_cwd_relative_in_tests(self):
+        from cora.connectors import photoroom_client
+
+        p = Path(photoroom_client._SPEND_LOG_PATH)
+        assert p.is_absolute(), (
+            "photoroom _SPEND_LOG_PATH is CWD-relative in tests -- a green run "
+            "appends to the REAL spend ledger"
+        )
+        assert "photoroom-spend.jsonl" == p.name
+
+    def test_send_audit_is_redirected(self):
+        from cora.revops import sender
+
+        assert Path(sender._AUDIT_PATH).resolve() != (
+            Path("logs") / "cora-send-audit.jsonl").resolve()
+
+    def test_heartbeat_file_is_redirected(self):
+        """The most dangerous of the three: _guard_logs_untouched reads this
+        same file to decide _bot_live, so a test writing it would permanently
+        disarm the isolation backstop."""
+        from cora import main as cora_main
+
+        assert Path(cora_main._HEARTBEAT_FILE).resolve() != (
+            Path("data") / "health" / "heartbeat.txt").resolve()
 
 
 class TestTheKnowledgeReviewLedgerHole:

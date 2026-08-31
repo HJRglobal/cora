@@ -412,6 +412,17 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
         ("cora.delegated_work", "_BOT_LEDGER", "delegated-work.jsonl"),
         ("cora.delegated_work", "_RUNNER_LEDGER", "delegated-work-runner.jsonl"),
         ("cora.delegated_work", "_STAGING_ROOT", "delegated-work-staging"),
+        # D-051 review of session #11 S2: the env-var rail below is BLIND to
+        # module constants, and these three were writing real files during green
+        # runs. photoroom's path is the worst shape -- Path("logs/...") is
+        # RELATIVE, so it resolves against the pytest CWD; a 30-test file was
+        # measured appending 10 rows to the real spend ledger. main._HEARTBEAT_FILE
+        # is the most dangerous: _guard_logs_untouched reads that same file to
+        # decide _bot_live, so a test writing it would permanently DISARM the
+        # backstop. revops _AUDIT_PATH is the email SEND audit.
+        ("cora.connectors.photoroom_client", "_SPEND_LOG_PATH", "photoroom-spend.jsonl"),
+        ("cora.revops.sender", "_AUDIT_PATH", "cora-send-audit.jsonl"),
+        ("cora.main", "_HEARTBEAT_FILE", "heartbeat.txt"),
     ]
     for _mod_name, _attr, _fname in _LEDGER_CONSTS:
         try:
