@@ -209,6 +209,7 @@ def get_shared_kb():
 # HJRP/UFL/F3C/HJRPROD were written to files Cora never read (WS17-B item 6).
 # LEX sub-entity keys are EXCLUDED on purpose: their answers all share lex.md and
 # surface only at the LEX (GM) level, never inside a sibling sub-entity channel.
+from . import known_answer_staleness  # noqa: E402
 from .known_answers_map import ENTITY_FILES as _ENTITY_FILES  # noqa: E402
 
 _KNOWN_ANSWERS_PATHS: dict[str, Path] = {
@@ -469,6 +470,12 @@ def _build_static_context(entity: str, now: float) -> str:
             ka_path, timeout=_CTX_TIMEOUT_SECONDS, retry_seconds=_CTX_RETRY_SECONDS
         ).strip()
         if ka_content:
+            # S3 (cq-b0e5bc37c41b): two-tier staleness, READ-PATH ONLY -- the
+            # store is never mutated. Applied inside _build_static_context (the
+            # CACHED builder) so the TTL object-identity assertion in
+            # test_context_loader still holds; computing it in load_context_parts
+            # would hand back a fresh object on every call.
+            ka_content = known_answer_staleness.apply_staleness(ka_content)
             parts.append(f"{KNOWN_ANSWERS_SECTION_HEADER}\n\n" + ka_content)
     else:
         log.info("no known-answers file for entity %s", entity)

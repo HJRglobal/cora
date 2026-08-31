@@ -467,6 +467,63 @@ def answer_substance(answer: str) -> str:
     return re.sub(r"\s+", " ", text).strip(" ,.;:-\u2013\u2014")
 
 
+# A contributed TEAM NOTE has no Q/A shape -- apply_contributed_note stores a bare
+# one-line fact under a "**[date] Team note ...**" header -- so an A:-keyed floor is
+# blind to it. Measured live: fndr.md carries "and he can update inventory for us"
+# (2026-08-24, Hannah Grant), a sentence FRAGMENT persisted as canon, and
+# answer_quality_ok PASSES it: it is long enough, is not a deflection, is not
+# in-progress and is not a snapshot.
+#
+# This predicate is deliberately NOT folded into answer_quality_ok. Fork-1
+# (2026-07-30) ruled that function stays strict and unchanged -- it is used on the
+# MINE path where a leading conjunction is far likelier to be legitimate prose --
+# so the fragment rule is scoped to the contributed-note writer alone, where a
+# stored fact is a standalone one-liner by construction.
+# LOWERCASE lead + no following comma. Both halves were MEASURED, not assumed:
+#   * case-INSENSITIVE over-rejected "However, the Gilbert office moved to Suite
+#     200." -- real content. A capitalised conjunction is a deliberate sentence
+#     opener; a LOWERCASE one is text copied out of the middle of a sentence,
+#     which is exactly how the live fragment arrived.
+#   * the comma guard keeps "So, the vendor is Apex." while still rejecting
+#     "so we went with Apex" -- the discourse-marker sense of these words is
+#     nearly always comma-separated.
+# Deliberately NOT re.IGNORECASE, and no nested quantifier (the repo has found
+# seven ReDoS bugs; this is a plain alternation with a bounded lookahead).
+_FRAGMENT_LEAD_RE = re.compile(
+    r"^\s*(?:and|but|or|so|because|which|that|also|plus|then)\b(?!\s*,)"
+)
+
+
+def contributed_note_quality_ok(text: str, kind: str = "") -> tuple[bool, str]:
+    """Quality floor for a bare contributed fact. Returns (ok, reason).
+
+    `kind` is the contribution class (note / correction / bookmark). It matters:
+    a BOOKMARK is a pointer to a document BY DESIGN ("The retail deck lives in
+    the F3E Drive"), and answer_quality_ok's vague-deflection rule -- "answer
+    punts to a person/doc/tool instead of stating the fact" -- is precisely
+    wrong for it. Screening a bookmark with a rule written for mined ANSWERS is
+    the reuse-a-screen-on-the-wrong-text-shape error; caught by
+    test_contributed_note_bookmark_provenance, which this floor broke on its
+    first draft.
+
+    Bookmarks still get the substance and fragment checks -- only the
+    deflection rule is lifted.
+    """
+    if (kind or "").strip().lower() == "bookmark":
+        substance = answer_substance((text or "").strip())
+        if (len(substance) < _MIN_DURABLE_ANSWER_CHARS
+                and not _HAS_SUBSTANCE_RE.search(substance)):
+            return False, "bookmark too short to be a durable pointer"
+    else:
+        ok, reason = answer_quality_ok(text)
+        if not ok:
+            return False, reason
+    if _FRAGMENT_LEAD_RE.match(text or ""):
+        return False, ("contribution opens mid-sentence -- it reads as a fragment of a "
+                       "conversation, not a standalone fact")
+    return True, ""
+
+
 def answer_quality_ok(answer: str) -> tuple[bool, str]:
     """Reject vague-deflection / in-progress / point-in-time-snapshot drafts
     before a MINE proposal is queued (GL-11/12). Returns (ok, reason).
@@ -1848,6 +1905,18 @@ def apply_contributed_note(payload: dict[str, Any]) -> tuple[bool, str]:
         # producer that reaches this executor (the team-note fold, backfills).
         from .info_intake import scrub_contribution
         text = scrub_contribution(text)
+        # S3 non-answer floor (cq-b0e5bc37c41b): this writer had NO quality screen
+        # at all, so a deflection or a conversational fragment became always-injected
+        # canon. NOTE the deliberate asymmetry with apply_known_answer, which is
+        # screen-free BY DESIGN (its docstring: a Harrison thumbs-up must always
+        # produce a write, or you get "approved but nothing saved"). A contributed
+        # note has no such approval behind it.
+        note_ok, note_reason = contributed_note_quality_ok(
+            text, str(payload.get("kind") or ""))
+        if not note_ok:
+            log.info("gap_autofill: contributed note refused (quality: %s) -- not persisted",
+                     note_reason)
+            return False, f"contribution not stored -- {note_reason}"
         # Fail-closed PHI re-check at the IRREVERSIBLE write (adversarial review
         # MEDIUM). This is a durable write to an always-loaded known-answers file;
         # the #info-for-cora intake admin-PHI gate is LEX-ASKER-scoped, so a non-LEX
