@@ -103,6 +103,28 @@ def _load_task_state_config() -> tuple[set[str], set[str]]:
 # favor of the meeting_action_items PULL tool (supersedes the D-052 "ENABLED"
 # note). A disabled-state drift is a WARNING, never a CRITICAL -- only the
 # always-on service being down is CRITICAL.
+def _load_run_marker_registry() -> list[dict]:
+    """The `run_markers:` section of the SAME task-state YAML (session #11 S4).
+
+    A FOCUSED accessor rather than an extra return value on
+    _load_task_state_config: that function's 2-tuple shape is pinned by
+    tests/test_nightly_health_check.py and unpacked at module import, so widening
+    its arity would break existing pins for no gain. Same file, same single
+    source of truth -- there is no second registry to drift against.
+
+    Fail-soft: a missing or malformed section yields an empty registry, so a
+    config problem can never turn a healthy fleet into alarms.
+    """
+    path = _REPO_ROOT / "data" / "maps" / "scheduled-task-state.yaml"
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        entries = data.get("run_markers") or []
+        return [e for e in entries if isinstance(e, dict) and e.get("name")]
+    except Exception:
+        return []
+
+
 _EXPECTED_DISABLED, _EXPECTED_RUNNING = _load_task_state_config()
 
 # Friendly labels for the report
@@ -151,7 +173,14 @@ _CRITICAL_LOG_PATTERNS = [
     r"ImportError",
     r"ModuleNotFoundError",
     r"UnicodeDecodeError",
-    r"\bFATAL\b",
+    # cq-b2dee156caee (session #11 S6): was r"\bFATAL\b", which MATCHES the word
+    # "non-fatal" -- the hyphen is a word boundary. Every health-ping failure logs
+    # "ping failed (non-fatal)", so a benign, self-healing blip was escalated to a
+    # CRITICAL health alarm. Verified: this was the ONLY one of the nine patterns
+    # carrying the hazard (the others are multi-word). The lookbehind must stay
+    # FIXED-WIDTH -- these patterns are joined into one alternation and compiled
+    # with re.IGNORECASE -- and (?<![-\w]) is width 1 and succeeds at position 0.
+    r"(?<![-\w])FATAL\b",
     r"Socket Mode disconnect",
     r"connection refused",
     r"SLACK_BOT_TOKEN.*invalid",
@@ -160,8 +189,23 @@ _CRITICAL_LOG_PATTERNS = [
     # watchdog and this check both trust heartbeat.txt, so a persistent write
     # failure is an outage of the signal, not a warning.
     r"HEARTBEAT_FILE_WRITE_FAILING",
+    # Session #11 S4: the run-marker writer failing silently would convert
+    # "this task wrote nothing" into "this task never ran" -- the exact
+    # ambiguity the marker contract exists to remove. Same precedent as the
+    # heartbeat token above: observability that can fail quietly is worse than
+    # none, so its failure is itself a CRITICAL.
+    r"RUN_MARKER_WRITE_FAILING",
 ]
 _CRITICAL_RE = re.compile("|".join(_CRITICAL_LOG_PATTERNS), re.IGNORECASE)
+
+# A real ERROR-LEVEL line: the level field immediately after the timestamp. Both
+# live formats are accepted -- bot "2026-08-28T03:25:37 ERROR [Thread-1] n: msg"
+# and script "2026-08-28 03:30:15,081 ERROR n: msg". Deliberately NOT IGNORECASE:
+# the level field is upper-case by construction, and case-insensitivity would
+# re-admit ordinary prose containing the word "error".
+_ERROR_LINE_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:,\d+)?\s+ERROR\b"
+)
 
 log = logging.getLogger("health-check")
 
@@ -484,8 +528,15 @@ def _classify_task_last_results(
         hexr = f"0x{result & 0xFFFFFFFF:08X}"
         hint = _LAST_RESULT_HINTS.get(result, "")
         warn.append(
+            # cq-b2dee156caee (session #11 S6): this line used to end with
+            # "- this repeats silently every run", appended to EVERY nonzero result
+            # with no recurrence check of any kind. The check reads a single Last
+            # Task Result, so it cannot know that -- and the fabricated claim is
+            # the direct source of a false premise that became a queue seed. State
+            # the observation and its known limit instead of asserting recurrence.
             f"{name}: last run exited {result} ({hexr}"
-            f"{' - ' + hint if hint else ''}) - this repeats silently every run"
+            f"{' - ' + hint if hint else ''}) - most recent run only; "
+            f"this check does not see run history"
         )
     return warn, ok
 
@@ -552,6 +603,48 @@ def check_task_last_results() -> list[CheckResult]:
 
 
 _QBO_MONITOR_TASK = "Cora - QBO Token Monitor"
+
+
+def check_run_markers(now: datetime | None = None) -> CheckResult:
+    """Diff expected task cadence against observed run markers (session #11 S4).
+
+    Retires the cq-a251dee3f5cf class. Task Scheduler reports that a task RAN and
+    its exit code; it cannot report that the run produced NOTHING. The weekly
+    Slack-clarity check fired 8/22 with a registry-confirmed lastRunAt and posted
+    no digest, and no surface recorded it.
+
+    Raises two DISTINCT alarms -- "MISSED FIRE" (no marker in the window) and
+    "FIRED BUT WROTE NOTHING" (marker present and recent, outputs == 0 on a task
+    declaring expects_output). Conflating them would hide the second, which is
+    the one nothing else in the estate can see.
+
+    WARN, never CRITICAL: a lane producing no output is a defect to investigate,
+    not an outage of the bot.
+    """
+    registry = _load_run_marker_registry()
+    if not registry:
+        return CheckResult(
+            "Task run markers", "ok",
+            "no run-marker registry configured -- nothing to diff.")
+    try:
+        sys.path.insert(0, str(_REPO_ROOT / "src"))
+        from cora import run_marker  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult("Task run markers", "warn",
+                           f"run_marker module unavailable: {exc}")
+    try:
+        markers = run_marker.latest_by_task()
+        findings = run_marker.evaluate(registry, markers, now=now)
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult("Task run markers", "warn",
+                           f"run-marker evaluation failed: {exc}")
+    if not findings:
+        return CheckResult(
+            "Task run markers", "ok",
+            f"{len(registry)} task(s) tracked; all fired in-window with output.")
+    return CheckResult(
+        "Task run markers", "warn",
+        "%d issue(s): %s" % (len(findings), " | ".join(m for _sev, m in findings)))
 
 
 def check_qbo_monitor(now: datetime | None = None) -> CheckResult:
@@ -1269,9 +1362,6 @@ def check_logs_24h() -> list[CheckResult]:
         except Exception:
             continue
 
-        error_count = text.count(" ERROR ")
-        total_errors += error_count
-
         for line in text.splitlines():
             # PER-LINE recency (D-051 lens-4/lens-5 MEDIUM). A start-date-pinned
             # log accumulates the whole life of an instance and its mtime is always
@@ -1282,6 +1372,18 @@ def check_logs_24h() -> list[CheckResult]:
             # continuation lines, which is exactly what a critical needs.
             if not _line_within(line, cutoff):
                 continue
+            # cq-b2dee156caee (session #11 S6): the ERROR tally used to be
+            # text.count(" ERROR ") computed OUTSIDE this loop, so it was neither a
+            # line count nor last-24h. It counted the whole life of a
+            # start-date-pinned log file and matched any JSON payload containing
+            # the substring -- including this check's OWN "N ERROR lines" report
+            # (verified live: the 8/29 log scores 1 by substring, 0 by level).
+            # Counting HERE inherits the per-line window above. Unlike the critical
+            # scan, an UNSTAMPED line is deliberately NOT counted: keeping
+            # traceback continuations is right for criticals and wrong for a volume
+            # metric. Validated on the known 8/28 corpus: 56, not 57 and not 63.
+            if _ERROR_LINE_RE.search(line):
+                total_errors += 1
             if _CRITICAL_RE.search(line):
                 snippet = line[:120].strip()
                 # Dedup on the BARE snippet -- the list stores a prefixed form, so
@@ -1733,6 +1835,7 @@ def main() -> int:
 
     log.info("Checking QBO token monitor freshness...")
     all_results.append(check_qbo_monitor())
+    all_results.append(check_run_markers())
     all_results.append(check_info_for_cora_watermark())
 
     log.info("Checking dynamic-answers snapshot freshness...")

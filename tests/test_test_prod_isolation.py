@@ -30,7 +30,15 @@ _SRC = Path("src/cora")
 _CONFTEST = Path("tests/conftest.py")
 
 # Path-shaped env vars resolved at call time inside src/cora.
-_ENV_PATH_RE = re.compile(r"""os\.environ\.get\(\s*["']([A-Z0-9_]*(?:PATH|DIR|ROOT))["']""")
+# Suffixes that name a filesystem location. LEDGER/LOG/FILE were added in
+# session #11 after this very rail MISSED a new write path introduced in the same
+# session (run_marker's TASK_RUNS_LEDGER): a completeness rail keyed on a naming
+# convention silently under-reports every variable that does not follow it. The
+# var was also renamed to TASK_RUNS_LEDGER_PATH to match the repo's convention --
+# both halves, because either alone leaves the hole open for the next one.
+_ENV_PATH_RE = re.compile(
+    r"""os\.environ\.get\(\s*["']([A-Z0-9_]*(?:PATH|DIR|ROOT|LEDGER|LOG|FILE))["']"""
+)
 _SETENV_RE = re.compile(r"""monkeypatch\.setenv\(\s*["']([A-Z0-9_]+)["']""")
 
 # Env-var path resolvers deliberately NOT redirected, each with the reason.

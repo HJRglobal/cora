@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+from cora import run_marker
 import sys
 from pathlib import Path
 
@@ -105,7 +106,15 @@ def main() -> int:
     # previously published post now 404ing -- so a lane that had been dead for a
     # month would have reported Last Result 0 every Monday. A run that simply had
     # no QUEUED row is NOT a failure and still exits 0.
-    return 1 if (report.failed or report.gate_closed) else 0
+    # S4 run marker. expects_output is FALSE for this lane in the registry -- a
+    # week with no publishable draft is a legitimate quiet run, not a defect --
+    # so the count is recorded for visibility rather than alarmed on.
+    failed = bool(report.failed or report.gate_closed)
+    run_marker.write("Cora - F3E Blog Pipeline", script="run_f3e_blog_pipeline.py",
+                     ok=not failed, outputs=len(getattr(report, "staged", []) or []),
+                     outcome="gate_closed" if report.gate_closed else
+                             ("failed" if report.failed else "ok"))
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

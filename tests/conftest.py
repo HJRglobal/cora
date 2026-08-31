@@ -364,6 +364,16 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     monkeypatch.setenv("FLYWHEEL_MIRROR_DIR", str(tmp_path / "flywheel-mirror"))
     monkeypatch.setenv("LEXICON_ROSTER_PATH", str(tmp_path / "lexicon-roster.yaml"))
     monkeypatch.setenv("STRATEGY_HEARTBEAT_PATH", str(tmp_path / "strategy-heartbeat.json"))
+    # session #11 S4: the run-marker ledger. A new write path needs its conftest
+    # redirect in the SAME commit that introduces it, or the next suite run is
+    # what discovers the omission -- by writing to it.
+    monkeypatch.setenv("TASK_RUNS_LEDGER_PATH", str(tmp_path / "task-runs.jsonl"))
+    # Found by WIDENING the isolation rail's suffix list to include *_LEDGER
+    # (session #11 S4). Both were live, unredirected write paths that the
+    # PATH/DIR/ROOT-only scanner could not see -- and decision_inbox has TWO env
+    # vars, so redirecting only its *_PATH half had left the other half open.
+    monkeypatch.setenv("CORA_DECISIONS_INBOX_LEDGER", str(tmp_path / "decisions-inbox-ledger.jsonl"))
+    monkeypatch.setenv("CORA_MEETING_CAPTURE_LEDGER", str(tmp_path / "meeting-capture-ledger.jsonl"))
     # Belt: even if a test flips a flag live but forgets to isolate the path,
     # redirect every module-constant ledger writer to tmp so a test can NEVER touch
     # a real logs/ or data/state/ file. Each in its own try/except (a missing or

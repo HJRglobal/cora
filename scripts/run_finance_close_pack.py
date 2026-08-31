@@ -40,6 +40,7 @@ import argparse
 import datetime
 import json
 import logging
+from cora import run_marker
 import os
 import re
 import sys
@@ -741,6 +742,14 @@ def main() -> int:
 
     log.info("=== finance close-support pack complete (%d/%d delivered) ===",
              len(delivered), len(_ALL_TARGETS))
+    # S4 run marker. `delivered` is the count of targets that actually received
+    # the pack. A run where every target FAILED previously wrote no marker of any
+    # kind (_mark_sent is only called on success), leaving it indistinguishable
+    # from a run that never happened -- which is the whole class this closes.
+    run_marker.write("cowork-cora-finance-close-pack",
+                     script="run_finance_close_pack.py", ok=bool(delivered),
+                     outputs=len(delivered) if hasattr(delivered, "__len__") else int(bool(delivered)),
+                     outcome="delivered" if delivered else "no_targets_delivered")
     return 1 if not delivered else 0
 
 

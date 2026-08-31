@@ -100,3 +100,39 @@ enabled:
   # the 06:33 F3E daily synthesis that consumes it -- a later slot would leave
   # every synthesis reading a ~24h-old file.
   - cowork-cora-inventory-state-sync
+
+# ── Run-marker contract (session #11 S4, retires the cq-a251dee3f5cf class) ────
+# Task Scheduler knows a task RAN and its exit code; it cannot know the run
+# produced NOTHING. The Slack-clarity check fired 8/22 and posted no digest, and
+# no surface anywhere recorded that. Tasks listed here write a marker via
+# src/cora/run_marker.write(); nightly_health_check.check_run_markers() diffs
+# expected cadence against observed markers and raises TWO distinct alarms:
+# MISSED FIRE (no marker in window) and FIRED-BUT-WROTE-NOTHING (marker present,
+# outputs == 0 on an expects_output task).
+#
+# `registered` gates the grace period: a task registered longer ago than its
+# window with NO marker at all is an alarm, not a bootstrap excuse. (The existing
+# info-for-cora reader returns OK when its marker file is absent, which makes a
+# never-adopted lane look healthy forever -- deliberately not repeated here.)
+#
+# expects_output: true means "a run that writes/sends zero things is a defect".
+# Set it false for a task whose legitimate steady state is doing nothing.
+#
+# SCOPE NOTE: only IN-REPO Python tasks can call the helper. 'verdict review'
+# (fndr-weekly-task-verdict-review) and the Slack-clarity check are COWORK
+# scheduled tasks in a separate 93-task estate -- a src/cora helper cannot reach
+# them. They need a file-drop marker contract for prompt-driven tasks; staged as
+# a follow-on rather than half-built here.
+run_markers:
+  - name: cowork-cora-finance-close-pack
+    cadence_hours: 168        # weekly, Mon 09:00 AZ
+    expects_output: true
+    registered: 2026-08-30T00:00:00+00:00
+  - name: cowork-cora-meeting-capture-audit
+    cadence_hours: 24         # daily 07:22 AZ
+    expects_output: true
+    registered: 2026-08-30T00:00:00+00:00
+  - name: Cora - F3E Blog Pipeline
+    cadence_hours: 168        # weekly, Mon 08:50 AZ
+    expects_output: false     # a week with no publishable draft is legitimate
+    registered: 2026-08-30T00:00:00+00:00

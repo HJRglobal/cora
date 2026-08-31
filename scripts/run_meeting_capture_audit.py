@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+from cora import run_marker
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -138,9 +139,22 @@ def main() -> int:
 
     if args.post:
         if not _post(text):
+            # S4: a failed post is a run that produced NO output -- record it as
+            # such rather than letting a non-zero exit be the only trace.
+            run_marker.write("cowork-cora-meeting-capture-audit",
+                             script="run_meeting_capture_audit.py", ok=False,
+                             outputs=0, outcome="post_failed",
+                             detail="Slack post returned falsy")
             return 1
     else:
         log.info("dry-run (no --post): nothing sent to Slack")
+    # S4 run marker. `outputs` counts what this run actually PRODUCED: the ledger
+    # row it appended, plus the Slack post when one was sent. A dry run writes the
+    # ledger row but sends nothing, which is a legitimate 1.
+    run_marker.write("cowork-cora-meeting-capture-audit",
+                     script="run_meeting_capture_audit.py", ok=True,
+                     outputs=1 + (1 if args.post else 0),
+                     outcome="posted" if args.post else "dry_run")
     return 0
 
 
