@@ -204,7 +204,7 @@ def _query_kb_chunks(
         rows = conn.execute(
             f"""
             SELECT source, source_id, entity, sub_entity, content,
-                   deep_link, title, ingested_at
+                   deep_link, title, ingested_at, metadata
             FROM knowledge_chunks
             WHERE {where}
             ORDER BY {content_date} DESC
@@ -225,7 +225,8 @@ def _query_kb_chunks(
 
     chunks = []
     for row in rows:
-        source, source_id, entity, sub_entity, content, deep_link, title, ingested_at = row
+        (source, source_id, entity, sub_entity, content, deep_link, title,
+         ingested_at, metadata_raw) = row
         # PHI guardrail: skip LEX chunks with PHI language entirely
         if exclude_phi_lex and (entity or "").startswith("LEX"):
             if _is_phi_content(content or ""):
@@ -242,6 +243,13 @@ def _query_kb_chunks(
             "deep_link": deep_link or "",
             "title": title or "",
             "ingested_at": ingested_at or 0,
+            # cq-ebe18d20a949 (session #11 S8): the seed reads "add a check for
+            # attribution_unreliable", but the flag was UNREACHABLE -- this query
+            # never selected `metadata`, so passes 1-4 could not see it at all.
+            # Pass 5 already selected it; this copies that shape. Parsed
+            # defensively: malformed JSON must degrade to "not flagged", never
+            # raise inside the chunk loop.
+            "attribution_unreliable": _attribution_unreliable(metadata_raw),
         })
 
     log.debug(
@@ -364,12 +372,73 @@ def _extract_sentences(text: str) -> list[str]:
     return [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", text) if s.strip()]
 
 
-def _confidence_from_ratio(fuzzy_ratio: float, source: str) -> str:
+def _attribution_unreliable(metadata_raw) -> bool:
+    """True when a chunk's diarization collapsed (cq-e63feff3a0bf).
+
+    Fail-soft by design: bad/absent JSON means "not flagged", so a metadata
+    problem can never suppress a gap.
+    """
+    if not metadata_raw:
+        return False
+    try:
+        meta = json.loads(metadata_raw) if isinstance(metadata_raw, str) else metadata_raw
+        return bool((meta or {}).get("attribution_unreliable"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# Source credibility. Fireflies earns its 0.90 premium over slack from TWO
+# properties: a verbatim record AND reliable speaker attribution. Diarization
+# collapse falsifies only the SECOND -- fireflies_diarization never drops a
+# transcript because "the words were still said in that meeting", and passes
+# 2/3/4 all detect on CONTENT, not on speaker. So a flagged transcript keeps the
+# verbatim half of the premium and drops to the SLACK tier rather than to
+# static_md (0.40) or to exclusion.
+#
+# Measured against the live thresholds before choosing 0.75: at 0.40, pass3 goes
+# LOW (discarded) and a pass4 match at sim=0.72 goes LOW -- that would silently
+# DELETE the decisions and task-completions flagged transcripts currently
+# contribute. At 0.75 the HIGH boundary merely moves (pass4: sim>=0.70 ->
+# sim>=0.80), so a marginal match demotes HIGH->MED and MED is still proposed.
+# 0.75 changes PRIORITY, never SUPPRESSION -- which is the correct trade for a
+# signal whose content is trustworthy and whose attribution is not.
+_SOURCE_WEIGHTS = {
+    "fireflies": 0.90, "slack": 0.75, "gmail": 0.70,
+    "hubspot": 0.65, "asana": 0.60, "static_md": 0.40,
+}
+_SLACK_TIER_WEIGHT = 0.75
+
+
+def _source_weight(source: str, attribution_unreliable: bool = False) -> float:
+    if attribution_unreliable and source == "fireflies":
+        return _SLACK_TIER_WEIGHT
+    return _SOURCE_WEIGHTS.get(source, 0.55)
+
+
+_SPEAKER_PREFIX_RE = re.compile(r"^\s*\[[^\]\n]{1,60}\]\s*")
+_SPEAKER_UNKNOWN = "[speaker unknown -- diarization collapsed] "
+
+
+def _neutralize_speaker(text: str, attribution_unreliable: bool) -> str:
+    """Replace a leading "[Name]" token when attribution is not trustworthy.
+
+    The downweight alone does not fix the reported harm: the cards QUOTE the
+    sentence verbatim, so a mis-attributed speaker is still rendered to Harrison
+    as fact. Vocabulary mirrors context_loader's retrieval-side wording so one
+    idea reads the same on every surface.
+    """
+    if not attribution_unreliable or not text:
+        return text
+    if not _SPEAKER_PREFIX_RE.match(text):
+        return text
+    return _SPEAKER_UNKNOWN + _SPEAKER_PREFIX_RE.sub("", text, count=1)
+
+
+def _confidence_from_ratio(
+    fuzzy_ratio: float, source: str, attribution_unreliable: bool = False
+) -> str:
     """Map fuzzy ratio + source type to HIGH/MED/LOW."""
-    source_weight = {
-        "fireflies": 0.90, "slack": 0.75, "gmail": 0.70,
-        "hubspot": 0.65, "asana": 0.60, "static_md": 0.40,
-    }.get(source, 0.55)
+    source_weight = _source_weight(source, attribution_unreliable)
     score = source_weight * 0.55 + fuzzy_ratio * 0.45
     if score >= 0.75:
         return "HIGH"
@@ -475,17 +544,16 @@ def _semantic_best_match(
     return best_sim, best_task
 
 
-def _confidence_from_sim(cosine_sim: float, source: str) -> str:
+def _confidence_from_sim(
+    cosine_sim: float, source: str, attribution_unreliable: bool = False
+) -> str:
     """Map cosine similarity + source to HIGH/MED/LOW confidence.
 
     Semantic similarity (0.72+) is weighted 60%; source credibility 40%.
     Thresholds calibrated so a strong semantic match from Fireflies = HIGH,
     a weak match from static_md = LOW.
     """
-    source_weight = {
-        "fireflies": 0.90, "slack": 0.75, "gmail": 0.70,
-        "hubspot": 0.65, "asana": 0.60, "static_md": 0.40,
-    }.get(source, 0.55)
+    source_weight = _source_weight(source, attribution_unreliable)
     score = source_weight * 0.40 + cosine_sim * 0.60
     if score >= 0.78:
         return "HIGH"
@@ -790,19 +858,21 @@ def pass3_uncaptured_decisions(
             if matches_in_decisions >= 3:
                 continue  # likely already captured
 
-            confidence = _confidence_from_ratio(0.5, chunk["source"])
+            unreliable = bool(chunk.get("attribution_unreliable"))
+            confidence = _confidence_from_ratio(0.5, chunk["source"], unreliable)
             if confidence == "LOW":
                 continue
 
+            shown = _neutralize_speaker(sentence, unreliable)
             description = (
                 f"Possible uncaptured decision in {chunk['source']} "
-                f"({chunk['entity']}): \"{sentence[:150]}\""
+                f"({chunk['entity']}): \"{shown[:150]}\""
             )
             gaps.append(ReconciliationGap(
                 gap_id=_gap_id("uncaptured_decision", chunk["source_id"], sentence[:80]),
                 gap_type="uncaptured_decision",
                 description=description,
-                source_evidence=sentence[:400],
+                source_evidence=_neutralize_speaker(sentence, unreliable)[:400],
                 source=chunk["source"],
                 source_id=chunk["source_id"],
                 entity=chunk["entity"],
@@ -1083,7 +1153,10 @@ def pass4_stale_open_tasks(
         # Quote the SENTENCE that actually matched (not the chunk head, which can be an
         # unrelated -- even contradicting -- synthesis line), and resolve/strip any raw
         # Slack <U…> token so a Harrison-facing card never leaks an id (Slice 3).
-        evidence_quote = resolve_slack_mentions(matched_sentence).strip()
+        unreliable = bool(chunk.get("attribution_unreliable"))
+        evidence_quote = _neutralize_speaker(
+            resolve_slack_mentions(matched_sentence).strip(), unreliable
+        )
         description = (
             f"Possible task completion: \"{task_name}\" "
             f"-- {chunk['source']} says: \"{evidence_quote[:200]}\""
@@ -1095,14 +1168,16 @@ def pass4_stale_open_tasks(
             gap_id=_gap_id("stale_open_task", chunk["source_id"], task_gid),
             gap_type="stale_open_task",
             description=description,
-            source_evidence=resolve_slack_mentions(chunk["content"][:400]),
+            source_evidence=_neutralize_speaker(
+                resolve_slack_mentions(chunk["content"][:400]), unreliable
+            ),
             source=chunk["source"],
             source_id=chunk["source_id"],
             entity=chunk["entity"],
             confidence=(
-                _confidence_from_sim(match_score, chunk["source"])
+                _confidence_from_sim(match_score, chunk["source"], unreliable)
                 if used_semantic
-                else _confidence_from_ratio(match_score, chunk["source"])
+                else _confidence_from_ratio(match_score, chunk["source"], unreliable)
             ),
             proposed_action=(
                 f"Close Asana task \"{task_name}\" "

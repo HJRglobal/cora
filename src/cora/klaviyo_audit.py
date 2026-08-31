@@ -193,6 +193,11 @@ def build_audit(*, segments: list[dict] | None,
         "candidates": [],
         "other_segments": [],
         "seat_holders": list(seat_holders or []),
+        # cq-c2eb2979e793: carried through so format_report can distinguish an
+        # "unknown" caused by throttling from one caused by absence. build_audit
+        # stays PURE -- it reads the client's already-accumulated counter rather
+        # than performing any request of its own.
+        "throttled_reads": kc.throttled_reads(),
     }
     if isinstance(account, dict):
         attrs = account.get("attributes") or {}
@@ -280,6 +285,19 @@ def format_report(audit: dict[str, Any]) -> str:
             )
 
     basis = audit.get("charge_basis")
+    # cq-c2eb2979e793 (session #11 S8): an "unknown" caused by rate-limiting is
+    # not the same fact as an "unknown" caused by absence, and only the first is
+    # worth re-running. The client retries 429s; this reports the ones that
+    # survived every retry, so the reader knows the figures are incomplete for a
+    # KNOWN and transient reason rather than silently trusting them.
+    throttled = int(audit.get("throttled_reads") or 0)
+    if throttled:
+        lines.append("")
+        lines.append(
+            f"⚠️ {throttled} read(s) were rate-limited by Klaviyo after retries — "
+            f"figures shown as _unknown_ below may be throttling, not absence. "
+            f"Re-run to confirm."
+        )
     lines.append("")
     lines.append("*Charge basis*")
     if basis:

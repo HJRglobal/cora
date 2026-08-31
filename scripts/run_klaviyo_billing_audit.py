@@ -88,6 +88,10 @@ def main(argv: list[str] | None = None) -> int:
         log.warning("KLAVIYO_API_KEY not set -- the profile figures will report "
                     "UNAVAILABLE; the seat section still applies")
 
+    # cq-c2eb2979e793: the throttle counter is process-global, so reset it at the
+    # start of a run -- otherwise a long-lived process would report a previous
+    # run's throttles against this one's figures.
+    kc.reset_throttle_state()
     account = kc.get_account()
     segments = kc.get_segments()
     audit = klaviyo_audit.build_audit(

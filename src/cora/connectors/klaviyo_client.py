@@ -45,6 +45,7 @@ and `_scrub` strips it from anything this module logs or raises.
 from __future__ import annotations
 
 import logging
+import time
 import os
 import re
 from typing import Any
@@ -92,8 +93,42 @@ def _headers() -> dict[str, str]:
     }
 
 
+# Rate-limit handling (cq-c2eb2979e793). Klaviyo throttles the audit's read
+# burst; a bare "unknown" cannot be distinguished from genuine absence by the
+# reader, so throttles are counted and surfaced in the report.
+_RATE_LIMIT_RETRIES = 3
+_BACKOFF_BASE_SEC = 1.0
+_RETRY_AFTER_CAP_SEC = 30.0
+_THROTTLE_STATE: dict[str, int] = {"reads": 0}
+
+
+def reset_throttle_state() -> None:
+    """Call once at the start of a report run."""
+    _THROTTLE_STATE["reads"] = 0
+
+
+def throttled_reads() -> int:
+    """Reads that were still 429 after every retry."""
+    return _THROTTLE_STATE["reads"]
+
+
+def _retry_after_seconds(resp: Any) -> float | None:
+    """Honour Retry-After when the server sends it, capped so a bad header can
+    never park a scheduled task for minutes."""
+    try:
+        raw = (resp.headers or {}).get("Retry-After")
+    except Exception:  # noqa: BLE001
+        return None
+    if not raw:
+        return None
+    try:
+        return max(0.0, min(float(raw), _RETRY_AFTER_CAP_SEC))
+    except (TypeError, ValueError):
+        return None
+
+
 def _get(path: str, params: dict[str, Any] | None = None,
-         *, transport: Any = None) -> dict | None:
+         *, transport: Any = None, attempt: int = 0) -> dict | None:
     """THE ONLY request primitive. Returns the parsed JSON body, or None on any
     failure (unconfigured, transport error, non-2xx, unparseable body).
 
@@ -115,6 +150,24 @@ def _get(path: str, params: dict[str, Any] | None = None,
             kwargs["transport"] = transport
         with httpx.Client(**kwargs) as client:
             resp = client.request("GET", url, headers=_headers(), params=params or {})
+        if resp.status_code == 429 and attempt < _RATE_LIMIT_RETRIES:
+            # cq-c2eb2979e793 (session #11 S8): Klaviyo rate-limits the audit's
+            # burst of reads, and without a backoff roughly half the monthly
+            # report rendered "unknown". The None-means-unknown contract above
+            # is honest but not free -- an unknown that is really a throttle is
+            # indistinguishable from an unknown that is really absence, and the
+            # reader cannot tell whether to re-run. Retry first; if it still
+            # fails, RECORD that it was a throttle so the report can say so.
+            delay = _retry_after_seconds(resp) or _BACKOFF_BASE_SEC * (2 ** attempt)
+            log.info("klaviyo_client: %s -> 429, retrying in %.1fs (attempt %d/%d)",
+                     path, delay, attempt + 1, _RATE_LIMIT_RETRIES)
+            time.sleep(delay)
+            return _get(path, params, transport=transport, attempt=attempt + 1)
+        if resp.status_code == 429:
+            _THROTTLE_STATE["reads"] += 1
+            log.warning("klaviyo_client: %s -> 429 after %d retries -- giving up",
+                        path, _RATE_LIMIT_RETRIES)
+            return None
         if resp.status_code >= 300:
             # Name the revision: an unknown/retired revision is the single most
             # likely first-run failure and it must not read as an empty account.
