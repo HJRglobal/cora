@@ -336,6 +336,34 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     # specific value sets it explicitly (its monkeypatch wins).
     monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path / "known-answers"))
     monkeypatch.setenv("RESOLVED_GAPS_PATH", str(tmp_path / "resolved-gaps.jsonl"))
+    # cq-eba0861fc043 (session #11 S2): these four resolve through os.environ.get()
+    # at CALL time (friction_mining.py:178/183, gap_autofill.py:103/108), so they are
+    # redirected here rather than in _LEDGER_CONSTS below -- there is no module
+    # constant to patch. Un-redirected, apply_efficiency() appends to the real
+    # design/efficiency-backlog.md, a shared human file.
+    monkeypatch.setenv("EFFICIENCY_BACKLOG_PATH", str(tmp_path / "efficiency-backlog.md"))
+    monkeypatch.setenv("FRICTION_LEDGER_PATH", str(tmp_path / "friction-fingerprints.jsonl"))
+    monkeypatch.setenv("GAP_AUTOFILL_STATE_PATH", str(tmp_path / "gap_autofill_state.json"))
+    monkeypatch.setenv("GAP_ASK_PENDING_PATH", str(tmp_path / "gap_ask_pending.json"))
+    # Remaining unambiguous WRITE ledgers/dirs found by the session #11 S2 audit
+    # (tests/test_test_prod_isolation.py enumerates the full surface and keeps the
+    # read-only remainder declared rather than invisible).
+    monkeypatch.setenv("CORA_DECISIONS_INBOX_PATH", str(tmp_path / "decisions-inbox.jsonl"))
+    monkeypatch.setenv("MISSED_CATCHUP_LEDGER_PATH", str(tmp_path / "missed-catchup.jsonl"))
+    monkeypatch.setenv("FILER_CONTENT_LEDGER_PATH", str(tmp_path / "filer-content.jsonl"))
+    monkeypatch.setenv("FILER_MESSAGE_LEDGER_PATH", str(tmp_path / "filer-message.jsonl"))
+    monkeypatch.setenv("CORA_GRADUATED_SHADOW_DIR", str(tmp_path / "graduated-shadow"))
+    monkeypatch.setenv("LEXICON_CANDIDATES_PATH", str(tmp_path / "lexicon-candidates.jsonl"))
+    monkeypatch.setenv("LEXICON_FINGERPRINTS_PATH", str(tmp_path / "lexicon-fingerprints.jsonl"))
+    monkeypatch.setenv("SYNTHESIS_SNAPSHOT_DIR", str(tmp_path / "synthesis-snapshots"))
+    monkeypatch.setenv("STRATEGY_SNAPSHOT_DIR", str(tmp_path / "strategy-snapshots"))
+    monkeypatch.setenv("STRATEGY_MEMO_DIR", str(tmp_path / "strategy-memos"))
+    monkeypatch.setenv("MATERIALIZATION_WATERMARK_PATH", str(tmp_path / "materialization-wm.json"))
+    monkeypatch.setenv("CORA_SNAPSHOT_DIR", str(tmp_path / "snapshots"))
+    monkeypatch.setenv("CORA_SNAPSHOT_MIRROR_DIR", str(tmp_path / "snapshot-mirror"))
+    monkeypatch.setenv("FLYWHEEL_MIRROR_DIR", str(tmp_path / "flywheel-mirror"))
+    monkeypatch.setenv("LEXICON_ROSTER_PATH", str(tmp_path / "lexicon-roster.yaml"))
+    monkeypatch.setenv("STRATEGY_HEARTBEAT_PATH", str(tmp_path / "strategy-heartbeat.json"))
     # Belt: even if a test flips a flag live but forgets to isolate the path,
     # redirect every module-constant ledger writer to tmp so a test can NEVER touch
     # a real logs/ or data/state/ file. Each in its own try/except (a missing or
@@ -347,6 +375,18 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
         ("cora.code_queue", "_FINGERPRINT_LEDGER", "code-queue-fingerprints.jsonl"),
         ("cora.code_queue", "_SIGNALS_LEDGER", "code-queue-signals.jsonl"),
         ("cora.knowledge_review", "_AUTOWRITE_AUDIT_PATH", "cora-autowrite-audit.jsonl"),
+        # cq-eba0861fc043 (session #11 S2): these THREE sat un-redirected right beside
+        # _AUTOWRITE_AUDIT_PATH above. propose_update() appends to
+        # _PROPOSED_UPDATES_PATH unconditionally, so a suite run put two synthetic
+        # "gapfill-*" proposals into the LIVE review ledger; one was later one-tapped
+        # into live canon (fndr.md on Drive). The file WAS in _GUARDED_LEDGERS -- so it
+        # was detect-only, and the detector is defeated on this host (see _bot_live).
+        # The same constant took a lexicon-teach fixture on 2026-08-02, three weeks
+        # before the incident that got noticed.
+        ("cora.knowledge_review", "_PROPOSED_UPDATES_PATH", "cora-proposed-memory-updates.jsonl"),
+        ("cora.knowledge_review", "_ARCHIVE_PATH", "cora-proposed-memory-updates.archive.jsonl"),
+        ("cora.knowledge_review", "_REPLY_LOG_PATH", "cora-reply-log.jsonl"),
+
         ("cora.pm_metrics", "_ACTION_LOG", "pm-actions.jsonl"),
         ("cora.pm_metrics", "_SNAPSHOT_DIR", "pm-adoption-snapshots"),
         ("cora.finance_receipts", "_AUDIT_LOG_PATH", "finance-access-audit.jsonl"),

@@ -404,6 +404,10 @@ class TestWave1ConversionMetrics:
         # RESOLVED_GAPS_PATH at a tmp file; this test builds its OWN repo-root
         # tree and needs the repo-relative fallback to resolve within it.
         monkeypatch.delenv("RESOLVED_GAPS_PATH", raising=False)
+        # Same reason (session #11 S2): the autouse fixture now also redirects
+        # GAP_AUTOFILL_STATE_PATH, and this test writes its own copy under
+        # tmp_path/data/state and relies on the repo-relative fallback.
+        monkeypatch.delenv("GAP_AUTOFILL_STATE_PATH", raising=False)
         old1 = NOW - timedelta(days=10)
         old2 = NOW - timedelta(days=12)
         old3 = NOW - timedelta(days=15)
