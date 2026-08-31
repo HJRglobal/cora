@@ -8,10 +8,11 @@ Run AFTER Harrison FF-merges the branch. Idempotent; dry-run by default;
 Without this the queue reads stale-positive and the Monday menu re-offers
 shipped work (the 2026-07-31 incident: 14 seeds still PROPOSED post-merge).
 
-TWO SEEDS ARE DELIBERATELY *NOT* MARKED SHIPPED -- see NOT_SHIPPED below. A
-step-7.5 script that marks a seed shipped when the work was escalated rather
-than done is exactly the stale-positive it exists to prevent, pointing the
-other way.
+SIX SEEDS ARE DELIBERATELY *NOT* MARKED SHIPPED -- see NOT_SHIPPED below. A
+step-7.5 script that marks a seed shipped when the work was escalated, reverted,
+or merely diagnosed is exactly the stale-positive it exists to prevent, pointing
+the other way. One of the six (cq-85b35413b020) was BUILT and then REVERTED by
+the D-051 review, which is the case most likely to be mis-recorded as shipped.
 """
 
 import argparse
@@ -42,8 +43,6 @@ SHIPS: list[tuple[str, str]] = [
     ("cq-f7ec95e2d313", "S6: health-check reporting fixes (health-ping class)"),
     ("cq-b2dee156caee", "S6: \\bFATAL\\b vs 'non-fatal', ERROR-volume line count, "
                         "fabricated recurrence claim"),
-    ("cq-85b35413b020", "S7: preflight FP fix -- R2 proper-noun + R1 negation "
-                        "scope (HIGH)"),
     ("cq-ebe18d20a949", "S8: attribution_unreliable made readable, honoured in "
                         "weight AND in the quoted evidence"),
     ("cq-c2eb2979e793", "S8: Klaviyo 429 backoff + honest throttled rendering"),
@@ -54,6 +53,20 @@ SHIPS: list[tuple[str, str]] = [
 
 # Seeds this session touched but did NOT close. Printed, never transitioned.
 NOT_SHIPPED: list[tuple[str, str]] = [
+    ("cq-85b35413b020",
+     "S7 CODE half BUILT then REVERTED by the D-051 review (HIGH). The fix was "
+     "correct about the two false positives and WRONG about the cost: loading "
+     "main and the branch side by side showed five real claims that main BLOCKS "
+     "and the branch PASSED -- 'F3 Energy is Clean Energy.', 'No other drink "
+     "prevents fatigue like F3 Energy.', 'No one denies that F3 Energy cures "
+     "fatigue.' Two mechanisms: a claim never has to BRIDGE a clause (it lives "
+     "inside the negation window), and the widened redaction also fed R1's "
+     "PRESENCE-ALONE disease scans, erasing condition names before they were "
+     "read. Reverted to main; stays PROPOSED. The seed now carries a proven "
+     "reason the naive fix is unsafe -- a refix needs governing-negation grammar "
+     "and a proper-noun ALLOWLIST, not a shape heuristic, plus Harrison's ruling "
+     "on the rail-2 attribution question (which was never taken)."),
+
     ("cq-db780fcf7889",
      "S7 DATA half NOT BUILT -- structurally out of scope. No body-edit function "
      "exists (articleUpdate appears once, hard-wired to isPublished), process_tap "
