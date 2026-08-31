@@ -61,6 +61,7 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import re
 import subprocess
 import threading
 from pathlib import Path
@@ -359,6 +360,13 @@ def known_answers(entity: str) -> dict[str, Any]:
     if not text:
         return {"entity": entity, "file": fname, "found": False,
                 "message": "known-answers file is empty"}
+
+    # S3 (cq-b0e5bc37c41b): the SAME two-tier staleness the Slack reply path
+    # applies. This surface hands raw file text to Code/Cowork sessions, so
+    # without it a >30d cash figure would be withheld from Slack answers and
+    # still quoted verbatim to a Code session -- one store, two truths.
+    from . import known_answer_staleness
+    text = known_answer_staleness.apply_staleness(text)
     return {
         "entity": entity, "file": fname, "found": True,
         "provenance": _KA_PROVENANCE,
@@ -535,6 +543,21 @@ def health() -> dict[str, Any]:
     return out
 
 
+# cq-bd286f89b357 (session #11 S9): the old parser took EVERYTHING after
+# "uptime_s=" and joined the digits -- so it silently concatenated the pid onto the
+# uptime. main.py logs "heartbeat alive uptime_s=%d pid=%d", so '345678 pid=8844'
+# became 3456788844: ~109 YEARS, which is what data/session-bus/snapshots/status.json
+# has been publishing. This is not an epoch or units error, and clamping would hide
+# it while still being wrong whenever the concatenation lands in a plausible range.
+#
+# Regression date is exact: the parser was correct until 2026-08-19, when commit
+# 35b7e7d added " pid=%d" to the heartbeat line. A log-line FIELD ADDITION broke a
+# downstream parser, and every fixture in the suite omitted that field -- so the
+# suite certified the bug. Anchoring on the digits immediately after the key makes
+# any future trailing field harmless.
+_UPTIME_RE = re.compile(r"uptime_s=(\d+)")
+
+
 def _read_uptime_from_log(log_dir: Path | None = None) -> int | None:
     """Parse the most recent `heartbeat alive uptime_s=N` from the LIVE Cora log.
 
@@ -561,11 +584,12 @@ def _read_uptime_from_log(log_dir: Path | None = None) -> int | None:
                 tail = fh.read().decode("utf-8", errors="replace")
             last = None
             for line in tail.splitlines():
-                idx = line.find("uptime_s=")
-                if idx != -1 and "heartbeat alive" in line:
-                    last = line[idx + len("uptime_s="):].strip()
+                if "heartbeat alive" in line:
+                    m = _UPTIME_RE.search(line)
+                    if m:
+                        last = m.group(1)
             if last is not None:
-                return int("".join(ch for ch in last if ch.isdigit()) or "0")
+                return int(last)
         return None
     except Exception:  # noqa: BLE001
         return None

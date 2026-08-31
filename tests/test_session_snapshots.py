@@ -324,7 +324,10 @@ def test_uptime_reads_newest_live_log_across_midnight(tmp_path):
 
     live = tmp_path / "cora-2026-07-30.log"        # start-date basename, still live
     live.write_text(
-        "2026-07-31 00:18:00 INFO cora heartbeat alive uptime_s=93780\n",
+        # MUST match the producer's real format (main.py: "heartbeat alive
+        # uptime_s=%d pid=%d"). The old fixture omitted " pid=N", so it did not
+        # exercise the concatenation bug and the suite certified it (session #11 S9).
+        "2026-07-31 00:18:00 INFO cora heartbeat alive uptime_s=93780 pid=8844\n",
         encoding="utf-8")
     decoy = tmp_path / "cora-2026-07-31.log"       # empty same-day file, no heartbeat
     decoy.write_text("", encoding="utf-8")

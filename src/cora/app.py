@@ -5515,8 +5515,18 @@ def _handle_confirm_tap(body: dict, client, *, action: str,
         text = "This preview was replaced by a newer one -- check your latest message."
     elif outcome == "expired":
         label = result.get("label", "that request")
-        text = (f"That {label} expired before you confirmed. Nothing was "
-                f"changed -- tell me again and I'll re-preview it.")
+        # cq-38faa8bd62a1 (session #11 S9): this read "That {label} expired", and
+        # 13 of the 16 labels already begin with "that " -- so the live copy was
+        # "That that note expired before you confirmed." Fixed at the CONSUMER, not
+        # in _stash_expired_label/_expired_pending_label: the latter is SHARED with
+        # the typed-confirm path (tool_dispatch), where it sits inside parentheses
+        # and reads correctly today. Editing the shared label would fix one caller
+        # and break the other. Capitalising the label instead is safe across all
+        # three label shapes: "that note" -> "That note", the asana/calendar quoted
+        # form '"Fix the bug"' is unchanged (upper() on a quote is a no-op), and
+        # shopify's "the inventory update ..." -> "The inventory update ...".
+        text = (f"{label[:1].upper()}{label[1:]} expired before you confirmed. "
+                f"Nothing was changed -- tell me again and I'll re-preview it.")
     elif outcome == "cancelled":
         # v2b S5: an item Skip dismisses ONE item, and the sibling cards next to
         # it are still live -- "nothing was changed" would read as "I cancelled
