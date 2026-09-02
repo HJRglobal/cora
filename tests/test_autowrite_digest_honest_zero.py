@@ -51,8 +51,22 @@ def shadow_dir(tmp_path, monkeypatch):
     return d
 
 
+def _recent_day(ago: int = 0) -> str:
+    """A date INSIDE the default 7-day read window, relative to now.
+
+    These helpers used to hardcode day="2026-08-24". `read_autowrite_scans`
+    derives its cutoff from `datetime.now()` and drops anything older, so the
+    fixtures aged out of the window on 2026-08-31 and four tests in this file
+    went red on a clean main -- asserting on a product path that was, correctly,
+    seeing no rows at all. A test fixture must be positioned relative to the
+    clock the code under test reads, never pinned to the day it was written.
+    """
+    return (datetime.now(timezone.utc) - timedelta(days=ago)).strftime("%Y-%m-%d")
+
+
 def _scan_row(d: Path, *, level="all", scanned=3, applied=0, refusals=None,
-              day="2026-08-24"):
+              day=None):
+    day = day or _recent_day()
     rec = {"type": "autowrite_scan", "ts": f"{day}T14:00:00+00:00",
            "level": level, "scanned": scanned, "applied": applied,
            "refusals": refusals or {}}
@@ -60,12 +74,25 @@ def _scan_row(d: Path, *, level="all", scanned=3, applied=0, refusals=None,
         fh.write(json.dumps(rec) + "\n")
 
 
-def _tier_row(d: Path, uid: str, tier: int, day="2026-08-24"):
+def _tier_row(d: Path, uid: str, tier: int, day=None):
+    day = day or _recent_day()
     rec = {"type": "shadow_decision", "ts": f"{day}T14:00:00+00:00",
            "update_id": uid, "update_type": "efficiency", "shadow_tier": tier,
            "shadow_decision": "harrison" if tier == 2 else "would-auto-approve"}
     with (d / f"graduated-trust-shadow-{day}.jsonl").open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(rec) + "\n")
+
+
+def test_the_fixture_helpers_land_inside_the_default_read_window(shadow_dir):
+    """Guard the guard: if _recent_day ever drifts out of the window again, fail
+    HERE with a clear cause instead of as four confusing assertion failures on
+    product wording."""
+    _scan_row(shadow_dir, scanned=1)
+    _tier_row(shadow_dir, "u0", 2)
+    assert gts.read_autowrite_scans(days=7), "scan fixture is outside the 7d window"
+    assert gts.build_report(days=7).get("total_decisions"), (
+        "tier fixture is outside the 7d window"
+    )
 
 
 # ── the why-zero line ───────────────────────────────────────────────────────
@@ -101,9 +128,14 @@ def test_a_lane_that_ran_but_saw_nothing_is_called_a_starved_pipe(shadow_dir):
 
 
 def test_refusals_aggregate_across_runs_in_the_window(shadow_dir):
-    _scan_row(shadow_dir, scanned=4, refusals={"tier_2": 4}, day="2026-08-22")
-    _scan_row(shadow_dir, scanned=5, refusals={"tier_2": 5}, day="2026-08-24")
-    line = rad._why_zero_line({"this_week": 0, "level": "all"}, days=3650)
+    """Two runs on two different days, both inside the DEFAULT window -- which is
+    what the name claims. This used to pin two 2026-08 dates and then pass
+    days=3650 to reach them, so it never actually exercised the window it is
+    named for (and was the only reason it stayed green while its four siblings
+    aged out)."""
+    _scan_row(shadow_dir, scanned=4, refusals={"tier_2": 4}, day=_recent_day(2))
+    _scan_row(shadow_dir, scanned=5, refusals={"tier_2": 5}, day=_recent_day())
+    line = rad._why_zero_line({"this_week": 0, "level": "all"})
     assert "9 item(s) scanned over 2 run(s)" in line
     assert "`tier_2` x9" in line
 
@@ -184,7 +216,11 @@ def test_scan_rows_are_inert_in_the_shadow_report(shadow_dir):
 def test_read_scans_ignores_other_row_types_and_junk(shadow_dir):
     _tier_row(shadow_dir, "real-1", 2)
     _scan_row(shadow_dir, scanned=2)
-    with (shadow_dir / "graduated-trust-shadow-2026-08-24.jsonl").open(
+    # Same file the helpers above just wrote to: the point is that junk sitting
+    # NEXT TO real rows is skipped without taking them down with it. A hardcoded
+    # filename here would append to a different (empty) file once the helpers
+    # became date-relative, quietly weakening the test to nothing.
+    with (shadow_dir / f"graduated-trust-shadow-{_recent_day()}.jsonl").open(
             "a", encoding="utf-8") as fh:
         fh.write("not json\n")
         fh.write("[1,2,3]\n")

@@ -743,13 +743,26 @@ class TestScriptsAndDeployment:
         """
         import importlib.util
 
-        monkeypatch.delenv("CORA_ONECORA_ENSURE", raising=False)
         spec = importlib.util.spec_from_file_location(
             "_ensure_script", _REPO_ROOT / "scripts" / "run_meeting_capture_ensure.py"
         )
         mod = importlib.util.module_from_spec(spec)
         monkeypatch.setattr(sys, "argv", ["run_meeting_capture_ensure.py", "--apply"])
         spec.loader.exec_module(mod)
+
+        # ORDER IS LOAD-BEARING: clear the flag AFTER exec_module, never before.
+        # The script does `load_dotenv(_REPO_ROOT / ".env", override=True)` at
+        # module scope, so executing it re-populates anything set in .env -- and
+        # .env now carries CORA_ONECORA_ENSURE=live (the lane was turned on after
+        # this test was written). Clearing first therefore had no effect: the
+        # lane ran, the monkeypatched plan_ensure returned None, and the test
+        # died with an AttributeError deep inside meeting_capture rather than
+        # testing anything. Reordering this back would silently re-break it.
+        monkeypatch.delenv("CORA_ONECORA_ENSURE", raising=False)
+        assert mc.ensure_mode() == "off", (
+            "precondition: the flag must be unset for this test; something "
+            "re-populated CORA_ONECORA_ENSURE after exec_module"
+        )
 
         called: list[str] = []
         monkeypatch.setattr(mc, "plan_ensure", lambda *a, **k: called.append("plan"))
