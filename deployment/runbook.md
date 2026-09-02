@@ -85,7 +85,48 @@ Stop-ScheduledTask -TaskName "cowork-cora-service" -ErrorAction SilentlyContinue
 Get-CimInstance Win32_Process | Where-Object { $_.Name -eq "cora.exe" -or ($_.Name -eq "python.exe" -and $_.CommandLine -like "*cora*") } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 ```
 
-**IMPORTANT — `schtasks /End` or `Stop-ScheduledTask` does NOT kill the Python process.** The task scheduler record changes state but the underlying `python.exe` keeps running. After any stop command, always kill orphan processes before restarting:
+### Windowless tasks: the `pythonw.exe` launcher (2026-09-02)
+
+Every Cora scheduled task action is wrapped as:
+
+```
+pythonw.exe deployment\run_hidden.py --name <slug> -- <original exe> <original args>
+```
+
+`pythonw.exe` is GUI-subsystem (Windows gives it no console at all) and it
+spawns the real command with `CREATE_NO_WINDOW`, so no task fire flashes a
+console window on the founder's desktop. Consequences for anyone at a prompt
+during an incident:
+
+- **There is one extra pid per running task**, a `pythonw.exe` whose command
+  line contains `run_hidden.py`. It is the launcher, not a second instance.
+  Doctrine 5's kill filter (`Name='python.exe' OR Name='cora.exe'`) does not
+  match it, so the "one healthy instance = 2 matching processes" count still
+  means what it says.
+- **`restart-cora.ps1` kills the launcher explicitly.** It must: the launcher
+  holds the task's running instance, and the service is
+  `MultipleInstances=IgnoreNew`, so leaving it alive makes the next
+  `Start-ScheduledTask` a silent no-op and Cora stays down.
+- **Each task's stdout/stderr now lands in `logs\tasks\<slug>-<date>.log`** —
+  output Task Scheduler used to discard. That is the first place to look when a
+  task's Last Result is nonzero.
+- **Last Result `224`-`227` (`0xE0`-`0xE3`) are the LAUNCHER's own failures**,
+  not the script's: 224 malformed wrapped action, 225 `logs\tasks` unusable,
+  226 could not start the child, 227 internal error (see
+  `logs\tasks\_launcher-errors.log`). The nightly health check names these, and
+  its `Windowless launcher` check reports any task that is not wrapped.
+- The child runs in a kill-on-close **job object**, so a task killed at its
+  `ExecutionTimeLimit` takes its whole process tree with it instead of
+  orphaning the worker.
+
+Re-wrap the estate (idempotent, dry-run by default) with:
+
+```powershell
+.\deployment\rewrap-tasks-hidden.ps1              # dry run
+.\deployment\rewrap-tasks-hidden.ps1 -Apply       # ELEVATED; skips disabled tasks
+```
+
+**IMPORTANT — `schtasks /End` or `Stop-ScheduledTask` does NOT kill the Python process.** The task scheduler record changes state but the underlying `python.exe` keeps running. After any stop command, always kill orphan processes before restarting (and note the `pythonw.exe` launcher above — `restart-cora.ps1` is the maintained path and handles both):
 ```powershell
 # Step 1: signal the task scheduler
 Stop-ScheduledTask -TaskName "cowork-cora-service" -ErrorAction SilentlyContinue

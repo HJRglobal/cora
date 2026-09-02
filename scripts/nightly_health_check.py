@@ -515,6 +515,21 @@ _LAST_RESULT_HINTS: dict[int, str] = {
     267012: "NO_MORE_RUNS",
     267013: "NOT_SCHEDULED",
     267015: "NO_VALID_TRIGGERS",
+    # deployment/run_hidden.py, the windowless launcher every Cora task now
+    # runs through, reserves 0xE0-0xE3 for ITS OWN failures so a rewrap
+    # regression cannot be mistaken for a script bug. These codes exist
+    # precisely to be recognised here.
+    # Raw strings: these messages carry Windows paths, and in a normal string
+    # "logs\tasks" is logs + TAB + asks and "deployment\rewrap" embeds a
+    # carriage return -- the message would render mangled in the Slack digest.
+    224: ("run_hidden LAUNCHER: no child command line after ' -- ' -- the task's "
+          r"wrapped action is malformed; re-run deployment\rewrap-tasks-hidden.ps1"),
+    225: (r"run_hidden LAUNCHER: logs\tasks is unusable (full disk? permissions?) "
+          "-- the child was NOT run"),
+    226: ("run_hidden LAUNCHER: could not start the child (missing exe or bad path) "
+          "-- check the command after ' -- ' in the task's action"),
+    227: (r"run_hidden LAUNCHER: unexpected internal error -- see "
+          r"logs\tasks\_launcher-errors.log"),
 }
 
 
@@ -800,6 +815,84 @@ _WATCHDOG_ESCALATE_EVENTS = frozenset({
     "no_heartbeat_file",
     "thrash_guard_hold",
 })
+
+
+def check_windowless_launcher() -> CheckResult:
+    r"""The windowless launcher is a single point of failure for the estate.
+
+    Every Cora task's action runs `pythonw.exe deploymentun_hidden.py -- ...`,
+    so if the launcher or pythonw.exe goes missing -- a branch checkout, a venv
+    rebuild -- ALL of them fail at once, and they fail SILENTLY: pythonw has no
+    stderr to complain to. Worse, the things that would report it (this check,
+    the security monitor, the watchdog) are themselves scheduled tasks behind
+    the same launcher.
+
+    This is the cheap out-of-band-ish guard: assert the two files exist, and
+    report any Cora task whose action is NOT wrapped -- which is how a re-run
+    setup script on a host without the venv silently puts a flashing window
+    back (New-WrappedTaskAction degrades to a console action by design, because
+    an unregistered task is worse than a visible one).
+    """
+    launcher = _REPO_ROOT / "deployment" / "run_hidden.py"
+    pythonw = _REPO_ROOT / ".venv" / "Scripts" / "pythonw.exe"
+    missing = [str(p) for p in (launcher, pythonw) if not p.exists()]
+    if missing:
+        return CheckResult(
+            "Windowless launcher", "critical",
+            "MISSING: " + ", ".join(missing) +
+            " -- every wrapped Cora task fails silently until this is restored.",
+        )
+
+    if os.name != "nt":
+        return CheckResult("Windowless launcher", "ok", "launcher present (task scan is Windows-only)")
+
+    ps = (
+        "Get-ScheduledTask | Where-Object { $_.TaskName -like 'Cora - *' -or "
+        "$_.TaskName -like 'cowork-cora-*' -or $_.TaskName -eq 'cora-watchdog' } | "
+        "ForEach-Object { Write-Output ($_.TaskName + '|' + $_.State + '|' + "
+        "$_.Actions[0].Execute + '|' + $_.Actions[0].Arguments) }"
+    )
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True, timeout=60,
+            creationflags=_NO_WINDOW,
+        ).stdout
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult("Windowless launcher", "warn", f"task scan failed: {exc}")
+
+    unwrapped: list[str] = []
+    total = 0
+    for line in out.splitlines():
+        parts = line.rstrip("\r").split("|", 3)
+        if len(parts) < 3:
+            continue
+        name, state = parts[0].strip(), parts[1].strip()
+        execute = parts[2].strip()
+        args = parts[3].strip() if len(parts) > 3 else ""
+        total += 1
+        # A disabled task never fires, so it never flashes a window; the rewrap
+        # script skips those by design and this must agree with it or it would
+        # report 18 permanent "failures".
+        if state.lower() == "disabled":
+            continue
+        if not (execute.lower().endswith("pythonw.exe") and "run_hidden.py" in args):
+            unwrapped.append(name)
+
+    if not total:
+        return CheckResult("Windowless launcher", "warn", "task scan returned no tasks")
+    if unwrapped:
+        return CheckResult(
+            "Windowless launcher", "warn",
+            f"{len(unwrapped)} of {total} Cora task(s) are NOT windowless and will flash a "
+            f"console window at every fire: {', '.join(sorted(unwrapped)[:8])}"
+            + (" ..." if len(unwrapped) > 8 else "")
+            + r" -- fix with (ELEVATED) deployment\rewrap-tasks-hidden.ps1 -Apply",
+        )
+    return CheckResult(
+        "Windowless launcher", "ok",
+        f"launcher present; all {total} enabled Cora task(s) run windowless",
+    )
 
 
 def check_watchdog_liveness(now: datetime | None = None) -> CheckResult:
@@ -1859,6 +1952,7 @@ def main() -> int:
 
     log.info("Checking watchdog liveness...")
     all_results.append(check_watchdog_liveness())
+    all_results.append(check_windowless_launcher())
 
     log.info("Checking decision gate dates...")
     all_results.append(check_decision_gates())

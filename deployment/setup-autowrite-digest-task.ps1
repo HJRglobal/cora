@@ -26,7 +26,10 @@ $tr = '"{0}" "{1}"' -f $Python, $Script
 schtasks /Create /TN $TaskName /TR $tr /SC WEEKLY /D MON /ST 11:00 /F
 # schtasks /TR caps at 261 chars, too short for the wrapper -- wrap the
 # registered action instead (COM/CIM, no length limit).
-Set-WrappedTaskAction -TaskName $TaskName | Out-Null
+if (-not (Set-WrappedTaskAction -TaskName $TaskName)) {
+    Write-Host "  WARNING: the task is registered but NOT windowless -- it will flash a console window at every fire."
+    Write-Host ("  Fix with (ELEVATED): .\deployment\rewrap-tasks-hidden.ps1 -Apply -Only " + $TaskName)
+}
 
 Write-Host "Registered: $TaskName (weekly, Monday 11:00 AZ)"
 Write-Host "Smoke test now:"

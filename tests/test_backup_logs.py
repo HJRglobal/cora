@@ -229,5 +229,12 @@ class TestBackgroundIoMode:
         and SetPriorityClass returns FALSE, so the whole feature silently did
         nothing."""
         bl = _load("backup_logs")
-        assert bl._set_process_background(True) is True, "BEGIN failed -- check ctypes argtypes"
-        assert bl._set_process_background(False) is True, "END failed"
+        # try/finally: if BEGIN succeeds and the END assertion fails, the
+        # PYTEST PROCESS would stay in background I/O mode for the remaining
+        # ~13.6k tests.
+        began = bl._set_process_background(True)
+        try:
+            assert began is True, "BEGIN failed -- check the ctypes argtypes"
+        finally:
+            ended = bl._set_process_background(False) if began else True
+        assert ended is True, "END failed"

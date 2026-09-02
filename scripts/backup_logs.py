@@ -59,12 +59,19 @@ ENV_PATH = REPO_ROOT / ".env"
 
 # --- Background I/O priority ------------------------------------------------
 #
-# This job copies the ~5.7 GB cora_kb.db (with --include-kb) and a pile of logs
-# to Google Drive at 1pm, while Harrison is working at the machine. The task is
-# registered at Priority 9 (IDLE cpu class) by
+# This job copies logs, ledgers and the small feature DBs to Google Drive at
+# 1pm, while Harrison is working at the machine. It copies the ~5.7 GB
+# cora_kb.db ONLY with --include-kb, which the scheduled action does NOT pass
+# (verified live 2026-09-02: `python.exe scripts\backup_logs.py`) -- that is
+# the manual DR one-off. So the daily run is Drive-bound rather than
+# KB-bound, and this is a smaller win than "the 5.7 GB copy" would suggest;
+# it is still the right setting for a network-copy job on a foreground machine,
+# and it is what makes the manual --include-kb run tolerable.
+#
+# The task is registered at Priority 9 (IDLE cpu class) by
 # deployment/rewrap-tasks-hidden.ps1, but Task Scheduler's Priority only sets
-# the CPU priority class -- it does NOT lower I/O priority, and the disk is what
-# this job actually saturates.
+# the CPU priority class -- it does NOT lower I/O priority, and the disk/network
+# is what this job actually saturates.
 #
 # PROCESS_MODE_BACKGROUND_BEGIN lowers CPU *and* I/O priority together for the
 # whole process, which is exactly the "get out of the foreground's way" knob.

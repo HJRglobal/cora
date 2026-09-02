@@ -31,9 +31,31 @@ Stop-ScheduledTask -TaskName "cowork-cora-service" -ErrorAction SilentlyContinue
 Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='cora.exe'" |
     Where-Object { $_.CommandLine -like "*\Scripts\cora.exe*" -or $_.CommandLine -like "*cora.main*" } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+
+# THE WINDOWLESS LAUNCHER MUST BE KILLED TOO (2026-09-02).
+#
+# Once cowork-cora-service is rewrapped, the task runs
+#   pythonw.exe run_hidden.py -- python.exe -m cora.main
+# The doctrine-5 filter above is Name='python.exe' OR 'cora.exe', so it does
+# NOT match the pythonw launcher. Doctrine 5 also records that
+# Stop-ScheduledTask alone does not reliably kill the task's process. Leaving
+# the launcher alive is not cosmetic: it still HOLDS the task's running
+# instance, and the service is MultipleInstances=IgnoreNew (verified live), so
+# the Start-ScheduledTask below would be silently rejected and Cora would stay
+# DOWN -- while the $leftover guard, whose whole job is to refuse to start on
+# top of a live instance, reported zero because it cannot see pythonw either.
+#
+# Killing the launcher is also the cleanest possible stop: run_hidden puts the
+# child in a kill-on-close job object, so the child dies with it.
+$launcherFilter = { $_.CommandLine -like "*run_hidden.py*" -and ($_.CommandLine -like "*cora.main*" -or $_.CommandLine -like "*\Scripts\cora.exe*") }
+Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
+    Where-Object $launcherFilter |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+
 Start-Sleep 3
 $leftover = @(Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='cora.exe'" |
     Where-Object { $_.CommandLine -like "*\Scripts\cora.exe*" -or $_.CommandLine -like "*cora.main*" })
+$leftover += @(Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" | Where-Object $launcherFilter)
 if ($leftover.Count -gt 0) {
     Write-Warning ("Still " + $leftover.Count + " bot process(es) alive after kill -- investigate before starting:")
     $leftover | ForEach-Object { Write-Warning ("  PID " + $_.ProcessId + " " + $_.Name) }
@@ -74,12 +96,24 @@ $bot | ForEach-Object { Write-Host ("  PID " + $_.ProcessId + " " + $_.Name) }
 # exits with the child's code, which is what Task Scheduler reports.
 # Surfaced here only so a reader who sees an extra pid in Task Manager knows
 # what it is.
-$launchers = @(Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
-    Where-Object { $_.CommandLine -like "*run_hidden.py*" -and $_.CommandLine -like "*cora.main*" })
-if ($launchers.Count -gt 0) {
-    $launchers | ForEach-Object { Write-Host ("  (windowless launcher, not counted above) PID " + $_.ProcessId + " pythonw.exe") }
+$launchers = @(Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" | Where-Object $launcherFilter)
+$launchers | ForEach-Object { Write-Host ("  (windowless launcher, not counted above) PID " + $_.ProcessId + " pythonw.exe") }
+
+# Whether the service is WRAPPED is a property of the task DEFINITION, not of
+# which processes happen to be alive. Reading it from process presence reported
+# "not rewrapped yet" whenever a wrapped service had failed to come up -- i.e.
+# exactly when someone is debugging -- which is the same false-report class the
+# process-shape comment above was rewritten to eliminate.
+$svcAction = (Get-ScheduledTask -TaskName "cowork-cora-service" -ErrorAction SilentlyContinue).Actions[0]
+if ($null -eq $svcAction) {
+    Write-Host "  (could not read the cowork-cora-service definition)"
+} elseif ($svcAction.Execute.ToLower().EndsWith("pythonw.exe") -and $svcAction.Arguments -like "*run_hidden.py*") {
+    if ($launchers.Count -eq 0) {
+        Write-Host "  service action IS windowless, but NO launcher process is alive -- the service did not come up."
+    }
 } else {
-    Write-Host "  (service is not rewrapped yet -- it still runs as a console action and flashes a window)"
+    Write-Host "  (service action is NOT wrapped -- it still runs as a console action and flashes a window;"
+    Write-Host "   wrap it with: .\deployment\rewrap-tasks-hidden.ps1 -Apply -Only cowork-cora-service)"
 }
 if ($bot.Count -eq 0) {
     Write-Warning "NO bot process is running -- the service did not come up. Check today's log and the task's Last Result."

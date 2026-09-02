@@ -135,7 +135,10 @@ foreach ($job in $jobs) {
 
     # schtasks /TR caps at 261 chars, too short for the wrapper -- wrap the
     # registered action instead (COM/CIM, no length limit).
-    Set-WrappedTaskAction -TaskName $job.Name | Out-Null
+    if (-not (Set-WrappedTaskAction -TaskName $job.Name)) {
+        Write-Host "  WARNING: the task is registered but NOT windowless -- it will flash a console window at every fire."
+        Write-Host ("  Fix with (ELEVATED): .\deployment\rewrap-tasks-hidden.ps1 -Apply -Only " + $job.Name)
+    }
 
     # NO DESCRIPTION IS SET, DELIBERATELY. Two attempts failed live on
     # 2026-08-25 and the third move is to stop rather than keep swinging at a

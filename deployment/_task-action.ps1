@@ -32,12 +32,22 @@ function Get-TaskSlug {
     # becomes "Cora-Daily-Synthesis-F3E". Runs of unsafe characters collapse to
     # a single dash so log names stay readable, and the result can never contain
     # the launcher's " -- " sentinel (it has no spaces at all).
-    param([Parameter(Mandatory = $true)][string]$Name)
+    # AllowEmptyString, NOT Mandatory: a [Parameter(Mandatory=$true)][string]
+    # REJECTS "" with a ParameterArgumentValidationError, so the documented
+    # empty-name -> "task" fallback could never run and diverged from
+    # run_hidden.sanitize_slug (which does return "task").
+    param([AllowEmptyString()][string]$Name = "")
     $s = [regex]::Replace($Name, '[^A-Za-z0-9._-]+', '-')
     $s = [regex]::Replace($s, '-{2,}', '-')
     $s = $s.Trim('-', '.', ' ')
-    if ([string]::IsNullOrEmpty($s)) { $s = "task" }
+    # Cap AFTER the trim and re-trim AFTER the cap, in that order, so this
+    # agrees with sanitize_slug in run_hidden.py for names over 80 characters.
+    # Truncating a name whose 80th character is '-' or '.' would otherwise
+    # leave a trailing separator on one side only, and the log filename this
+    # script advertises would not be the one the launcher actually writes.
     if ($s.Length -gt 80) { $s = $s.Substring(0, 80) }
+    $s = $s.Trim('-', '.', ' ')
+    if ([string]::IsNullOrEmpty($s)) { $s = "task" }
     return $s
 }
 
@@ -99,10 +109,14 @@ function New-WrappedTaskAction {
             $script:CoraPythonW + " or " + $script:CoraLauncher +
             ". Registering a plain console action (it will flash a window). " +
             "Re-run deployment\rewrap-tasks-hidden.ps1 -Apply once the venv exists.")
-        if ([string]::IsNullOrEmpty($WorkingDirectory)) {
-            return New-ScheduledTaskAction -Execute $Execute -Argument $Argument
-        }
-        return New-ScheduledTaskAction -Execute $Execute -Argument $Argument -WorkingDirectory $WorkingDirectory
+        # -Argument $null is REJECTED by New-ScheduledTaskAction ("The argument
+        # is null or empty"), and setup-windows-task.ps1 -- the service task --
+        # is exactly the caller that passes no -Argument. Omit the parameter
+        # instead of forwarding an empty one.
+        $fb = @{ Execute = $Execute }
+        if (-not [string]::IsNullOrEmpty($Argument)) { $fb["Argument"] = $Argument }
+        if (-not [string]::IsNullOrEmpty($WorkingDirectory)) { $fb["WorkingDirectory"] = $WorkingDirectory }
+        return New-ScheduledTaskAction @fb
     }
 
     $slug = Get-TaskSlug $TaskName

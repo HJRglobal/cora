@@ -42,7 +42,10 @@ $tr = "`"$Python`" `"$Script`" --apply"
 schtasks /Create /TN $TaskName /TR $tr /SC MONTHLY /D 2 /ST 07:15 /F
 # schtasks /TR caps at 261 chars, too short for the wrapper -- wrap the
 # registered action instead (COM/CIM, no length limit).
-Set-WrappedTaskAction -TaskName $TaskName | Out-Null
+if (-not (Set-WrappedTaskAction -TaskName $TaskName)) {
+    Write-Host "  WARNING: the task is registered but NOT windowless -- it will flash a console window at every fire."
+    Write-Host ("  Fix with (ELEVATED): .\deployment\rewrap-tasks-hidden.ps1 -Apply -Only " + $TaskName)
+}
 
 Write-Host ""
 Write-Host "Registered: $TaskName (monthly, day 2, 07:15 AZ)"
