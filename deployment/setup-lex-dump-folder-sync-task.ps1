@@ -16,7 +16,9 @@ $Script = Join-Path $RepoRoot "scripts\run_lex_dump_folder_sync.py"
 if (-not (Test-Path $PythonExe)) { throw "venv python not found: $PythonExe" }
 if (-not (Test-Path $Script)) { throw "script not found: $Script" }
 
-$Action = New-ScheduledTaskAction -Execute $PythonExe -Argument "`"$Script`"" -WorkingDirectory $RepoRoot
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+$Action = New-WrappedTaskAction -TaskName $TaskName -Execute $PythonExe -Argument "`"$Script`"" -WorkingDirectory $RepoRoot
 $Trigger = New-ScheduledTaskTrigger -Daily -At "4:45AM"
 $Settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 2) -MultipleInstances IgnoreNew
 

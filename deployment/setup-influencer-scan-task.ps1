@@ -43,7 +43,9 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Write-Host "Removed existing task: $TaskName"
 }
 
-$Action  = New-ScheduledTaskAction `
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+$Action  = New-WrappedTaskAction -TaskName $TaskName `
     -Execute $PythonPath `
     -Argument "`"$ScriptPath`"" `
     -WorkingDirectory $RepoRoot

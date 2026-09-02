@@ -41,7 +41,9 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 }
 
 # Action: run the filer script via the venv python (full path -- Task Scheduler has no user PATH)
-$Action = New-ScheduledTaskAction `
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+$Action = New-WrappedTaskAction -TaskName "Cora - Email Attachment Filer" `
     -Execute $PythonPath `
     -Argument "`"$ScriptPath`"" `
     -WorkingDirectory $RepoRoot

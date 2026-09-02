@@ -57,6 +57,78 @@ DATA_DIR = REPO_ROOT / "data"
 KB_DB_PATH = REPO_ROOT / "data" / "cora_kb.db"
 ENV_PATH = REPO_ROOT / ".env"
 
+# --- Background I/O priority ------------------------------------------------
+#
+# This job copies the ~5.7 GB cora_kb.db (with --include-kb) and a pile of logs
+# to Google Drive at 1pm, while Harrison is working at the machine. The task is
+# registered at Priority 9 (IDLE cpu class) by
+# deployment/rewrap-tasks-hidden.ps1, but Task Scheduler's Priority only sets
+# the CPU priority class -- it does NOT lower I/O priority, and the disk is what
+# this job actually saturates.
+#
+# PROCESS_MODE_BACKGROUND_BEGIN lowers CPU *and* I/O priority together for the
+# whole process, which is exactly the "get out of the foreground's way" knob.
+# It is Windows-only and best-effort: a failure here must never fail a DR
+# backup, so every path is swallowed and reported.
+_PROCESS_MODE_BACKGROUND_BEGIN = 0x00100000
+_PROCESS_MODE_BACKGROUND_END = 0x00200000
+# Set when BEGIN succeeded, so END is only attempted if we actually entered
+# background mode (calling END outside it fails with ERROR_PROCESS_NOT_IN_JOB).
+_background_mode_entered = False
+
+
+def _set_process_background(enter: bool) -> bool:
+    """Enter/leave Windows background processing mode. True if it took effect.
+
+    ctypes restype/argtypes are declared DELIBERATELY, not decoratively: without
+    them GetCurrentProcess's pseudo-handle (-1) comes back as a 32-bit C int and
+    is passed into a 64-bit HANDLE parameter, so SetPriorityClass gets a
+    truncated handle and returns FALSE. Measured 2026-09-02 -- the first cut of
+    this helper silently did nothing for exactly that reason.
+
+    Note GetPriorityClass does NOT report background mode (it still reads
+    NORMAL_PRIORITY_CLASS), so the BOOL return is the only success signal.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.SetPriorityClass.restype = wintypes.BOOL
+
+        mode = _PROCESS_MODE_BACKGROUND_BEGIN if enter else _PROCESS_MODE_BACKGROUND_END
+        ok = bool(kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), mode))
+        if not ok:
+            # 402 = ERROR_PROCESS_MODE_ALREADY_BACKGROUND,
+            # 403 = ERROR_PROCESS_MODE_NOT_BACKGROUND -- both benign.
+            err = ctypes.get_last_error()
+            label = "BEGIN" if enter else "END"
+            print(f"  (background mode {label} not applied: err={err} {ctypes.FormatError(err).strip()})")
+        return ok
+    except Exception as exc:  # noqa: BLE001 -- never fail a backup over a priority hint
+        print(f"  (background mode unavailable: {exc})")
+        return False
+
+
+def enter_background_mode() -> None:
+    global _background_mode_entered
+    _background_mode_entered = _set_process_background(True)
+    if _background_mode_entered:
+        print("Background I/O mode: ON (low CPU + low disk priority for this run)")
+
+
+def leave_background_mode() -> None:
+    global _background_mode_entered
+    if _background_mode_entered:
+        _set_process_background(False)
+        _background_mode_entered = False
+        print("Background I/O mode: OFF")
+
+
 # Read .env so GOOGLE_SERVICE_ACCOUNT_JSON + CORA_BACKUP_PASSPHRASE are available.
 load_dotenv(ENV_PATH, override=True)
 
@@ -422,7 +494,17 @@ def verify_offsite(dest_dir: Path, kb_status, include_kb: bool, dry_run: bool) -
 
 def main() -> int:
     args = parse_args()
+    # Yield CPU and disk to the foreground for the whole run; always restored.
+    enter_background_mode()
+    started = datetime.now()
+    try:
+        return _run(args)
+    finally:
+        leave_background_mode()
+        print(f"Elapsed: {(datetime.now() - started).total_seconds():.1f}s")
 
+
+def _run(args) -> int:
     today = date.today().isoformat()
     dest_dir = args.backup_root / today
 

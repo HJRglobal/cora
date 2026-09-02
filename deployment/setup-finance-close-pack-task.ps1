@@ -55,7 +55,9 @@ if ($existing) {
 
 # D-005: absolute .venv python; script path is relative to WorkingDirectory, which
 # is pinned to the repo root. Never uv in a scheduled task.
-$Action = New-ScheduledTaskAction -Execute $PythonExe `
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+$Action = New-WrappedTaskAction -TaskName $TaskName -Execute $PythonExe `
     -Argument "scripts\run_finance_close_pack.py" `
     -WorkingDirectory $RepoRoot
 

@@ -22,12 +22,18 @@
 # (The marked tier only ever touches EXPLICITLY banner'd files, so it is a no-op
 # until you start stamping the KB-STATUS: SUPERSEDED banner.)
 
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+
 $TaskName = "cowork-cora-kb-hygiene"
 $Python   = "C:\Users\Harri\code\cora\.venv\Scripts\python.exe"
 $Script   = "C:\Users\Harri\code\cora\scripts\kb_hygiene_sweep.py"
 
 $tr = '"{0}" "{1}" --marked --apply --proactive --gc --slack' -f $Python, $Script
 schtasks /Create /TN $TaskName /TR $tr /SC MONTHLY /D 1 /ST 15:00 /F
+# schtasks /TR caps at 261 chars, too short for the wrapper -- wrap the
+# registered action instead (COM/CIM, no length limit).
+Set-WrappedTaskAction -TaskName $TaskName | Out-Null
 
 Write-Host "Registered: $TaskName (monthly, day 1 at 15:00 AZ)"
 Write-Host "Action: --marked --apply --proactive --gc --slack"

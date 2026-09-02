@@ -96,7 +96,9 @@ foreach ($t in $Tasks) {
     }
 
     # D-005: absolute .venv python + relative script path + WorkingDirectory = repo root.
-    $Action = New-ScheduledTaskAction -Execute $PythonExe `
+    # Windowless action: route the command through run_hidden.py under pythonw.exe
+    . "$PSScriptRoot\_task-action.ps1"
+    $Action = New-WrappedTaskAction -TaskName $t.Name -Execute $PythonExe `
         -Argument $t.Script `
         -WorkingDirectory $RepoRoot
 

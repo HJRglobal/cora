@@ -50,9 +50,15 @@ param(
     [switch]$SelfTest
 )
 
+# The wrapping itself (slug rule, quoting rule, argument assembly) lives in
+# _task-action.ps1 and is SHARED with every deployment\setup-*-task.ps1, so a
+# task gets the same logs\tasks\<slug>.log name whichever path registered it.
+# Duplicating the slug rule would silently split a task's log in two.
+. "$PSScriptRoot\_task-action.ps1"
+
 $RepoRoot   = "C:\Users\Harri\code\cora"
-$PythonW    = Join-Path $RepoRoot ".venv\Scripts\pythonw.exe"
-$Launcher   = Join-Path $RepoRoot "deployment\run_hidden.py"
+$PythonW    = Get-CoraPythonW
+$Launcher   = Get-CoraLauncher
 $BackupRoot = Join-Path $RepoRoot "deployment\task-backups"
 
 # Held back from a bulk -Apply. Both are recovery-critical: the service IS Cora,
@@ -74,51 +80,9 @@ $PriorityOverrides = @{
 }
 
 # ---------------------------------------------------------------------------
-# Pure transformation helpers (exercised by -SelfTest, no task access)
+# Local helper (Get-TaskSlug / Get-QuotedPath / Get-WrappedArguments are
+# dot-sourced above; positional calls bind to -Slug -Execute -Arguments)
 # ---------------------------------------------------------------------------
-
-function Get-TaskSlug {
-    # Task name -> a filename-safe log slug. "Cora - Daily Synthesis (F3E)"
-    # becomes "Cora-Daily-Synthesis-F3E". Runs of unsafe characters collapse to
-    # a single dash so log names stay readable, and the result can never
-    # contain the launcher's " -- " sentinel (it has no spaces at all).
-    param([string]$Name)
-    $s = [regex]::Replace($Name, '[^A-Za-z0-9._-]+', '-')
-    $s = [regex]::Replace($s, '-{2,}', '-')
-    $s = $s.Trim('-', '.', ' ')
-    if ([string]::IsNullOrEmpty($s)) { $s = "task" }
-    if ($s.Length -gt 80) { $s = $s.Substring(0, 80) }
-    return $s
-}
-
-function Get-QuotedPath {
-    # Quote only when needed. CreateProcess resolves a bare token against PATH,
-    # which is what the `cmd` and `powershell` actions rely on, so quoting them
-    # unconditionally would be a behaviour change.
-    param([string]$Path)
-    if ([string]::IsNullOrEmpty($Path)) { return $Path }
-    if ($Path.Contains(" ")) { return '"' + $Path + '"' }
-    return $Path
-}
-
-function Get-WrappedArguments {
-    # Build the wrapped Arguments string. The original Execute and Arguments are
-    # appended VERBATIM after the " -- " sentinel: run_hidden.py recovers the
-    # child command line from the raw process command line (GetCommandLineW),
-    # so the original quoting survives byte-for-byte. That is what makes the
-    # `cmd.exe /c cd /d "<dir>" & "<exe>" "<script>"` actions safe to wrap --
-    # tokenizing and re-quoting them would not round-trip.
-    param(
-        [string]$Slug,
-        [string]$Execute,
-        [string]$Arguments
-    )
-    $child = Get-QuotedPath $Execute
-    if (-not [string]::IsNullOrEmpty($Arguments)) {
-        $child = $child + " " + $Arguments
-    }
-    return (Get-QuotedPath $Launcher) + " --name " + $Slug + " -- " + $child
-}
 
 function Test-ActionIsWrapped {
     # Idempotency probe: an action already routed through the launcher.
@@ -344,15 +308,28 @@ foreach ($task in $targets) {
     $runLevelBefore = [string]$task.Principal.RunLevel
 
     try {
-        # Mutate the live definition object and push it back whole, so triggers,
-        # principal and every untouched setting are carried through by
-        # construction rather than rebuilt (and silently defaulted).
-        $task.Actions[0].Execute = $PythonW
-        $task.Actions[0].Arguments = $newArgs
-        if ($null -ne $wantPriority) {
-            $task.Settings.Priority = $wantPriority
+        # Send ONLY the action, via -TaskName -Action.
+        #
+        # Measured 2026-09-02: pushing the whole task object back with
+        # -InputObject fails with 0x80070057 "The parameter is incorrect" on any
+        # task registered by schtasks.exe /Create -- 7 of these 94, because
+        # PowerShell has no monthly (or minute) trigger cmdlet, so the
+        # compaction / kb-hygiene / autowrite-digest / qbo-monthly-reports /
+        # monthly-finance / watchdog tasks all go through schtasks. -Action
+        # works on both registration styles and leaves triggers alone; the
+        # read-back below proves it for every task rather than trusting it.
+        if ([string]::IsNullOrEmpty($wd)) {
+            $newAction = New-ScheduledTaskAction -Execute $PythonW -Argument $newArgs
+        } else {
+            $newAction = New-ScheduledTaskAction -Execute $PythonW -Argument $newArgs -WorkingDirectory $wd
         }
-        Set-ScheduledTask -InputObject $task | Out-Null
+        Set-ScheduledTask -TaskName $name -Action $newAction | Out-Null
+        if ($null -ne $wantPriority) {
+            # Priority lives in Settings, so it needs its own call.
+            $settings = $task.Settings
+            $settings.Priority = $wantPriority
+            Set-ScheduledTask -TaskName $name -Settings $settings | Out-Null
+        }
     } catch {
         Write-Host ("        ERROR: Set-ScheduledTask failed (" + $_.Exception.Message + ")")
         Write-Host ("        rollback: Register-ScheduledTask -Xml (Get-Content '" + $backupPath + "' -Raw) -TaskName '" + $name + "' -Force")

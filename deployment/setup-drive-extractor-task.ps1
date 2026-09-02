@@ -36,7 +36,9 @@ try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue } cat
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
 # Build action -- absolute paths, no PATH dependency (Task Scheduler doctrine)
-$Action = New-ScheduledTaskAction `
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+$Action = New-WrappedTaskAction -TaskName $TaskName `
     -Execute $Python `
     -Argument "scripts\run_drive_extractor.py --propose" `
     -WorkingDirectory $RepoRoot

@@ -39,7 +39,9 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 }
 
 # NUDGE armed 2026-06-08 (Harrison reviewed the first digest). Revert to "--digest-only" to disarm.
-$Action = New-ScheduledTaskAction `
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+$Action = New-WrappedTaskAction -TaskName $TaskName `
     -Execute $PythonPath `
     -Argument "`"$ScriptPath`" --nudge" `
     -WorkingDirectory $RepoRoot

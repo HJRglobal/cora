@@ -21,7 +21,9 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 }
 
 # Action: run nightly incremental (no flags = watermark-based, picks up new/changed files only)
-$Action = New-ScheduledTaskAction `
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+$Action = New-WrappedTaskAction -TaskName $TaskName `
     -Execute $Python `
     -Argument $Script `
     -WorkingDirectory $RepoRoot

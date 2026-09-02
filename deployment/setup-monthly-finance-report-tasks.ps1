@@ -57,6 +57,9 @@
 #     schtasks /Delete /TN "Cora - Expected Invoice Check" /F
 #     schtasks /Delete /TN "Cora - Klaviyo Billing Audit" /F
 
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+
 $ErrorActionPreference = "Stop"
 
 $RepoRoot  = "C:\Users\Harri\code\cora"
@@ -129,6 +132,10 @@ foreach ($job in $jobs) {
         Write-Error "Failed to register $($job.Name) (exit $LASTEXITCODE)."
         exit 1
     }
+
+    # schtasks /TR caps at 261 chars, too short for the wrapper -- wrap the
+    # registered action instead (COM/CIM, no length limit).
+    Set-WrappedTaskAction -TaskName $job.Name | Out-Null
 
     # NO DESCRIPTION IS SET, DELIBERATELY. Two attempts failed live on
     # 2026-08-25 and the third move is to stop rather than keep swinging at a

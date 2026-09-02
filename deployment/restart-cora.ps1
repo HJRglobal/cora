@@ -62,6 +62,25 @@ $bot = @(Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='cora.
     Where-Object { $_.CommandLine -like "*\Scripts\cora.exe*" -or $_.CommandLine -like "*cora.main*" })
 Write-Host ("Bot processes matching the kill filter: " + $bot.Count + " (ONE healthy instance = 2 for '-m cora.main', 3 via the cora.exe launcher)")
 $bot | ForEach-Object { Write-Host ("  PID " + $_.ProcessId + " " + $_.Name) }
+
+# WINDOWLESS SERVICE (2026-09-02): once cowork-cora-service is rewrapped by
+# deployment\rewrap-tasks-hidden.ps1, the task launches
+# pythonw.exe run_hidden.py -- python.exe -m cora.main
+# so a THIRD process sits above the chain. The kill filter above is unaffected
+# and deliberately unchanged: it matches on Name='python.exe' OR 'cora.exe',
+# and the launcher is pythonw.exe, so the launcher is neither killed nor
+# counted -- while the real bot child IS (its command line still carries
+# "cora.main"). Killing the child makes the launcher's wait() return and it
+# exits with the child's code, which is what Task Scheduler reports.
+# Surfaced here only so a reader who sees an extra pid in Task Manager knows
+# what it is.
+$launchers = @(Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
+    Where-Object { $_.CommandLine -like "*run_hidden.py*" -and $_.CommandLine -like "*cora.main*" })
+if ($launchers.Count -gt 0) {
+    $launchers | ForEach-Object { Write-Host ("  (windowless launcher, not counted above) PID " + $_.ProcessId + " pythonw.exe") }
+} else {
+    Write-Host "  (service is not rewrapped yet -- it still runs as a console action and flashes a window)"
+}
 if ($bot.Count -eq 0) {
     Write-Warning "NO bot process is running -- the service did not come up. Check today's log and the task's Last Result."
 } elseif ($bot.Count -gt 3) {

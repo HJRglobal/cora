@@ -19,7 +19,9 @@ if ($existing) {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
 
-$action = New-ScheduledTaskAction `
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+$action = New-WrappedTaskAction -TaskName $TaskName `
     -Execute $Python `
     -Argument "`"$Script`"" `
     -WorkingDirectory $RepoRoot

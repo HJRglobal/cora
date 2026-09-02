@@ -41,7 +41,9 @@ if ($existing) {
 # --all re-scans the whole (small: ~1 file/entity/day) swept tree so a >26h missed run
 # (machine asleep / skipped fire) never leaves a written file unscanned. Quarantined
 # files are skipped; clean files re-scan as cheap no-ops.
-$action = New-ScheduledTaskAction `
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+$action = New-WrappedTaskAction -TaskName 'Cora - LEX Swept PHI Check' `
     -Execute $PythonExe `
     -Argument "`"$ScriptPath`" --all" `
     -WorkingDirectory $RepoRoot

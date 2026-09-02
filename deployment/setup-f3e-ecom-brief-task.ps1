@@ -13,7 +13,9 @@ $PythonExe  = Join-Path $RepoRoot ".venv\Scripts\python.exe"
 $ScriptPath = Join-Path $RepoRoot "scripts\run_f3e_ecom_brief.py"
 $TaskName   = "Cora - F3E Daily Ecom Brief"
 
-$Action = New-ScheduledTaskAction -Execute $PythonExe -Argument "`"$ScriptPath`"" -WorkingDirectory $RepoRoot
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+$Action = New-WrappedTaskAction -TaskName $TaskName -Execute $PythonExe -Argument "`"$ScriptPath`"" -WorkingDirectory $RepoRoot
 $Trigger = New-ScheduledTaskTrigger -Daily -At "07:10"
 $Settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -StartWhenAvailable -RestartCount 1 -RestartInterval (New-TimeSpan -Minutes 5)
 $Principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited

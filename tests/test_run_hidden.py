@@ -539,3 +539,184 @@ def test_the_spawn_rail_covers_the_known_hot_files():
         "deployment/run_hidden.py",
     ):
         assert expected in covered, f"{expected} not seen by the spawn rail"
+
+
+# ---------------------------------------------------------------------------
+# 11. the shared _task-action.ps1 helper + setup-script parity
+# ---------------------------------------------------------------------------
+
+HELPER_PATH = REPO_ROOT / "deployment" / "_task-action.ps1"
+SETUP_SCRIPTS = sorted((REPO_ROOT / "deployment").glob("setup-*.ps1"))
+
+
+def test_helper_is_ascii_only():
+    assert all(b < 128 for b in HELPER_PATH.read_bytes()), "D-016: _task-action.ps1 must be ASCII"
+
+
+def test_every_setup_script_registers_a_windowless_action():
+    """A setup script re-run must not hand a console action back to the
+    scheduler. Each one must build its action with New-WrappedTaskAction, or
+    (for the schtasks.exe /Create scripts, whose /TR is capped at 261 chars)
+    wrap the registered action afterwards with Set-WrappedTaskAction."""
+    assert SETUP_SCRIPTS, "no setup scripts found -- the rail would be vacuous"
+    offenders = []
+    for p in SETUP_SCRIPTS:
+        src = p.read_text(encoding="ascii", errors="replace")
+        if "New-WrappedTaskAction" in src or "Set-WrappedTaskAction" in src:
+            continue
+        offenders.append(p.name)
+    assert not offenders, f"setup scripts still registering console actions: {offenders}"
+
+
+def test_no_setup_script_calls_new_scheduledtaskaction_directly():
+    """New-ScheduledTaskAction is the console-action constructor. Only the
+    shared helper may call it."""
+    offenders = [
+        p.name
+        for p in SETUP_SCRIPTS
+        if "New-ScheduledTaskAction" in p.read_text(encoding="ascii", errors="replace")
+    ]
+    assert not offenders, (
+        "these setup scripts bypass the helper and build a raw console action: "
+        f"{offenders}"
+    )
+
+
+def test_setup_scripts_dot_source_the_helper_they_use():
+    missing = []
+    for p in SETUP_SCRIPTS:
+        src = p.read_text(encoding="ascii", errors="replace")
+        uses = "New-WrappedTaskAction" in src or "Set-WrappedTaskAction" in src
+        if uses and "_task-action.ps1" not in src:
+            missing.append(p.name)
+    assert not missing, f"uses the helper without dot-sourcing it: {missing}"
+
+
+def test_the_powershell_slug_is_a_fixed_point_of_the_python_sanitiser():
+    """The rewrap/setup scripts NAME the log file; run_hidden.py only defends.
+    If the Python sanitiser rewrote the slug PowerShell passed, the real log
+    filename would differ from the one the setup script printed."""
+    for ps_slug in [
+        "Cora-Drive-Sweep",
+        "Cora-Daily-Synthesis-F3E",
+        "cowork-cora-backup",
+        "cora-watchdog",
+        "cowork-cora-kb-sync-asana",
+        "Cora-Log-Compaction",
+        "x" * 80,
+    ]:
+        assert run_hidden.sanitize_slug(ps_slug) == ps_slug, ps_slug
+
+
+def test_restart_script_does_not_kill_or_count_the_launcher():
+    """restart-cora.ps1's kill filter must stay on python.exe/cora.exe. If
+    pythonw.exe were added, a restart would kill the launcher and orphan (or
+    double-count) the bot child."""
+    src = (REPO_ROOT / "deployment" / "restart-cora.ps1").read_text(encoding="ascii")
+    kill_lines = [
+        ln for ln in src.splitlines()
+        if "Win32_Process -Filter" in ln and "Stop-Process" not in ln
+    ]
+    assert kill_lines, "could not find the process-filter lines"
+    # The two kill/count filters must not name pythonw.
+    for ln in kill_lines:
+        if "pythonw.exe" in ln:
+            # only the informational launcher lookup may mention pythonw
+            assert "run_hidden.py" in src, "pythonw filter without the launcher lookup"
+    assert "Name='python.exe' OR Name='cora.exe'" in src
+
+
+@pytest.mark.skipif(os.name != "nt", reason="PowerShell helper")
+def test_helper_builds_a_wrapped_action_object():
+    """Dot-source the helper and build an action. New-ScheduledTaskAction only
+    constructs an in-memory object -- nothing is registered, so this is safe to
+    run inside the suite."""
+    ps = r"""
+$ErrorActionPreference='Stop'
+. "{helper}"
+$a = New-WrappedTaskAction -TaskName 'Cora - Drive Sweep' -Execute 'C:\p\python.exe' -Argument '"C:\s\x.py" --flag' -WorkingDirectory 'C:\repo'
+Write-Output ("EXEC=" + $a.Execute)
+Write-Output ("ARGS=" + $a.Arguments)
+Write-Output ("WD=" + $a.WorkingDirectory)
+Write-Output ("SLUG=" + (Get-TaskSlug 'Cora - Drive Sweep'))
+""".replace("{helper}", str(HELPER_PATH))
+    proc = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+        capture_output=True, text=True, timeout=180,
+    )
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    out = dict(
+        line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line
+    )
+    assert out["EXEC"].lower().endswith("pythonw.exe")
+    assert "run_hidden.py" in out["ARGS"]
+    assert out["SLUG"] == "Cora-Drive-Sweep"
+    assert out["WD"] == r"C:\repo", "WorkingDirectory must be carried through"
+    # The original command must survive verbatim after the sentinel...
+    assert out["ARGS"].endswith(r'-- C:\p\python.exe "C:\s\x.py" --flag')
+    # ...and the Python launcher must recover exactly that from the raw line.
+    raw = f'pythonw.exe {out["ARGS"]}'
+    slug, child = run_hidden.split_child_command(raw, ["run_hidden.py", "--name", out["SLUG"], "--"])
+    assert slug == "Cora-Drive-Sweep"
+    assert child == r'C:\p\python.exe "C:\s\x.py" --flag'
+
+
+@pytest.mark.skipif(os.name != "nt", reason="PowerShell helper")
+def test_helper_falls_back_to_a_console_action_when_the_launcher_is_missing():
+    """A setup script must still register a WORKING task on a host where the
+    venv has not been built. A flashing window is a nuisance; an unregistered
+    task is an outage."""
+    ps = r"""
+$ErrorActionPreference='Stop'
+. "{helper}"
+$script:CoraLauncher = 'C:\definitely\missing\run_hidden.py'
+$a = New-WrappedTaskAction -TaskName 't' -Execute 'C:\p\python.exe' -Argument 'x.py' -WarningAction SilentlyContinue
+Write-Output ("EXEC=" + $a.Execute)
+Write-Output ("ARGS=" + $a.Arguments)
+""".replace("{helper}", str(HELPER_PATH))
+    proc = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+        capture_output=True, text=True, timeout=180,
+    )
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    out = dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
+    assert out["EXEC"] == r"C:\p\python.exe", "must degrade to the original command"
+    assert out["ARGS"] == "x.py"
+
+
+def test_helper_documents_the_schtasks_261_char_limit():
+    """The reason the schtasks scripts wrap AFTER /Create rather than wrapping
+    the /TR string. Measured: schtasks rejects /TR over 261 characters, and the
+    wrapper prefix alone is ~113."""
+    src = HELPER_PATH.read_text(encoding="ascii")
+    assert "261" in src
+    assert "Set-ScheduledTask -TaskName $TaskName -Action" in src, (
+        "-InputObject fails with 0x80070057 on schtasks-created tasks"
+    )
+
+
+def _ps_code_only(path: Path) -> str:
+    """PowerShell source with whole-line comments stripped.
+
+    A source pin must not match the comment that EXPLAINS the thing being
+    banned. This exact trap bit twice in this session: the mcp_server read-only
+    rail false-positived on a "deployment/run_hidden.py" path containing "/run",
+    and the first cut of the rail below false-positived on the comment
+    documenting why -InputObject is not used.
+    """
+    return "\n".join(
+        ln for ln in path.read_text(encoding="ascii").splitlines()
+        if not ln.lstrip().startswith("#")
+    )
+
+
+def test_rewrap_applies_via_action_not_inputobject():
+    """Set-ScheduledTask -InputObject fails with 0x80070057 'The parameter is
+    incorrect' on any task registered by schtasks.exe /Create -- 7 of the 94."""
+    src = REWRAP_PATH.read_text(encoding="ascii")
+    assert "Set-ScheduledTask -TaskName $name -Action $newAction" in src
+    code = _ps_code_only(REWRAP_PATH)
+    assert "Set-ScheduledTask -InputObject" not in code, (
+        "the -InputObject path breaks schtasks-created tasks"
+    )
+    assert "Set-ScheduledTask -InputObject" not in _ps_code_only(HELPER_PATH)

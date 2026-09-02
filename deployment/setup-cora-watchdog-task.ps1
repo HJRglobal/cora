@@ -6,6 +6,9 @@
 # NOTE: ErrorActionPreference is intentionally NOT "Stop" here -- schtasks writes status
 # to stderr on some paths and we don't want native stderr to terminate the script.
 
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+
 $TaskName = "cora-watchdog"
 $Script   = "C:\Users\Harri\code\cora\deployment\cora-watchdog.ps1"
 # Script path has no spaces, so no inner quoting is needed (avoids schtasks quote-escaping pain).
@@ -16,6 +19,10 @@ $Run      = "powershell -NoProfile -ExecutionPolicy Bypass -File $Script"
 # (matches the always-on, logged-in desktop). /F = create-or-overwrite (idempotent).
 schtasks /Create /TN $TaskName /TR $Run /SC MINUTE /MO 5 /RL HIGHEST /F
 $rc = $LASTEXITCODE
+
+# schtasks /TR caps at 261 chars, too short for the wrapper -- wrap the
+# registered action instead (COM/CIM, no length limit).
+Set-WrappedTaskAction -TaskName $TaskName | Out-Null
 
 # schtasks /Create leaves the DEFAULTS MultipleInstances=IgnoreNew and
 # ExecutionTimeLimit=PT72H, which is how this task went dark on 2026-08-19: it sat

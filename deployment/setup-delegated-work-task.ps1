@@ -18,7 +18,9 @@ $TaskName = "cowork-cora-delegated-work"
 if (-not (Test-Path $Python)) { throw "venv python not found: $Python" }
 if (-not (Test-Path $Script)) { throw "runner script not found: $Script" }
 
-$Action = New-ScheduledTaskAction -Execute $Python `
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+$Action = New-WrappedTaskAction -TaskName $TaskName -Execute $Python `
     -Argument "`"$Script`" --time-budget-min 12" `
     -WorkingDirectory $RepoRoot
 

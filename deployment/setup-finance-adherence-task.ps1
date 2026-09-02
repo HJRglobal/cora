@@ -61,7 +61,9 @@ if ($existing) {
 }
 
 # D-005: absolute .venv python + absolute script path + WorkingDirectory = repo root.
-$Action = New-ScheduledTaskAction -Execute $PythonExe `
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+$Action = New-WrappedTaskAction -TaskName $TaskName -Execute $PythonExe `
     -Argument "scripts\run_finance_adherence_check.py" `
     -WorkingDirectory $RepoRoot
 

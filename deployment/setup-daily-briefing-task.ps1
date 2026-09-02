@@ -66,7 +66,9 @@ if ($SendUsers) {
     $Mode = "force-deliver to ALL users (--send-users)"
 }
 
-$Action = New-ScheduledTaskAction `
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+$Action = New-WrappedTaskAction -TaskName "Cora - Daily Briefing" `
     -Execute $PythonPath `
     -Argument $ScriptArgs `
     -WorkingDirectory $RepoRoot

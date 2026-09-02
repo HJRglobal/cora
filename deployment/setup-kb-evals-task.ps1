@@ -22,7 +22,9 @@ if (-not (Test-Path $PythonExe)) {
     exit 1
 }
 
-$action = New-ScheduledTaskAction -Execute $PythonExe -Argument $TaskArgs -WorkingDirectory $RepoRoot
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+$action = New-WrappedTaskAction -TaskName $TaskName -Execute $PythonExe -Argument $TaskArgs -WorkingDirectory $RepoRoot
 $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At 9:05am
 $settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Minutes 20) `

@@ -22,6 +22,9 @@
 # Dropped rather than shipped on an untested assumption: one command now owns
 # both the trigger and the action.
 
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+
 $ErrorActionPreference = "Stop"
 
 $TaskName = "Cora - QBO Monthly Reports"
@@ -37,6 +40,9 @@ if (-not (Test-Path $Script)) { throw "script not found: $Script" }
 $tr = "`"$Python`" `"$Script`" --apply"
 
 schtasks /Create /TN $TaskName /TR $tr /SC MONTHLY /D 2 /ST 07:15 /F
+# schtasks /TR caps at 261 chars, too short for the wrapper -- wrap the
+# registered action instead (COM/CIM, no length limit).
+Set-WrappedTaskAction -TaskName $TaskName | Out-Null
 
 Write-Host ""
 Write-Host "Registered: $TaskName (monthly, day 2, 07:15 AZ)"

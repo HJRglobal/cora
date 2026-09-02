@@ -150,3 +150,84 @@ class TestBackupFeatureDbs:
         assert count == 2  # cora_kb.db excluded
         assert (dest / "influencer_tracker.db").exists()
         assert not (dest / "cora_kb.db").exists()
+
+
+# -- background I/O priority (2026-09-02) -----------------------------------
+#
+# The 1pm backup streams a multi-GB KB copy to Drive while Harrison is at the
+# machine. Task Scheduler's Priority only lowers the CPU class; background
+# processing mode lowers CPU *and disk*, which is what this job saturates.
+
+class TestBackgroundIoMode:
+    def test_enter_then_leave_in_order(self, monkeypatch, capsys):
+        bl = _load("backup_logs")
+        calls = []
+        monkeypatch.setattr(bl, "_set_process_background", lambda enter: calls.append(enter) or True)
+        monkeypatch.setattr(bl, "_background_mode_entered", False, raising=False)
+        bl.enter_background_mode()
+        bl.leave_background_mode()
+        assert calls == [True, False]
+        out = capsys.readouterr().out
+        assert "Background I/O mode: ON" in out
+        assert "Background I/O mode: OFF" in out
+
+    def test_leave_is_a_noop_when_enter_failed(self, monkeypatch):
+        """END outside background mode fails with ERROR_PROCESS_MODE_NOT_BACKGROUND,
+        so it must only be attempted if BEGIN actually took effect."""
+        bl = _load("backup_logs")
+        calls = []
+
+        def fake(enter):
+            calls.append(enter)
+            return False  # BEGIN did not take effect
+
+        monkeypatch.setattr(bl, "_set_process_background", fake)
+        monkeypatch.setattr(bl, "_background_mode_entered", False, raising=False)
+        bl.enter_background_mode()
+        bl.leave_background_mode()
+        assert calls == [True], "END must not be called when BEGIN failed"
+
+    def test_background_mode_is_restored_even_when_the_run_raises(self, monkeypatch):
+        """main() must leave the process out of background mode on ANY exit
+        path -- a leaked background mode would slow whatever runs next."""
+        bl = _load("backup_logs")
+        calls = []
+        monkeypatch.setattr(bl, "_set_process_background", lambda enter: calls.append(enter) or True)
+        monkeypatch.setattr(bl, "_background_mode_entered", False, raising=False)
+        monkeypatch.setattr(bl, "parse_args", lambda: object())
+
+        def boom(_args):
+            raise RuntimeError("drive unmounted")
+
+        monkeypatch.setattr(bl, "_run", boom)
+        with pytest.raises(RuntimeError):
+            bl.main()
+        assert calls == [True, False], "background mode leaked on the exception path"
+
+    def test_main_returns_the_run_result(self, monkeypatch):
+        bl = _load("backup_logs")
+        monkeypatch.setattr(bl, "_set_process_background", lambda enter: True)
+        monkeypatch.setattr(bl, "_background_mode_entered", False, raising=False)
+        monkeypatch.setattr(bl, "parse_args", lambda: object())
+        monkeypatch.setattr(bl, "_run", lambda _args: 1)
+        assert bl.main() == 1
+
+    def test_mode_constants_match_the_win32_values(self):
+        bl = _load("backup_logs")
+        assert bl._PROCESS_MODE_BACKGROUND_BEGIN == 0x00100000
+        assert bl._PROCESS_MODE_BACKGROUND_END == 0x00200000
+
+    def test_no_op_off_windows(self, monkeypatch):
+        bl = _load("backup_logs")
+        monkeypatch.setattr(bl.os, "name", "posix")
+        assert bl._set_process_background(True) is False
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Win32 background mode")
+    def test_real_win32_call_succeeds_both_ways(self):
+        """Regression pin for the ctypes declaration bug: without an explicit
+        restype on GetCurrentProcess the pseudo-handle is truncated to 32 bits
+        and SetPriorityClass returns FALSE, so the whole feature silently did
+        nothing."""
+        bl = _load("backup_logs")
+        assert bl._set_process_background(True) is True, "BEGIN failed -- check ctypes argtypes"
+        assert bl._set_process_background(False) is True, "END failed"

@@ -113,7 +113,9 @@ foreach ($task in $Tasks) {
     # redirection works. cd to repo root, run the script, redirect to log file.
     $scriptPath = Join-Path $RepoRoot $task.Script
     $cmdArgs = "/c cd /d `"$RepoRoot`" `& `"$PythonExe`" `"$scriptPath`""
-    $action = New-ScheduledTaskAction -Execute "cmd.exe" -WorkingDirectory $RepoRoot -Argument $cmdArgs
+    # Windowless action: route the command through run_hidden.py under pythonw.exe
+    . "$PSScriptRoot\_task-action.ps1"
+    $action = New-WrappedTaskAction -TaskName $taskName -Execute "cmd.exe" -WorkingDirectory $RepoRoot -Argument $cmdArgs
 
     # Trigger: daily at the specified time
     $trigger = New-ScheduledTaskTrigger -Daily -At $task.HourMin

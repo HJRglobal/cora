@@ -30,7 +30,7 @@
 #   - Fireflies transcripts now include participant Slack IDs in metadata
 #   - Stale open task DMs: reconciliation now DMs assignees directly
 #   - HubSpot migration scripts: export + pipeline setup + import (data migration ready)
-#   - Gmail → HubSpot email sync: auto-logs emails to matching contacts/deals hourly
+#   - Gmail -> HubSpot email sync: auto-logs emails to matching contacts/deals hourly
 
 $ErrorActionPreference = "Stop"
 
@@ -245,4 +245,4 @@ Write-Host "  Daily briefing DMs    - register task: .\deployment\setup-daily-br
 Write-Host "  Fireflies Slack IDs   - participant_slack_ids in transcript metadata"
 Write-Host "  Stale-task DMs        - reconciliation now DMs assignees directly"
 Write-Host "  HubSpot migration     - run export/setup/import scripts (see scripts/)"
-Write-Host "  Gmail → HubSpot sync  - register task: .\deployment\setup-hubspot-sync-task.ps1"
+Write-Host "  Gmail -> HubSpot sync  - register task: .\deployment\setup-hubspot-sync-task.ps1"

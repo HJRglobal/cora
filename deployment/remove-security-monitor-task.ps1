@@ -17,7 +17,7 @@ Write-Host ""
 Write-Host "[1/2] Looking for task '$TASK_NAME'..."
 $task = Get-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
 if (-not $task) {
-    Write-Host "  Task not found — nothing to remove."
+    Write-Host "  Task not found -- nothing to remove."
     Write-Host ""
     Write-Host "=== Done (no-op) ==="
     Write-Host ""

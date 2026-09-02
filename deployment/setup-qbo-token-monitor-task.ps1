@@ -23,7 +23,9 @@ $Python   = "$RepoRoot\.venv\Scripts\python.exe"
 $Script   = "$RepoRoot\scripts\qbo_token_status.py"
 $TaskName = "Cora - QBO Token Monitor"
 
-$Action   = New-ScheduledTaskAction `
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+$Action   = New-WrappedTaskAction -TaskName $TaskName `
     -Execute $Python `
     -Argument "`"$Script`" --alert" `
     -WorkingDirectory $RepoRoot

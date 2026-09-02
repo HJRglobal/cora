@@ -76,7 +76,9 @@ if ($orphans) {
     Start-Sleep -Seconds 2
 }
 
-$action = New-ScheduledTaskAction `
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+$action = New-WrappedTaskAction -TaskName $TASK_NAME `
     -Execute $CoraExe `
     -WorkingDirectory $REPO_DIR
 

@@ -123,7 +123,9 @@ if ($existing) {
     Unregister-ScheduledTask -TaskName $TASK_NAME -Confirm:$false
 }
 
-$action = New-ScheduledTaskAction `
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+$action = New-WrappedTaskAction -TaskName "cowork-cora-mcp-http" `
     -Execute $PythonExe `
     -Argument "scripts\run_mcp_server_http.py" `
     -WorkingDirectory $REPO_DIR

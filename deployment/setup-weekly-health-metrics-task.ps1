@@ -15,7 +15,9 @@ Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Silent
 
 # --slack posts the digest; offline char/4 token heuristic (no API key needed).
 # Channel pinned to cora-health so it does not depend on HEALTH_REPORT_CHANNEL.
-$Action  = New-ScheduledTaskAction `
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+$Action  = New-WrappedTaskAction -TaskName $TaskName `
     -Execute $Python `
     -Argument "$Script --slack --channel cora-health --log-days 7" `
     -WorkingDirectory $RepoRoot

@@ -10,7 +10,9 @@ $Script   = "$RepoRoot\scripts\run_osn_metrics_digest.py"
 # Remove existing task if present
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
-$Action  = New-ScheduledTaskAction `
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+$Action  = New-WrappedTaskAction -TaskName $TaskName `
     -Execute $Python `
     -Argument $Script `
     -WorkingDirectory $RepoRoot

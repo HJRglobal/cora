@@ -4,7 +4,7 @@
 #     cd C:\Users\Harri\code\cora
 #     .\deployment\remove-kb-sync-tasks.ps1
 #
-# Idempotent — safe to run if any subset of the tasks already doesn't exist.
+# Idempotent -- safe to run if any subset of the tasks already doesn't exist.
 
 $ErrorActionPreference = "Stop"
 

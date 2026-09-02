@@ -15,12 +15,18 @@
 # needs the bot on current main.) A value other than off|tier0|all falls back to
 # off, so do NOT set '1'.
 
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+
 $TaskName = "cowork-cora-autowrite-digest"
 $Python   = "C:\Users\Harri\code\cora\.venv\Scripts\python.exe"
 $Script   = "C:\Users\Harri\code\cora\scripts\run_autowrite_digest.py"
 
 $tr = '"{0}" "{1}"' -f $Python, $Script
 schtasks /Create /TN $TaskName /TR $tr /SC WEEKLY /D MON /ST 11:00 /F
+# schtasks /TR caps at 261 chars, too short for the wrapper -- wrap the
+# registered action instead (COM/CIM, no length limit).
+Set-WrappedTaskAction -TaskName $TaskName | Out-Null
 
 Write-Host "Registered: $TaskName (weekly, Monday 11:00 AZ)"
 Write-Host "Smoke test now:"

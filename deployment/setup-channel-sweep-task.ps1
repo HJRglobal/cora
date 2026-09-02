@@ -29,7 +29,9 @@ if (-not (Test-Path $ScriptPath -PathType Leaf)) { Write-Error "Script not found
 
 Write-Host "Registering task: $TaskName" -ForegroundColor Cyan
 
-$Action  = New-ScheduledTaskAction `
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+$Action  = New-WrappedTaskAction -TaskName $TaskName `
     -Execute $PythonPath `
     -Argument "`"$ScriptPath`"" `
     -WorkingDirectory $RepoRoot

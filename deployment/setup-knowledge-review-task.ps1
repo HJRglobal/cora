@@ -2,7 +2,7 @@
 #
 # Reads cora-proposed-memory-updates.jsonl for PENDING items, processes any
 # Harrison reactions from cora-reply-log.jsonl, and DMs Harrison a batch
-# summary of pending items for 👍/👎 approval.
+# summary of pending items for thumbs-up/thumbs-down approval.
 #
 # Run from elevated PowerShell:
 #     cd C:\Users\Harri\code\cora
@@ -41,7 +41,9 @@ if (-not (Test-Path $scriptPath -PathType Leaf)) {
     Write-Error "Script not found at $scriptPath."
     exit 1
 }
-$action = New-ScheduledTaskAction -Execute $PythonPath -WorkingDirectory $RepoRoot -Argument "`"$scriptPath`""
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+$action = New-WrappedTaskAction -TaskName 'cowork-cora-knowledge-review' -Execute $PythonPath -WorkingDirectory $RepoRoot -Argument "`"$scriptPath`""
 
 # Mon-Fri only at 7:00 AM local time (machine is set to AZ timezone)
 $trigger = New-ScheduledTaskTrigger -Weekly `

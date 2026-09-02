@@ -73,7 +73,9 @@ if ($existing) {
 }
 
 # D-005: absolute .venv python + absolute script path + WorkingDirectory
-$action = New-ScheduledTaskAction `
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+$action = New-WrappedTaskAction -TaskName 'Cora - Meeting Ask Capture' `
     -Execute $PythonExe `
     -Argument "`"$ScriptPath`"" `
     -WorkingDirectory $RepoRoot

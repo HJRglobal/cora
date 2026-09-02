@@ -1,6 +1,6 @@
 # setup-hubspot-sync-task.ps1
 #
-# Registers a Windows Scheduled Task that runs Gmail → HubSpot email sync every hour.
+# Registers a Windows Scheduled Task that runs Gmail -> HubSpot email sync every hour.
 #
 # Usage (from an elevated PowerShell prompt):
 #
@@ -27,11 +27,11 @@ Write-Host ""
 
 # Verify prerequisites
 if (-not (Test-Path $RepoRoot -PathType Container)) {
-    Write-Error "Repo not found at $RepoRoot — deploy first."
+    Write-Error "Repo not found at $RepoRoot -- deploy first."
     exit 1
 }
 if (-not (Test-Path $PythonExe -PathType Leaf)) {
-    Write-Error "Python not found at $PythonExe — run 'uv sync' first."
+    Write-Error "Python not found at $PythonExe -- run 'uv sync' first."
     exit 1
 }
 Write-Host "  OK  Repo: $RepoRoot"
@@ -45,7 +45,9 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 }
 
 # Build task components
-$action = New-ScheduledTaskAction `
+# Windowless action: route the command through run_hidden.py under pythonw.exe
+. "$PSScriptRoot\_task-action.ps1"
+$action = New-WrappedTaskAction -TaskName $TaskName `
     -Execute $PythonExe `
     -Argument $ScriptPath `
     -WorkingDirectory $RepoRoot
@@ -89,7 +91,7 @@ try {
     $exitCode = $LASTEXITCODE
     $ErrorActionPreference = $savedEAP
     if ($exitCode -ne 0) {
-        Write-Host "  WARN  Dry run exited $exitCode — check output above" -ForegroundColor Yellow
+        Write-Host "  WARN  Dry run exited $exitCode -- check output above" -ForegroundColor Yellow
     } else {
         Write-Host "  OK  Dry run passed." -ForegroundColor Green
     }
