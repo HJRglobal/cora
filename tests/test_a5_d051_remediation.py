@@ -535,6 +535,26 @@ class TestFreshnessFailureDoesNotDiscardBalances:
         assert out["types_covered"] == out["types_expected"] - 1
 
 
+def _future_and_past_txn_dates() -> tuple[str, str]:
+    """(postdated, legitimately-past) QBO TxnDates, RELATIVE to today.
+
+    A fixture whose whole purpose is to be "in the future" must be positioned
+    against the clock the code under test reads -- `newest_bank_side_txn_date`
+    clamps against `datetime.date.today()`. Pinning it to a literal gives the
+    test a self-destruct date: the original "2026-12-31" made this the only
+    genuine time-rot in the suite, due to fail on 2026-12-31.
+
+    The other TxnDate literals in this class are deliberately left as literals:
+    they only need to be <= today (they exercise account filtering and
+    max-picking, not the future clamp), and a past date stays past forever.
+    """
+    today = datetime.date.today()
+    return (
+        (today + datetime.timedelta(days=120)).isoformat(),
+        (today - datetime.timedelta(days=90)).isoformat(),
+    )
+
+
 class TestFreshnessCountsOnlyBankSideActivity:
     """FINDING 1 (HIGH, finance lens): `Purchase` was counted unfiltered, but a
     QBO Purchase with PaymentType=CreditCard never touches a bank account.
@@ -607,13 +627,32 @@ class TestFreshnessCountsOnlyBankSideActivity:
     def test_future_dated_rows_never_win_the_max(self, monkeypatch):
         """FINDING 4 (MED): clamping a future age to 0 turned a detectable anomaly
         into the strongest possible 'current' signal -- a postdated deposit dated
-        five months out suppressed the staleness flag for the whole period."""
+        five months out suppressed the staleness flag for the whole period.
+
+        The two dates are RELATIVE to today, not pinned. `newest_bank_side_txn_date`
+        clamps against `datetime.date.today()`, so the postdated row only exercises
+        the clamp while it is genuinely in the future. Pinned as "2026-12-31" (its
+        original form) this test would have passed until 2026-12-30 and then
+        asserted the OPPOSITE of its own name -- measured by a clock-shift audit:
+        green at +118d, red at +120d, i.e. it self-destructed on 2026-12-31.
+        """
+        future, legit = _future_and_past_txn_dates()
         qc = self._rows(monkeypatch, {"Purchase": [
-            {"TxnDate": "2026-12-31", "AccountRef": {"value": "9"}},
-            {"TxnDate": "2026-06-01", "AccountRef": {"value": "9"}},
+            {"TxnDate": future, "AccountRef": {"value": "9"}},
+            {"TxnDate": legit, "AccountRef": {"value": "9"}},
         ]})
         out = qc.newest_bank_side_txn_date("LEX", bank_account_ids={"9"})
-        assert out["per_type"]["Purchase"] == "2026-06-01"
+        assert out["per_type"]["Purchase"] == legit
+
+    def test_the_postdated_fixture_is_actually_in_the_future(self):
+        """Guard the guard. If the fixture above is ever re-pinned to a literal
+        date, fail HERE naming the cause -- rather than having
+        test_future_dated_rows_never_win_the_max quietly assert the opposite of
+        its own name on the day the literal goes stale."""
+        future, legit = _future_and_past_txn_dates()
+        today = datetime.date.today().isoformat()
+        assert future > today, f"the postdated fixture {future} is not in the future"
+        assert legit < today, f"the legitimate fixture {legit} is not in the past"
 
     def test_every_type_empty_is_reported_as_suspicious_not_clean(self, monkeypatch):
         """QBO was observed returning an EMPTY QueryResponse (not an error) for
