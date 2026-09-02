@@ -15,6 +15,7 @@ Covers the D-051 load-bearing invariants:
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -412,9 +413,25 @@ def test_health_task_query_is_read_only():
     src = Path(mcp_server.__file__).read_text(encoding="utf-8")
     # locate the query string
     assert "Get-ScheduledTask" in src and "Get-ScheduledTaskInfo" in src
-    assert "Start-ScheduledTask" not in src
-    assert "Stop-ScheduledTask" not in src
-    assert "schtasks" not in src.lower() or "/run" not in src.lower()
+    # Every mutating scheduled-task cmdlet, not just the two originally listed.
+    for verb in (
+        "Start-ScheduledTask",
+        "Stop-ScheduledTask",
+        "Set-ScheduledTask",
+        "Register-ScheduledTask",
+        "Unregister-ScheduledTask",
+        "Enable-ScheduledTask",
+        "Disable-ScheduledTask",
+    ):
+        assert verb not in src, f"{verb} would make the MCP health query a mutator"
+    # And no mutating schtasks.exe invocation. This was previously a bare
+    # `"/run" not in src.lower()` substring check, which false-positived on any
+    # path containing "/run" -- e.g. the comment referencing
+    # deployment/run_hidden.py. Match the actual command form instead, and cover
+    # every mutating switch rather than just /run.
+    assert not re.search(
+        r"schtasks[^\n]*?/(run|end|change|create|delete)\b", src, re.IGNORECASE
+    ), "mcp_server must not invoke a mutating schtasks switch"
 
 
 # ── H. provenance framing on every content-bearing result ────────────────────

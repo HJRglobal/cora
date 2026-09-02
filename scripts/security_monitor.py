@@ -29,6 +29,15 @@ from pathlib import Path
 
 import httpx
 
+# Windows: spawn helper processes without a console window.
+#
+# A task wrapped by deployment/run_hidden.py already runs with a windowless
+# console that children inherit, so this is defence-in-depth -- it also covers
+# a manual run, an unwrapped task, and any future caller whose parent has no
+# console at all (where a console child would get a BRAND NEW visible window).
+# 0 where the constant does not exist (POSIX), so behaviour is unchanged there.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 CORA_ROOT = Path(__file__).resolve().parent.parent
 LOG_DIR = CORA_ROOT / "logs"
 SECURITY_DIR = CORA_ROOT / "data" / "security"
@@ -198,6 +207,7 @@ def check_windows_failed_logins() -> list[dict]:
                 "/q:*[System[(EventID=4625) and TimeCreated[timediff(@SystemTime) <= 900000]]]",
             ],
             capture_output=True, text=True, timeout=10,
+            creationflags=_NO_WINDOW,
         )
         if result.returncode != 0 or not result.stdout.strip():
             return []

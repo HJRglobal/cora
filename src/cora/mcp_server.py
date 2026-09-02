@@ -72,6 +72,15 @@ from cora import drive_io, historical_access
 from cora.knowledge_base import embeddings
 from cora.knowledge_base.store import KnowledgeBase
 
+# Windows: spawn helper processes without a console window.
+#
+# A task wrapped by deployment/run_hidden.py already runs with a windowless
+# console that children inherit, so this is defence-in-depth -- it also covers
+# a manual run, an unwrapped task, and any future caller whose parent has no
+# console at all (where a console child would get a BRAND NEW visible window).
+# 0 where the constant does not exist (POSIX), so behaviour is unchanged there.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 log = logging.getLogger("cora.mcp_server")
 
 # The founder whose surface this serves (local, founder-scope). Used to resolve the
@@ -611,6 +620,7 @@ def _read_task_last_results() -> dict[str, tuple[str, int | None]]:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps],
             capture_output=True, text=True, timeout=45,
+            creationflags=_NO_WINDOW,
         ).stdout
     except Exception as exc:  # noqa: BLE001
         log.warning("MCP health: task-result query failed: %s", exc)

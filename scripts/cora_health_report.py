@@ -35,6 +35,15 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+# Windows: spawn helper processes without a console window.
+#
+# A task wrapped by deployment/run_hidden.py already runs with a windowless
+# console that children inherit, so this is defence-in-depth -- it also covers
+# a manual run, an unwrapped task, and any future caller whose parent has no
+# console at all (where a console child would get a BRAND NEW visible window).
+# 0 where the constant does not exist (POSIX), so behaviour is unchanged there.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
@@ -457,6 +466,7 @@ def scheduled_tasks() -> dict:
         proc = subprocess.run(
             ["schtasks", "/query", "/fo", "LIST", "/v"],
             capture_output=True, text=True, timeout=60,
+            creationflags=_NO_WINDOW,
         )
     except Exception as exc:  # noqa: BLE001
         return {"available": False, "reason": str(exc)}

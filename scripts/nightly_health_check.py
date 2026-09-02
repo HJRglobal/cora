@@ -51,6 +51,15 @@ from typing import Literal
 
 from dotenv import load_dotenv
 
+# Windows: spawn helper processes without a console window.
+#
+# A task wrapped by deployment/run_hidden.py already runs with a windowless
+# console that children inherit, so this is defence-in-depth -- it also covers
+# a manual run, an unwrapped task, and any future caller whose parent has no
+# console at all (where a console child would get a BRAND NEW visible window).
+# 0 where the constant does not exist (POSIX), so behaviour is unchanged there.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(dotenv_path=_REPO_ROOT / ".env", override=True)
 sys.path.insert(0, str(_REPO_ROOT / "src"))
@@ -278,7 +287,8 @@ def _restart_cora(dry_run: bool) -> str:
     try:
         subprocess.run(
             ["schtasks", "/End", "/TN", "cowork-cora-service"],
-            capture_output=True, timeout=15
+            capture_output=True, timeout=15,
+            creationflags=_NO_WINDOW,
         )
         # Kill orphan BOT processes only. The old filter was "*cora*" anywhere in
         # the command line, which also matches scripts/run_mcp_server.py (path
@@ -291,12 +301,14 @@ def _restart_cora(dry_run: bool) -> str:
              r"Where-Object { $_.CommandLine -like '*\Scripts\cora.exe*' -or "
              "$_.CommandLine -like '*cora.main*' } | "
              "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"],
-            capture_output=True, timeout=15
+            capture_output=True, timeout=15,
+            creationflags=_NO_WINDOW,
         )
         time.sleep(2)
         subprocess.run(
             ["schtasks", "/Run", "/TN", "cowork-cora-service"],
-            capture_output=True, timeout=15
+            capture_output=True, timeout=15,
+            creationflags=_NO_WINDOW,
         )
         return "Auto-restarted cowork-cora-service (orphan-kill applied)."
     except Exception as exc:
@@ -373,7 +385,7 @@ def _stuck_running_tasks(running_names: list[str], *,
         try:
             out = subprocess.run(
                 ["schtasks", "/Query", "/TN", name, "/FO", "LIST", "/V"],
-                capture_output=True, text=True, timeout=30).stdout
+                capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW).stdout
         except Exception:  # noqa: BLE001
             continue
         started = None
@@ -405,7 +417,8 @@ def check_scheduled_tasks() -> list[CheckResult]:
     try:
         out = subprocess.run(
             ["schtasks", "/Query", "/FO", "CSV", "/NH"],
-            capture_output=True, text=True, timeout=30
+            capture_output=True, text=True, timeout=30,
+            creationflags=_NO_WINDOW,
         ).stdout
     except Exception as exc:
         return [CheckResult("Scheduled tasks", "warn", f"schtasks query failed: {exc}")]
@@ -562,6 +575,7 @@ def _get_task_last_results() -> dict[str, tuple[str, int | None]]:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps],
             capture_output=True, text=True, timeout=60,
+            creationflags=_NO_WINDOW,
         ).stdout
     except Exception as exc:  # noqa: BLE001
         log.warning("check_task_last_results: query failed: %s", exc)
@@ -671,6 +685,7 @@ def check_qbo_monitor(now: datetime | None = None) -> CheckResult:
         proc = subprocess.run(
             ["schtasks", "/Query", "/TN", _QBO_MONITOR_TASK, "/V", "/FO", "LIST"],
             capture_output=True, text=True, timeout=30,
+            creationflags=_NO_WINDOW,
         )
     except Exception as exc:  # noqa: BLE001
         return CheckResult("QBO token monitor", "warn", f"schtasks query failed: {exc}")
@@ -1194,6 +1209,7 @@ def check_mcp_http_bridge(port: int | None = None) -> CheckResult:
         proc = subprocess.run(
             ["schtasks", "/Query", "/TN", _MCP_HTTP_TASK, "/FO", "LIST"],
             capture_output=True, text=True, timeout=30,
+            creationflags=_NO_WINDOW,
         )
     except Exception as exc:  # noqa: BLE001
         return CheckResult("MCP HTTP bridge", "ok", f"schtasks query failed (non-fatal): {exc}")
@@ -1624,7 +1640,8 @@ def check_disk_space() -> CheckResult:
         result = subprocess.run(
             ["powershell", "-Command",
              "(Get-PSDrive C).Free"],
-            capture_output=True, text=True, timeout=10
+            capture_output=True, text=True, timeout=10,
+            creationflags=_NO_WINDOW,
         )
         free_bytes = int(result.stdout.strip())
         free_gb = free_bytes / (1024 ** 3)

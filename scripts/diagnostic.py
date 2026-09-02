@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """Cora diagnostic sweep — tests every major layer and reports pass/fail."""
 import os, sqlite3, subprocess, sys
+
+# Windows: spawn helper processes without a console window.
+#
+# A task wrapped by deployment/run_hidden.py already runs with a windowless
+# console that children inherit, so this is defence-in-depth -- it also covers
+# a manual run, an unwrapped task, and any future caller whose parent has no
+# console at all (where a console child would get a BRAND NEW visible window).
+# 0 where the constant does not exist (POSIX), so behaviour is unchanged there.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 sys.path.insert(0, 'src')
 from dotenv import load_dotenv
 load_dotenv('.env', override=True)
@@ -188,7 +197,7 @@ for var, label in [('SLACK_BOT_TOKEN','Slack bot token'),
 
 # ── 7. Scheduled tasks ───────────────────────────────────────────────────────
 result = subprocess.run(['schtasks','/Query','/FO','CSV','/NH'],
-                        capture_output=True, text=True, timeout=15)
+                        capture_output=True, text=True, timeout=15, creationflags=_NO_WINDOW)
 expected_disabled = {'cowork-cora-qbo-token-refresh','cowork-cora-asana-email-sync'}
 task_fails = []
 task_count = 0

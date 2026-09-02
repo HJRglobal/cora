@@ -474,3 +474,68 @@ def test_rewrap_script_defaults_to_dry_run_and_holds_back_the_service():
     assert '$HeldBack = @("cowork-cora-service", "cora-watchdog")' in src
     assert "-Apply requires an ELEVATED PowerShell" in src
     assert "Export-ScheduledTask" in src, "must back up XML before modifying"
+
+
+# ---------------------------------------------------------------------------
+# 10. repo-wide rail: every helper spawn asks for no window
+# ---------------------------------------------------------------------------
+
+
+def _subprocess_spawn_sites():
+    """Every subprocess.run/Popen/call/check_* call in shipped code.
+
+    Keyed on the actual AST call sites rather than on a list of filenames: the
+    original plan named 10 sites and there were 13 (cora_health_report.py,
+    diagnostic.py and security_monitor.py -- the last of which fires every 15
+    minutes -- were missing from it). A rail that enumerates files under-reports
+    exactly the sites nobody remembered.
+    """
+    methods = {"run", "Popen", "call", "check_output", "check_call"}
+    sites = []
+    for folder in ("src", "scripts", "deployment"):
+        for path in sorted((REPO_ROOT / folder).rglob("*.py")):
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+            except SyntaxError:  # pragma: no cover
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                f = node.func
+                if (
+                    isinstance(f, ast.Attribute)
+                    and f.attr in methods
+                    and isinstance(f.value, ast.Name)
+                    and f.value.id == "subprocess"
+                ):
+                    has_flags = any(k.arg == "creationflags" for k in node.keywords)
+                    sites.append((path.relative_to(REPO_ROOT).as_posix(), node.lineno, has_flags))
+    return sites
+
+
+def test_every_subprocess_spawn_passes_creationflags():
+    """A console child spawned from a parent with NO console gets a brand new
+    visible window. Once tasks run under pythonw via run_hidden.py, any spawn
+    that forgets creationflags is a window back on Harrison's desktop."""
+    sites = _subprocess_spawn_sites()
+    assert sites, "the AST scan found no spawn sites at all -- the rail is broken"
+    missing = [(f, ln) for f, ln, ok in sites if not ok]
+    assert not missing, (
+        "these spawns do not pass creationflags (use "
+        '`getattr(subprocess, "CREATE_NO_WINDOW", 0)`): ' + repr(missing)
+    )
+
+
+def test_the_spawn_rail_covers_the_known_hot_files():
+    """Guard against the rail silently scanning nothing (a bad glob would make
+    the test above vacuous). These files are known to spawn helpers."""
+    covered = {f for f, _, _ in _subprocess_spawn_sites()}
+    for expected in (
+        "scripts/nightly_health_check.py",
+        "src/cora/mcp_server.py",
+        "scripts/cora_health_report.py",
+        "scripts/diagnostic.py",
+        "scripts/security_monitor.py",
+        "deployment/run_hidden.py",
+    ):
+        assert expected in covered, f"{expected} not seen by the spawn rail"
