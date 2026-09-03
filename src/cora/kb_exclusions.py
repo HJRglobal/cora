@@ -313,7 +313,16 @@ _CORA_BUILD_DOC_RE = re.compile(
     r"forensic|rebuild|execution-log|code-prompt|build-plan|build-queue|"
     r"master-build|cascade-report|cascade|incident-triage|north-star|"
     r"findings|phase-?\d|synthesis-and-path|report-synthesis|audit-addendum|"
-    r"audit|review|sweep|exec-summary|backlog"
+    r"audit|review|sweep|exec-summary|backlog|"
+    # ``mirror`` (2026-09-03, claude-workspace mirror lane): every file that
+    # scripts/mirror_claude_workspace.py writes into the KB-EXCLUDED ZONE-X
+    # folder (_shared/projects/cora/_mirror/) carries a ``cora-mirror-`` prefix
+    # -- Cowork task prompt BODIES (LEX-prefixed tasks included) and the cora
+    # repo's own agent memory. The folder rule keeps them out of static_md; this
+    # keyword is the drive_sweep belt (a title-only door with no path) so the
+    # 06:00 sweep can never ingest a body through the other door (D-057/D-086).
+    # TARGETED, not broad-only, so both scopes and the default purge scope see it.
+    r"mirror"
     r")\b",
     re.IGNORECASE,
 )

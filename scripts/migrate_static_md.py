@@ -135,7 +135,11 @@ def file_to_document(path: Path) -> Document | None:
 def discover_files() -> list[Path]:
     """Walk the Founder OS root and collect all *.md files (excluding PHI paths)."""
     found: list[Path] = []
-    for path in FOUNDER_OS_ROOT.rglob("*.md"):
+    # Candidate set is SHARED with the nightly incremental walk (*.md + the
+    # exact-filename companions such as bootstrap.txt) so the full rebuild and
+    # the incremental sync can never disagree about what is a static doc.
+    from incremental_sync_static import iter_static_candidates  # noqa: PLC0415
+    for path in iter_static_candidates(FOUNDER_OS_ROOT):
         if not path.is_file():
             continue
         if is_phi_path(path):

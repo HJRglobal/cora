@@ -21,6 +21,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 
 from dotenv import load_dotenv
 
@@ -56,6 +57,48 @@ ENTITY_FOLDERS: dict[str, str] = {
 }
 
 PHI_BLACKLIST_SEGMENTS = {"consumers", "clients", "phi", "clinical", "ehr"}
+
+# Exact-filename companions to the ``*.md`` walk (2026-09-03, knowledge-parity
+# audit gap G5). ``bootstrap.txt`` is the per-project Cowork bootstrap note (28
+# in the tree on 2026-09-03) and was never walked because the sync is ``.md``-only.
+# It is the ONLY non-``.md`` name walked -- ``*.txt`` in general stays out (an
+# ``env.txt`` / ``notes.txt`` never enters). Every candidate passes the SAME
+# exclusion chain as the ``.md`` files (``is_static_excluded``) and the same
+# ``classify_entity``, so a ``bootstrap.txt`` under ``_shared/projects/cora/``
+# or ``copa-bhrf/`` is excluded exactly like its ``.md`` siblings.
+# migrate_static_md.py (the full rebuild) imports these so the two walks cannot
+# drift.
+STATIC_EXACT_FILENAMES: tuple[str, ...] = ("bootstrap.txt",)
+
+
+def iter_static_candidates(root: Path) -> Iterator[Path]:
+    """Every file the static walk considers: ``*.md`` plus the exact-filename
+    companions. Filtering (``is_static_excluded``) is the caller's job so the
+    incremental and full-rebuild walks share ONE candidate generator."""
+    yield from root.rglob("*.md")
+    for name in STATIC_EXACT_FILENAMES:
+        yield from root.rglob(name)
+
+
+def is_static_excluded(path: Path) -> bool:
+    """The single exclusion chain for the static walk -- PHI path segments,
+    ``_brain/swept`` materialization output, Cora's own workspace (D-057), the
+    copa-bhrf NDA folder, dot-dirs, and ``_archive`` trees. Returns True when the
+    path must NOT be ingested. Shared by ``main`` and ``file_to_document``'s
+    callers so a new candidate class (bootstrap.txt) inherits every rule."""
+    if is_phi_path(path):
+        return True
+    if is_swept_path(path):
+        return True
+    if is_cora_internal_path(path):
+        return True
+    if is_copa_bhrf_path(str(path)):
+        return True
+    if any(part.startswith(".") for part in path.parts):
+        return True
+    if "_archive" in str(path).lower():
+        return True
+    return False
 
 # F-09: the mtime watermark alone MISSES a content change that does not advance
 # mtime past the watermark -- notably a REDACTION (content shrinks) synced by Drive
@@ -145,6 +188,17 @@ def classify_entity(path: Path) -> str:
     return ENTITY_FOLDERS.get(parts[0], "FNDR")
 
 
+def _static_title(path: Path) -> str:
+    """Human title for a static doc. A ``bootstrap.txt`` is named after the
+    project folder it bootstraps ("Pure Launch Bootstrap"), never the bare stem
+    -- 28 chunks all titled "Bootstrap" would be indistinguishable in retrieval."""
+    stem = path.stem.replace("-", " ").replace("_", " ").title()
+    if path.name.lower() in STATIC_EXACT_FILENAMES:
+        parent = path.parent.name.replace("-", " ").replace("_", " ").title()
+        return f"{parent} {stem}".strip()
+    return stem
+
+
 def file_to_document(path: Path) -> Document | None:
     if is_phi_path(path):
         return None
@@ -176,6 +230,8 @@ def file_to_document(path: Path) -> Document | None:
     )
 
     metadata: dict = {"path": rel_path, "size_bytes": stat.st_size}
+    if path.name.lower() in STATIC_EXACT_FILENAMES:
+        metadata["kind"] = "bootstrap"
     # Delegated-work artifacts (2026-08-01, D-096 lesson): anything under an
     # entity's _delegated-work/ tree is AI-authored output. Tag it
     # bot_authored so the existing machinery applies for free -- the "not
@@ -206,7 +262,7 @@ def file_to_document(path: Path) -> Document | None:
         date_created=int(stat.st_ctime),
         date_modified=int(stat.st_mtime),
         author="",
-        title=path.stem.replace("-", " ").replace("_", " ").title(),
+        title=_static_title(path),
         deep_link=f"computer://{path}",
         metadata=metadata,
     )
@@ -251,24 +307,17 @@ def main() -> int:
     modified_files: list[Path] = []
     skipped_cora_internal = 0
     hash_triggered = 0
-    for path in FOUNDER_OS_ROOT.rglob("*.md"):
+    for path in iter_static_candidates(FOUNDER_OS_ROOT):
         if not path.is_file():
             continue
-        if is_phi_path(path):
-            continue
-        # Drive-materialization output — never re-ingest (loop guard).
-        if is_swept_path(path):
-            continue
-        # Cora's own build/audit/forensic docs are NOT org knowledge — never ingest.
+        # Cora's own build/audit/forensic docs are NOT org knowledge — never ingest
+        # (counted separately for the log line; is_static_excluded re-checks it).
         if is_cora_internal_path(path):
             skipped_cora_internal += 1
             continue
-        # copa-bhrf NDA folder (decision §2c) — never re-ingest after the purge.
-        if is_copa_bhrf_path(str(path)):
-            continue
-        if any(part.startswith(".") for part in path.parts):
-            continue
-        if "_archive" in str(path).lower():
+        # PHI segments, _brain/swept, copa-bhrf, dot-dirs, _archive -- one chain
+        # shared with the bootstrap.txt candidates and the full rebuild.
+        if is_static_excluded(path):
             continue
         try:
             mtime = path.stat().st_mtime

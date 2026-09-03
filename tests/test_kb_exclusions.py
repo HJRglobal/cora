@@ -317,3 +317,69 @@ class TestIsCopaBhrfPath:
     def test_copa_folder_id_registered_for_drive_sweep(self):
         # The drive_sweep enumeration exclusion relies on the folder-id being present.
         assert "112C7ljGRI5VO_ic66fVGQk4kf6IC40HQ" in KB_EXCLUDED_FOLDER_IDS
+
+
+class TestClaudeWorkspaceMirrorBelt:
+    """2026-09-03 claude-workspace mirror (S3): the ZONE-X mirror files are
+    ``cora-mirror-*`` and must trip the TITLE rule so the drive_sweep door (no
+    path, title-only) can never ingest a Cowork task body or the cora repo's
+    agent memory. The ZONE-K names must NOT trip the static_md path rule, or
+    the mirror would be invisible to Cora."""
+
+    ZONE_X_TITLES = [
+        "cora-mirror-fndr-email-triage-draft-staging.md",
+        "cora-mirror-lex-swept-phi-check.md",
+        "cora-mirror-hygiene-asana.md",
+        "cora-mirror-MEMORY.md",
+        "cora-mirror-project_cora_integrity_rails.md",
+        "CORA_MIRROR_feedback_time_rot_audit.md",       # underscore form
+        "Copy of cora-mirror-hygiene-asana.md",         # Drive decoration
+        "cora-mirror-hygiene-asana (1).md",             # Drive conflict copy
+    ]
+
+    def test_zone_x_titles_trip_both_scopes(self):
+        for name in self.ZONE_X_TITLES:
+            assert is_cora_internal_title(name), name
+            assert is_cora_internal_title(name, broad=True), name
+
+    def test_zone_x_paths_and_source_ids_excluded(self):
+        # Belt AND suspenders: even without the keyword, the folder rule catches
+        # ZONE-X by path (static_md) and by path-shaped source_id (purge).
+        p = Path(_DRIVE) / "_shared" / "projects" / "cora" / "_mirror" / "cowork-scheduled-tasks" / "cora-mirror-hygiene-asana.md"
+        assert is_cora_internal_path(p)
+        assert is_cora_internal_source_id(r"_shared\projects\cora\_mirror\LADDER-ROW.md")
+        assert is_cora_internal_source_id("_shared/projects/cora/_mirror/_quarantine/INDEX.md")
+
+    def test_mirror_keyword_is_whole_word_and_needs_the_cora_token(self):
+        # "mirror" alone, or a mirror doc for another system, is not ours.
+        assert not is_cora_internal_title("drive-mirror-status.md")
+        assert not is_cora_internal_title("drive-mirror-status.md", broad=True)
+        assert not is_cora_internal_title("mirror-of-cora-notes.md")      # keyword BEFORE cora (documented under-match)
+        # sub-word: "mirrored" / "mirroring" must not fire
+        assert not is_cora_internal_title("cora-mirrored-thoughts.md")
+        assert not is_cora_internal_title("cora-mirroring.md", broad=True)
+        # a protected family with the soft keyword stays spared
+        assert not is_cora_internal_title("cora-mapping-mirror.md")
+        assert not is_cora_internal_title("cora-mapping-mirror.md", broad=True)
+
+    ZONE_K_RELPATHS = [
+        "skills/cora.SKILL.md",
+        "skills/cascade.SKILL.md",
+        "skills/wrap-it.SKILL.md",
+        "skills/INDEX.md",
+        "cowork-scheduled-tasks/INDEX.md",
+        "cowork-memory/21e3fecd-c5ab-419d-8210-d7ba631c0056/cora-project-pointer.md",
+        "cowork-memory/INDEX.md",
+        "code-memory/some-other-repo/MEMORY.md",
+        "PARITY-REPORT.md",
+        "MANIFEST.md",
+    ]
+
+    def test_zone_k_names_do_not_trip_the_static_md_path_rule(self):
+        root = Path(_DRIVE) / "_shared" / "claude-workspace-mirror"
+        for rel in self.ZONE_K_RELPATHS:
+            assert not is_cora_internal_path(root / rel), rel
+            # The drive_sweep twin of a ZONE-K file is the known double-ingest
+            # (audit A1, out of scope) -- it must at least not be BLOCKED by the
+            # broad title rule, or ZONE-K would ingest only via static_md.
+            assert not is_cora_internal_title(Path(rel).name, broad=True), rel
