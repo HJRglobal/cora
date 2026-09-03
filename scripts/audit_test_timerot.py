@@ -80,6 +80,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 PLUGIN_SOURCE = r'''"""Ephemeral pytest plugin: run the suite as if it were N days from now.
@@ -194,7 +196,8 @@ def _run(shift: int, shim: bool, plugin_dir: Path, extra: list[str]) -> str:
     env["TIMEROT_SHIFT_MTIME"] = "1" if shim else "0"
     cmd = [sys.executable, "-m", "pytest", "-p", "timeshift_plugin", "-q", *extra]
     proc = subprocess.run(cmd, cwd=str(_REPO_ROOT), env=env,
-                          capture_output=True, text=True)
+                          capture_output=True, text=True,
+                          creationflags=_NO_WINDOW)
     return proc.stdout + proc.stderr
 
 
