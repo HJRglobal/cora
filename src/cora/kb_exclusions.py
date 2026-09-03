@@ -29,6 +29,11 @@ Scope notes:
   * The folder rule is the keystone: anything under ``_shared/projects/cora/``.
     Sibling projects (gmail-deep-dive, reddit-strategy, wikipedia-strategy, …)
     are NOT matched and stay ingested — only the ``cora`` project is excluded.
+    It is PATH-keyed, so it covers static_md. On ``drive_sweep`` (bare file id,
+    no path) the same folder is closed by its Drive folder id in
+    ``KB_EXCLUDED_FOLDER_IDS`` (pinned 2026-09-03 -- the DOOR); the filename rule
+    below is that door's BELT, never its sole guard (decisions.md 2026-09-03
+    "D-057 IS LEAKING", Doctrine 1).
   * The filename rule is the workhorse for Drive copies (no path on the source_id).
     Requires a ``cora`` token AND a WHOLE-WORD build keyword. Both edges are anchored:
     the keyword with ``\\b`` (so "fix" never fires inside "fixed", "plan" inside
@@ -77,7 +82,8 @@ from pathlib import Path
 # copa-bhrf entry is a SEPARATE class (a LEX NDA'd M&A-diligence project folder,
 # NOT a dashboard -- deliberately NOT in dashboard-access.yaml); it blocks the
 # drive_sweep re-ingest of the copa-bhrf tree after the 2026-07-21 KB purge
-# (see is_copa_bhrf_path below + decision §2c).
+# (see is_copa_bhrf_path below + decision §2c). The _shared/projects/cora entry
+# is a THIRD class: Cora's own build workspace (D-057) -- see its comment.
 KB_EXCLUDED_FOLDER_IDS: frozenset[str] = frozenset(
     {
         "1INi4fLXG23xao-d_yf56Wrbrah54pIBB",  # 00-Founder/insurance/oneamerica (PERSONAL)
@@ -102,6 +108,37 @@ KB_EXCLUDED_FOLDER_IDS: frozenset[str] = frozenset(
         # Verified live 2026-08-05: this id resolves to "cashflow-ledger" under
         # accounting <- 01-HJR-Global <- HJR-Founder-OS.
         "1aDnmz3oY7QZxsH7mv7_ZDu7cUyDWLhy7",  # 01-HJR-Global/accounting/cashflow-ledger (13WCF mirror)
+        # _shared/projects/cora -- the Cora build workspace that D-057 exists to
+        # keep OUT of the KB. Closes "D-057 IS LEAKING" (decisions.md 2026-09-03,
+        # cq-11e9abda254a): the keystone folder rule below
+        # (_CORA_WORKSPACE_SEGMENTS) is PATH-keyed, so it covers static_md only;
+        # drive_sweep stores a bare Drive file id and NO path, so on that door the
+        # folder had rested on the is_cora_internal_title FILENAME heuristic alone
+        # since the 6/19 WS1 exclusion shipped -- and 157 of its 550 .md files
+        # carry no ``cora`` token at all (the _fndr_/_cora_ naming split), a hard
+        # floor no keyword can reach. Live-retrievable on 9/3: the project
+        # CLAUDE.md (87 chunks), the system-architecture reference (57), even an
+        # entity system prompt (hjrg.md, 25). The pin is the DOOR; the title rule
+        # (incl. its ``mirror`` keyword for ZONE-X) stays the BELT.
+        #
+        # The PARENT is pinned, never the child _mirror/: the child has no id
+        # until the first mirror apply creates it, and a pinned parent prunes the
+        # whole subtree -- sweep_founders_os passes this set as skip_folder_ids
+        # and its BFS neither processes a skipped folder nor enqueues its
+        # subfolders (tests/test_drive_sweep.py TestPinnedParentPrunesSubtree);
+        # the flat per-user sweep is covered by _expanded_excluded_folder_ids. So
+        # the mirror's _mirror/ (created by its first apply) and its _removed/ +
+        # _quarantine/ children are covered without their ids ever existing at
+        # pin time. The one allowlisted view
+        # under this folder (code-session-backlog.md, _KB_ALLOWLIST_BASENAMES)
+        # still ingests through static_md -- path-keyed, unaffected by folder ids;
+        # only its redundant drive_sweep twin stops (the audit-A1 double ingest).
+        # Verified live 2026-09-03 (read-only; forward exact-name chain from
+        # FOUNDERS_OS_ROOT_ID with exactly one hit per level AND a reverse
+        # parents walk, both agreeing): this id resolves to "cora" under
+        # projects <- _shared <- HJR-Founder-OS (221 direct children incl.
+        # CLAUDE.md, _notes, design). Pinned by Harrison's 9/3 ruling "A) Option 1".
+        "1YNObhKwo8RITgrRbw3MFpf-0hIiLWTx9",  # _shared/projects/cora (D-057 workspace; 2026-09-03 parent pin)
     }
 )
 
@@ -117,8 +154,9 @@ _DASHBOARD_STORE_SEGMENTS: frozenset[str] = frozenset(
 
 
 def is_excluded_folder(folder_id: str) -> bool:
-    """True if a Drive folder id is a personal/confidential dashboard store that
-    must never be KB-ingested."""
+    """True if a Drive folder id is KB-excluded: a personal/confidential dashboard
+    store, the LEX copa-bhrf NDA folder, the 13WCF ledger, or the Cora build
+    workspace (D-057). drive_sweep skips the whole subtree of a pinned id."""
     return bool(folder_id) and folder_id in KB_EXCLUDED_FOLDER_IDS
 
 

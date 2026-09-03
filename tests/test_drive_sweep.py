@@ -865,6 +865,32 @@ class TestPinnedParentPrunesSubtree:
         assert not ({self.PIN, self.CHILD, self.GRAND} & set(svc.parents_queried))
         assert stats["files_enumerated"] == 0            # the three planted files were never seen
 
+    def test_the_real_excluded_set_prunes_the_real_cora_workspace_id(self):
+        # Same proof with the REAL set the call sites pass (skip_folder_ids=
+        # KB_EXCLUDED_FOLDER_IDS) and the REAL _shared/projects/cora id as the
+        # pinned node: today's _mirror/ child and its _quarantine/ grandchild are
+        # never listed.
+        from cora.kb_exclusions import KB_EXCLUDED_FOLDER_IDS
+        cora_ws = "1YNObhKwo8RITgrRbw3MFpf-0hIiLWTx9"
+        assert cora_ws in KB_EXCLUDED_FOLDER_IDS
+        f = lambda i: [{"id": i, "name": f"{i}.md", "mimeType": "text/markdown",  # noqa: E731
+                        "modifiedTime": "2026-09-01T00:00:00Z", "size": "999", "parents": []}]
+        svc = _RecordingTreeService(
+            subfolders={
+                "root": [{"id": cora_ws, "name": "cora"}, {"id": self.SIB, "name": "gmail-deep-dive"}],
+                cora_ws: [{"id": "mirror", "name": "_mirror"}],
+                "mirror": [{"id": "quarantine", "name": "_quarantine"}],
+                "quarantine": [], self.SIB: [],
+            },
+            files={cora_ws: f("cora-CLAUDE"), "mirror": f("cora-mirror-body"),
+                   "quarantine": f("cora-mirror-INDEX")},
+        )
+        done, kb, stats = self._walk(svc, KB_EXCLUDED_FOLDER_IDS)
+        assert done is True
+        assert set(kb.checkpoints["ck"]["completed_folder_ids"]) == {"root", self.SIB}
+        assert not ({cora_ws, "mirror", "quarantine"} & set(svc.parents_queried))
+        assert stats["files_enumerated"] == 0
+
     def test_without_the_pin_the_same_tree_is_walked(self):
         # Control: the pruning above is the pin's doing, not an artifact of the fixture.
         svc = self._tree()

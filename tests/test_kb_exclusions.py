@@ -10,10 +10,12 @@ from pathlib import Path
 
 from cora.kb_exclusions import (
     KB_EXCLUDED_FOLDER_IDS,
+    folder_ids_excluded,
     is_copa_bhrf_path,
     is_cora_internal_path,
     is_cora_internal_source_id,
     is_cora_internal_title,
+    is_excluded_folder,
 )
 
 _DRIVE = r"G:\My Drive\HJR-Founder-OS"
@@ -383,3 +385,73 @@ class TestClaudeWorkspaceMirrorBelt:
             # (audit A1, out of scope) -- it must at least not be BLOCKED by the
             # broad title rule, or ZONE-K would ingest only via static_md.
             assert not is_cora_internal_title(Path(rel).name, broad=True), rel
+
+
+class TestCoraWorkspaceFolderPin:
+    """2026-09-03 "D-057 IS LEAKING": the PARENT _shared/projects/cora folder is
+    id-pinned in KB_EXCLUDED_FOLDER_IDS -- the drive_sweep DOOR (that connector
+    stores a bare file id, so no path rule can see it). The cora-mirror- title
+    keyword stays the BELT. Door and belt must hold independently."""
+
+    #: cora <- projects <- _shared <- HJR-Founder-OS. Verified live 2026-09-03
+    #: (forward exact-name chain from FOUNDERS_OS_ROOT_ID + reverse parents walk
+    #: agree; 221 direct children incl. CLAUDE.md, _notes, design).
+    CORA_WORKSPACE_FOLDER = "1YNObhKwo8RITgrRbw3MFpf-0hIiLWTx9"
+
+    def test_parent_folder_id_is_pinned(self):
+        assert self.CORA_WORKSPACE_FOLDER in KB_EXCLUDED_FOLDER_IDS
+        assert is_excluded_folder(self.CORA_WORKSPACE_FOLDER)
+        assert folder_ids_excluded([self.CORA_WORKSPACE_FOLDER])
+        assert folder_ids_excluded(["some-other-parent", self.CORA_WORKSPACE_FOLDER])
+        assert not folder_ids_excluded(["some-other-parent"])
+        assert not is_excluded_folder("")
+
+    def test_pin_is_the_parent_and_no_prior_pin_was_dislodged(self):
+        # The PARENT is the design (the child _mirror/ has no id until the first
+        # mirror apply; a pinned parent prunes the subtree). Guard against a later
+        # "fix" that swaps in a child id and drops the parent, and against this
+        # edit having dislodged any of the six prior pins.
+        priors = (
+            "1INi4fLXG23xao-d_yf56Wrbrah54pIBB",  # oneamerica
+            "1BZI6v5pmpgrt7G2dPsAib3u3S-HqB7ZP",  # capital-raise
+            "1NPBNBfx3MMjqQM_WnmL6jOJSaRAQf752",  # travel-points
+            "1HEHpMWgkJkHmV1wfWIiT5OhBI0p5p2P-",  # OneAmerica-Handoff dup
+            "112C7ljGRI5VO_ic66fVGQk4kf6IC40HQ",  # copa-bhrf
+            "1aDnmz3oY7QZxsH7mv7_ZDu7cUyDWLhy7",  # cashflow-ledger
+        )
+        for prior in priors:
+            assert prior in KB_EXCLUDED_FOLDER_IDS, prior
+        assert self.CORA_WORKSPACE_FOLDER in KB_EXCLUDED_FOLDER_IDS
+        expected = frozenset(priors) | {self.CORA_WORKSPACE_FOLDER}
+        assert KB_EXCLUDED_FOLDER_IDS == expected, (
+            "KB_EXCLUDED_FOLDER_IDS changed. A NEW pin? Add its id to `priors` here "
+            "(with its live-verified chain in a comment) so the tripwire re-arms; a "
+            "REMOVED id is a KB-exclusion regression unless a decision says otherwise. "
+            f"extra={sorted(KB_EXCLUDED_FOLDER_IDS - expected)} missing={sorted(expected - KB_EXCLUDED_FOLDER_IDS)}"
+        )
+
+    def test_belt_intact_zone_x_titles_still_trip(self):
+        # (iii) the cora-mirror- keyword still trips the title rule in BOTH scopes
+        # after the pin -- the door did not replace the belt.
+        for name in TestClaudeWorkspaceMirrorBelt.ZONE_X_TITLES:
+            assert is_cora_internal_title(name), name
+            assert is_cora_internal_title(name, broad=True), name
+        assert is_cora_internal_title("cora-mirror-INDEX.md", broad=True)
+        assert is_cora_internal_title("cora-mirror-LADDER-ROW.md")
+
+    def test_door_and_belt_are_independent(self):
+        # The leak class the pin closes: a token-less name under the folder is
+        # invisible to the title rule in BOTH scopes (the regex requires a
+        # ``cora[-_]`` token -- a hard floor, not a keyword gap). These are REAL
+        # names from the 9/3 folder-mode dry-run manifest; only the folder id
+        # catches them. CLAUDE.md is also in the SPARED list above on purpose --
+        # a founder/entity brief must never be excluded by TITLE anywhere else.
+        for name in (
+            "2026-08-30_fndr_code-12-queue-metabolism-scope-draft-v0.9.md",
+            "2026-08-25_fndr_REMAINING-STEPS-code-8-and-carryover.md",
+            "2026-08-05_fndr_13-week-cashflow-tool-design.md",
+            "hjrg.md",
+            "CLAUDE.md",
+        ):
+            assert not is_cora_internal_title(name, broad=True), name
+        assert is_excluded_folder(self.CORA_WORKSPACE_FOLDER)
