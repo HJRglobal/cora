@@ -100,7 +100,7 @@ enabled:
   # task defs, agent memory) into the Founder OS for static_md ingest. T0 lane;
   # register with deployment/setup-claude-mirror-task.ps1 AFTER Harrison's first
   # dry-run review (S6). NOTE the SAME build added a SECOND daily trigger to
-  # cowork-cora-kb-sync-static (12:30) and cowork-cora-session-capture (12:20)
+  # cowork-cora-kb-sync-static (12:20) and cowork-cora-session-capture (12:30)
   # via deployment/add-midday-sync-triggers.ps1 -Apply -- both keep their morning
   # triggers + args unchanged; "same-day" now means "by early afternoon".
   - cowork-cora-claude-mirror

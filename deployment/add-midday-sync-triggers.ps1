@@ -1,10 +1,12 @@
 # add-midday-sync-triggers.ps1 (S4, claude-workspace mirror)
 #
 # Adds ONE midday daily trigger to two existing KB-freshness tasks so same-day
-# knowledge is retrievable by early afternoon (not only next morning):
+# knowledge is retrievable by early afternoon (not only next morning). The order
+# mirrors the morning sequence (static THEN session-capture, so capture never
+# races the static ingest -- setup-session-capture-task.ps1's stated ordering):
 #
-#   cowork-cora-kb-sync-static      + 12:30 AZ  (2nd static ingest of the day)
-#   cowork-cora-session-capture     + 12:20 AZ  (2nd Cowork/Code capture; keeps --with-kb)
+#   cowork-cora-kb-sync-static      + 12:20 AZ  (2nd static ingest of the day)
+#   cowork-cora-session-capture     + 12:30 AZ  (2nd Cowork/Code capture; keeps --with-kb)
 #
 # WHY NOT re-run the original setup scripts: re-registration is the registry-drop
 # class (TOM 1nnnn) -- it rewrites the whole task and can strip cadence/principal.
@@ -35,8 +37,8 @@ $Stamp      = Get-Date -Format "yyyy-MM-dd"
 $BackupDir  = Join-Path $BackupRoot $Stamp
 
 $Changes = @(
-    @{ Name = "cowork-cora-kb-sync-static";  Add = "12:30" }
-    @{ Name = "cowork-cora-session-capture"; Add = "12:20" }
+    @{ Name = "cowork-cora-kb-sync-static";  Add = "12:20" }
+    @{ Name = "cowork-cora-session-capture"; Add = "12:30" }
 )
 
 if ($Apply) {
