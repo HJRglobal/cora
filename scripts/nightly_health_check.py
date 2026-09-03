@@ -1358,8 +1358,16 @@ def check_claude_mirror(now_epoch: float | None = None) -> CheckResult:
                            f"No mirror-status.json yet ({st.get('error', 'absent')}) -- "
                            f"lane not yet run (register + first --apply is Harrison-gated).")
     problems: list[str] = []
+    age = st.get("age_hours")
+    age_s = f"{age:.0f}h" if isinstance(age, (int, float)) else "unknown-age"
+    if age is None:
+        # A present status file with an unparseable/absent timestamp is itself a
+        # WARN (a schema drift or a partial write) -- but must NEVER crash the run
+        # (D-051 bootstrap finding 1: f"{None:.0f}" is a TypeError that would abort
+        # the whole nightly report).
+        problems.append("status file has no parseable timestamp")
     if st.get("stale"):
-        problems.append(f"last run {st['age_hours']:.0f}h ago (> {st['max_age_hours']:.0f}h)")
+        problems.append(f"last run {age_s} ago (> {st.get('max_age_hours', 26)}h)")
     if st.get("roots_missing"):
         problems.append("roots NOT FOUND: " + ", ".join(st["roots_missing"]))
     if st.get("unknown_skills"):
@@ -1372,7 +1380,7 @@ def check_claude_mirror(now_epoch: float | None = None) -> CheckResult:
                            "claude-workspace mirror: " + "; ".join(problems)
                            + f" (quarantined={st.get('quarantined_count', '?')}).")
     return CheckResult("Claude mirror", "ok",
-                       f"mirror fresh ({st['age_hours']:.0f}h), "
+                       f"mirror fresh ({age_s}), "
                        f"quarantined={st.get('quarantined_count', 0)}, "
                        f"unpinned={len(st.get('unpinned', []))}.")
 

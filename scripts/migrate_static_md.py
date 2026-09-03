@@ -37,7 +37,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from cora.knowledge_base import KnowledgeBase, KnowledgeBaseError  # noqa: E402
 from cora.knowledge_base.store import Document  # noqa: E402
-from cora.kb_exclusions import is_cora_internal_path, is_swept_path  # noqa: E402
+from cora.kb_exclusions import is_cora_internal_path, is_swept_path  # noqa: E402, F401
+from incremental_sync_static import _static_title  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -88,16 +89,14 @@ def classify_entity(path: Path) -> str:
 
 def file_to_document(path: Path) -> Document | None:
     """Read a markdown file and convert to a Document. Returns None on read failure."""
-    if is_phi_path(path):
-        log.info("PHI guardrail: skipping %s", path)
-        return None
-    # Drive-materialization output: never re-ingest the nightly _brain/swept/ digests
-    # (loop + bloat) — the full-rebuild path must apply the same guard as the incremental.
-    if is_swept_path(path):
-        return None
-    # Cora's own build/audit/forensic docs are operational metadata, not org knowledge
-    # (parity with incremental_sync_static + the kb-rebuild.md guard claim).
-    if is_cora_internal_path(path):
+    # Share the EXACT exclusion chain with the incremental sync so the full
+    # rebuild can never drift (PHI segs, _brain/swept, cora-workspace, copa-bhrf
+    # NDA, dot-dirs, _archive). S2 (2026-09-03) widened the walked set to include
+    # bootstrap.txt, so the full rebuild must apply the same belt the incremental
+    # does -- including copa-bhrf, which this path previously lacked (D-051
+    # bootstrap review).
+    from incremental_sync_static import is_static_excluded  # noqa: PLC0415
+    if is_static_excluded(path):
         return None
     try:
         content = path.read_text(encoding="utf-8", errors="replace")
@@ -123,13 +122,25 @@ def file_to_document(path: Path) -> Document | None:
         date_created=int(stat.st_ctime),
         date_modified=int(stat.st_mtime),
         author="",
-        title=path.stem.replace("-", " ").replace("_", " ").title(),
+        # Shared title builder so a bootstrap.txt is titled after its project
+        # folder ("Pure Launch Bootstrap"), not a bare "Bootstrap" x28 that would
+        # be indistinguishable in retrieval (D-051 bootstrap finding 2 -- the full
+        # rebuild must match the incremental).
+        title=_static_title(path),
         # Drive deep-link: best-effort. The actual Drive URL would require a Drive API
         # lookup; for now we surface the local path so the static-md citation shows
         # where the content lives. Future: enrich with Drive file_id via Drive connector.
         deep_link=f"computer://{path}",
-        metadata={"path": rel_path, "size_bytes": stat.st_size},
+        metadata=_static_meta(path, rel_path, stat.st_size),
     )
+
+
+def _static_meta(path: Path, rel_path: str, size_bytes: int) -> dict:
+    from incremental_sync_static import STATIC_EXACT_FILENAMES  # noqa: PLC0415
+    meta: dict = {"path": rel_path, "size_bytes": size_bytes}
+    if path.name.lower() in STATIC_EXACT_FILENAMES:
+        meta["kind"] = "bootstrap"
+    return meta
 
 
 def discover_files() -> list[Path]:
@@ -138,23 +149,14 @@ def discover_files() -> list[Path]:
     # Candidate set is SHARED with the nightly incremental walk (*.md + the
     # exact-filename companions such as bootstrap.txt) so the full rebuild and
     # the incremental sync can never disagree about what is a static doc.
-    from incremental_sync_static import iter_static_candidates  # noqa: PLC0415
+    from incremental_sync_static import iter_static_candidates, is_static_excluded  # noqa: PLC0415
     for path in iter_static_candidates(FOUNDER_OS_ROOT):
         if not path.is_file():
             continue
-        if is_phi_path(path):
-            log.info("PHI guardrail: skipping %s", path)
-            continue
-        # Drive-materialization output — never re-ingest (loop guard, both static walks).
-        if is_swept_path(path):
-            continue
-        # Cora's own build/audit/forensic docs are not org knowledge.
-        if is_cora_internal_path(path):
-            continue
-        # Skip obvious noise: .obsidian dot-dirs, archive folders, etc.
-        if any(part.startswith(".") for part in path.parts):
-            continue
-        if "_archive" in str(path).lower():
+        # ONE shared exclusion chain with the incremental sync (PHI segs, swept,
+        # cora-workspace, copa-bhrf NDA, dot-dirs, _archive) so the two walks can
+        # never disagree -- the full rebuild previously lacked the copa-bhrf belt.
+        if is_static_excluded(path):
             continue
         found.append(path)
     return found

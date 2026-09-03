@@ -365,33 +365,48 @@ def _mirror_key(dest: Path) -> str:
 
 
 def _allow_files_hit(key: str, cfg: Config) -> bool:
-    """A D-194 opt-in matches the full mirror key OR its basename. Basename is a
-    convenience; the quarantine INDEX shows the full key so Harrison can copy an
-    unambiguous one when a basename would opt in siblings too."""
-    low = key.lower()
-    return low in cfg.allow_files or low.rsplit("/", 1)[-1] in cfg.allow_files
+    """A D-194 opt-in matches the FULL mirror key ONLY (never the bare basename).
+
+    D-051 (2026-09-03, PHI lens finding 5): basenames collide massively (every
+    skill body is ``SKILL.md``; ``MEMORY.md``/``project_*.md`` repeat across every
+    repo and space), so a basename opt-in would silently un-gate every same-named
+    sibling -- releasing screened content for all of them. The quarantine INDEX
+    shows the full key, so Harrison copies an unambiguous one."""
+    return key.lower() in cfg.allow_files
 
 
 def _add_zone_k_source(plan: Plan, cfg: Config, *, dest: Path, source: Path,
-                       text: str, cls: str) -> None:
-    """Screen + size-gate a ZONE-K source file, then plan the write (or quarantine)."""
+                       text: str, cls: str) -> bool:
+    """Screen + size-gate a ZONE-K source file, then plan the write (or quarantine).
+
+    Returns True iff the body was actually planned for mirroring (so a caller's
+    INDEX row is only emitted for content that reached ZONE-K -- D-051 PHI finding 2).
+
+    The screen runs over the CONTENT *and* the derived identifiers that ride into
+    ZONE-K with it -- the mirror key (dest path) and the source path label the
+    provenance header embeds (D-051 PHI finding 1: a LEX/client token in a repo
+    label or filename must not reach the KB-ingested zone just because the body
+    is clean)."""
     key = _mirror_key(dest)
+    src_label = _rel_source(source)
     if len(text.encode("utf-8", "replace")) > cfg.max_file_bytes:
         plan.warns.append(f"[{cls}] {key}: over {cfg.max_file_bytes}B cap -- skipped (never truncated)")
         _record(plan, cls, "skipped_oversize")
-        return
-    reason = screen_reason(text, cfg)
+        return False
+    # Screen the content AND everything derived that lands in ZONE-K with it.
+    reason = screen_reason("\n".join([text, key, src_label]), cfg)
     if reason and not _allow_files_hit(key, cfg):
         plan.quarantined.append((key, f"{cls}: {reason}"))
         _record(plan, cls, "quarantined")
-        return
+        return False
     if reason:  # allow_files opt-in overrode the screen
         _record(plan, cls, "allowlisted_override")
     sha = _sha_text(text)
     plan.writes.append(Planned(dest=dest, zone="K",
-                               text=_provenance(_rel_source(source), sha) + text,
-                               source=_rel_source(source), sha256=sha, cls=cls))
+                               text=_provenance(src_label, sha) + text,
+                               source=src_label, sha256=sha, cls=cls))
     _record(plan, cls, "mirrored")
+    return True
 
 
 def _add_zone_x_source(plan: Plan, cfg: Config, *, dest: Path, source: Path,
@@ -432,11 +447,12 @@ def plan_skills(plan: Plan, cfg: Config) -> None:
             st = f.stat()
         except OSError:
             continue
-        _add_zone_k_source(plan, cfg, dest=_zk("skills", f"{skill}.SKILL.md"),
-                           source=f, text=text, cls="skills")
-        index_rows.append((skill, desc, st.st_size,
-                           datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d"),
-                           _sha_text(text)[:12]))
+        mirrored = _add_zone_k_source(plan, cfg, dest=_zk("skills", f"{skill}.SKILL.md"),
+                                      source=f, text=text, cls="skills")
+        if mirrored:  # D-051 PHI finding 2: no INDEX row for a quarantined body
+            index_rows.append((skill, desc, st.st_size,
+                               datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d"),
+                               _sha_text(text)[:12]))
     if index_rows:
         lines = ["# Skills INDEX (HJR-custom Cowork skills)", "",
                  "| skill | description | bytes | mtime | sha256 |",
@@ -473,21 +489,31 @@ def plan_cowork_tasks(plan: Plan, cfg: Config) -> None:
         _add_zone_x_source(plan, cfg,
                            dest=_zx("cowork-scheduled-tasks", f"cora-mirror-{d.name}.md"),
                            source=f, text=text, cls="cowork_tasks")
-        # ZONE-K INDEX row: manifest only. Redact the description if it trips the
-        # screen (a task name is structural org knowledge; a description may carry
-        # a LEX/PHI detail). D-145: nothing screened reaches ZONE-K un-redacted.
-        row_desc = desc
-        if screen_reason(f"{name} {desc}", cfg) and not _allow_files_hit(d.name, cfg):
+        # ZONE-K INDEX row: manifest only, screened. Opt-in for a task is by its
+        # id (there is no per-task ZONE-K file to key a mirror-key on).
+        opted = d.name.lower() in cfg.allow_files
+        # D-051 PHI finding 3: the redaction must cover the task NAME + entity, not
+        # only the description -- the trip-test already includes the name, so a LEX
+        # task name (cowork-cora-lex-lbhs-*) would otherwise ride into ZONE-K raw.
+        # If the NAME itself trips, the whole row is withheld; if only the
+        # name+desc trips (name clean), just the description is withheld.
+        name_reason = screen_reason(name, cfg)
+        pair_reason = screen_reason(f"{name} {desc}", cfg)
+        if name_reason and not opted:
+            row_name, row_ent, row_desc = "[task withheld -- LEX/PHI screen]", "--", "[withheld]"
+            _record(plan, "cowork_tasks", "row_redacted")
+        elif pair_reason and not opted:
+            row_name, row_ent = name, _entity_prefix(d.name)
             row_desc = "[details withheld -- see ZONE-X body]"
+            _record(plan, "cowork_tasks", "desc_redacted")
+        else:
+            row_name, row_ent, row_desc = name, _entity_prefix(d.name), desc
         sched = _schedule_hint(name, desc)
         index_rows.append((
-            name, sched or "unspecified", model,
-            _entity_prefix(d.name),
+            row_name, sched or "unspecified", model, row_ent,
             datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d"),
-            _sha_text(text)[:12],
+            _sha_text(text)[:12], row_desc,
         ))
-        # stash redacted desc alongside for the INDEX render
-        index_rows[-1] = index_rows[-1] + (row_desc,)  # type: ignore[assignment]
     if index_rows:
         lines = ["# Cowork scheduled-task INDEX (manifest only -- bodies live in ZONE-X)",
                  "",
@@ -588,19 +614,42 @@ def _manifest_dir() -> Path:
     return _zone_x_root() / "_manifests"
 
 
+# The manifest carries the cora-mirror- prefix (ZONE-X) so, like every other
+# ZONE-X file, its title trips the drive_sweep belt even before the folder-id is
+# pinned. (It is JSON, which drive_sweep skips by MIME today -- belt + suspenders.)
+_MANIFEST_LATEST = "cora-mirror-manifest-latest.json"
+
+
 def _load_prev_manifest() -> dict | None:
-    latest = _zone_x_root() / "manifest-latest.json"
+    latest = _zone_x_root() / _MANIFEST_LATEST
     try:
         return json.loads(latest.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         return None
 
 
+def _prev_present(prev: dict | None) -> tuple[set[str], dict[str, str]]:
+    """From a previous manifest, the set of dests that are actually ON DISK
+    (written or skipped-unchanged, i.e. present==True) and their source shas. A
+    write that failed mid-apply (present==False) is excluded so it is not mistaken
+    for live state by the removal-diff or the skip-unchanged check."""
+    dests: set[str] = set()
+    shas: dict[str, str] = {}
+    for w in (prev or {}).get("writes", []):
+        if not w.get("present", True):
+            continue
+        d = w.get("dest", "")
+        dests.add(d)
+        if w.get("sha256"):
+            shas[d] = w["sha256"]
+    return dests, shas
+
+
 def _write_manifest(run_id: str, payload: dict) -> Path:
     mdir = _manifest_dir()
-    path = mdir / f"{run_id}.json"
+    path = mdir / f"cora-mirror-{run_id}.json"
     _write(path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
-    _write(_zone_x_root() / "manifest-latest.json",
+    _write(_zone_x_root() / _MANIFEST_LATEST,
            json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
     return path
 
@@ -613,30 +662,67 @@ _SUPERSEDE_STUB = (
     "purges the old chunks.\n"
 )
 
+_SUPERSEDE_MARKER = "KB-STATUS: SUPERSEDED"
+
+
+def _under_a_root(dest: Path) -> bool:
+    """Lexical containment (no ``.resolve()`` -- that touches the G: mount, which
+    drive_io exists to keep off hot paths). Dests are built from _zk()/_zx()
+    joinpath of separator-free names, so there is no ``..`` to collapse."""
+    return _is_relative_to(dest, _zone_k_root()) or _is_relative_to(dest, _zone_x_root())
+
+
+# The SOURCE classes whose disappearance is a real removal. Generated VIEWS
+# (parity/status/quarantine/ladder/removal-stub/manifest) are regenerated every
+# run and must NEVER be removal-detected -- they are not sources.
+SOURCE_CLASSES: frozenset[str] = frozenset(CLASSES)
+
 
 def _handle_removals(plan: Plan, prev: dict | None, run_id: str,
-                     removed_date: str) -> list[dict]:
-    """Compare the current plan's dest set against the previous manifest. A
-    ZONE-K dest gone from the plan -> overwrite in place with a SUPERSEDED stub
-    (stable path, D-087). A ZONE-X dest gone -> move to ``_removed/<date>/``."""
+                     removed_date: str, scoped_classes: frozenset[str] | set[str]) -> list[dict]:
+    """Compare the current plan's dest set against the previous manifest's PRESENT
+    SOURCE dests. A ZONE-K dest gone from the plan -> overwrite in place with a
+    SUPERSEDED stub (stable path, D-087) UNLESS it is already a stub (idempotent --
+    D-051 write finding 4, no daily re-stub churn). A ZONE-X dest gone -> move to
+    ``_removed/<date>/``.
+
+    Only prev SOURCE entries whose cls is in ``scoped_classes`` are considered, so
+    (a) a regenerated generated VIEW is never mistaken for a removed source, and
+    (b) a ``--only <class>`` partial run does not falsely "remove" every OTHER
+    class's mirror (D-051 defect found in remediation)."""
     events: list[dict] = []
     if not prev:
         return events
-    current = {str(w.dest): w.zone for w in plan.writes}
-    for entry in prev.get("writes", []):
-        dest = entry.get("dest", "")
-        zone = entry.get("zone", "")
+    current = {str(w.dest) for w in plan.writes}
+    prev_zone: dict[str, str] = {}
+    prev_present: set[str] = set()
+    for w in prev.get("writes", []):
+        if not w.get("present", True):
+            continue
+        if w.get("cls") not in scoped_classes:
+            continue  # a generated view, or a class not processed this run
+        d = w.get("dest", "")
+        prev_present.add(d)
+        prev_zone[d] = w.get("zone", "")
+    for dest in sorted(prev_present):
         if dest in current:
             continue
         p = Path(dest)
-        if not _is_relative_to(p.resolve() if p.exists() else p, _zone_k_root().resolve()) and \
-           not _is_relative_to(p.resolve() if p.exists() else p, _zone_x_root().resolve()):
+        if not _under_a_root(p):
             continue
+        zone = prev_zone.get(dest, "")
         if zone == "K":
+            # Already a stub? leave it -- it settles here and kb_hygiene takes it.
+            try:
+                existing = drive_io.read_text(dest, timeout=5.0, retry_seconds=0.0)
+            except Exception:  # noqa: BLE001
+                existing = ""
+            if _SUPERSEDE_MARKER in existing:
+                continue
             stub = _SUPERSEDE_STUB.format(date=removed_date)
             plan.writes.append(Planned(dest=p, zone="K", text=stub, cls="removal"))
             events.append({"dest": dest, "action": "superseded-stub"})
-        elif zone == "X" and p.exists():
+        elif zone == "X" and drive_io.exists(dest):
             rel = _safe_rel(p, _zone_x_root())
             events.append({"dest": dest, "action": "removed-move",
                            "moved_to": str(_zx("_removed", removed_date, rel))})
@@ -650,7 +736,16 @@ def _safe_rel(p: Path, root: Path) -> str:
         return p.name
 
 
-def apply_plan(plan: Plan, *, run_id: str, removals: list[dict]) -> None:
+def apply_plan(plan: Plan, *, run_id: str, removals: list[dict],
+               prev_dests: set[str], prev_sha: dict[str, str],
+               applied: list[dict]) -> None:
+    """Apply the plan. Appends a per-write outcome dict to ``applied`` AS IT GOES,
+    so a mid-apply exception still leaves an accurate record for the manifest
+    (D-051 write finding 3: no overclaiming). Skips a source-mirror write whose
+    source sha matches the previous run AND whose file still exists -- unchanged
+    files keep their bytes (and their MIRROR-AT), so static_md does not re-embed
+    the whole mirror every run (D-051 write finding 1). Generated views (empty
+    sha) always write."""
     # Execute ZONE-X removal-moves first (read old, write to _removed, delete old).
     for ev in removals:
         if ev.get("action") == "removed-move":
@@ -665,18 +760,34 @@ def apply_plan(plan: Plan, *, run_id: str, removals: list[dict]) -> None:
             except OSError:
                 pass
     for w in plan.writes:
+        dest_s = str(w.dest)
+        created = dest_s not in prev_dests
+        unchanged = bool(w.sha256) and prev_sha.get(dest_s) == w.sha256 and drive_io.exists(dest_s)
+        entry = {"dest": dest_s, "zone": w.zone, "source": w.source,
+                 "sha256": w.sha256, "cls": w.cls, "created": created}
+        if unchanged:
+            entry.update({"written": False, "present": True, "skipped": "unchanged"})
+            applied.append(entry)
+            continue
         _write(w.dest, w.text)
+        entry.update({"written": True, "present": True})
+        applied.append(entry)
 
 
-def build_manifest(plan: Plan, run_id: str, removals: list[dict]) -> dict:
+def build_manifest(plan: Plan, run_id: str, removals: list[dict],
+                   *, applied: list[dict] | None = None) -> dict:
     utc, az = _now_stamps()
+    if applied is not None:
+        writes = applied
+    else:  # intent manifest (written before apply) -- every planned dest, unresolved
+        writes = [{"dest": str(w.dest), "zone": w.zone, "source": w.source,
+                   "sha256": w.sha256, "cls": w.cls, "present": True} for w in plan.writes]
     return {
         "run_id": run_id,
         "at_utc": utc, "at_az": az,
         "zone_k_root": str(_zone_k_root()),
         "zone_x_root": str(_zone_x_root()),
-        "writes": [{"dest": str(w.dest), "zone": w.zone, "source": w.source,
-                    "sha256": w.sha256, "cls": w.cls} for w in plan.writes],
+        "writes": writes,
         "removals": removals,
         "task_models": plan.task_models,
         "quarantined": [{"name": n, "reason": r} for n, r in plan.quarantined],
@@ -686,34 +797,39 @@ def build_manifest(plan: Plan, run_id: str, removals: list[dict]) -> dict:
 
 
 def revert(manifest_path: Path) -> int:
-    """Undo a run: delete every file the manifest created. Best-effort; a file
-    already gone is fine. Does NOT resurrect removal-moved ZONE-X files (their
-    bodies live under ``_removed/`` -- restore by hand if needed)."""
+    """Undo a run: delete ONLY the files this run CREATED (dest not present in the
+    prior run). A file the run merely OVERWROTE (present before) is left in place --
+    deleting it would destroy content this run did not author and cannot restore
+    (D-051 write finding 2). The mirror is deterministically regenerable, so a
+    full content rollback is a fresh ``--apply``, not a delete. Removal-moved
+    ZONE-X bodies live under ``_removed/`` -- restore by hand if needed."""
     try:
         data = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         log.error("cannot read manifest %s: %s", manifest_path, exc)
         return 1
-    n = 0
+    n = skipped = 0
     for w in data.get("writes", []):
         dest = Path(w.get("dest", ""))
-        try:
-            _assert_under_roots(dest)
-        except RuntimeError:
+        if not w.get("created"):
+            skipped += 1
+            continue  # overwrote a pre-existing file -- not ours to delete
+        if not _under_a_root(dest):
             log.warning("skip revert of out-of-root path %s", dest)
             continue
         try:
-            if dest.exists():
+            if drive_io.exists(str(dest)):
                 dest.unlink()
                 n += 1
         except OSError as exc:
             log.warning("could not delete %s: %s", dest, exc)
-    log.info("revert: deleted %d file(s) from %s", n, manifest_path.name)
+    log.info("revert: deleted %d created file(s), left %d pre-existing, from %s",
+             n, skipped, manifest_path.name)
     return 0
 
 
 # ── Parity report ─────────────────────────────────────────────────────────────
-def render_parity(plan: Plan, prev: dict | None, removals: list[dict]) -> str:
+def render_parity(plan: Plan, prev: dict | None, removals: list[dict], cfg: Config) -> str:
     utc, az = _now_stamps()
     lines = [f"# Claude-workspace mirror -- PARITY REPORT", "",
              f"_Generated {utc} / {az} by scripts/mirror_claude_workspace.py._", ""]
@@ -745,24 +861,38 @@ def render_parity(plan: Plan, prev: dict | None, removals: list[dict]) -> str:
     up = delta.get("unpinned", [])
     lines.append(f"- **unpinned** ({len(up)}): " + (", ".join(up[:20]) if up else "none"))
     lines.append("")
-    lines.append("## Quarantined (ZONE-K screen tripped; opt in by name via allow_files)")
+    # D-051 PHI finding 4: this report is ZONE-K (KB-ingested). A quarantined
+    # FILENAME can itself carry a client/LEX token, so the ZONE-K report shows only
+    # COUNTS by reason -- the full names live in ZONE-X _quarantine/cora-mirror-INDEX.md
+    # (never ingested).
+    lines.append("## Quarantined (ZONE-K screen tripped) -- counts only")
     if plan.quarantined:
-        for name, reason in sorted(plan.quarantined):
-            lines.append(f"- `{name}` -- {reason}")
+        by_reason: dict[str, int] = {}
+        for _name, reason in plan.quarantined:
+            head = reason.split("(", 1)[0].strip()
+            by_reason[head] = by_reason.get(head, 0) + 1
+        lines.append(f"- total: {len(plan.quarantined)}")
+        for r, c in sorted(by_reason.items()):
+            lines.append(f"  - {r}: {c}")
+        lines.append("- (full list with filenames: ZONE-X `_mirror/_quarantine/cora-mirror-INDEX.md`; "
+                     "opt one in by its full key via `allow_files:`.)")
     else:
         lines.append("- none")
     lines.append("")
     lines.append("## Removals this run")
     if removals:
         for ev in removals:
-            lines.append(f"- {ev.get('action')}: `{ev.get('dest')}`")
+            lines.append(f"- {ev.get('action')}: `{_md_cell(ev.get('dest', ''))}`")
     else:
         lines.append("- none")
     lines.append("")
+    # WARN lines can interpolate a candidate FILENAME (the oversize warn) -- screen
+    # each before it enters this ZONE-K report.
     lines.append("## WARNs")
     if plan.warns:
         for w in plan.warns:
-            lines.append(f"- {w}")
+            safe = w if not screen_reason(w, cfg) else "[warning withheld -- screened]"
+            lines.append(f"- {safe}")
     else:
         lines.append("- none")
     lines.append("")
@@ -774,7 +904,7 @@ _ALL_COUNT_KEYS = ("mirrored", "quarantined", "denied_stock", "unknown_not_allow
 
 
 # ── Structured status (for the health lane, S5) ──────────────────────────────
-def status_payload(plan: "Plan", prev: dict | None, removals: list) -> dict:
+def status_payload(plan: "Plan", prev: dict | None, removals: list, cfg: Config) -> dict:
     """A machine-readable summary the health checks read instead of re-parsing the
     markdown report. Written to ZONE-K as ``mirror-status.json`` every run."""
     utc, az = _now_stamps()
@@ -785,7 +915,8 @@ def status_payload(plan: "Plan", prev: dict | None, removals: list) -> dict:
         "quarantined_count": len(plan.quarantined),
         "unknown_skills": [w.split("'")[1] for w in plan.warns
                            if "not in allowlist" in w and "'" in w],
-        "warns": plan.warns,
+        "warns": [w if not screen_reason(w, cfg) else "[warning withheld -- screened]"
+                  for w in plan.warns],
         "unpinned": sorted(plan.unpinned_tasks),
         "added": delta.get("added", []),
         "removed": delta.get("removed", []),
@@ -881,14 +1012,14 @@ def _quarantine_index_write(plan: Plan) -> None:
     lines = ["# Quarantined ZONE-K candidates (names + reason only; NO content)",
              "",
              "These tripped the deterministic PHI / LEX / personal screen and were "
-             "NOT mirrored into the KB-ingested ZONE-K. Harrison opts one in by exact "
-             "basename via `allow_files:` in data/maps/claude-workspace-mirror.yaml "
-             "(D-194).", "",
-             "| file | reason |", "|---|---|"]
+             "NOT mirrored into the KB-ingested ZONE-K. Harrison opts one in by its "
+             "EXACT FULL KEY (the `file` column below, not the bare basename) via "
+             "`allow_files:` in data/maps/claude-workspace-mirror.yaml (D-194).", "",
+             "| file (full mirror key) | reason |", "|---|---|"]
     for name, reason in sorted(plan.quarantined):
         lines.append(f"| {_md_cell(name)} | {_md_cell(reason)} |")
-    plan.writes.append(Planned(dest=_zx("_quarantine", "INDEX.md"), zone="X",
-                               text=_generated_header("_mirror/_quarantine/INDEX.md")
+    plan.writes.append(Planned(dest=_zx("_quarantine", "cora-mirror-INDEX.md"), zone="X",
+                               text=_generated_header("_mirror/_quarantine/cora-mirror-INDEX.md")
                                     + "\n".join(lines) + "\n",
                                cls="quarantine"))
 
@@ -932,19 +1063,27 @@ def main(argv: list[str] | None = None) -> int:
     run_id = datetime.now(timezone.utc).strftime("mirror-%Y%m%dT%H%M%SZ")
     removed_date = datetime.now().strftime("%Y-%m-%d")
     prev = _load_prev_manifest()
-    removals = _handle_removals(plan, prev, run_id, removed_date)
+    # Removal detection is scoped to the SOURCE classes actually processed this run
+    # (a --only run must not "remove" every other class's mirror).
+    scoped = frozenset({args.only}) if args.only else SOURCE_CLASSES
+    removals = _handle_removals(plan, prev, run_id, removed_date, scoped)
 
     # Generated ZONE-X views (quarantine index + ladder row) + ZONE-K parity report.
+    # ZONE-X files carry the cora-mirror- prefix so the drive_sweep TITLE belt
+    # (is_cora_internal_title) catches them even before the _mirror folder-id is
+    # pinned -- LADDER-ROW.md / _quarantine/INDEX.md had no cora/mirror token and
+    # leaked via drive_sweep in that window (D-051 exclusion finding 1).
     _quarantine_index_write(plan)
-    plan.writes.append(Planned(dest=_zx("LADDER-ROW.md"), zone="X", text=_LADDER_ROW, cls="ladder"))
-    parity_text = render_parity(plan, prev, removals)
+    plan.writes.append(Planned(dest=_zx("cora-mirror-LADDER-ROW.md"), zone="X",
+                               text=_LADDER_ROW, cls="ladder"))
+    parity_text = render_parity(plan, prev, removals, cfg)
     plan.writes.append(Planned(dest=_zk("PARITY-REPORT.md"), zone="K",
                                text=_generated_header("PARITY-REPORT.md") + parity_text,
                                cls="parity"))
     # Structured status for the health lane (S5) -- both health tools read this
     # instead of re-parsing the markdown.
     plan.writes.append(Planned(dest=status_json_path(), zone="K",
-                               text=json.dumps(status_payload(plan, prev, removals),
+                               text=json.dumps(status_payload(plan, prev, removals, cfg),
                                                indent=2, ensure_ascii=False) + "\n",
                                cls="status"))
 
@@ -957,14 +1096,21 @@ def main(argv: list[str] | None = None) -> int:
         log.info("DRY-RUN -- nothing written. Re-run with --apply to write.")
         return 0
 
-    manifest = build_manifest(plan, run_id, removals)
-    # Manifest-first (D-086): write it BEFORE any mutation, and again in finally.
-    manifest_path = _write_manifest(run_id, manifest)
+    # Manifest-first (D-086): write an INTENT manifest BEFORE any mutation, then
+    # apply, then re-write the manifest from what ACTUALLY landed (D-051 write
+    # finding 3: no overclaiming -- a mid-apply G: failure leaves an accurate
+    # record for the next run's removal-diff + --revert).
+    prev_dests, prev_sha = _prev_present(prev)
+    applied: list[dict] = []
+    manifest_path = _write_manifest(run_id, build_manifest(plan, run_id, removals))
     try:
-        apply_plan(plan, run_id=run_id, removals=removals)
+        apply_plan(plan, run_id=run_id, removals=removals,
+                   prev_dests=prev_dests, prev_sha=prev_sha, applied=applied)
     finally:
-        _write_manifest(run_id, manifest)
-    log.info("APPLIED -- manifest at %s", manifest_path)
+        _write_manifest(run_id, build_manifest(plan, run_id, removals, applied=applied))
+    log.info("APPLIED -- manifest at %s (%d written, %d unchanged)",
+             manifest_path, sum(1 for a in applied if a.get("written")),
+             sum(1 for a in applied if a.get("skipped") == "unchanged"))
     return 0
 
 
