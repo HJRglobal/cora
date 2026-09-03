@@ -117,7 +117,8 @@ def test_assert_under_roots_raises_outside(roots):
 
 
 # ── zone routing ──────────────────────────────────────────────────────────────
-def test_zone_routing_cora_slugs_to_zone_x(roots):
+def test_zone_routing_cora_slugs_to_zone_x(roots, monkeypatch):
+    monkeypatch.setattr(m, "CORA_REPO_ROOT", Path(r"C:\Users\Harri\code\cora"))
     _codemem(roots["code_projects"], "C--Users-Harri-code-cora", "MEMORY.md", "cora mem")
     _codemem(roots["code_projects"], "C--Users-Harri-code-cora-revops", "MEMORY.md", "revops mem")
     _codemem(roots["code_projects"], "C--Users-Harri-code-rogers-ranch-web", "MEMORY.md", "web repo mem")
@@ -468,3 +469,273 @@ def test_only_run_does_not_remove_other_classes(roots):
     _run(["--apply", "--only", "skills"])
     assert zx_body.exists(), "a --only skills run wrongly removed the task mirror"
     assert not list((roots["zx"] / "_removed").rglob("*")) if (roots["zx"] / "_removed").exists() else True
+
+
+# ── worktree handling (2026-09-03, cowork-side findings §2) ───────────────────
+def test_path_to_slug_matches_claude_code_scheme():
+    assert m._path_to_slug(r"C:\Users\Harri\code\cora") == "C--Users-Harri-code-cora"
+    assert m._path_to_slug(r"C:\Users\Harri\code\cora\.claude\worktrees\lexicon-flywheel") == \
+        "C--Users-Harri-code-cora--claude-worktrees-lexicon-flywheel"
+    assert m._path_to_slug(r"G:\My Drive\HJR-Founder-OS") == "G--My-Drive-HJR-Founder-OS"
+
+
+def test_cora_codebase_slugs_route_to_zone_x_by_path_prefix(monkeypatch, tmp_path):
+    monkeypatch.setattr(m, "CORA_REPO_ROOT", Path(r"D:\work\code\cora"))
+    assert m.slug_repo_zone("D--work-code-cora") == ("cora", "X")
+    assert m.slug_repo_zone("D--work-code-cora-revops") == ("cora-revops", "X")            # sibling worktree
+    assert m.slug_repo_zone("D--work-code-cora--claude-worktrees-lexicon-flywheel") == \
+        ("cora-worktree-lexicon-flywheel", "X")                                             # .claude/worktrees
+    assert m.slug_repo_zone("d--WORK-code-cora") == ("cora", "X")                           # case-insensitive
+    # a lookalike sibling repo is NOT the cora codebase (prefix + "-" boundary)
+    assert m.slug_repo_zone("D--work-code-coral-reef") == ("coral-reef", "K")
+    assert m.slug_repo_zone("D--work-code-rogers-ranch-web") == ("rogers-ranch-web", "K")
+    # belt: a cora-ish slug OUTSIDE the checkout path still goes to ZONE-X, under its own label
+    label, zone = m.slug_repo_zone("G--My-Drive-HJR-Founder-OS--shared-projects-cora")
+    assert zone == "X" and label != "cora"
+    lab, zone = m.slug_repo_zone("C--elsewhere-cora-revops")
+    assert zone == "X" and lab == "c--elsewhere-cora-revops"        # belt: full slug, never the sibling's label
+
+
+def test_prefix_resolves_to_the_base_checkout_when_run_from_a_worktree(monkeypatch, tmp_path):
+    base = tmp_path / "cora"
+    (base / ".git" / "worktrees" / "wt1").mkdir(parents=True)
+    wt = tmp_path / "cora-wt1"
+    wt.mkdir()
+    (wt / ".git").write_text(f"gitdir: {base / '.git' / 'worktrees' / 'wt1'}\n", encoding="utf-8")
+    monkeypatch.setattr(m, "CORA_REPO_ROOT", wt)
+    assert m._cora_base_repo_root() == base
+    assert m._cora_slug_prefix() == m._path_to_slug(base).lower()
+
+
+def _fake_repo(tmp_path, *, registered: dict):
+    """A fake cora checkout with .git/worktrees/<name>/gitdir registrations."""
+    base = tmp_path / "code" / "cora"
+    (base / ".git").mkdir(parents=True)
+    for name, path in registered.items():
+        d = base / ".git" / "worktrees" / name
+        d.mkdir(parents=True)
+        (d / "gitdir").write_text(str(path / ".git") + "\n", encoding="utf-8")
+    return base
+
+
+def test_prunable_worktree_slug_is_reported_not_found_not_thrown_not_skipped(roots, monkeypatch, tmp_path):
+    gone = tmp_path / "code" / "cora-revops"                       # registered, NOT on disk = prunable
+    base = _fake_repo(tmp_path, registered={"cora-revops": gone})
+    monkeypatch.setattr(m, "CORA_REPO_ROOT", base)
+    slug_gone = m._path_to_slug(gone)
+    slug_absent = m._path_to_slug(base) + "--claude-worktrees-web-gate-notes-fix"   # never registered, not on disk
+    _codemem(roots["code_projects"], slug_gone, "MEMORY.md", "revops memory survives the worktree")
+    _codemem(roots["code_projects"], slug_absent, "project_x.md", "worktree memory")
+    _codemem(roots["code_projects"], m._path_to_slug(base), "MEMORY.md", "base memory")
+    cfg = m.load_config()
+    plan = m.build_plan(cfg, "code_memory")                         # must not raise
+    nf = [w for w in plan.warns if "worktree NOT FOUND" in w]
+    assert len(nf) == 2
+    assert any(slug_gone in w and "cora-revops" in w for w in nf)
+    assert any(slug_absent in w and "web-gate-notes-fix" in w for w in nf)
+    assert not any(f"'{m._path_to_slug(base)}'" in w for w in nf)  # the base checkout itself is found
+    assert plan.counts["code_memory"]["worktree_not_found"] == 2
+    # the memory files behind a gone worktree are STILL mirrored (ZONE-X), never skipped
+    dests = {w.dest.as_posix() for w in plan.writes}
+    assert any(d.endswith("code-memory/cora-revops/cora-mirror-MEMORY.md") for d in dests)
+    assert any(d.endswith("code-memory/cora-worktree-web-gate-notes-fix/cora-mirror-project_x.md") for d in dests)
+    assert any(d.endswith("code-memory/cora/cora-mirror-MEMORY.md") for d in dests)
+    assert all(w.zone == "X" for w in plan.writes if w.cls == "code_memory")
+
+
+def test_registered_worktree_on_disk_is_ok_and_unregistered_dir_is_flagged(roots, monkeypatch, tmp_path):
+    present = tmp_path / "code" / "cora" / ".claude" / "worktrees" / "lexicon-flywheel"
+    present.mkdir(parents=True)
+    base = _fake_repo(tmp_path, registered={"lexicon-flywheel": present})
+    (present / ".git").write_text(f"gitdir: {base / '.git' / 'worktrees' / 'lexicon-flywheel'}\n", encoding="utf-8")
+    orphan = base / ".claude" / "worktrees" / "dw-rebase"           # on disk, registration pruned
+    orphan.mkdir(parents=True)
+    monkeypatch.setattr(m, "CORA_REPO_ROOT", base)
+    assert m._worktree_status(m._path_to_slug(present)) == ("ok", present)
+    status, path = m._worktree_status(m._path_to_slug(orphan))
+    assert status == "unregistered" and path == orphan
+    _codemem(roots["code_projects"], m._path_to_slug(present), "MEMORY.md", "ok")
+    _codemem(roots["code_projects"], m._path_to_slug(orphan), "MEMORY.md", "orphan")
+    plan = m.build_plan(m.load_config(), "code_memory")
+    assert not any("NOT FOUND" in w for w in plan.warns)
+    assert sum("not registered" in w for w in plan.warns) == 1
+
+
+def test_two_cora_slugs_with_memory_md_do_not_collide_on_dest(roots, monkeypatch, tmp_path):
+    base = _fake_repo(tmp_path, registered={})
+    monkeypatch.setattr(m, "CORA_REPO_ROOT", base)
+    _codemem(roots["code_projects"], m._path_to_slug(base), "MEMORY.md", "checkout memory")
+    _codemem(roots["code_projects"], "G--My-Drive-HJR-Founder-OS--shared-projects-cora", "MEMORY.md", "drive-cwd memory")
+    plan = m.build_plan(m.load_config(), "code_memory")
+    mem = [w for w in plan.writes if w.dest.name == "cora-mirror-MEMORY.md"]
+    assert len(mem) == 2 and len({w.dest for w in mem}) == 2       # two files, two dests
+    assert not any("dest collision" in w for w in plan.warns)
+    assert all(w.zone == "X" for w in mem)
+
+
+def test_dest_collision_guard_keeps_both_and_uniquifies_the_second(roots):
+    dest = roots["zx"] / "code-memory" / "cora" / "cora-mirror-MEMORY.md"
+    plan = m.Plan()
+    a = m.Planned(dest=dest, zone="X", text="a", source="~/.claude/projects/A/memory/MEMORY.md", cls="code_memory")
+    b = m.Planned(dest=dest, zone="X", text="b", source="~/.claude/projects/B/memory/MEMORY.md", cls="code_memory")
+    plan.writes = [a, b]
+    m._uniquify_dest_collisions(plan)
+    assert plan.writes == [a, b] and a.dest == dest and b.dest != dest    # nothing dropped
+    assert b.dest.parent == dest.parent and b.dest.suffix == ".md"
+    assert b.dest.name.startswith("cora-mirror-MEMORY-")                   # belt prefix kept
+    assert any("dest collision" in w and "projects/B" in w for w in plan.warns)
+    assert plan.counts["code_memory"]["dest_uniquified"] == 1
+    # deterministic run to run
+    plan2 = m.Plan()
+    a2 = m.Planned(dest=dest, zone="X", text="a", source=a.source, cls="code_memory")
+    b2 = m.Planned(dest=dest, zone="X", text="b", source=b.source, cls="code_memory")
+    plan2.writes = [a2, b2]
+    m._uniquify_dest_collisions(plan2)
+    assert b2.dest == b.dest
+    # a case-variant dest is the same file on Windows and is treated as a collision too
+    plan3 = m.Plan()
+    c1 = m.Planned(dest=dest, zone="X", text="a", source="s1", cls="code_memory")
+    c2 = m.Planned(dest=dest.with_name("CORA-MIRROR-memory.md"), zone="X", text="b", source="s2", cls="code_memory")
+    plan3.writes = [c1, c2]
+    m._uniquify_dest_collisions(plan3)
+    if os.path.normcase("A") == os.path.normcase("a"):
+        assert c2.dest.name != "CORA-MIRROR-memory.md"
+    else:
+        assert c2.dest.name == "CORA-MIRROR-memory.md"
+
+
+def test_dest_collision_guard_is_wired_through_build_plan(roots, monkeypatch, tmp_path):
+    # MED-3 (tests lens): prove the guard RUNS from build_plan, not just in isolation.
+    base = _fake_repo(tmp_path, registered={})
+    monkeypatch.setattr(m, "CORA_REPO_ROOT", base)
+    monkeypatch.setattr(m, "slug_repo_zone", lambda slug: ("same-label", "X"))
+    _codemem(roots["code_projects"], "A--one", "MEMORY.md", "one")
+    _codemem(roots["code_projects"], "B--two", "MEMORY.md", "two")
+    plan = m.build_plan(m.load_config(), "code_memory")
+    mem = [w for w in plan.writes if w.cls == "code_memory"]
+    assert len(mem) == 2 and len({os.path.normcase(str(w.dest)) for w in mem}) == 2
+    assert sum("dest collision" in w for w in plan.warns) == 1
+    assert plan.counts["code_memory"]["dest_uniquified"] == 1
+    assert all(w.dest.name.startswith("cora-mirror-") for w in mem)      # belt shape kept
+    assert plan.counts["code_memory"]["mirrored"] == 2                    # counts stay truthful
+
+
+def test_relative_gitdir_paths_resolve_against_the_dot_git_file(monkeypatch, tmp_path):
+    # git >= 2.48 worktree.useRelativePaths: both the worktree's .git file and the
+    # registration's gitdir may be RELATIVE. Neither may collapse the prefix or
+    # report a healthy worktree as unregistered.
+    base = tmp_path / "cora"
+    reg = base / ".git" / "worktrees" / "wt-rel"
+    reg.mkdir(parents=True)
+    wt = tmp_path / "cora-wt-rel"
+    wt.mkdir()
+    (wt / ".git").write_text("gitdir: ../cora/.git/worktrees/wt-rel\n", encoding="utf-8")
+    (reg / "gitdir").write_text("../../../../cora-wt-rel/.git\n", encoding="utf-8")
+    monkeypatch.setattr(m, "CORA_REPO_ROOT", wt)
+    assert m._cora_base_repo_root() == base.resolve()
+    assert m._cora_slug_prefix() == m._path_to_slug(base.resolve()).lower()
+    monkeypatch.setattr(m, "CORA_REPO_ROOT", base)
+    status, path = m._worktree_status(m._path_to_slug(wt.resolve()))
+    assert status == "ok" and path == wt.resolve()
+
+
+def test_subdirectory_session_slug_is_the_same_checkout_not_a_missing_worktree(roots, monkeypatch, tmp_path):
+    base = _fake_repo(tmp_path, registered={})
+    (base / "scripts").mkdir()
+    (base / "src" / "cora").mkdir(parents=True)
+    monkeypatch.setattr(m, "CORA_REPO_ROOT", base)
+    slug = m._path_to_slug(base / "scripts")
+    assert m._worktree_status(slug) == ("ok", base / "scripts")
+    assert m.slug_repo_zone(slug) == ("cora-scripts", "X")               # still ZONE-X, its own label
+    assert m._worktree_status(m._path_to_slug(base / "src" / "cora"))[0] == "ok"
+    _codemem(roots["code_projects"], slug, "MEMORY.md", "subdir session memory")
+    plan = m.build_plan(m.load_config(), "code_memory")
+    assert not any("NOT FOUND" in w for w in plan.warns)
+
+
+def test_prunable_means_the_gitfile_is_gone_and_locked_is_not_prunable(roots, monkeypatch, tmp_path):
+    kept_dir = tmp_path / "code" / "cora" / ".claude" / "worktrees" / "dir-kept-gitfile-gone"
+    kept_dir.mkdir(parents=True)                       # dir present, NO .git file -> git: prunable
+    locked_gone = tmp_path / "code" / "cora-locked"    # registered + locked marker, dir absent -> git: NOT prunable
+    base = _fake_repo(tmp_path, registered={"dir-kept": kept_dir, "cora-locked": locked_gone})
+    (base / ".git" / "worktrees" / "cora-locked" / "locked").write_text("", encoding="utf-8")
+    monkeypatch.setattr(m, "CORA_REPO_ROOT", base)
+    assert m._worktree_status(m._path_to_slug(kept_dir))[0] == "missing"
+    assert m._worktree_status(m._path_to_slug(locked_gone))[0] == "locked"
+    _codemem(roots["code_projects"], m._path_to_slug(kept_dir), "MEMORY.md", "a")
+    _codemem(roots["code_projects"], m._path_to_slug(locked_gone), "MEMORY.md", "b")
+    plan = m.build_plan(m.load_config(), "code_memory")
+    assert sum("worktree NOT FOUND" in w for w in plan.warns) == 1       # the prunable one
+    assert sum("LOCKED" in w for w in plan.warns) == 1                   # the locked one, not NOT FOUND
+    assert plan.counts["code_memory"]["worktree_not_found"] == 1
+    assert plan.counts["code_memory"]["worktree_locked"] == 1
+    assert len([w for w in plan.writes if w.cls == "code_memory"]) == 2  # both still mirrored
+
+
+def test_parity_table_renders_every_recorded_count_key():
+    import re as _re
+    src = Path(m.__file__).read_text(encoding="utf-8")
+    recorded = set(_re.findall(r'_record\(plan, [^,]+, "([a-z_]+)"\)', src))
+    assert recorded, "no _record() calls found -- regex drifted"
+    missing = recorded - set(m._ALL_COUNT_KEYS)
+    assert not missing, f"count keys recorded but not rendered in the parity table: {sorted(missing)}"
+
+
+def test_unreadable_memory_file_is_a_warn_not_a_silent_skip(roots, monkeypatch, tmp_path):
+    base = _fake_repo(tmp_path, registered={})
+    monkeypatch.setattr(m, "CORA_REPO_ROOT", base)
+    _codemem(roots["code_projects"], m._path_to_slug(base), "MEMORY.md", "ok")
+    real_read = Path.read_text
+
+    def boom(self, *a, **k):
+        if self.name == "MEMORY.md":
+            raise OSError("locked")
+        return real_read(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", boom)
+    plan = m.build_plan(m.load_config(), "code_memory")
+    assert any("could not read" in w for w in plan.warns)
+    assert plan.counts["code_memory"].get("unreadable") == 1
+
+
+def test_colliding_opted_in_zone_k_key_is_quarantined_not_released_under_a_derived_name(roots, monkeypatch, tmp_path):
+    # D-051 second pass LOW-3: allow_files is keyed on the dest; two sources sharing
+    # that dest were opted in as ONE reviewed key. The second must not reach the
+    # KB-ingested zone under a name nobody reviewed.
+    base = _fake_repo(tmp_path, registered={})
+    monkeypatch.setattr(m, "CORA_REPO_ROOT", base)
+    monkeypatch.setattr(m, "slug_repo_zone", lambda slug: ("foo", "K"))
+    _codemem(roots["code_projects"], "A--one", "MEMORY.md", "Lexington client billing note one")
+    _codemem(roots["code_projects"], "B--two", "MEMORY.md", "Lexington client billing note two")
+    cfg = m.load_config()
+    cfg.allow_files = {"code-memory/foo/memory.md"}                 # the reviewed key (lowercased)
+    plan = m.build_plan(cfg, "code_memory")
+    writes = [w for w in plan.writes if w.cls == "code_memory"]
+    assert len(writes) == 1 and writes[0].dest.name == "MEMORY.md" and writes[0].allow_override
+    assert any(k == "code-memory/foo/MEMORY.md" and "dest collision on an opted-in key" in r
+               for k, r in plan.quarantined)
+    assert sum("QUARANTINED" in w for w in plan.warns) == 1
+    assert plan.counts["code_memory"]["mirrored"] == 1
+    assert plan.counts["code_memory"]["quarantined"] == 1
+    assert "dest_uniquified" not in plan.counts["code_memory"]
+    # a CLEAN ZONE-K collision is still uniquified (both kept)
+    plan2 = m.Plan()
+    d = roots["zk"] / "code-memory" / "foo" / "MEMORY.md"
+    x = m.Planned(dest=d, zone="K", text="a", source="s1", cls="code_memory")
+    y = m.Planned(dest=d, zone="K", text="b", source="s2", cls="code_memory")
+    plan2.writes = [x, y]
+    m._uniquify_dest_collisions(plan2)
+    assert len(plan2.writes) == 2 and y.dest != d and not plan2.quarantined
+
+
+def test_sibling_checkout_wins_over_the_subdirectory_heuristic(monkeypatch, tmp_path):
+    # D-051 second pass LOW-4: a sibling checkout named like a subdir (cora-scripts)
+    # must not read "ok" just because <base>/scripts exists.
+    base = _fake_repo(tmp_path, registered={})
+    (base / "scripts").mkdir()
+    monkeypatch.setattr(m, "CORA_REPO_ROOT", base)
+    slug = m._path_to_slug(base / "scripts")                       # == slug of sibling <parent>/cora-scripts
+    assert m._worktree_status(slug) == ("ok", base / "scripts")     # no sibling -> the subdir session
+    sibling = base.parent / "cora-scripts"
+    sibling.mkdir()
+    assert m._worktree_status(slug) == ("unregistered", sibling)   # sibling exists -> it is the checkout

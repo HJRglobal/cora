@@ -796,6 +796,85 @@ class _FakeTreeService:
         return _Req()
 
 
+class _RecordingTreeService(_FakeTreeService):
+    """_FakeTreeService that records every parent id the BFS ever queried, so a
+    test can prove a pruned folder was never LISTED, not merely never completed."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.parents_queried: list[str] = []
+
+    def list(self, **kwargs):
+        import re
+        m = re.search(r"'([^']+)' in parents", kwargs.get("q", ""))
+        if m:
+            self.parents_queried.append(m.group(1))
+        return super().list(**kwargs)
+
+
+class TestPinnedParentPrunesSubtree:
+    """2026-09-03 (D-057 IS LEAKING): a folder id in skip_folder_ids prunes its WHOLE
+    subtree -- the BFS neither processes the pinned folder nor enqueues its
+    subfolders, so pinning the PARENT _shared/projects/cora covers today's
+    _mirror/ and any future _removed/ + _quarantine/ children without their ids
+    ever existing at pin time. Files placed in every pruned level prove no
+    file listing is ever issued for them.
+
+    This class proves the pruning MECHANISM with a synthetic id (the skip check is
+    pre-existing drive_sweep behaviour, pinned here because the door now leans on
+    it); the pin commit adds test_the_real_excluded_set_prunes_the_real_cora_workspace_id,
+    the same walk with the REAL KB_EXCLUDED_FOLDER_IDS and the real folder id."""
+
+    PIN, CHILD, GRAND, SIB = "pinned-parent", "pinned-child", "pinned-grandchild", "sibling"
+
+    def _tree(self):
+        f = lambda i: [{"id": i, "name": f"{i}.md", "mimeType": "text/markdown",  # noqa: E731
+                        "modifiedTime": "2026-09-01T00:00:00Z", "size": "999", "parents": []}]
+        return _RecordingTreeService(
+            subfolders={
+                "root": [{"id": self.PIN, "name": "cora"}, {"id": self.SIB, "name": "gmail-deep-dive"}],
+                self.PIN: [{"id": self.CHILD, "name": "_mirror"}],
+                self.CHILD: [{"id": self.GRAND, "name": "_quarantine"}],
+                self.GRAND: [], self.SIB: [],
+            },
+            files={self.PIN: f("file-in-parent"), self.CHILD: f("file-in-child"),
+                   self.GRAND: f("file-in-grandchild")},
+        )
+
+    def _walk(self, svc, skip):
+        kb = _FakeKB()
+        stats = {"files_enumerated": 0, "files_extracted": 0, "chunks_ingested": 0,
+                 "phi_skipped": 0, "noise_filtered": 0, "dedup_skipped": 0}
+        done = _ds._sweep_folder_tree(
+            service=svc, folder_id="root", entity="FNDR", sub_entity=None,
+            kb=kb, anthropic_client=None, cutoff_str="2020-01-01T00:00:00Z",
+            dry_run=False, is_lex=False, score_threshold=4,
+            seen_file_ids=set(), stats=stats, checkpoint_key="ck",
+            skip_folder_ids=skip,
+        )
+        return done, kb, stats
+
+    def test_pinned_parent_prunes_child_and_grandchild(self):
+        svc = self._tree()
+        done, kb, stats = self._walk(svc, frozenset({self.PIN}))
+        assert done is True
+        completed = set(kb.checkpoints["ck"]["completed_folder_ids"])
+        assert completed == {"root", self.SIB}
+        # Never LISTED, not just never completed: no file or subfolder query ever
+        # named the pinned parent, its child, or its grandchild.
+        assert not ({self.PIN, self.CHILD, self.GRAND} & set(svc.parents_queried))
+        assert stats["files_enumerated"] == 0            # the three planted files were never seen
+
+    def test_without_the_pin_the_same_tree_is_walked(self):
+        # Control: the pruning above is the pin's doing, not an artifact of the fixture.
+        svc = self._tree()
+        svc._files = {}                                   # empty file lists -> no extraction path
+        done, kb, _ = self._walk(svc, frozenset())
+        assert done is True
+        assert {self.PIN, self.CHILD, self.GRAND} <= set(kb.checkpoints["ck"]["completed_folder_ids"])
+        assert {self.PIN, self.CHILD, self.GRAND} <= set(svc.parents_queried)
+
+
 class TestFoundersOsEntityFor:
     def test_exact_match(self):
         assert _ds._founders_os_entity_for("08-Lexington-Services") == "LEX"

@@ -18,7 +18,8 @@ network, into two landing zones -- the D-057 split, by construction:
 
 ZONE-K holds org knowledge (skill bodies, a task INDEX manifest, non-cora repo
 memory, screened Cowork memory). ZONE-X holds Cora-operational metadata (full
-Cowork task BODIES incl. LEX-prefixed, the cora/cora-revops repo memory, the
+Cowork task BODIES incl. LEX-prefixed, the cora checkout's memory incl. its
+git worktrees such as cora-revops, the
 quarantine index, removed files). Nothing that trips the deterministic
 PHI/LEX/personal screen reaches ZONE-K unless Harrison name-opts-it-in
 (``allow_files:`` in the yaml, D-194).
@@ -159,7 +160,7 @@ def _code_memory_files() -> list[Path]:
     root = _code_projects_root()
     out: list[Path] = []
     try:
-        slugs = [d for d in root.iterdir() if d.is_dir()]
+        slugs = sorted(d for d in root.iterdir() if d.is_dir())
     except OSError:
         return out
     for slug in slugs:
@@ -192,21 +193,165 @@ def _task_dirs(cfg: Config) -> list[Path]:
 
 
 # ── Slug -> (repo label, zone) ───────────────────────────────────────────────
+# A Claude Code project slug is the session's cwd with every non-alphanumeric
+# character replaced by "-" (C:\Users\Harri\code\cora -> C--Users-Harri-code-cora;
+# the "." of .claude makes a worktree read ...-cora--claude-worktrees-<name>).
+#
+# Routing is by PATH PREFIX of the cora checkout (2026-09-03, cowork-side
+# findings §2): the base repo, every git worktree under its .claude/worktrees/,
+# and every sibling checkout are the cora codebase -> ZONE-X (D-057).
+# cora-revops is a git WORKTREE of this same repository on
+# claude/revops-loop-2026-08-02 (the 9/3 cowork-side findings saw it marked
+# prunable; registration state varies), NOT a fork. The regex belt
+# (_CORA_SLUG_RE) stays for cora-ish slugs that do not live under the checkout
+# path (e.g. the Founder-OS _shared/projects/cora working-dir slug, which also
+# carries a MEMORY.md); each is labelled by its FULL slug so no two can collide.
 _CORA_SLUG_RE = re.compile(r"(?:^|[-])cora(?:[-]|$)", re.IGNORECASE)
+_WORKTREES_TAIL = "--claude-worktrees-"
+
+
+def _path_to_slug(p: Path | str) -> str:
+    """Claude Code's project-slug encoding of a path (lossy: every non-alphanumeric
+    character becomes ``-``). Encode-and-compare, never decode."""
+    return re.sub(r"[^A-Za-z0-9]", "-", str(p))
+
+
+def _cora_base_repo_root() -> Path:
+    """The BASE cora checkout. When this script runs from a worktree its ``.git``
+    is a FILE (``gitdir: <base>/.git/worktrees/<name>``); resolve to ``<base>`` so
+    the prefix is the same wherever the mirror runs from."""
+    root = Path(CORA_REPO_ROOT)
+    dotgit = root / ".git"
+    if dotgit.is_file():
+        try:
+            line = dotgit.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            line = ""
+        if line.lower().startswith("gitdir:"):
+            gd = Path(line.split(":", 1)[1].strip())
+            if not gd.is_absolute():
+                # git >= 2.48 can write RELATIVE gitdir paths (worktree.useRelativePaths
+                # / --relative-paths); they are relative to the .git file's directory.
+                gd = (dotgit.parent / gd).resolve()
+            if gd.parent.name == "worktrees" and gd.parent.parent.name == ".git":
+                return gd.parent.parent.parent
+    return root
+
+
+def _cora_slug_prefix() -> str:
+    return _path_to_slug(_cora_base_repo_root()).lower()
+
+
+def _cora_codebase_tail(slug: str) -> str | None:
+    """``""`` for the base checkout, ``-revops`` for a sibling checkout,
+    ``--claude-worktrees-<name>`` for a worktree; ``None`` when the slug is not
+    under the cora checkout path (``...-coral-reef`` is not ``cora``)."""
+    low = slug.lower()
+    prefix = _cora_slug_prefix()
+    if low == prefix:
+        return ""
+    if low.startswith(prefix + "-"):
+        return low[len(prefix):]
+    return None
+
+
+def _registered_worktrees() -> dict[str, dict]:
+    """``{slug: {"path", "gitfile", "locked", "base"}}`` for the base checkout plus
+    every worktree registered in ``<base>/.git/worktrees/<name>/gitdir`` -- read
+    from disk, no git subprocess. ``gitfile`` is the worktree's ``.git`` FILE,
+    which is what git itself checks: a registration whose gitfile is gone is
+    "prunable" unless a ``locked`` marker sits beside the registration. Relative
+    gitdir paths (git >= 2.48 ``worktree.useRelativePaths``) are resolved against
+    the registration directory."""
+    base = _cora_base_repo_root()
+    out: dict[str, dict] = {
+        _path_to_slug(base).lower(): {"path": base, "gitfile": base / ".git", "locked": False, "base": True},
+    }
+    try:
+        entries = list((base / ".git" / "worktrees").iterdir())
+    except OSError:
+        entries = []
+    for e in entries:
+        try:
+            gitdir = (e / "gitdir").read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        if not gitdir:
+            continue
+        gf = Path(gitdir)
+        if not gf.is_absolute():
+            gf = (e / gf).resolve()
+        wt = gf.parent if gf.name == ".git" else gf
+        out[_path_to_slug(wt).lower()] = {
+            "path": wt, "gitfile": gf, "locked": (e / "locked").exists(), "base": False,
+        }
+    return out
+
+
+def _worktree_status(slug: str) -> tuple[str, Path | None]:
+    """For a cora-codebase slug:
+    ``("ok" | "missing" | "locked" | "unregistered" | "unknown", path)``.
+
+    ``ok`` = the checkout is there (registered gitfile present; the base checkout;
+    or a session started in a SUBDIRECTORY of the checkout -- ``cd scripts; claude``
+    slugs as ``<base>-scripts``, the same checkout, not a sibling worktree);
+    ``missing`` = registered (or decodable) but its gitfile/dir is gone -- git's
+    prunable; ``locked`` = registered + locked marker + gone (git will NOT prune
+    it); ``unregistered`` = the directory exists but git no longer lists it;
+    ``unknown`` = a slug shape this decoder does not know. The caller REPORTS
+    these; it never throws and never skips the memory files themselves."""
+    low = slug.lower()
+    reg = _registered_worktrees()
+    if low in reg:
+        r = reg[low]
+        if r.get("base"):
+            return ("ok" if r["path"].is_dir() else "missing"), r["path"]
+        if r["gitfile"].is_file():
+            return "ok", r["path"]
+        return ("locked" if r["locked"] else "missing"), r["path"]
+    tail = _cora_codebase_tail(slug)
+    base = _cora_base_repo_root()
+    if tail is None:
+        return "unknown", None
+    if tail.startswith(_WORKTREES_TAIL):
+        cand = base / ".claude" / "worktrees" / tail[len(_WORKTREES_TAIL):]
+        return ("unregistered" if cand.is_dir() else "missing"), cand
+    if tail.startswith("-"):
+        cand = base.parent / (base.name + tail)          # sibling checkout, e.g. cora-revops
+        if cand.is_dir():
+            return "unregistered", cand                   # exists but git no longer lists it
+        rest = tail[1:]
+        for sub in (base / rest, base.joinpath(*[part for part in rest.split("-") if part])):
+            if sub.is_dir():
+                return "ok", sub                          # a subdirectory session of this checkout
+        return "missing", cand
+    return "unknown", None
 
 
 def slug_repo_zone(slug: str) -> tuple[str, str]:
     """Map a Claude Code project slug to (repo_label, zone).
 
-    cora / cora-revops memory is Cora-operational -> ZONE-X. Any OTHER repo's
-    memory is org knowledge -> ZONE-K. Worktree slugs
-    (``...-cora--claude-worktrees-...``) resolve to their base repo.
+    Anything under the cora checkout path -- the base repo, its
+    ``.claude/worktrees/*``, sibling checkouts like ``cora-revops`` -- is
+    Cora-operational -> ZONE-X, each under its OWN label (every checkout carries
+    a ``MEMORY.md``; one shared label would silently collide). Any OTHER repo's
+    memory is org knowledge -> ZONE-K.
     """
     low = slug.lower()
-    if "cora-revops" in low:
-        return "cora-revops", "X"
+    tail = _cora_codebase_tail(slug)
+    if tail is not None:
+        if tail == "":
+            return "cora", "X"
+        if tail.startswith(_WORKTREES_TAIL):
+            return "cora-worktree-" + tail[len(_WORKTREES_TAIL):].strip("-"), "X"
+        return "cora" + tail.rstrip("-"), "X"            # sibling checkout: cora-revops
+    # Belt: cora-ish slugs OUTSIDE the checkout path (the regex covers a stray
+    # cora-revops too; a constant label here would collide with the sibling's).
     if _CORA_SLUG_RE.search(low):
-        return "cora", "X"
+        # e.g. the Founder-OS _shared/projects/cora working-dir slug: ZONE-X,
+        # labelled by its full slug so it can never collide with the checkout's
+        # own "cora" label (both carry a MEMORY.md).
+        return low.strip("-") or "cora", "X"
     # non-cora repo: derive a label from the slug's repo component.
     m = re.search(r"code-([a-z0-9][a-z0-9-]*?)(?:--|$)", low)
     label = m.group(1) if m else (low.rsplit("-", 1)[-1] or "unknown-repo")
@@ -239,6 +384,7 @@ class Planned:
     source: str = ""           # source path (for manifest/provenance)
     sha256: str = ""           # sha256 of the SOURCE content (dedup / manifest)
     cls: str = ""              # source class
+    allow_override: bool = False  # ZONE-K: the screen tripped and allow_files released it (keyed on dest)
 
 
 @dataclass
@@ -404,7 +550,8 @@ def _add_zone_k_source(plan: Plan, cfg: Config, *, dest: Path, source: Path,
     sha = _sha_text(text)
     plan.writes.append(Planned(dest=dest, zone="K",
                                text=_provenance(src_label, sha) + text,
-                               source=src_label, sha256=sha, cls=cls))
+                               source=src_label, sha256=sha, cls=cls,
+                               allow_override=bool(reason)))
     _record(plan, cls, "mirrored")
     return True
 
@@ -542,12 +689,40 @@ def plan_code_memory(plan: Plan, cfg: Config) -> None:
     if not files:
         plan.warns.append("code_memory: no ~/.claude/projects/<slug>/memory/*.md found "
                           "(non-cora repos may simply have none)")
+    # Worktree check per cora-codebase slug (cowork-side findings §2): a slug whose
+    # git worktree is prunable/absent is REPORTED as NOT FOUND -- never thrown,
+    # never silently skipped. Its memory files still exist and are still mirrored
+    # (to ZONE-X); only the worktree behind them is gone.
+    per_slug: dict[str, int] = {}
+    for f in files:
+        per_slug[f.parent.parent.name] = per_slug.get(f.parent.parent.name, 0) + 1
+    for slug, n in sorted(per_slug.items()):
+        if _cora_codebase_tail(slug) is None:
+            continue
+        status, path = _worktree_status(slug)
+        if status in ("missing", "unknown"):
+            plan.warns.append(
+                f"code_memory: worktree NOT FOUND for slug '{slug}' (expected {path}) -- "
+                f"prunable/absent git worktree; its {n} memory file(s) are still mirrored to ZONE-X")
+            _record(plan, "code_memory", "worktree_not_found")
+        elif status == "unregistered":
+            plan.warns.append(
+                f"code_memory: worktree dir {path} for slug '{slug}' exists but is not registered "
+                f"in .git/worktrees (registration pruned) -- {n} memory file(s) still mirrored")
+            _record(plan, "code_memory", "worktree_unregistered")
+        elif status == "locked":
+            plan.warns.append(
+                f"code_memory: worktree for slug '{slug}' is registered LOCKED and its checkout is "
+                f"absent ({path}) -- git will not prune it; {n} memory file(s) still mirrored")
+            _record(plan, "code_memory", "worktree_locked")
     for f in files:
         slug = f.parent.parent.name
         label, zone = slug_repo_zone(slug)
         try:
             text = f.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        except OSError as exc:
+            plan.warns.append(f"code_memory: could not read {_rel_source(f)} ({exc}) -- skipped")
+            _record(plan, "code_memory", "unreadable")
             continue
         if zone == "X":
             _add_zone_x_source(plan, cfg,
@@ -900,7 +1075,11 @@ def render_parity(plan: Plan, prev: dict | None, removals: list[dict], cfg: Conf
 
 
 _ALL_COUNT_KEYS = ("mirrored", "quarantined", "denied_stock", "unknown_not_allowlisted",
-                   "skipped_oversize", "allowlisted_override", "indexed")
+                   "skipped_oversize", "allowlisted_override", "indexed",
+                   # every key _record() writes must be a column, or the table silently
+                   # hides it (D-051 mirror lens LOW-5, 2026-09-03)
+                   "row_redacted", "desc_redacted", "worktree_not_found",
+                   "worktree_unregistered", "worktree_locked", "unreadable", "dest_uniquified")
 
 
 # ── Structured status (for the health lane, S5) ──────────────────────────────
@@ -994,6 +1173,59 @@ def task_estate_delta(plan: Plan, prev: dict | None) -> dict[str, list[str]]:
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+def _uniquify_dest_collisions(plan: Plan) -> None:
+    """Two sources planning the SAME dest would race silently (last write wins,
+    and the manifest would record only one of them). Keep BOTH: the later one is
+    renamed ``<stem>-<sha8 of its source><suffix>`` in the same directory, with a
+    WARN -- the mirror exists for parity, so dropping content is the wrong failure
+    mode (D-051 mirror lens, 2026-09-03). The rename keeps the leading
+    ``cora-mirror-`` prefix, so the ZONE-X title belt and the ZONE-K ingest
+    predicates see the same shape. Deterministic: the same inputs rename the same
+    way run after run. Origin: the cora checkout slug and the Founder-OS
+    _shared/projects/cora working-dir slug both carry a MEMORY.md and both used
+    to label as "cora"."""
+    seen: dict[str, Planned] = {}
+    kept: list[Planned] = []
+    for w in plan.writes:
+        key = os.path.normcase(str(w.dest))
+        if key not in seen:
+            seen[key] = w
+            kept.append(w)
+            continue
+        first = seen[key]
+        if w.zone == "K" and w.allow_override:
+            # The allow_files opt-in was reviewed under the ORIGINAL key, which two
+            # sources now share; releasing the second under a derived key nobody
+            # reviewed would put screened content into the KB-ingested zone.
+            # Quarantine it (the INDEX shows the shared key twice -- that is the
+            # signal) rather than rename it.
+            cls = w.cls or "unknown"
+            plan.quarantined.append((_mirror_key(w.dest),
+                                     f"{cls}: dest collision on an opted-in key -- second source "
+                                     f"NOT released; review it under its own key"))
+            _record(plan, cls, "quarantined")
+            plan.counts[cls]["mirrored"] = plan.counts[cls].get("mirrored", 1) - 1
+            plan.warns.append(
+                f"[{cls}] dest collision -- {w.dest} already planned from "
+                f"{first.source or first.cls}; {w.source or w.cls} QUARANTINED (its allow_files "
+                f"key is ambiguous)")
+            continue
+        tag = hashlib.sha256((w.source or w.cls or "").encode("utf-8")).hexdigest()[:8]
+        new_dest = w.dest.with_name(f"{w.dest.stem}-{tag}{w.dest.suffix}")
+        n = 0
+        while os.path.normcase(str(new_dest)) in seen:
+            n += 1
+            new_dest = w.dest.with_name(f"{w.dest.stem}-{tag}-{n}{w.dest.suffix}")
+        plan.warns.append(
+            f"[{w.cls}] dest collision -- {w.dest} already planned from "
+            f"{first.source or first.cls}; {w.source or w.cls} written as {new_dest.name}")
+        _record(plan, w.cls or "unknown", "dest_uniquified")
+        w.dest = new_dest
+        seen[os.path.normcase(str(new_dest))] = w
+        kept.append(w)
+    plan.writes = kept
+
+
 def build_plan(cfg: Config, only: str | None) -> Plan:
     plan = Plan()
     if only in (None, "skills"):
@@ -1004,6 +1236,7 @@ def build_plan(cfg: Config, only: str | None) -> Plan:
         plan_code_memory(plan, cfg)
     if only in (None, "cowork_memory"):
         plan_cowork_memory(plan, cfg)
+    _uniquify_dest_collisions(plan)
     return plan
 
 
