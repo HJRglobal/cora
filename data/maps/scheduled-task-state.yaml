@@ -95,6 +95,15 @@ enabled:
   # pack. Added 2026-08-04 (A5 S1). Exit 1 = a realm errored (snapshot still
   # written, that realm UNKNOWN); exit 2 = total failure, prior snapshot kept.
   - cowork-cora-bank-snapshot
+  # Claude-workspace mirror (2026-09-03, knowledge-parity build). Twice daily
+  # (03:45 + 12:15 AZ) it mirrors out-of-tree Claude knowledge (skills, Cowork
+  # task defs, agent memory) into the Founder OS for static_md ingest. T0 lane;
+  # register with deployment/setup-claude-mirror-task.ps1 AFTER Harrison's first
+  # dry-run review (S6). NOTE the SAME build added a SECOND daily trigger to
+  # cowork-cora-kb-sync-static (12:30) and cowork-cora-session-capture (12:20)
+  # via deployment/add-midday-sync-triggers.ps1 -Apply -- both keep their morning
+  # triggers + args unchanged; "same-day" now means "by early afternoon".
+  - cowork-cora-claude-mirror
   # Daily 06:20 AZ F3E inventory-state sync -> the cross-channel inventory store in
   # 02-F3-Energy/inventory-state. Added 2026-08-05 (A5 Part 2). Scheduled BEFORE
   # the 06:33 F3E daily synthesis that consumes it -- a later slot would leave

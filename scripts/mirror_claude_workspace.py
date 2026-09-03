@@ -773,6 +773,67 @@ _ALL_COUNT_KEYS = ("mirrored", "quarantined", "denied_stock", "unknown_not_allow
                    "skipped_oversize", "allowlisted_override", "indexed")
 
 
+# ── Structured status (for the health lane, S5) ──────────────────────────────
+def status_payload(plan: "Plan", prev: dict | None, removals: list) -> dict:
+    """A machine-readable summary the health checks read instead of re-parsing the
+    markdown report. Written to ZONE-K as ``mirror-status.json`` every run."""
+    utc, az = _now_stamps()
+    delta = task_estate_delta(plan, prev)
+    return {
+        "at_utc": utc, "at_az": az,
+        "roots_missing": [c for c in CLASSES if not plan.roots_found.get(c)],
+        "quarantined_count": len(plan.quarantined),
+        "unknown_skills": [w.split("'")[1] for w in plan.warns
+                           if "not in allowlist" in w and "'" in w],
+        "warns": plan.warns,
+        "unpinned": sorted(plan.unpinned_tasks),
+        "added": delta.get("added", []),
+        "removed": delta.get("removed", []),
+        "model_changed": delta.get("model_changed", []),
+        "counts": plan.counts,
+    }
+
+
+PARITY_REPORT_NAME = "PARITY-REPORT.md"
+STATUS_JSON_NAME = "mirror-status.json"
+
+
+def status_json_path() -> Path:
+    return _zone_k_root() / STATUS_JSON_NAME
+
+
+def read_parity_status(*, max_age_hours: float = 26.0) -> dict:
+    """Read the latest ``mirror-status.json`` from ZONE-K for the health lane.
+
+    Returns ``{available, error, age_hours, stale, roots_missing, ...}``. Never
+    raises -- a missing/unreadable file (incl. a gone G: mount) yields
+    ``available=False`` with an error string, which the caller surfaces as a WARN.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    path = status_json_path()
+    try:
+        raw = drive_io.read_text(str(path), timeout=5.0, retry_seconds=0.0)
+    except Exception as exc:  # noqa: BLE001 -- report, never raise (D-214)
+        return {"available": False, "error": f"{type(exc).__name__}: {exc}",
+                "path": str(path)}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return {"available": False, "error": f"unparseable status json: {exc}",
+                "path": str(path)}
+    age_h = None
+    try:
+        at = _dt.strptime(data.get("at_utc", ""), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_tz.utc)
+        age_h = (_dt.now(_tz.utc) - at).total_seconds() / 3600.0
+    except (ValueError, TypeError):
+        pass
+    data["available"] = True
+    data["age_hours"] = age_h
+    data["stale"] = bool(age_h is not None and age_h > max_age_hours)
+    data["max_age_hours"] = max_age_hours
+    return data
+
+
 def task_estate_delta(plan: Plan, prev: dict | None) -> dict[str, list[str]]:
     """Diff the Cowork task INDEX rows this run against the previous manifest's,
     keyed on the ZONE-X body dest (one per task). Reports added/removed and, from
@@ -880,6 +941,12 @@ def main(argv: list[str] | None = None) -> int:
     plan.writes.append(Planned(dest=_zk("PARITY-REPORT.md"), zone="K",
                                text=_generated_header("PARITY-REPORT.md") + parity_text,
                                cls="parity"))
+    # Structured status for the health lane (S5) -- both health tools read this
+    # instead of re-parsing the markdown.
+    plan.writes.append(Planned(dest=status_json_path(), zone="K",
+                               text=json.dumps(status_payload(plan, prev, removals),
+                                               indent=2, ensure_ascii=False) + "\n",
+                               cls="status"))
 
     apply = args.apply and not args.dry_run
     log.info("mirror plan: %d writes, %d quarantined, %d warns, %d removals (apply=%s)",

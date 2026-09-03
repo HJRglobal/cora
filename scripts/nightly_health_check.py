@@ -1331,6 +1331,52 @@ def check_mcp_http_bridge(port: int | None = None) -> CheckResult:
 _DYNAMIC_ANSWERS_DIR = _REPO_ROOT / "design" / "known-answers" / "dynamic"
 
 
+def check_claude_mirror(now_epoch: float | None = None) -> CheckResult:
+    """WARN on the claude-workspace mirror lane (S5). Reads the structured
+    ``mirror-status.json`` the mirror writes to ZONE-K each run and alarms on:
+    the report missing/unreadable, a run older than 26h (a stalled mirror silently
+    freezes the out-of-tree knowledge parity), a source-class root NOT FOUND, a
+    new skill not allowlisted, or a task-estate change (added/removed/model
+    changed -- the registry-drop detector 1nnnn never had). New quarantine counts
+    are surfaced in the Monday digest, not alarmed nightly (they are expected to
+    be non-zero by design, D-194). Report, never absorb (D-214/D-249).
+
+    Never registered / never run -> a single OK (the lane is Harrison-gated at S6),
+    same posture as check_mcp_http_bridge. `now_epoch` accepted for signature
+    parity; the age comes from the status file's own timestamp."""
+    try:
+        sys.path.insert(0, str(_REPO_ROOT / "scripts"))
+        import mirror_claude_workspace as mw  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult("Claude mirror", "ok",
+                           f"mirror module not importable (non-fatal): {exc}")
+    st = mw.read_parity_status()
+    if not st.get("available"):
+        # The lane may simply not have run yet (Harrison-gated first apply, S6).
+        # A missing status file is an OK-until-adopted, not a nightly WARN.
+        return CheckResult("Claude mirror", "ok",
+                           f"No mirror-status.json yet ({st.get('error', 'absent')}) -- "
+                           f"lane not yet run (register + first --apply is Harrison-gated).")
+    problems: list[str] = []
+    if st.get("stale"):
+        problems.append(f"last run {st['age_hours']:.0f}h ago (> {st['max_age_hours']:.0f}h)")
+    if st.get("roots_missing"):
+        problems.append("roots NOT FOUND: " + ", ".join(st["roots_missing"]))
+    if st.get("unknown_skills"):
+        problems.append("skills not allowlisted: " + ", ".join(st["unknown_skills"]))
+    for k in ("added", "removed", "model_changed"):
+        if st.get(k):
+            problems.append(f"task-estate {k}: " + ", ".join(str(x) for x in st[k][:10]))
+    if problems:
+        return CheckResult("Claude mirror", "warn",
+                           "claude-workspace mirror: " + "; ".join(problems)
+                           + f" (quarantined={st.get('quarantined_count', '?')}).")
+    return CheckResult("Claude mirror", "ok",
+                       f"mirror fresh ({st['age_hours']:.0f}h), "
+                       f"quarantined={st.get('quarantined_count', 0)}, "
+                       f"unpinned={len(st.get('unpinned', []))}.")
+
+
 def check_dynamic_snapshots(now_epoch: float | None = None) -> CheckResult:
     """WARN when a dynamic-answers snapshot is missing or stale past its yaml
     threshold (D-084). context_loader serves the yaml `fallback` in that case --
@@ -1964,6 +2010,9 @@ def main() -> int:
 
     log.info("Checking dynamic-answers snapshot freshness...")
     all_results.append(check_dynamic_snapshots())
+
+    log.info("Checking claude-workspace mirror freshness...")
+    all_results.append(check_claude_mirror())
 
     log.info("Checking 13wk cashflow forecast snapshot (S1) freshness...")
     all_results.append(check_cashflow_forecast_snapshot())

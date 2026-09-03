@@ -569,6 +569,33 @@ def dashboard_drift_section() -> dict:
         return {"available": False, "reason": str(exc)}
 
 
+def claude_mirror_section() -> dict:
+    """Read the claude-workspace mirror's structured status (S5) for the Monday
+    digest: freshness, quarantine count, unpinned tasks, and any task-estate
+    delta. Fail-soft -- a machine without the mirror (never run) returns
+    available=False, no alarm."""
+    try:
+        sys.path.insert(0, str(REPO_ROOT / "scripts"))
+        import mirror_claude_workspace as mw  # noqa: PLC0415
+        st = mw.read_parity_status()
+        if not st.get("available"):
+            return {"available": False, "reason": st.get("error", "no status")}
+        return {
+            "available": True,
+            "age_hours": st.get("age_hours"),
+            "stale": st.get("stale"),
+            "quarantined": st.get("quarantined_count", 0),
+            "roots_missing": st.get("roots_missing", []),
+            "unknown_skills": st.get("unknown_skills", []),
+            "unpinned": len(st.get("unpinned", [])),
+            "added": st.get("added", []),
+            "removed": st.get("removed", []),
+            "model_changed": st.get("model_changed", []),
+        }
+    except Exception as exc:  # noqa: BLE001 -- fail-soft convention (see kb_corpus)
+        return {"available": False, "reason": str(exc)}
+
+
 # --------------------------------------------------------------------------- #
 # rendering
 # --------------------------------------------------------------------------- #
@@ -636,6 +663,23 @@ def threshold_alarms(report: dict) -> list[str]:
             f"dashboard drift: {len(dd['unregistered'])} pinned artifact(s) not in "
             f"dashboard-access.yaml -- {ids} (register or purge)."
         )
+    # Claude-workspace mirror (S5): stale run, a source root NOT FOUND, an
+    # un-allowlisted skill, or a task-estate change (registry-drop detector 1nnnn).
+    cm = report.get("claude_mirror", {})
+    if cm.get("available"):
+        probs = []
+        if cm.get("stale"):
+            probs.append(f"last run {cm['age_hours']:.0f}h ago (stale)")
+        if cm.get("roots_missing"):
+            probs.append("roots NOT FOUND: " + ", ".join(cm["roots_missing"]))
+        if cm.get("unknown_skills"):
+            probs.append("skills not allowlisted: " + ", ".join(cm["unknown_skills"]))
+        for k in ("added", "removed", "model_changed"):
+            if cm.get(k):
+                probs.append(f"task-estate {k}: " + ", ".join(str(x) for x in cm[k][:10]))
+        if probs:
+            alarms.append("claude mirror: " + "; ".join(probs) + ".")
+
     # Flywheel alarms come pre-evaluated by cora.flywheel_metrics (WS-2) so the
     # thresholds are single-sourced with the nightly health check.
     fw = report.get("flywheel", {})
@@ -734,6 +778,17 @@ def format_slack(report: dict) -> str:
                 f"*Mechanical lane:* {mech_pending:,} pending | "
                 f"{fw.get('mechanical_overdue', '?')} past review deadline"
             )
+    cm = report.get("claude_mirror", {})
+    if cm.get("available"):
+        age = cm.get("age_hours")
+        age_s = f"{age:.0f}h" if isinstance(age, (int, float)) else "n/a"
+        lines.append(
+            f"*Claude mirror:* fresh {age_s}"
+            + (" (STALE)" if cm.get("stale") else "")
+            + f" | quarantined {cm.get('quarantined', 0)} | unpinned {cm.get('unpinned', 0)}"
+            + (f" | +{len(cm['added'])}/-{len(cm['removed'])} tasks"
+               if (cm.get('added') or cm.get('removed')) else "")
+        )
     lines.append(f"_token method: {report.get('token_method')}_")
     return "\n".join(lines)
 
@@ -895,6 +950,7 @@ def build_report(log_days: int, use_api: bool) -> dict:
         "scheduled_tasks": scheduled_tasks(),
         "flywheel": flywheel_metrics_section(),
         "dashboard_drift": dashboard_drift_section(),
+        "claude_mirror": claude_mirror_section(),
     }
     report["alarms"] = threshold_alarms(report)
     return report
