@@ -1,0 +1,81 @@
+# claude-workspace-mirror.yaml -- config for scripts/mirror_claude_workspace.py
+#
+# The mirror copies out-of-tree Claude workspace knowledge (skills, Cowork task
+# definitions, Claude Code + Cowork agent memory, bootstrap notes are handled by
+# the static sync itself) INTO the Founder OS as read-only, provenance-headed
+# .md files so the existing static_md lane ingests them (ZONE-K) or so Cowork +
+# DR can read them without KB ingestion (ZONE-X, KB-excluded under D-057).
+#
+# Harrison edits this file; Cowork sessions PROPOSE edits. Runtime-effective at
+# the next mirror run (no restart -- the script re-reads it each run).
+# ---------------------------------------------------------------------------
+
+# HJR-custom skills to mirror into ZONE-K (skills/<name>.SKILL.md). Exact folder
+# names under the Cowork skills-plugin root. A skill NOT in `allow` and NOT in
+# `deny_stock` is a NEW skill -> WARN "not allowlisted", never mirrored until
+# Harrison adds it here (a KB-swept publication surface is opt-in, D-194).
+skills:
+  allow:
+    - cascade
+    - cora
+    - handoff
+    - new-session
+    - wrap-it
+    - morning
+    - f3e-seedance
+    - consolidate-memory
+    - import-memory
+    - explain-usage
+    - schedule
+    - setup-cowork
+  # Anthropic stock skills -- deliberately NOT mirrored (they are not HJR knowledge
+  # and drift with the app, not with the org). Denied silently, no WARN.
+  deny_stock:
+    - docx
+    - pptx
+    - xlsx
+    - pdf
+    - skill-creator
+    - init
+    - security-review
+    - frontend-design
+    - dataviz
+    - artifact-design
+    - artifact-diagramming
+    - artifact-capabilities
+
+# Cowork scheduled-task store. DEFAULT MUST MATCH the `$Root` default in
+# C:\Users\Harri\code\pin-scheduled-task-models.ps1 (a test pins the two in
+# sync). Env override COWORK_TASKS_ROOT wins at runtime.
+cowork_tasks:
+  # %USERPROFILE% is expanded by the script.
+  default_root: "%USERPROFILE%\\OneDrive\\Documents\\Claude\\Scheduled"
+  # A task whose id starts with one of these is Cora-operational -> its FULL body
+  # is Cora metadata; the body still goes to ZONE-X, and its INDEX row stays in
+  # ZONE-K (org knowledge: "task X exists, runs model Y"). No task bodies ever
+  # reach ZONE-K.
+
+# D-194 opt-in: exact basenames (case-insensitive) that Harrison has reviewed and
+# wants mirrored into ZONE-K EVEN IF the PHI/LEX/personal screen trips. Start
+# empty; Harrison adds names after eyeballing the first dry-run's quarantine list.
+allow_files: []
+
+# Per-file byte cap for ZONE-K + ZONE-X source mirrors (skills / memory / bodies).
+# A file over the cap is skipped with a WARN (never truncated -- a half file is a
+# lie). Generated INDEX/PARITY/MANIFEST outputs are exempt.
+max_file_bytes: 524288
+
+# Personal / highly-confidential container keyword families. A ZONE-K candidate
+# whose CONTENT trips any of these (in addition to phi_guard.is_any_phi and the
+# LEX token family, both applied in code) is quarantined by default. Whole-word
+# where a bare substring would over-match; deterministic, no LLM (D-194).
+personal_families:
+  - oneamerica
+  - one america
+  - capital-raise
+  - capital raise
+  - travel-points
+  - travel points
+  - personal-legal
+  - whole life
+  - watchtower
