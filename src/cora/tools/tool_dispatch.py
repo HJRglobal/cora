@@ -8456,6 +8456,38 @@ def _tool_cora_self_check(slack_user_id: str, entity: str, _input: dict) -> str:
     return "\n".join(lines)
 
 
+def _tool_cora_self_inventory(slack_user_id: str, entity: str, _input: dict) -> str:
+    """Deterministic listing of WHAT Cora ingests, through WHICH doors, what is
+    EXCLUDED, and her own scheduled cadence -- from live signals, never the KB
+    (ingest-integrity I4, cq-3542e1b095b2, 2026-09-08).
+
+    Founder scope (Harrison, or a FNDR/HJRG channel) gets mailbox addresses,
+    watermark keys and every task; other channels get door names, counts and the
+    ingest lanes only. The listing carries its own REPLY FORMAT rule: a miss is
+    'not in my sources' with the door named -- never 'I don't have that knowledge'
+    inferred from a search miss (Doctrine 3).
+    """
+    from .. import self_inventory
+
+    detail = slack_user_id == _FOUNDER_SLACK_ID or (entity or "").upper() in ("FNDR", "HJRG")
+    try:
+        kb, kb_lock = _notes_kb()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("cora_self_inventory: shared KB unavailable: %s", exc)
+        kb, kb_lock = None, None
+    try:
+        inv = self_inventory.build_inventory(kb=kb, kb_lock=kb_lock, detail=detail)
+        text = self_inventory.render_inventory(inv)
+    except Exception as exc:  # noqa: BLE001 -- never a crash, never an improvised inventory
+        log.warning("cora_self_inventory failed: %s", exc)
+        text = (
+            "Cora self-inventory: UNAVAILABLE this turn (%s). Say the inventory could not be "
+            "read; do NOT infer what you have or lack from a search miss." % type(exc).__name__
+        )
+    log.info("cora_self_inventory actor=%s entity=%s detail=%s", slack_user_id, entity, detail)
+    return text
+
+
 def _tool_cora_person_dossier(slack_user_id: str, entity: str, _input: dict) -> str:
     """On-demand per-person involvement dossier (North Star pillar 4).
 
@@ -11962,6 +11994,27 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "cora_self_inventory",
+        "description": (
+            "Deterministic listing of Cora's OWN knowledge sources: every ingest door "
+            "(static_md / drive_sweep / gmail / slack / fireflies / asana / notion ...) with "
+            "chunk counts and last-sync times, every pinned exclusion (Drive folder ids + "
+            "names), the path/title exclusion rules, the allowlisted views, the entity "
+            "partitions, her own scheduled-task cadence (live registry + run markers), and "
+            "the claude-workspace mirror parity report. Call this FIRST for ANY question "
+            "about what Cora has, knows, ingests, indexes, can see or has access to -- 'do "
+            "you have access to X', 'do you know about the Cowork/Cascade knowledge', 'are "
+            "you ingesting Y', 'is Z in your knowledge base', 'what sources do you read'. "
+            "A knowledge-absence claim must cite this inventory; a semantic-search miss is "
+            "NEVER evidence of absence. Read-only; never queue a code session for it."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
         "name": "cora_person_dossier",
         "description": (
             "Pull a teammate's recent WORK involvement -- a founder check-in or a "
@@ -13496,6 +13549,7 @@ _GLOBAL_CORE_TOOLS: frozenset[str] = frozenset({
     "financial_get_cashflow",
     "fndr_open_decisions",
     "cora_self_check",
+    "cora_self_inventory",
     "cora_person_dossier",
     # Dashboard discovery -- available everywhere; guard-filtered per surface, so it
     # only ever lists what the current channel/DM can actually reach (no leak).
@@ -13699,6 +13753,8 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "cora_delegate_work": _tool_cora_delegate_work,
     # Read-only operational self-status (heartbeat + KB size + sync watermarks)
     "cora_self_check": _tool_cora_self_check,
+    # Deterministic self-inventory of doors / exclusions / cadence (I4, cq-3542e1b095b2)
+    "cora_self_inventory": _tool_cora_self_inventory,
     # Per-person involvement dossier (founder-or-self; North Star pillar 4)
     "cora_person_dossier": _tool_cora_person_dossier,
     # Meeting action items -- PULL flow (replaces the retired auto-create push)
@@ -13827,6 +13883,7 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "cora_my_notes": 8,
     "cora_forget_note": 8,
     "cora_self_check": 8,
+    "cora_self_inventory": 20,   # one schtasks query (<=12s, cached 10 min) + KB stat reads
     # cq-7fb82054ee4a residual: the confirmed explicit path runs an OpenAI embed
     # (novel-request dedup), a G: backlog render (drive_io default timeout 10s),
     # and 2 synchronous Slack DM calls INLINE -- an 8s budget was smaller than a

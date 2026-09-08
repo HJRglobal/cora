@@ -1100,6 +1100,15 @@ class KnowledgeBase:
         ).fetchone()
         return tuple(row) if row else None
 
+    def list_sync_states(self) -> dict[str, tuple[int, int | None]]:
+        """Every sync_state row -- ``{source_key: (last_sync_at, last_source_modified)}``.
+        Read-only. The self-inventory tool (ingest-integrity I4, 2026-09-08) lists
+        the doors the KB knows about from THIS, never from retrieved content."""
+        rows = self._conn.execute(
+            "SELECT source, last_sync_at, last_source_modified FROM sync_state ORDER BY source"
+        ).fetchall()
+        return {str(r[0]): (r[1], r[2]) for r in rows}
+
     def set_sync_state(
         self, source: str, last_sync_at: int, last_source_modified: int | None = None
     ) -> None:

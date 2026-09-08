@@ -52,6 +52,7 @@ from . import finance_receipts
 from . import model_router
 from . import org_roles
 from . import phi_guard
+from . import self_inventory
 from .prompt_loader import load_prompt
 from . import rate_limiter
 from .reply_formatter import format_reply
@@ -944,6 +945,17 @@ def _remember_intent(text: str) -> bool:
     return bool(_REMEMBER_INTENT_RE.search(t))
 
 
+def _self_inventory_force(text: str) -> str | None:
+    """``cora_self_inventory`` when *text* asks Cora about her OWN sources / doors /
+    coverage ("do you have access to X", "are you ingesting Y", "is Z in your
+    knowledge base"); else None. I4 (cq-3542e1b095b2): a meta-question about her
+    own corpus is answered from the deterministic inventory, forced via tool_choice
+    so the listing is in context BEFORE the model composes -- never from a semantic
+    miss (Doctrine 3). Retrieval still runs on the turn: a fact phrased "do you
+    have ..." is answered from retrieval, the inventory names the door."""
+    return "cora_self_inventory" if self_inventory.is_self_inventory_question(text or "") else None
+
+
 def _staged_write_force_tool(text: str) -> str | None:
     """The staged-write tool to force for this message, or None.
 
@@ -1622,6 +1634,16 @@ def _dispatch_qa(
             # (cq-d30815ee6993).
             force_tool = "cora_delegate_work"
             log.info("delegate-work intent -> forcing tool channel=#%s user=%s",
+                     channel_name, user_id)
+        elif _self_inventory_force(user_message):
+            # I4 (cq-3542e1b095b2): a question about Cora's OWN sources / doors /
+            # coverage is answered from the deterministic inventory, not from a
+            # semantic miss. Ordered BELOW the code-queue / delegate commands (an
+            # explicit command wins) and ABOVE the staged-write + Asana forces (a
+            # meta-question is never a write). Forcing also pins Sonnet and keeps
+            # the turn out of the shared cache (both keyed on force_tool below).
+            force_tool = "cora_self_inventory"
+            log.info("self-inventory intent -> forcing tool channel=#%s user=%s",
                      channel_name, user_id)
         else:
             # S6 rider (cq-904f849bc59a): the Class-B staged-write intents.
