@@ -265,11 +265,14 @@ def test_harvest_writes_note_and_dedups(tmp_path):
     assert results2 == []
 
 
-def test_harvest_phi_forces_lex(tmp_path):
+def test_harvest_phi_topic_word_no_longer_forces_lex(tmp_path):
+    """Leak #2 (ingest-integrity I2, 2026-09-08): "care plan" trips the STRICT
+    ingestion screen, which used to re-home this F3E distill to LEX under a false
+    PHI stamp. A non-LEX distill is never re-homed; a bare topic word files
+    normally. (The quarantine branch is pinned in test_session_capture_quarantine.py.)"""
     projects = tmp_path / "projects"
     fos = tmp_path / "founder-os"
     ledger = tmp_path / "ledger.jsonl"
-    # "care plan" trips phi_guard.is_phi_risk -> force LEX routing.
     _setup_session_file(projects, "sess-phi-bbbb", text_extra="review the care plan")
 
     results = scap.harvest(
@@ -279,10 +282,11 @@ def test_harvest_phi_forces_lex(tmp_path):
     )
     assert len(results) == 1
     r = results[0]
-    assert r.phi is True
-    assert r.entity == "LEX"
-    assert "08-Lexington-Services" in str(r.note_path)
-    assert "- PHI: yes" in r.note_path.read_text(encoding="utf-8")
+    assert r.phi is False and r.quarantined is False
+    assert r.entity == "F3E"
+    assert "02-F3-Energy" in str(r.note_path)
+    assert "08-Lexington-Services" not in str(r.note_path)
+    assert "- PHI: yes" not in r.note_path.read_text(encoding="utf-8")
 
 
 def test_harvest_dry_run_writes_nothing(tmp_path):
@@ -487,7 +491,9 @@ class TestHarvestCowork:
         )
         assert results2 == []
 
-    def test_cowork_phi_forces_lex(self, tmp_path):
+    def test_cowork_phi_topic_word_no_longer_forces_lex(self, tmp_path):
+        """Leak #2 (I2): the Cowork path shares _finalize_capture, so a bare
+        topic word files by the distilled entity here too -- never LEX."""
         store = tmp_path / "cowork"
         fos = tmp_path / "founder-os"
         ledger = tmp_path / "ledger.jsonl"
@@ -500,10 +506,29 @@ class TestHarvestCowork:
             include_cowork=True, cowork_roots=[store],
         )
         assert len(results) == 1
-        assert results[0].phi is True
-        assert results[0].entity == "LEX"
-        assert "08-Lexington-Services" in str(results[0].note_path)
-        assert "- PHI: yes" in results[0].note_path.read_text(encoding="utf-8")
+        assert results[0].phi is False and results[0].quarantined is False
+        assert results[0].entity == "F3E"
+        assert "02-F3-Energy" in str(results[0].note_path)
+        assert "- PHI: yes" not in results[0].note_path.read_text(encoding="utf-8")
+
+    def test_cowork_value_phi_is_quarantined(self, tmp_path):
+        store = tmp_path / "cowork"
+        fos = tmp_path / "founder-os"
+        ledger = tmp_path / "ledger.jsonl"
+        _cowork_session(store, "3333cccc", text_extra="client Marcus Johnson was diagnosed with autism")
+        results = scap.harvest(
+            lookback_hours=24, dry_run=False,
+            projects_root=tmp_path / "empty-code",
+            founder_os_root=fos, ledger_path=ledger,
+            anthropic_client=_FakeClient(_distilled_body("F3E", "phi cowork")),
+            include_cowork=True, cowork_roots=[store],
+        )
+        assert len(results) == 1
+        r = results[0]
+        assert r.quarantined is True and r.phi is True and r.entity == "F3E"
+        assert scap.QUARANTINE_DIRNAME in str(r.note_path)
+        assert r.note_path.name.startswith(scap.QUARANTINE_PREFIX)
+        assert "08-Lexington-Services" not in str(r.note_path)
 
     def test_cowork_disabled_by_default(self, tmp_path):
         """Module default include_cowork=False: a real store on the host must NOT

@@ -185,6 +185,8 @@ class TestRegistryAndWiring:
             "cowork-cora-meeting-capture-audit": "scripts/run_meeting_capture_audit.py",
             "cowork-cora-finance-close-pack": "scripts/run_finance_close_pack.py",
             "Cora - F3E Blog Pipeline": "scripts/run_f3e_blog_pipeline.py",
+            # ingest-integrity I2 (2026-09-08): the harvester adopted the marker
+            "cowork-cora-session-capture": "scripts/run_session_capture.py",
         }
         for entry in data.get("run_markers") or []:
             path = scripts.get(entry["name"])

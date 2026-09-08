@@ -361,11 +361,21 @@ def slug_repo_zone(slug: str) -> tuple[str, str]:
 # ── Screens (ZONE-K only, deterministic, no LLM) ─────────────────────────────
 def screen_reason(text: str, cfg: Config) -> str | None:
     """Return a short reason string if the text must be quarantined from ZONE-K,
-    else None. Union of phi_guard.is_any_phi, the LEX token family, and the
-    personal-container keyword families."""
-    if phi_guard.is_any_phi(text):
-        preds = ",".join(phi_guard.which_predicates(text)) or "phi"
-        return f"phi ({preds})"
+    else None. Union of the PROSE PHI screen, the LEX token family, and the
+    personal-container keyword families.
+
+    2026-09-08 (ingest-integrity I2; cq-e4b0d20a313f folded): the first cut used
+    phi_guard.is_any_phi, whose is_lex_billing_status_phi leg fires on ordinary
+    business vocabulary -- "status APPROVED", "restock pending", "CLAIMS CHECK" --
+    so 5 of 6 skill quarantines and ~14 F3 memory quarantines in the first mirror
+    run were false positives and the lane needed per-file allow_files opt-ins.
+    Skills and memory files are PROSE about many things, the same object class as
+    a session transcript, so they take the same value-/individual-shaped screen
+    (phi_guard.is_prose_phi_risk). LEX tokens and the personal families are
+    unchanged -- a LEX-named memory still quarantines as "lex-token"."""
+    legs = phi_guard.prose_phi_legs(text)
+    if legs:
+        return f"phi ({','.join(legs)})"
     if _LEX_TOKEN_RE.search(text):
         return "lex-token"
     low = text.lower()

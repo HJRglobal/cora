@@ -104,13 +104,36 @@ def main() -> int:
 
     captured = [r for r in results if r.distilled and r.note_path]
     skipped = [r for r in results if not (r.distilled and r.note_path)]
-    log.info("Run complete: %d captured, %d skipped, %d total examined",
-             len(captured), len(skipped), len(results))
+    quarantined = [r for r in captured if getattr(r, "quarantined", False)]
+    log.info("Run complete: %d captured (%d quarantined), %d skipped, %d total examined",
+             len(captured), len(quarantined), len(skipped), len(results))
     for r in captured:
-        log.info("  + %s  entity=%s phi=%s  %s",
-                 r.session_id[:8], r.entity, r.phi, r.meta.get("topic", ""))
+        log.info("  + %s  entity=%s phi=%s quarantined=%s  %s",
+                 r.session_id[:8], r.entity, r.phi, getattr(r, "quarantined", False),
+                 r.meta.get("topic", ""))
     for r in skipped:
         log.info("  - %s  skipped=%s", r.session_id[:8], r.skipped_reason)
+    if quarantined:
+        # I2 (Leak #2): a held note is an alert, not a silent side effect. The
+        # nightly health check reads the same ledger rows (check_session_capture_quarantine).
+        log.warning("QUARANTINED %d capture(s) -- PHI-risk on a non-LEX session; founder review "
+                    "under %s: %s", len(quarantined), scap.quarantine_root(),
+                    ", ".join(r.session_id[:8] for r in quarantined))
+    if not args.dry_run:
+        # Run marker (session #11 S4 contract): outputs = notes actually written.
+        # A quiet window writes 0 and that is legitimate (expects_output: false
+        # in the registry); the marker still proves the lane FIRED.
+        try:
+            from cora import run_marker
+            run_marker.write(
+                "cowork-cora-session-capture", script="run_session_capture.py", ok=True,
+                outputs=len(captured),
+                outcome="ok-with-quarantine" if quarantined else "ok",
+                detail=(f"captured={len(captured)} quarantined={len(quarantined)} "
+                        f"skipped={len(skipped)} examined={len(results)}"),
+            )
+        except Exception as exc:  # noqa: BLE001 -- a marker must never fail the lane
+            log.warning("run marker write failed: %s", exc)
     return 0
 
 

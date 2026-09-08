@@ -360,7 +360,14 @@ _CORA_BUILD_DOC_RE = re.compile(
     # keyword is the drive_sweep belt (a title-only door with no path) so the
     # 06:00 sweep can never ingest a body through the other door (D-057/D-086).
     # TARGETED, not broad-only, so both scopes and the default purge scope see it.
-    r"mirror"
+    r"mirror|"
+    # ``quarantine`` (2026-09-08, ingest-integrity I2): every note the session
+    # harvester HOLDS instead of filing (a non-LEX distill whose transcript
+    # carries value-shaped PHI) is written as ``cora-quarantine-<name>.md`` under
+    # _shared/projects/cora/_session-capture-quarantine/. The folder is covered by
+    # the parent pin (drive_sweep) and the workspace path rule (static_md); this
+    # keyword is the title belt so the file trips even outside its folder.
+    r"quarantine"
     r")\b",
     re.IGNORECASE,
 )

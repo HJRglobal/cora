@@ -727,6 +727,130 @@ def non_lex_phi_backstop_trips_individual(
 
 
 # ---------------------------------------------------------------------------
+# PROSE screen -- free text that is ABOUT many things (ingest-integrity 2026-09-08)
+# ---------------------------------------------------------------------------
+# Consumers: session_capture (a Code/Cowork transcript being FILED under a non-LEX
+# entity -- Leak #2, cq-bc5e5b7512bd) and the claude-workspace mirror's ZONE-K
+# screen over skills / memory files (cq-e4b0d20a313f, folded).
+#
+# WHY A THIRD SHAPE. is_phi_risk is an INGESTION screen: bare topic words are a
+# fair proxy for a client record when the text is an email subject or a Drive
+# filename, and over-refusing costs nothing. A session TRANSCRIPT is the
+# opposite object: it is prose about the whole portfolio, and measured on the 116
+# transcripts the harvester had filed into the LEX partition (2026-09-08), the
+# strict screen tripped on ``diagnosis`` (root-cause, 50 sessions), ``arc`` (the
+# knowledge-parity arc, 45), ``assessment`` (13), ``discharge``, ``patient``,
+# ``dob``, and on the literal PHI-regex vocabulary a Cora code session quotes
+# (ssn / date of birth / member id / ddd client / intake form). Even the
+# person-linked and non-LEX backstop variants still fired on 103 and 46 of them:
+# nearly every Cora-build session says "Lexington" (the programme cue) and carries
+# a non-staff possessive plus approved/pending/claims (the billing leg).
+#
+# So this screen keys on VALUES and INDIVIDUALS only -- never a bare topic word:
+#   dob            -- a birth cue followed by a date VALUE (_DOB_RE)
+#   icd10          -- an ICD-10 code with its decimal (_ICD10_RE)
+#   diagnosed_with -- the past-participle clinical framing "diagnosed with X"
+#                     (NOT "diagnosis of/with X", which is how an ops session says
+#                     "root-cause diagnosis of the checkout failure")
+#   program_id     -- a payer/programme NAME immediately followed by an id NUMBER
+#                     (the beneficiary-number shape from is_phi_risk_person_linked)
+#   dx_individual  -- a diagnosis term or medication NAME tied to a SPECIFIC
+#                     non-staff individual (care-noun-governed name or non-staff
+#                     possessive); a bare product/topic mention is not PHI
+#   billing_individual -- named billing/authorization/eligibility tied to a
+#                     Lexington/Medicaid programme AND a care-noun-GOVERNED name
+#                     (the tag-scoped leg of non_lex_phi_backstop_trips_individual)
+#
+# Measured on the same 116 transcripts: the composite fires on ~9, none of them
+# in the 9/3 or 9/4 misfiled sets (tests/test_leak2_live_fixtures.py pins the
+# live sets when the transcripts are present). A false positive here costs one
+# QUARANTINED note (held, founder-only, alerted) -- never a mis-filed one.
+# is_phi_risk / is_clinical_phi / is_lex_billing_status_phi are UNCHANGED.
+_DIAGNOSED_WITH_STRICT_RE = re.compile(r"\bdiagnosed\s+with\b", re.IGNORECASE)
+
+
+def _program_id_tail_present(text: str) -> bool:
+    """A payer/programme name immediately followed by an id number (never a
+    document reference like 'AHCCCS manual, section 1240')."""
+    for m in _PHI_PROGRAM_NAME_RE.finditer(text):
+        tail = _PROGRAM_ID_TAIL_RE.search(text, m.end(), m.end() + _PROGRAM_ID_TAIL_WINDOW)
+        if tail and not _is_document_reference(text, tail.start()):
+            return True
+    return False
+
+
+# A care-recipient noun governing a Title-case name, with the NOUN in any case --
+# prose starts sentences with "Client Marcus ..." / "Member Sofia ...", which the
+# lowercase-noun _CARE_RECIPIENT_NAME_RE (built for mid-sentence chunk text) skips.
+# Title-case COMMON nouns that follow a care noun in business prose ("Client
+# Services", "Parent Company", "Member Portal") are stop-listed, and rostered staff
+# names are spared exactly as the other individual legs spare them.
+_PROSE_CARE_NOUN_NAME_RE = re.compile(
+    r"\b(?i:client|patient|member|individual|participant|recipient|consumer|guardian|parent)"
+    r"\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b"
+)
+_PROSE_GOVERNED_STOPWORDS = frozenset({
+    "services", "service", "company", "portal", "name", "names", "records", "record", "data",
+    "care", "status", "billing", "authorization", "management", "relations", "success",
+    "support", "list", "id", "number", "count", "mix", "base", "file", "files", "intake",
+    "enrollment", "eligibility", "assessment", "review", "handbook", "guide", "faq",
+})
+
+
+def _prose_governed_name(text: str, allowed_names: set[str] | None = None) -> bool:
+    """A care noun (any case) governing a Title-case NAME that is neither a
+    stop-listed common noun nor a rostered staff name."""
+    full, first = _staff_name_index(allowed_names)
+    for m in _PROSE_CARE_NOUN_NAME_RE.finditer(text):
+        name = m.group(1)
+        if name.split()[0].lower() in _PROSE_GOVERNED_STOPWORDS:
+            continue
+        if _is_staff_name(name, full, first):
+            continue
+        return True
+    return False
+
+
+def prose_phi_legs(text: str, allowed_names: set[str] | None = None) -> list[str]:
+    """Names of the prose-screen legs that fire on *text* -- diagnostics AND the
+    decision basis for is_prose_phi_risk (the list is empty iff the screen passes).
+    Never raises; an internal error reports a single ``error`` leg (fail-closed)."""
+    if not text:
+        return []
+    legs: list[str] = []
+    try:
+        if _DOB_RE.search(text):
+            legs.append("dob")
+        if _ICD10_RE.search(text):
+            legs.append("icd10")
+        if _DIAGNOSED_WITH_STRICT_RE.search(text):
+            legs.append("diagnosed_with")
+        if _program_id_tail_present(text):
+            legs.append("program_id")
+        if (_CLINICAL_DX_RE.search(text) or _MED_NAME_RE.search(text)) and (
+            _reveals_individual_care_recipient(text, allowed_names)
+            or _prose_governed_name(text, allowed_names)
+        ):
+            legs.append("dx_individual")
+        if is_lex_billing_status_phi(text) and is_lex_program_context(text) and (
+            _names_governed_care_recipient(text, allowed_names)
+            or _prose_governed_name(text, allowed_names)
+        ):
+            legs.append("billing_individual")
+    except Exception:  # noqa: BLE001 -- a screen never raises; fail closed
+        legs.append("error")
+    return legs
+
+
+def is_prose_phi_risk(text: str, allowed_names: set[str] | None = None) -> bool:
+    """PHI screen for free prose that is ABOUT many things (a session transcript,
+    a mirrored skill or memory file). Value- and individual-shaped legs only; a
+    bare topic word (diagnosis / assessment / AHCCCS / approved / claims / the PHI
+    regex vocabulary itself) never trips. See the module section above."""
+    return bool(prose_phi_legs(text, allowed_names))
+
+
+# ---------------------------------------------------------------------------
 # LEX action-item PHI scrubber (Meeting Action Capture, 2026-06-14)
 # ---------------------------------------------------------------------------
 # Used by the Fireflies meeting-action-capture pipeline when LEX OPERATIONAL

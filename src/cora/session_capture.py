@@ -98,6 +98,18 @@ VALID_ENTITIES: frozenset[str] = frozenset(ENTITY_FOLDERS) | frozenset(
 SURFACE = "code-session"
 SURFACE_COWORK = "cowork-session"
 
+# Quarantine (ingest-integrity bundle I2, cq-bc5e5b7512bd, 2026-09-08): a
+# non-LEX distill whose transcript trips the VALUE-shaped prose PHI screen is
+# HELD here -- never filed into the LEX partition (Leak #2), never KB-ingested.
+# The folder sits under the id-pinned, path-excluded Cora build workspace
+# (_shared/projects/cora -> kb_exclusions.KB_EXCLUDED_FOLDER_IDS + the
+# _CORA_WORKSPACE_SEGMENTS path rule), so BOTH ingest doors skip it by
+# construction, and every quarantined note carries a ``cora-quarantine-`` name so
+# the drive_sweep title belt trips even if the folder were ever moved (a second
+# ingest door needs its own belt).
+QUARANTINE_DIRNAME = "_session-capture-quarantine"
+QUARANTINE_PREFIX = "cora-quarantine-"
+
 # Don't harvest a session whose last activity is younger than this — it may
 # still be live; let it settle so we capture the finished conversation.
 SETTLE_MINUTES = 30
@@ -166,6 +178,9 @@ class CaptureResult:
     distilled: bool
     skipped_reason: str = ""
     meta: dict[str, Any] = field(default_factory=dict)
+    # I2: True when the note was HELD in the quarantine folder (non-LEX distill +
+    # value-shaped PHI in the transcript) instead of being filed + KB-ingested.
+    quarantined: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -601,7 +616,8 @@ def _parse_distilled(raw: str, default_entity: str) -> dict[str, Any] | None:
 
 
 def render_note(distilled: dict[str, Any], session: ParsedSession,
-                date_str: str, phi: bool, *, surface: str = SURFACE) -> str:
+                date_str: str, phi: bool, *, surface: str = SURFACE,
+                quarantined: bool = False) -> str:
     """Render the distilled session into the locked note schema."""
     def _bullets(items: list[str]) -> str:
         if not items:
@@ -610,7 +626,13 @@ def render_note(distilled: dict[str, Any], session: ParsedSession,
 
     entity = distilled["entity"]
     header = f"## {date_str} — {surface} — {entity} — {distilled['topic']}"
-    phi_line = "- PHI: yes (LEX-scoped, access-controlled)\n" if phi else ""
+    if quarantined:
+        # I2: a non-LEX note held for founder review -- the stamp says WHY it is
+        # here and that it is not knowledge (not KB-ingested, not canon).
+        phi_line = (f"- QUARANTINED: PHI-risk on a non-LEX ({entity}) session -- founder review; "
+                    f"not KB-ingested (ingest-integrity 2026-09, cq-bc5e5b7512bd)\n")
+    else:
+        phi_line = "- PHI: yes (LEX-scoped, access-controlled)\n" if phi else ""
     return (
         f"{header}\n\n"
         f"- Decisions:\n{_bullets(distilled['decisions'])}\n"
@@ -637,6 +659,46 @@ def note_path_for(entity: str, when: datetime, session_id: str,
     short = clean[:8] if clean else uuid.uuid4().hex[:8]
     fname = f"{date}_{surface}_{short}.md"
     return root / folder / "_session-captures" / month / fname
+
+
+def quarantine_root(root: Path = FOUNDER_OS_ROOT) -> Path:
+    """The founder-only, KB-excluded quarantine folder (see QUARANTINE_DIRNAME)."""
+    return root / "_shared" / "projects" / "cora" / QUARANTINE_DIRNAME
+
+
+def quarantine_note_path_for(entity: str, when: datetime, session_id: str,
+                             root: Path = FOUNDER_OS_ROOT, *, surface: str = SURFACE) -> Path:
+    """Quarantine path: <root>/_shared/projects/cora/_session-capture-quarantine/
+    YYYY-MM/cora-quarantine-<the regular filename>. Same date/surface/short-id
+    filename so the re-file tooling can recognise the session; the prefix is the
+    drive_sweep title belt."""
+    regular = note_path_for(entity, when, session_id, root=root, surface=surface)
+    return quarantine_root(root) / when.strftime("%Y-%m") / f"{QUARANTINE_PREFIX}{regular.name}"
+
+
+def route_capture(distilled_entity: str, text: str) -> tuple[str, bool, bool]:
+    """Decide (entity, phi, quarantined) for a distilled session -- the Leak #2 fix.
+
+    * A LEX / LEX-* distill keeps the STRICT ingestion posture: ``phi`` is
+      ``phi_guard.is_phi_risk`` (over-flagging costs nothing there -- the note is
+      LEX-filed either way and the flag only adds the access-control stamp).
+    * A NON-LEX distill is NEVER re-homed to LEX. ``phi`` is the value-shaped
+      prose screen (``phi_guard.is_prose_phi_risk``: a DOB value, an ICD-10 code,
+      "diagnosed with", a programme id number, a diagnosis/medication tied to a
+      named individual). When it fires the note is QUARANTINED -- held in the
+      founder-only, KB-excluded folder and alerted -- instead of filed.
+
+    Until 2026-09-08 the strict screen decided the filing and re-homed every hit
+    to LEX; measured on the real transcripts it tripped on ``diagnosis``
+    (root-cause), ``arc``, ``assessment``, ``discharge``, ``patient`` ... and 142
+    non-LEX sessions since June landed in 08-Lexington-Services under a false PHI
+    stamp (decisions.md 2026-09-03 harvester entry + its 9/4 correction).
+    """
+    entity = distilled_entity
+    if entity.startswith("LEX"):
+        return entity, phi_guard.is_phi_risk(text), False
+    phi = phi_guard.is_prose_phi_risk(text)
+    return entity, phi, phi
 
 
 # ---------------------------------------------------------------------------
@@ -702,11 +764,16 @@ def _finalize_capture(
     dedup + ledger key; ``session.session_id`` remains the clean id shown in the
     note + filename. ``pre_distilled`` carries a batch-path result (parsed dict,
     or None when batch AND its per-item sync fallback both failed)."""
-    phi = phi_guard.is_phi_risk(session.text)
+    # The PRE-distill posture is deliberately the strict ingestion screen and is
+    # unchanged: it sizes the Haiku input cap (more room for a PHI-shaped
+    # transcript) and keeps PHI-shaped transcripts off the Message Batch (no
+    # 29-day at-rest copy). It no longer decides WHERE the note is filed --
+    # route_capture does, after the distill has named the entity (I2, Leak #2).
+    phi_strict = phi_guard.is_phi_risk(session.text)
     default_entity = entity_from_cwd(session.cwd)
 
     if pre_distilled is _NO_PREDISTILL:
-        distilled = distill(session.text, default_entity, phi=phi,
+        distilled = distill(session.text, default_entity, phi=phi_strict,
                             client=anthropic_client)
     else:
         distilled = pre_distilled
@@ -714,31 +781,42 @@ def _finalize_capture(
         # Fail-closed: do not write, do not mark captured — retry next run.
         return CaptureResult(
             session_id=session.session_id, entity=default_entity,
-            note_path=None, phi=phi, distilled=False,
+            note_path=None, phi=phi_strict, distilled=False,
             skipped_reason="distill_failed",
         )
 
-    entity = distilled["entity"]
-    # PHI present -> force into the LEX-scoped, access-controlled store.
-    if phi:
-        entity = "LEX" if not entity.startswith("LEX") else entity
-        distilled["entity"] = entity
+    # NEVER re-home a non-LEX distill to LEX. A LEX distill keeps the strict
+    # stamp; a non-LEX distill that trips the value-shaped prose screen is
+    # QUARANTINED (held + alerted), not filed.
+    entity, phi, quarantined = route_capture(distilled["entity"], session.text)
+    distilled["entity"] = entity
 
     when = datetime.now(timezone.utc)
-    npath = note_path_for(entity, when, session.session_id,
-                          root=founder_os_root, surface=surface)
-    note = render_note(distilled, session, when.strftime("%Y-%m-%d"), phi, surface=surface)
+    if quarantined:
+        npath = quarantine_note_path_for(entity, when, session.session_id,
+                                         root=founder_os_root, surface=surface)
+    else:
+        npath = note_path_for(entity, when, session.session_id,
+                              root=founder_os_root, surface=surface)
+    note = render_note(distilled, session, when.strftime("%Y-%m-%d"), phi,
+                       surface=surface, quarantined=quarantined)
 
     result = CaptureResult(
         session_id=session.session_id, entity=entity, note_path=npath,
-        phi=phi, distilled=True,
+        phi=phi, distilled=True, quarantined=quarantined,
         meta={"topic": distilled["topic"], "n_turns": session.n_turns,
               "surface": surface},
     )
+    if quarantined:
+        log.warning(
+            "session_capture: QUARANTINED %s (entity=%s surface=%s) -> %s -- PHI-risk on a "
+            "non-LEX session; founder review, not KB-ingested",
+            ledger_key, entity, surface, npath.name,
+        )
 
     if dry_run:
-        log.info("[DRY] would write %s (entity=%s phi=%s surface=%s)",
-                 npath, entity, phi, surface)
+        log.info("[DRY] would write %s (entity=%s phi=%s quarantined=%s surface=%s)",
+                 npath, entity, phi, quarantined, surface)
         captured.add(ledger_key)
         return result
 
@@ -754,7 +832,9 @@ def _finalize_capture(
         result.note_path = None
         return result
 
-    if with_kb and kb is not None:
+    # A quarantined note is NEVER KB-ingested (its folder is excluded on both doors
+    # too -- this is the belt for the immediate-ingest path).
+    if with_kb and kb is not None and not quarantined:
         _ingest_note(kb, npath, entity, distilled, session, founder_os_root,
                      content=note, when=when)
 
@@ -762,14 +842,15 @@ def _finalize_capture(
         "session_id": ledger_key,
         "entity": entity,
         "phi": phi,
+        "quarantined": quarantined,
         "note_path": str(npath),
         "topic": distilled["topic"],
         "surface": surface,
         "captured_at": when.isoformat(),
     }, ledger_path)
     captured.add(ledger_key)
-    log.info("Captured session %s -> %s (entity=%s phi=%s surface=%s)",
-             ledger_key, npath.name, entity, phi, surface)
+    log.info("Captured session %s -> %s (entity=%s phi=%s quarantined=%s surface=%s)",
+             ledger_key, npath.name, entity, phi, quarantined, surface)
     return result
 
 

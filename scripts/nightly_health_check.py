@@ -1385,6 +1385,59 @@ def check_claude_mirror(now_epoch: float | None = None) -> CheckResult:
                        f"unpinned={len(st.get('unpinned', []))}.")
 
 
+def check_session_capture_quarantine(
+    now: datetime | None = None, ledger_path: Path | None = None,
+) -> CheckResult:
+    """WARN when the session harvester QUARANTINED a capture in the last 26h
+    (ingest-integrity I2, cq-bc5e5b7512bd, 2026-09-08).
+
+    A quarantined note is a non-LEX Code/Cowork session whose transcript carried
+    value-shaped PHI (a DOB value, a programme id number, a diagnosis tied to a
+    named individual). It is HELD in the founder-only, KB-excluded folder
+    _shared/projects/cora/_session-capture-quarantine/ instead of being filed --
+    and never re-homed to LEX (Leak #2). The harvester ledger
+    (logs/session-captures.jsonl) carries ``quarantined: true`` on those rows;
+    this reads them so a hold is surfaced daily, not discovered months later.
+    Missing / unreadable ledger -> OK (the harvester's own log is the primary
+    record; this is the alert line). WARN, never CRITICAL."""
+    now = now or datetime.now(timezone.utc)
+    path = ledger_path or (_REPO_ROOT / "logs" / "session-captures.jsonl")
+    if not path.exists():
+        return CheckResult("Session-capture quarantine", "ok",
+                           "no harvester ledger yet -- nothing to read.")
+    recent: list[str] = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not row.get("quarantined"):
+                continue
+            ts_raw = str(row.get("refiled_at") or row.get("captured_at") or "")
+            try:
+                ts = datetime.fromisoformat(ts_raw)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            if (now - ts).total_seconds() <= 26 * 3600:
+                recent.append(str(row.get("session_id") or "?")[:8])
+    except Exception as exc:  # noqa: BLE001 -- report, never crash the run
+        return CheckResult("Session-capture quarantine", "ok",
+                           f"ledger unreadable (non-fatal): {exc}")
+    if recent:
+        return CheckResult(
+            "Session-capture quarantine", "warn",
+            f"{len(recent)} capture(s) QUARANTINED in the last 26h (PHI-risk on a non-LEX "
+            f"session; founder review under _shared/projects/cora/_session-capture-quarantine/): "
+            + ", ".join(recent[:10]))
+    return CheckResult("Session-capture quarantine", "ok", "no quarantined captures in the last 26h.")
+
+
 def check_dynamic_snapshots(now_epoch: float | None = None) -> CheckResult:
     """WARN when a dynamic-answers snapshot is missing or stale past its yaml
     threshold (D-084). context_loader serves the yaml `fallback` in that case --
@@ -2021,6 +2074,7 @@ def main() -> int:
 
     log.info("Checking claude-workspace mirror freshness...")
     all_results.append(check_claude_mirror())
+    all_results.append(check_session_capture_quarantine())
 
     log.info("Checking 13wk cashflow forecast snapshot (S1) freshness...")
     all_results.append(check_cashflow_forecast_snapshot())
