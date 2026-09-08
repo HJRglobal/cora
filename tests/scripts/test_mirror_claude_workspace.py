@@ -402,10 +402,15 @@ def test_task_name_redacted_when_name_trips_screen(roots):
 def test_skills_index_row_absent_when_body_quarantined(roots):
     """H3: a skill whose body is quarantined must not leave an INDEX row (whose
     description would leak the screened text)."""
-    _skill(roots["skills"], "cascade", desc="handles the LEX-LTS census", body="clean body")
+    # `morning` is mirrored (skills.allow) and carries NO allow_files opt-in, so the
+    # screen decides. (The first cut used `cascade`, which Harrison opted in via
+    # allow_files on 2026-09-03 -- the live config then released the body and this
+    # test read the ruled opt-in as a regression. Never key a quarantine assertion
+    # on a skill the live allowlist may release.)
+    _skill(roots["skills"], "morning", desc="handles the LEX-LTS census", body="clean body")
     _skill(roots["skills"], "wrap-it", desc="closes a session", body="clean")
     _run(["--apply", "--only", "skills"])
-    assert not (roots["zk"] / "skills" / "cascade.SKILL.md").exists()  # quarantined (LEX in desc)
+    assert not (roots["zk"] / "skills" / "morning.SKILL.md").exists()  # quarantined (LEX in desc)
     idx = (roots["zk"] / "skills" / "INDEX.md").read_text(encoding="utf-8")
     assert "census" not in idx.lower() and "lex-lts" not in idx.lower()
     assert "wrap-it" in idx
