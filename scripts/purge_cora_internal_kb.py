@@ -86,6 +86,7 @@ _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO / "src"))
 
 from cora.kb_exclusions import (  # noqa: E402
+    KB_EXCLUDED_WALK_ONLY_IDS,
     _is_kb_allowlisted,
     is_cora_internal_source_id,
     is_cora_internal_title,
@@ -144,10 +145,14 @@ _GOOGLE_FOLDER_MIME = "application/vnd.google-apps.folder"
 _FOLDER_ENUM_MAX_FOLDERS = 5000
 
 
-def _drive_service() -> Any:
-    """Direct-SA Drive v3 service (the SA is a Viewer on HJR-Founder-OS) -- the
-    same builder sweep_founders_os uses. Raises with a clear message when the SA
-    path is not configured; folder mode never proceeds on a guessed credential."""
+def _drive_service(impersonate: str | None = None) -> Any:
+    """Drive v3 service for folder mode. Default: the direct SA (a Viewer on
+    HJR-Founder-OS) -- the same builder sweep_founders_os uses. ``impersonate`` (I3,
+    2026-09-08) builds the DWD service AS that user -- the same builder the flat
+    per-user sweep uses -- because the Drive "Computers" backup roots live in
+    Harrison's own Drive, which the direct SA cannot see. Raises with a clear
+    message when the SA path is not configured; folder mode never proceeds on a
+    guessed credential."""
     sa = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
     if not sa or not Path(sa).exists():
         raise RuntimeError(
@@ -155,7 +160,24 @@ def _drive_service() -> Any:
             "--folder-id needs the Cora service account (read-only Drive)"
         )
     from cora.connectors import drive_sweep as ds  # local import: network deps only when used
+    if impersonate:
+        return ds._build_drive_service(sa, impersonate)
     return ds._build_sa_drive_service_direct(sa)
+
+
+def _computers_root_ok(folder_id: str, chain: list[tuple[str, str]], my_drive_root_id: str | None) -> bool:
+    """POSITIVE gate for the one shape the chain-depth floor must admit: a
+    PARENTLESS Drive "Computers" backup root that is PINNED walk-only in
+    kb_exclusions (never a denylist of one id -- doctrine b, 2026-09-03). The
+    impersonated user's My Drive root is also parentless and is refused; so is
+    the Founder-OS root and anything with a parent."""
+    return (
+        len(chain) == 1
+        and folder_id in KB_EXCLUDED_WALK_ONLY_IDS
+        and folder_id != _FOUNDERS_OS_ROOT_ID
+        and bool(my_drive_root_id)
+        and folder_id != my_drive_root_id
+    )
 
 
 def resolve_folder_chain(service: Any, folder_id: str, *, max_depth: int = 25) -> list[tuple[str, str]]:
@@ -370,6 +392,7 @@ def dump_selected_rows(conn, chunk_ids: list[str], path: Path) -> int:
 def run_folder_mode(
     conn, service: Any, folder_ids: list[str], logs_dir: Path, *,
     apply: bool = False, expect_leaf: str | None = None, accept_delta: bool = False,
+    computers_root: bool = False, my_drive_root_id: str | None = None,
 ) -> tuple[list[str], int, int, bool, list[FolderSelection]]:
     """Resolve, enumerate and select for every --folder-id (read-only).
 
@@ -406,10 +429,23 @@ def run_folder_mode(
         chain = resolve_folder_chain(service, folder_id)
         log.info("  FOLDER-MODE %s resolves to: %s", folder_id, format_chain(chain))
         if len(chain) < _MIN_CHAIN_DEPTH:
-            raise RuntimeError(
-                f"REFUSED: {folder_id} resolves to a root/top-level folder ({format_chain(chain)}) "
-                f"-- too broad for a purge. Pass the specific excluded folder."
-            )
+            # I3 (2026-09-08): the ONE admitted shallow shape -- a parentless Drive
+            # "Computers" backup root, pinned walk-only, asked for explicitly with
+            # --computers-root, never the user's My Drive root. Everything else
+            # shallow is still refused (a pasted sibling id passes a denylist and
+            # purges a partition; a positive gate does not).
+            if computers_root and _computers_root_ok(folder_id, chain, my_drive_root_id):
+                log.warning("  FOLDER-MODE %s is a PARENTLESS Drive Computers backup root (%s) -- "
+                            "admitted by --computers-root (pinned walk-only; not the My Drive root %s)",
+                            folder_id, format_chain(chain), my_drive_root_id)
+            else:
+                raise RuntimeError(
+                    f"REFUSED: {folder_id} resolves to a root/top-level folder ({format_chain(chain)}) "
+                    f"-- too broad for a purge. Pass the specific excluded folder"
+                    + (", or --computers-root for a pinned Computers backup root." if not computers_root
+                       else "; --computers-root admits only a pinned, parentless Computers root that is "
+                            "not the My Drive root.")
+                )
         leaf = chain[0][0]
         if expect_leaf is not None and leaf.strip().casefold() != expect_leaf.strip().casefold():
             raise RuntimeError(
@@ -623,6 +659,15 @@ def main() -> int:
     ap.add_argument("--accept-delta", action="store_true",
                     help="Folder mode --apply: also delete files that were NOT in the reviewed "
                          "dry-run manifest (appeared since the eyeball). Default: refuse.")
+    ap.add_argument("--impersonate", default=None, metavar="EMAIL",
+                    help="Folder mode: build the Drive service via DWD AS this user (the flat sweep's "
+                         "builder) instead of the direct SA -- required for the Drive Computers backup "
+                         "roots, which live in Harrison's own Drive (I3, 2026-09-08).")
+    ap.add_argument("--computers-root", action="store_true",
+                    help="Folder mode: admit a PARENTLESS Drive Computers backup root that is pinned "
+                         "walk-only in kb_exclusions (the chain-depth floor otherwise refuses it). "
+                         "The impersonated user's My Drive root is always refused. --expect-leaf must "
+                         "name the root itself (e.g. 'HJR Always-On Desktop').")
     args = ap.parse_args()
     folder_id_args = [str(f).strip() for f in (args.folder_id or []) if str(f).strip()]
     apply_changes = args.apply and not args.dry_run
@@ -688,11 +733,22 @@ def main() -> int:
         folder_complete = True
         folder_selections: list[FolderSelection] = []
         if folder_id_args:
-            service = _drive_service()
+            service = _drive_service(args.impersonate)
+            my_drive_root_id: str | None = None
+            if args.computers_root:
+                if not args.impersonate:
+                    log.error("REFUSED: --computers-root needs --impersonate <owner email> (the direct SA "
+                              "cannot see a user's Drive Computers backups)")
+                    return 1
+                my_drive_root_id = str(service.files().get(fileId="root", fields="id").execute().get("id") or "")
+                if not my_drive_root_id:
+                    log.error("REFUSED: could not resolve the impersonated user's My Drive root id")
+                    return 1
             folder_ids, folder_files, folder_chunks, folder_complete, folder_selections = run_folder_mode(
                 conn, service, folder_id_args, _REPO / "logs",
                 apply=apply_changes, expect_leaf=args.expect_leaf,
-                accept_delta=args.accept_delta)
+                accept_delta=args.accept_delta,
+                computers_root=args.computers_root, my_drive_root_id=my_drive_root_id)
         elif args.expect_leaf or args.accept_delta:
             log.warning("--expect-leaf / --accept-delta have no effect without --folder-id")
 

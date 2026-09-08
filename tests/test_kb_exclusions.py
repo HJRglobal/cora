@@ -418,6 +418,12 @@ class TestCoraWorkspaceFolderPin:
             "1HEHpMWgkJkHmV1wfWIiT5OhBI0p5p2P-",  # OneAmerica-Handoff dup
             "112C7ljGRI5VO_ic66fVGQk4kf6IC40HQ",  # copa-bhrf
             "1aDnmz3oY7QZxsH7mv7_ZDu7cUyDWLhy7",  # cashflow-ledger
+            # 2026-09-08 (ingest-integrity I3, cq-a0da505f8e5f): the two Drive
+            # "Computers" backup roots -- parentless, walk-only; verified live
+            # (DWD as harrison@) as folders named "HJR Always-On Desktop" /
+            # "Harrison Laptop", owner harrison@, children Desktop/Documents/Downloads.
+            "1cdDb9jvDhoOz1vliE-tmVaks01ey1AJj",  # Computers / HJR Always-On Desktop
+            "1xmXreU4eKvcpAsj7Ic3fiwJO_ySidZ0F",  # Computers / Harrison Laptop
         )
         for prior in priors:
             assert prior in KB_EXCLUDED_FOLDER_IDS, prior

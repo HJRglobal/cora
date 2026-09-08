@@ -47,7 +47,7 @@ _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO / "src"))
 
 from cora.kb_exclusions import (  # noqa: E402
-    KB_EXCLUDED_FOLDER_IDS,
+    KB_DASHBOARD_FOLDER_IDS,
     is_dashboard_store_path,
 )
 from cora.knowledge_base import schema  # noqa: E402
@@ -74,8 +74,13 @@ def _drive_excluded_file_ids(max_nodes: int = 5000) -> frozenset[str]:
         log.warning("Drive unreachable (%s) -- skipping DRIVE targeting; PATH still runs.", exc)
         return frozenset()
 
+    # cq-bd6eab1fcb44 (2026-09-08): walk ONLY the dashboard stores. This legacy
+    # purge carries none of the folder-ancestry gates (no --expect-leaf, no
+    # reviewed manifest), so it must never inherit later pins (copa-bhrf, the
+    # cashflow ledger, the Cora workspace, the Computers roots) from the whole
+    # exclusion set -- those are purged through purge_cora_internal_kb.py --folder-id.
     file_ids: set[str] = set()
-    folders: list[str] = list(KB_EXCLUDED_FOLDER_IDS)
+    folders: list[str] = list(KB_DASHBOARD_FOLDER_IDS)
     seen_folders: set[str] = set(folders)
     try:
         while folders and (len(file_ids) + len(seen_folders)) < max_nodes:

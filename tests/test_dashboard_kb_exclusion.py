@@ -226,8 +226,19 @@ def test_file_under_excluded_ancestor_fallback():
     assert drive_sweep._file_under_excluded_folder(_Service(), ["deckFolder"], base, False, cache) is True
     # A file whose ancestry never reaches an excluded root is not excluded.
     assert drive_sweep._file_under_excluded_folder(_Service(), ["unrelatedFolder"], base, False, cache) is False
-    # When expansion IS complete, the expanded set is authoritative (no ancestor walk).
-    assert drive_sweep._file_under_excluded_folder(_Service(), ["deckFolder"], base, True, {}) is False
+    # Since 2026-09-08 (I3) the two Drive "Computers" backup roots are pinned
+    # WALK-ONLY (parentless; expansion cannot see them), so the ancestry walk runs
+    # even when expansion is complete -- the expanded set is the fast path, no
+    # longer the authority. A nested capital-raise file is therefore caught here too.
+    assert drive_sweep._file_under_excluded_folder(_Service(), ["deckFolder"], base, True, {}) is True
+    # ...and with no walk-only roots pinned, the legacy contract holds: complete => no walk.
+    import cora.connectors.drive_sweep as _ds
+    saved = _ds.KB_EXCLUDED_WALK_ONLY_IDS
+    try:
+        _ds.KB_EXCLUDED_WALK_ONLY_IDS = frozenset()
+        assert drive_sweep._file_under_excluded_folder(_Service(), ["deckFolder"], base, True, {}) is False
+    finally:
+        _ds.KB_EXCLUDED_WALK_ONLY_IDS = saved
 
 
 # --------------------------------------------------------------------------- #

@@ -139,8 +139,65 @@ KB_EXCLUDED_FOLDER_IDS: frozenset[str] = frozenset(
         # projects <- _shared <- HJR-Founder-OS (221 direct children incl.
         # CLAUDE.md, _notes, design). Pinned by Harrison's 9/3 ruling "A) Option 1".
         "1YNObhKwo8RITgrRbw3MFpf-0hIiLWTx9",  # _shared/projects/cora (D-057 workspace; 2026-09-03 parent pin)
+        # Google Drive for Desktop "Computers" backups of BOTH machines (cq-a0da505f8e5f,
+        # pinned 2026-09-08, ingest-integrity I3). This is the located door of
+        # cq-b80c5bc5be7a: the Cowork task SKILL.md bodies were in the KB not from a
+        # stray copy of the Scheduled store but because Drive for Desktop backs up
+        # Desktop / Documents / Downloads of each PC into Drive "Computers", and
+        # the flat per-user sweep of Harrison's Drive enumerates them (Documents is
+        # OneDrive-redirected, so one Scheduled store yielded two Drive copies; the
+        # backups also hold Outlook Files, Mail Attachments, Scanned Documents, Fax,
+        # RDP files, loose contracts). These roots are PARENTLESS and outside the
+        # Founder OS tree, so sweep_founders_os never reaches them and the
+        # subfolder EXPANSION cannot be the door: they are matched by the ancestry
+        # walk instead (KB_EXCLUDED_WALK_ONLY_IDS below). Verified live 2026-09-08
+        # (read-only, DWD as harrison@): both resolve to folders with parents=None,
+        # owner harrison@hjrglobal.com, children exactly Desktop/Documents/Downloads.
+        "1cdDb9jvDhoOz1vliE-tmVaks01ey1AJj",  # Computers / HJR Always-On Desktop
+        "1xmXreU4eKvcpAsj7Ic3fiwJO_ySidZ0F",  # Computers / Harrison Laptop
     }
 )
+
+# Pinned roots that are matched by ANCESTRY WALK, never by subfolder expansion:
+# a Computers backup root is parentless (not under My Drive), so a flat sweep
+# cannot learn it from a file's `parents` field without walking upward, and a
+# downward BFS into a whole Documents backup would cost thousands of list calls
+# per sweep for nothing. drive_sweep._expanded_excluded_folder_ids never
+# descends into these; drive_sweep._file_disposition walks every candidate file's
+# ancestry (cached per folder) and skips a file whose chain touches ANY pinned id.
+KB_EXCLUDED_WALK_ONLY_IDS: frozenset[str] = frozenset({
+    "1cdDb9jvDhoOz1vliE-tmVaks01ey1AJj",  # Computers / HJR Always-On Desktop
+    "1xmXreU4eKvcpAsj7Ic3fiwJO_ySidZ0F",  # Computers / Harrison Laptop
+})
+
+# The DASHBOARD stores only -- the set scripts/purge_dashboard_kb.py may walk
+# (cq-bd6eab1fcb44, 2026-09-08). That legacy purge used to build its Drive
+# targeting from the WHOLE exclusion set, so every later pin (copa-bhrf, the
+# cashflow ledger, the Cora workspace, the Computers roots) silently widened a
+# purge that carries none of the folder-ancestry gates. It now walks exactly
+# these four ids; every other pinned folder is purged only through
+# purge_cora_internal_kb.py --folder-id (positive leaf gate, reviewed manifest).
+KB_DASHBOARD_FOLDER_IDS: frozenset[str] = frozenset({
+    "1INi4fLXG23xao-d_yf56Wrbrah54pIBB",  # 00-Founder/insurance/oneamerica
+    "1BZI6v5pmpgrt7G2dPsAib3u3S-HqB7ZP",  # 02-F3-Energy/projects/capital-raise
+    "1NPBNBfx3MMjqQM_WnmL6jOJSaRAQf752",  # 00-Founder/travel-points
+    "1HEHpMWgkJkHmV1wfWIiT5OhBI0p5p2P-",  # Downloads/OneAmerica-Handoff dup
+})
+
+# Human labels for every pinned id -- the self-inventory tool (I4) lists each
+# exclusion by id AND name so "do you ingest X" is answered from a listing, not a
+# guess. tests/test_kb_exclusions.py pins keys == KB_EXCLUDED_FOLDER_IDS.
+KB_EXCLUDED_FOLDER_LABELS: dict[str, str] = {
+    "1INi4fLXG23xao-d_yf56Wrbrah54pIBB": "00-Founder/insurance/oneamerica (PERSONAL dashboard store)",
+    "1BZI6v5pmpgrt7G2dPsAib3u3S-HqB7ZP": "02-F3-Energy/projects/capital-raise (HIGHLY CONFIDENTIAL dashboard store)",
+    "1NPBNBfx3MMjqQM_WnmL6jOJSaRAQf752": "00-Founder/travel-points (PERSONAL dashboard store)",
+    "1HEHpMWgkJkHmV1wfWIiT5OhBI0p5p2P-": "Downloads/OneAmerica-Handoff duplicate (PERSONAL)",
+    "112C7ljGRI5VO_ic66fVGQk4kf6IC40HQ": "08-Lexington-Services/projects/copa-bhrf (LEX NDA, purged 2026-07-21)",
+    "1aDnmz3oY7QZxsH7mv7_ZDu7cUyDWLhy7": "01-HJR-Global/accounting/cashflow-ledger (13WCF shadow-ledger mirror)",
+    "1YNObhKwo8RITgrRbw3MFpf-0hIiLWTx9": "_shared/projects/cora (Cora build workspace, D-057; ZONE-X mirror + capture quarantine live under it)",
+    "1cdDb9jvDhoOz1vliE-tmVaks01ey1AJj": "Drive Computers backup: HJR Always-On Desktop (Desktop, Documents, Downloads)",
+    "1xmXreU4eKvcpAsj7Ic3fiwJO_ySidZ0F": "Drive Computers backup: Harrison Laptop (Desktop, Documents, Downloads)",
+}
 
 
 # Distinctive folder-name segments of the excluded dashboard stores. A source_id

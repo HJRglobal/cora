@@ -50,6 +50,7 @@ from cora.connectors.drive_entity_detect import (
 from cora.drive_materializer import ENTITY_CODES as _MATERIALIZER_ENTITY_CODES
 from cora.kb_exclusions import (
     KB_EXCLUDED_FOLDER_IDS,
+    KB_EXCLUDED_WALK_ONLY_IDS,
     folder_ids_excluded,
     is_cora_internal_title,
 )
@@ -517,7 +518,8 @@ def _retry_execute(request: Any, max_retries: int = 3) -> Any:
 
 
 def _expanded_excluded_folder_ids(
-    service: Any, base_ids: frozenset[str] = KB_EXCLUDED_FOLDER_IDS, *, max_folders: int = 2000
+    service: Any, base_ids: frozenset[str] = KB_EXCLUDED_FOLDER_IDS, *, max_folders: int = 2000,
+    walk_only: frozenset[str] | None = None,
 ) -> tuple[frozenset[str], bool]:
     """Expand the KB-excluded dashboard folders to include their descendant
     subfolders, so a FLAT per-user sweep (no tree context) can skip NESTED files.
@@ -528,8 +530,14 @@ def _expanded_excluded_folder_ids(
     silently proceed with a partial denylist (a confidential fail-open, D-051
     2026-07-11). Paginates subfolders so a folder with >100 subfolders is not
     silently truncated. For users who can't see the roots, each list is empty."""
+    # I3 (2026-09-08): the Computers backup roots are pinned WALK-ONLY -- they are
+    # parentless, hold thousands of folders (a whole Documents backup), and are
+    # closed by the ancestry walk in _file_disposition, so the downward BFS never
+    # enters them. They stay in `out` (a file whose direct parent IS the root is
+    # still caught on the fast path).
+    walk_only = KB_EXCLUDED_WALK_ONLY_IDS if walk_only is None else walk_only
     out: set[str] = set(base_ids)
-    queue: list[str] = list(base_ids)
+    queue: list[str] = [b for b in base_ids if b not in walk_only]
     complete = True
     while queue:
         if len(out) >= max_folders:
@@ -569,46 +577,127 @@ def _expanded_excluded_folder_ids(
     return frozenset(out), complete
 
 
-def _any_ancestor_excluded(
-    service: Any, folder_ids: list[str] | None, cache: dict[str, list[str]], *, max_nodes: int = 400
-) -> bool:
-    """Walk a file's parent folders UPWARD; True if any ancestor is a KB-excluded
-    dashboard root. Used only as the fail-closed fallback when expansion did not
-    complete. Folder->parents lookups are cached per sweep run (bounded cost).
-    An unresolvable node is treated as non-excluded (logged) -- best effort."""
+def _ancestor_chain(
+    service: Any, parent_ids: list[str] | None, cache: dict, *, max_nodes: int = 400,
+) -> tuple[list[tuple[str, str]], bool]:
+    """Ordered ``[(folder_id, folder_name), ...]`` from a file's first parent UP to
+    its top-most ancestor, following ``parents[0]`` (Drive files have one parent).
+
+    ``cache`` is per sweep run: ``cache[fid] = {"parents": [...], "name": str}``
+    (a legacy ``list`` value -- parents only -- is upgraded in place), so the
+    walk costs one ``files.get`` per DISTINCT folder, not per file. A lookup
+    failure is NOT cached (the next file in that folder retries) and marks the
+    chain ``complete=False``; the caller treats an unresolvable ancestry as
+    EXCLUDED (fail-closed). That posture is load-bearing since 2026-09-08: the two
+    Computers backup roots (kb_exclusions.KB_EXCLUDED_WALK_ONLY_IDS) are
+    parentless and cannot be expanded downward -- this upward walk is the only
+    door that closes them, so "could not resolve" must never read as "not
+    excluded" (the same fail-closed rule _expanded_excluded_folder_ids applies to a
+    partial denylist).
+    """
+    chain: list[tuple[str, str]] = []
     seen: set[str] = set()
-    stack: list[str] = list(folder_ids or [])
-    while stack and len(seen) < max_nodes:
-        fid = stack.pop()
-        if fid in seen:
-            continue
+    complete = True
+    fid = (parent_ids or [None])[0] if parent_ids else None
+    while fid and fid not in seen and len(seen) < max_nodes:
         seen.add(fid)
-        if fid in KB_EXCLUDED_FOLDER_IDS:
-            return True
-        if fid not in cache:
+        entry = cache.get(fid)
+        if isinstance(entry, list):  # legacy shape (parents only)
+            entry = {"parents": list(entry), "name": ""}
+            cache[fid] = entry
+        if entry is None:
             try:
-                meta = _retry_execute(service.files().get(fileId=fid, fields="parents"))
-                cache[fid] = meta.get("parents") or []
-            except Exception as exc:  # noqa: BLE001
+                meta = _retry_execute(service.files().get(fileId=fid, fields="id,name,parents"))
+                raw_parents = meta.get("parents") if isinstance(meta, dict) else None
+                raw_name = meta.get("name") if isinstance(meta, dict) else ""
+                entry = {"parents": [str(p) for p in (raw_parents or [])],
+                         "name": str(raw_name or "")}
+                cache[fid] = entry
+            except Exception as exc:  # noqa: BLE001 -- fail-CLOSED at the caller
                 log.warning("drive_sweep: ancestor resolve failed for %s (%s)", fid, exc)
-                cache[fid] = []
-        stack.extend(cache[fid])
-    return False
+                complete = False
+                chain.append((fid, ""))
+                break
+        chain.append((fid, str(entry.get("name") or "")))
+        parents = entry.get("parents") or []
+        fid = parents[0] if parents else None
+    return chain, complete
+
+
+def _any_ancestor_excluded(
+    service: Any, folder_ids: list[str] | None, cache: dict, *, max_nodes: int = 400
+) -> bool:
+    """True if any ancestor of a file's parent folder is KB-excluded, OR the
+    ancestry could not be resolved (fail-closed -- see _ancestor_chain)."""
+    chain, complete = _ancestor_chain(service, folder_ids, cache, max_nodes=max_nodes)
+    if not complete:
+        return True
+    return any(fid in KB_EXCLUDED_FOLDER_IDS for fid, _name in chain)
+
+
+def _file_disposition(
+    service: Any, parents: list[str] | None, expanded: frozenset[str],
+    complete: bool, cache: dict,
+) -> str | None:
+    """Why a flat-sweep file must be SKIPPED, or None to ingest it.
+
+    ``"excluded"``        a parent is in the expanded exclusion set (fast path), or
+                          an ancestor is any pinned id -- incl. the parentless
+                          Computers backup roots, which only the walk can see;
+    ``"unresolved"``      the ancestry could not be resolved this run (fail-closed);
+    ``"founders_os_owned"`` the file sits under an entity-mapped top folder of the
+                          HJR-Founder-OS tree, which sweep_founders_os already
+                          ingests with the FOLDER-deterministic entity (I5,
+                          cq-12fd5d76fd04); the flat sweep's Haiku-tagged twin of
+                          the same file id used to overwrite it with FNDR/F3E.
+
+    The walk runs whenever expansion was incomplete OR walk-only roots are pinned
+    (always, in production) -- the expanded set is the fast path, no longer the
+    authority. Cached per folder, so the cost is one lookup per distinct folder.
+    """
+    parents = parents or []
+    if any(p in expanded for p in parents):
+        return "excluded"
+    if not parents:
+        return None
+    if complete and not KB_EXCLUDED_WALK_ONLY_IDS:
+        return None  # the expanded set is authoritative (legacy shape, no walk-only roots)
+    chain, ok = _ancestor_chain(service, parents, cache)
+    if not ok:
+        return "unresolved"
+    if any(fid in KB_EXCLUDED_FOLDER_IDS for fid, _name in chain):
+        return "excluded"
+    owner = _founders_os_owner_entity(chain)
+    if owner:
+        return "founders_os_owned"
+    return None
+
+
+def _founders_os_owner_entity(chain: list[tuple[str, str]]) -> str | None:
+    """The entity sweep_founders_os would assign to a file whose ancestry runs
+    through the HJR-Founder-OS root -- i.e. the entity mapped to the TOP-LEVEL
+    folder directly under the root -- or None when the file is not in that tree,
+    sits at the root itself, or its top folder is unmapped (memory/, _brain/ ...
+    which founders_os skips and the flat sweep therefore keeps covering)."""
+    ids = [fid for fid, _name in chain]
+    if FOUNDERS_OS_ROOT_ID not in ids:
+        return None
+    root_at = ids.index(FOUNDERS_OS_ROOT_ID)
+    if root_at == 0:
+        return None  # the file's direct parent IS the root -> founders_os never sweeps it
+    top_name = chain[root_at - 1][1]
+    return _founders_os_entity_for(top_name) if top_name else None
 
 
 def _file_under_excluded_folder(
     service: Any, parents: list[str] | None, expanded: frozenset[str],
-    complete: bool, cache: dict[str, list[str]],
+    complete: bool, cache: dict,
 ) -> bool:
-    """True if a file (by its parent folder ids) sits in an excluded dashboard
-    store. Fast path uses the expanded folder-id set; if expansion was incomplete
-    it falls back to ancestor resolution (fail-closed)."""
-    parents = parents or []
-    if any(p in expanded for p in parents):
-        return True
-    if complete:
-        return False  # the expanded set is authoritative
-    return _any_ancestor_excluded(service, parents, cache)
+    """True if a file (by its parent folder ids) sits in a KB-excluded folder --
+    the expanded set, any pinned ancestor (incl. the Computers roots), or an
+    ancestry that could not be resolved (fail-closed). Thin wrapper over
+    _file_disposition kept for the existing call sites and tests."""
+    return _file_disposition(service, parents, expanded, complete, cache) in ("excluded", "unresolved")
 
 
 def _build_drive_service(sa_json_path: str, user_email: str):
@@ -791,14 +880,33 @@ def sweep_user(
                 stats["personal_books_skipped"] += 1
                 continue
 
-            # Dashboard read layer: never ingest personal/confidential dashboard
-            # stores (OneAmerica, capital-raise, travel-points) or their subtrees.
-            if _file_under_excluded_folder(
+            # Never ingest a KB-excluded folder's subtree: the dashboard stores,
+            # the LEX NDA folder, the Cora workspace, the cashflow ledger, and --
+            # by ancestry walk, since 2026-09-08 -- the two Drive "Computers"
+            # backup roots of both PCs (I3, cq-a0da505f8e5f). An unresolvable
+            # ancestry is skipped this run (fail-closed) rather than ingested.
+            disposition = _file_disposition(
                 service, file_meta.get("parents"), excluded_folders,
                 _excl_complete, _folder_parent_cache,
-            ):
+            )
+            if disposition == "excluded":
                 stats.setdefault("dashboard_excluded_skipped", 0)
                 stats["dashboard_excluded_skipped"] += 1
+                continue
+            if disposition == "unresolved":
+                log.warning("drive_sweep: ancestry unresolved for %s (%s) -- skipped this run (fail-closed)",
+                            filename, file_id)
+                stats.setdefault("ancestry_unresolved_skipped", 0)
+                stats["ancestry_unresolved_skipped"] += 1
+                continue
+            if disposition == "founders_os_owned":
+                # I5 (cq-12fd5d76fd04): a file inside an entity-mapped Founder-OS top
+                # folder is sweep_founders_os's -- it tags by FOLDER and applies the
+                # LEX PHI guard; this Haiku-tagged twin of the same file id used to
+                # overwrite that row (last writer wins) with FNDR/F3E, so the two doors
+                # disagreed on 64 of 411 capture files (measured 2026-09-08).
+                stats.setdefault("founders_os_owned_skipped", 0)
+                stats["founders_os_owned_skipped"] += 1
                 continue
 
             # Skip very small files (likely empty/template)
