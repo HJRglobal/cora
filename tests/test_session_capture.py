@@ -511,6 +511,40 @@ class TestHarvestCowork:
         assert "02-F3-Energy" in str(results[0].note_path)
         assert "- PHI: yes" not in results[0].note_path.read_text(encoding="utf-8")
 
+    def test_cowork_lex_distill_keeps_the_strict_stamp(self, tmp_path):
+        """Lens F #11: the inverted test dropped the only Cowork-surface assertion
+        that a LEX distill still carries the access-control stamp; and a LEX
+        sub-entity distill with a strict trip keeps its SUB-entity."""
+        store = tmp_path / "cowork"
+        fos = tmp_path / "founder-os"
+        ledger = tmp_path / "ledger.jsonl"
+        _cowork_session(store, "3333cccc", text_extra="review the care plan")
+        results = scap.harvest(
+            lookback_hours=24, dry_run=False,
+            projects_root=tmp_path / "empty-code",
+            founder_os_root=fos, ledger_path=ledger,
+            anthropic_client=_FakeClient(_distilled_body("LEX", "lex cowork")),
+            include_cowork=True, cowork_roots=[store],
+        )
+        assert len(results) == 1
+        r = results[0]
+        assert r.entity == "LEX" and r.phi is True and r.quarantined is False
+        assert "08-Lexington-Services" in str(r.note_path)
+        assert "- PHI: yes (LEX-scoped, access-controlled)" in r.note_path.read_text(encoding="utf-8")
+        store2 = tmp_path / "cowork2"
+        # a STRICT-screen trip token (the LEX posture is is_phi_risk, unchanged)
+        _cowork_session(store2, "4444dddd", text_extra="review the diagnosis notes for the client")
+        results2 = scap.harvest(
+            lookback_hours=24, dry_run=False,
+            projects_root=tmp_path / "empty-code",
+            founder_os_root=fos, ledger_path=ledger,
+            anthropic_client=_FakeClient(_distilled_body("LEX-LLC", "llc cowork")),
+            include_cowork=True, cowork_roots=[store2],
+        )
+        r2 = results2[0]
+        assert r2.entity == "LEX-LLC" and r2.phi is True and r2.quarantined is False
+        assert "08-Lexington-Services" in str(r2.note_path)
+
     def test_cowork_value_phi_is_quarantined(self, tmp_path):
         store = tmp_path / "cowork"
         fos = tmp_path / "founder-os"

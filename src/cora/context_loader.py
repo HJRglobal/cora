@@ -1024,7 +1024,10 @@ def _format_kb_chunks(chunks: list) -> str:
             except (OSError, ValueError):
                 pass
 
-        title = r.title or r.source_id
+        # I1 / D-051 lens F: the title is an email subject or a file name and can
+        # carry the same identifiers as the body -- it rides in the header, the
+        # link label and the WARN line, so it goes through the same redactor.
+        title, n_title = banking_identifiers.redact_banking_identifiers(r.title or r.source_id)
 
         # Wrap deep_link as Slack mrkdwn if it's a bare URL (computer:// or https://)
         if r.deep_link:
@@ -1084,11 +1087,12 @@ def _format_kb_chunks(chunks: list) -> str:
         # the ONE renderer every retrieval consumer goes through (main path,
         # cross-entity fallback, MCP text), so the belt cannot be bypassed by a
         # new caller. n == 0 is a byte-identical pass-through.
-        body, n_redacted = banking_identifiers.redact_banking_identifiers(r.content.strip())
+        body, n_body = banking_identifiers.redact_banking_identifiers(r.content.strip())
+        n_redacted = n_body + n_title
         if n_redacted:
             log.warning(
                 "banking-identifier redaction: %d identifier(s) redacted from chunk %s | %s",
-                n_redacted, r.source, title,
+                n_redacted, r.source, title,   # `title` is already redacted
             )
         lines.append(body)
         lines.append("")

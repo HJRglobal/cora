@@ -820,7 +820,8 @@ _WATCHDOG_ESCALATE_EVENTS = frozenset({
 def check_windowless_launcher() -> CheckResult:
     r"""The windowless launcher is a single point of failure for the estate.
 
-    Every Cora task's action runs `pythonw.exe deploymentun_hidden.py -- ...`,
+    Every Cora task's action runs `pythonw.exe deployment
+un_hidden.py -- ...`,
     so if the launcher or pythonw.exe goes missing -- a branch checkout, a venv
     rebuild -- ALL of them fail at once, and they fail SILENTLY: pythonw has no
     stderr to complain to. Worse, the things that would report it (this check,
@@ -1436,6 +1437,54 @@ def check_session_capture_quarantine(
             f"session; founder review under _shared/projects/cora/_session-capture-quarantine/): "
             + ", ".join(recent[:10]))
     return CheckResult("Session-capture quarantine", "ok", "no quarantined captures in the last 26h.")
+
+
+def check_quarantine_folder_isolation(kb_path: Path | None = None,
+                                      founder_os_root: Path | None = None) -> CheckResult:
+    """WARN when a quarantined capture could reach a reader through the KB.
+
+    The quarantine folder is founder-only BY PLACEMENT: it lives inside the
+    pinned, path-excluded Cora workspace (_shared/projects/cora), its files carry
+    a belt-tripping name, and the harvester never --with-kb ingests one. This
+    probe checks the two things a code change could silently break: (1) the
+    folder path still resolves as Cora-internal (kb_exclusions), and (2) no KB row
+    carries a quarantine path or a quarantine-prefixed title. The Drive SHARING ACL
+    of the folder is Harrison's to verify by eye (Drive UI); it is not probed here
+    (D-051 lens A: the ACL was unstated).
+    """
+    try:
+        from cora import kb_exclusions, session_capture as scap
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult("Quarantine folder isolation", "ok", f"modules unavailable (non-fatal): {exc}")
+    root = founder_os_root or scap.FOUNDER_OS_ROOT
+    qdir = scap.quarantine_root(root)
+    problems: list[str] = []
+    try:
+        if not kb_exclusions.is_cora_internal_path(qdir / "2026-09" / "cora-quarantine-x.md"):
+            problems.append("quarantine folder is NOT inside the Cora-internal path exclusion")
+    except Exception as exc:  # noqa: BLE001
+        problems.append(f"path-rule check failed: {exc}")
+    db = kb_path or _KB_DB
+    if db.exists():
+        try:
+            from cora.knowledge_base import schema
+            conn = schema.connect(db, read_only=True)
+            try:
+                n = conn.execute(
+                    "SELECT count(*) FROM knowledge_chunks WHERE source_id LIKE ? OR title LIKE ? OR title LIKE ?",
+                    (f"%{scap.QUARANTINE_DIRNAME}%", f"{scap.QUARANTINE_PREFIX}%",
+                     f"Session capture \u2014 {scap.QUARANTINE_PREFIX}%"),
+                ).fetchone()[0]
+            finally:
+                conn.close()
+            if n:
+                problems.append(f"{n} KB row(s) carry a quarantine path/title -- a quarantined capture was ingested")
+        except Exception as exc:  # noqa: BLE001
+            return CheckResult("Quarantine folder isolation", "ok", f"KB unreadable (non-fatal): {exc}")
+    if problems:
+        return CheckResult("Quarantine folder isolation", "warn", "; ".join(problems))
+    return CheckResult("Quarantine folder isolation", "ok",
+                       "quarantine folder is path-excluded and no KB row carries it (Drive sharing ACL: founder-verified by eye).")
 
 
 def check_dynamic_snapshots(now_epoch: float | None = None) -> CheckResult:
@@ -2075,6 +2124,7 @@ def main() -> int:
     log.info("Checking claude-workspace mirror freshness...")
     all_results.append(check_claude_mirror())
     all_results.append(check_session_capture_quarantine())
+    all_results.append(check_quarantine_folder_isolation())
 
     log.info("Checking 13wk cashflow forecast snapshot (S1) freshness...")
     all_results.append(check_cashflow_forecast_snapshot())

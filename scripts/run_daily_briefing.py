@@ -70,6 +70,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from cora import decision_lane, org_roles  # noqa: E402
 from cora import phi_guard  # noqa: E402
+from cora import banking_identifiers  # noqa: E402  I1 / D-051 lens C
 from cora.org_roles import RoleRecord  # noqa: E402
 
 # Plate section builders -- SHARED with the whats_on_my_plate tool
@@ -519,6 +520,25 @@ def _build_briefing_prompt(
     )
 
 
+def _chunk_context_lines(chunks: list[dict]) -> list[str]:
+    """One context line per recent-activity chunk, banking identifiers redacted.
+
+    I1 / D-051 lens C: the briefing feeds raw gmail/drive chunk text to Haiku and
+    the reply lands in a teammate's DM -- a wire-instructions email in the 25h
+    window would have carried its routing/account numbers straight through.
+    Redaction runs BEFORE the 400-char slice so a truncated value cannot survive.
+    """
+    out: list[str] = []
+    for c in chunks:
+        src = (c.get("source") or "").upper()
+        ent = c.get("entity") or ""
+        title = banking_identifiers.redact_title(c.get("title") or "(no title)")
+        body, _n = banking_identifiers.redact_banking_identifiers(c.get("content") or "")
+        snippet = body.replace("\n", " ")[:400]
+        out.append(f"[{src}/{ent}] {title}: {snippet}")
+    return out
+
+
 def _synthesize(
     *,
     api_key: str,
@@ -530,13 +550,7 @@ def _synthesize(
     """Call Claude Haiku to turn the plate sections + recent activity into a DM."""
     first_name = rec.name.split()[0]
 
-    chunk_lines = []
-    for c in chunks:
-        src     = c["source"].upper()
-        ent     = c["entity"]
-        title   = c["title"] or "(no title)"
-        snippet = c["content"].replace("\n", " ")[:400]
-        chunk_lines.append(f"[{src}/{ent}] {title}: {snippet}")
+    chunk_lines = _chunk_context_lines(chunks)
     context_text = "\n".join(chunk_lines) if chunk_lines else "(no recent activity found)"
 
     prompt = _build_briefing_prompt(rec, sections_text, context_text, today_str)

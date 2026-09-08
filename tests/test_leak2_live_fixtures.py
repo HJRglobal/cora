@@ -63,13 +63,31 @@ def _transcript(sid: str):
 ROWS = _rows()
 FOUND = {r["session_id"]: _transcript(r["session_id"]) for r in ROWS} if ROWS else {}
 AVAILABLE = [sid for sid, s in FOUND.items() if s is not None]
-
-pytestmark = pytest.mark.skipif(
+# The Cora desktop is the ONLY host that can hold the fixture: it has the harvester
+# ledger AND a Cowork session store. Elsewhere the pin is meaningless and skips.
+_COWORK_STORE = Path(os.environ.get("APPDATA", "")) / "Claude" / "local-agent-mode-sessions"
+ON_FIXTURE_HOST = LEDGER.exists() and _COWORK_STORE.exists()
+_SKIP = pytest.mark.skipif(
     len(AVAILABLE) < 10,
     reason="live Leak #2 transcripts not present on this host (need >=10 of the 9/3 + 9/4 misfiled set)",
 )
 
 
+def test_live_fixture_window_still_open_on_this_host():
+    """Lens F #9: the pin above is a SILENT skip when the transcripts age out. On the
+    host that holds them this test FAILS BY NAME the day fewer than 10 remain -- the
+    signal to retire the pin (or re-pin on a synthetic fixture), never a quiet 0/0.
+    Retention: Code transcripts ~30 days (cleanupPeriodDays); Cowork unknown --
+    the 9/3-9/4 set is expected to start thinning after 2026-10-03."""
+    if not ON_FIXTURE_HOST:
+        pytest.skip("not the Cora desktop (no harvester ledger + Cowork store)")
+    assert len(ROWS) >= 10, "the ledger no longer lists the 9/3 + 9/4 misfiled rows -- retire this pin"
+    assert len(AVAILABLE) >= 10, (
+        f"only {len(AVAILABLE)} of {len(ROWS)} fixture transcripts remain on disk -- the live Leak #2 "
+        "fixture window has closed; retire tests/test_leak2_live_fixtures.py or re-pin it")
+
+
+@_SKIP
 @pytest.mark.parametrize("sid", AVAILABLE)
 def test_misfiled_9_3_and_9_4_transcripts_pass_the_prose_screen(sid):
     text = FOUND[sid].text

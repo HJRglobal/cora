@@ -206,19 +206,25 @@ def _result_dict(r: Any) -> dict[str, Any]:
     # 9/4 probe leaked through -- redact here too (the `text` rendering goes
     # through context_loader._format_kb_chunks, which redacts on its own). The
     # deep link is untouched so the consumer can open the source document.
-    content, n_redacted = banking_identifiers.redact_banking_identifiers(
+    content, n_body = banking_identifiers.redact_banking_identifiers(
         (getattr(r, "content", "") or "").strip()
     )
+    title, n_title = banking_identifiers.redact_banking_identifiers(
+        getattr(r, "title", "") or getattr(r, "source_id", "")
+    )
+    n_redacted = n_body + n_title
     if n_redacted:
-        log.warning(
+        # INFO, not WARN: the `text` rendering of the same rows goes through
+        # context_loader._format_kb_chunks, which already WARNs once per chunk
+        # (D-051 lens C -- one WARN per redaction event, not two).
+        log.info(
             "MCP banking-identifier redaction: %d identifier(s) redacted from chunk %s | %s",
-            n_redacted, getattr(r, "source", ""),
-            (getattr(r, "title", "") or getattr(r, "source_id", "")),
+            n_redacted, getattr(r, "source", ""), title,
         )
     return {
         "source": getattr(r, "source", ""),
         "entity": getattr(r, "entity", ""),
-        "title": (getattr(r, "title", "") or getattr(r, "source_id", "")),
+        "title": title,
         "date": date,
         "distance": round(getattr(r, "distance", 0.0), 4),
         "deep_link": getattr(r, "deep_link", "") or "",

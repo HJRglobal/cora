@@ -87,6 +87,53 @@ def test_apply_labels_follow_real_outcomes_and_record_the_bundle(capsys, monkeyp
     assert {e["id"] for e in recs} == (EXPECTED_SHIPPED - {"cq-12fd5d76fd04"}) | {"cq-b80c5bc5be7a"}
 
 
+def test_preconditions_can_actually_block(monkeypatch, tmp_path):
+    """Lens F #6: every precondition must be able to return a blocker -- a tree
+    lacking the code (or carrying a stub / dead branch) is BLOCKED, never marked."""
+    mod = _load()
+    # I5: the helper defined but the skip not wired into sweep_user
+    monkeypatch.setattr(mod.inspect, "getsource", lambda fn: "def sweep_user():\n    return {}\n")
+    assert mod._i5_present() and "not wired" in mod._i5_present()
+    monkeypatch.undo()
+    # I2: a route_capture that re-homes is caught behaviourally, not by grep
+    import cora.session_capture as scap
+    monkeypatch.setattr(scap, "route_capture", lambda ent, text: ("LEX", True, False))
+    assert mod._i2_present() and "re-homes" in mod._i2_present()
+    monkeypatch.undo()
+    # path-based preconditions against a tree that lacks the code
+    fake_root = tmp_path
+    (fake_root / "src" / "cora").mkdir(parents=True)
+    (fake_root / "scripts").mkdir()
+    (fake_root / "src" / "cora" / "app.py").write_text(
+        "def _dispatch_qa():\n    if False:\n        force_tool = \"cora_self_inventory\"\n", encoding="utf-8")
+    (fake_root / "src" / "cora" / "context_loader.py").write_text("# no wiring\n", encoding="utf-8")
+    (fake_root / "scripts" / "purge_dashboard_kb.py").write_text(
+        "folders = sorted(KB_EXCLUDED_FOLDER_IDS)  # KB_DASHBOARD_FOLDER_IDS imported but unused\n", encoding="utf-8")
+    (fake_root / "scripts" / "purge_cora_internal_kb.py").write_text("# no flags\n", encoding="utf-8")
+    (fake_root / "scripts" / "mirror_claude_workspace.py").write_text("# old screen\n", encoding="utf-8")
+    monkeypatch.setattr(mod, "_REPO_ROOT", fake_root)
+    assert "unreachable" in (mod._i4_present() or "")
+    assert "wiring missing" in (mod._i1_present() or "")
+    assert "walks" in (mod._dashboard_purge_scoped() or "")
+    assert "flags missing" in (mod._i3_present() or "")
+    assert "fold missing" in (mod._mirror_fold_present() or "")
+
+
+def test_a_failed_provenance_record_is_reported_not_misfiled_as_a_failed_transition(capsys, monkeypatch):
+    mod = _load()
+    monkeypatch.setattr(mod.code_queue, "get_item", _rec("PROPOSED"))
+    monkeypatch.setattr(mod, "_head_commit", lambda: "abc1234")
+    monkeypatch.setattr(mod.code_queue, "process_queue_action", lambda a, cq, actor: ("shipped", "ok"))
+    monkeypatch.setattr(mod.code_queue, "supersede_item", lambda loser, winner: True)
+    monkeypatch.setattr(mod.code_queue, "_append_event", lambda ev: (_ for _ in ()).throw(OSError("disk full")))
+    rc = mod.main(["--apply"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert out.count("SHIPPED  cq-") == len(EXPECTED_SHIPPED)                 # the transitions DID happen ...
+    assert out.count("[provenance record FAILED: OSError: disk full]") == len(EXPECTED_SHIPPED) + 1
+    assert "NOT SHIPPED" not in out                                          # ... and are never mislabelled
+
+
 def test_terminal_rows_are_never_flipped(capsys, monkeypatch):
     mod = _load()
     monkeypatch.setattr(mod.code_queue, "get_item", _rec("DISMISSED"))

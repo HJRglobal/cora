@@ -5,8 +5,14 @@ the entity on the FOLDER. The Drive door had TWO writers for the same file id:
 sweep_founders_os (folder-keyed) and the flat per-user sweep of Harrison's
 Drive (Haiku-keyed), both writing source="drive_sweep" -- last writer wins, so
 64 of 411 capture files disagreed on 2026-09-08 (30 LEX-vs-FNDR, 20 LEX-vs-F3E).
-Fix: the flat sweep SKIPS any file whose ancestry runs through an entity-mapped
-top folder of the HJR-Founder-OS tree -- founders_os owns those.
+
+Fix (as remediated by the D-051 lens-D review): the flat sweep skips MARKDOWN
+files inside the HJR-Founder-OS tree -- static_md already ingests every .md there
+with the folder entity and its own exclusions -- and NOTHING else: the founders_os
+sweep has been budget-interrupted for 37 consecutive runs, so the flat sweep is
+the only door actually ingesting most non-.md Founder-OS content (filed receipts,
+invoices, contracts). A "founders_os owns the tree" skip would have been a silent
+ingestion cliff; this file pins the boundary.
 """
 from __future__ import annotations
 
@@ -25,34 +31,10 @@ from cora.connectors import drive_sweep  # noqa: E402
 FOS = drive_sweep.FOUNDERS_OS_ROOT_ID
 
 
-def _chain(*pairs):
-    return list(pairs)
-
-
-class TestOwnerEntity:
-    def test_entity_mapped_top_folder_is_owned(self):
-        assert drive_sweep._founders_os_owner_entity(_chain(("CAP", "2026-09"), ("SC", "_session-captures"),
-                                                            ("LEX", "08-Lexington-Services"), (FOS, "HJR-Founder-OS"),
-                                                            ("MY", "My Drive"))) == "LEX"
-        assert drive_sweep._founders_os_owner_entity(_chain(("EA", "Email Attachments - Last 24 Months"),
-                                                            ("EAT", "email-attachments"), ("SH", "_shared"),
-                                                            (FOS, "HJR-Founder-OS"))) == "FNDR"
-        assert drive_sweep._founders_os_owner_entity(_chain(("X", "x"), ("F3E", "02-F3-Energy"), (FOS, "HJR-Founder-OS"))) == "F3E"
-
-    def test_unmapped_top_folder_and_root_level_are_not_owned(self):
-        # memory/ and _brain/ are unmapped -> founders_os skips them -> the flat sweep keeps covering them
-        assert drive_sweep._founders_os_owner_entity(_chain(("MEM", "memory"), (FOS, "HJR-Founder-OS"))) is None
-        assert drive_sweep._founders_os_owner_entity(_chain(("BR", "_brain"), (FOS, "HJR-Founder-OS"))) is None
-        # a file whose direct parent IS the root
-        assert drive_sweep._founders_os_owner_entity(_chain((FOS, "HJR-Founder-OS"), ("MY", "My Drive"))) is None
-        # not in the tree at all
-        assert drive_sweep._founders_os_owner_entity(_chain(("L", "loose"), ("MY", "My Drive"))) is None
-        assert drive_sweep._founders_os_owner_entity([]) is None
-
-
 class _Tree:
-    def __init__(self, parents):
+    def __init__(self, parents, *, fail_get=frozenset()):
         self.parents_of = parents
+        self.fail_get = set(fail_get)
         self.got = []
 
     def files(self):  # noqa: A003
@@ -64,6 +46,8 @@ class _Tree:
 
         class _R:
             def execute(_s):
+                if fileId in outer.fail_get:
+                    raise RuntimeError("500")
                 parent, name = outer.parents_of[fileId]
                 d = {"id": fileId, "name": name}
                 if parent:
@@ -75,48 +59,116 @@ class _Tree:
 PARENTS = {
     "CAP": ("SC", "2026-09"), "SC": ("LEX", "_session-captures"), "LEX": (FOS, "08-Lexington-Services"),
     FOS: ("MY", "HJR-Founder-OS"), "MY": (None, "My Drive"),
-    "MEM": (FOS, "memory"), "LOOSE": ("MY", "loose"),
+    "MEM": (FOS, "memory"), "SWEPT": ("BRAIN", "swept"), "BRAIN": (FOS, "_brain"),
+    "ACC": ("HJRG", "accounting"), "HJRG": (FOS, "01-HJR-Global"),
+    "OLD": ("CONTRACTS", "old"), "CONTRACTS": ("F3E", "contracts"), "F3E": (FOS, "02-F3-Energy"),
     "SHAREDEA": ("SH", "Email Attachments - Last 24 Months"), "SH": ("SHARED", "email-attachments"), "SHARED": (FOS, "_shared"),
+    "LOOSE": ("MY", "loose"),
 }
+EXPANDED = frozenset(kb_exclusions.KB_EXCLUDED_FOLDER_IDS)
 
 
-class TestDisposition:
-    def test_founders_os_owned_vs_kept(self):
+def _disp(svc, parent, mime, name, cache=None):
+    return drive_sweep._file_disposition(svc, [parent], EXPANDED, True, cache if cache is not None else {},
+                                         mime_type=mime, filename=name)
+
+
+class TestStaticMdOwnedBoundary:
+    def test_markdown_inside_the_tree_is_static_md_owned(self):
         svc = _Tree(PARENTS)
-        expanded = frozenset(kb_exclusions.KB_EXCLUDED_FOLDER_IDS)
-        cache: dict = {}
-        assert drive_sweep._file_disposition(svc, ["CAP"], expanded, True, cache) == "founders_os_owned"
-        assert drive_sweep._file_disposition(svc, ["SHAREDEA"], expanded, True, cache) == "founders_os_owned"
-        assert drive_sweep._file_disposition(svc, ["MEM"], expanded, True, cache) is None      # unmapped: flat sweep keeps it
-        assert drive_sweep._file_disposition(svc, ["LOOSE"], expanded, True, cache) is None
+        assert _disp(svc, "CAP", "text/markdown", "2026-09-04_cowork-session_cb995639.md") == "static_md_owned"
+        assert _disp(svc, "MEM", "text/markdown", "decisions.md") == "static_md_owned"      # memory/ is static_md's too
+        assert _disp(svc, "SWEPT", "text/markdown", "2026-09-07.md") == "static_md_owned"    # the self-poisoning digests
+        assert _disp(svc, "SHAREDEA", "text/plain", "notes.md") == "static_md_owned"         # .md by name, odd MIME
 
-    def test_sweep_user_skips_owned_files_and_counts(self):
+    def test_non_markdown_inside_the_tree_stays_on_the_flat_sweep(self):
+        # the flat sweep is the ONLY door actually ingesting these today (lens D)
         svc = _Tree(PARENTS)
+        assert _disp(svc, "ACC", "application/pdf", "2026-09-08_hjrg_receipt.pdf") is None
+        assert _disp(svc, "SHAREDEA", "application/pdf", "HJR Global Wire Instructions.pdf") is None
+        assert _disp(svc, "OLD", "application/pdf", "vendor-agreement-2024.pdf") is None      # name-skipped by founders_os
+        assert _disp(svc, "CAP", "application/vnd.google-apps.document", "notes") is None
+
+    def test_outside_the_tree_is_untouched(self):
+        svc = _Tree(PARENTS)
+        assert _disp(svc, "LOOSE", "text/markdown", "loose.md") is None
+        assert _disp(svc, "LOOSE", "application/pdf", "loose.pdf") is None
+
+    def test_is_markdown(self):
+        assert drive_sweep._is_markdown("text/markdown", "x") and drive_sweep._is_markdown("", "A.MD")
+        assert not drive_sweep._is_markdown("application/pdf", "a.pdf") and not drive_sweep._is_markdown(None, None)
+
+    def test_chain_cut_by_bound_or_cycle_is_incomplete(self):
+        deep = {f"n{i}": (f"n{i+1}", f"f{i}") for i in range(20)}
+        deep["n20"] = (None, "top")
+        svc = _Tree(deep)
+        chain, ok = drive_sweep._ancestor_chain(svc, ["n0"], {}, max_nodes=5)
+        assert ok is False and len(chain) == 5                                       # bound -> partial -> not complete
+        cyc = {"a": ("b", "a"), "b": ("a", "b")}
+        chain, ok = drive_sweep._ancestor_chain(_Tree(cyc), ["a"], {})
+        assert ok is False
+        # and a partial chain never reads as "not excluded"
+        assert drive_sweep._file_disposition(svc, ["n0"], EXPANDED, True, {}) == "unresolved" or \
+            drive_sweep._ancestor_chain(svc, ["n0"], {})[1] is True                    # default bound (400) resolves this one
+
+
+def _flat(listed, svc):
+    flat = MagicMock()
+    flat.files.return_value.list.return_value.execute.return_value = {"files": listed, "nextPageToken": None}
+    flat.files.return_value.get = svc.get
+    return flat
+
+
+def _kb():
+    kb = MagicMock(); kb.get_sync_state.return_value = None; kb.get_checkpoint.return_value = None
+    return kb
+
+
+def _anth():
+    anth = MagicMock()
+    anth.messages.create.return_value.content = [MagicMock(text='{"score": 9, "entity": "FNDR", "summary": "x", "discard_reason": ""}')]
+    return anth
+
+
+USER = {"email": "harrison@hjrglobal.com", "name": "Harrison", "entity_default": "FNDR"}
+
+
+def _sweep(listed, svc, kb=None):
+    kb = kb or _kb()
+    with patch("cora.connectors.drive_sweep._build_drive_service", return_value=_flat(listed, svc)), \
+         patch("cora.connectors.drive_sweep._build_sheets_service", return_value=None), \
+         patch("cora.connectors.drive_sweep._expanded_excluded_folder_ids", return_value=(EXPANDED, True)), \
+         patch("cora.connectors.drive_sweep._extract_content", return_value="Meaningful business content " * 20), \
+         patch("cora.connectors.drive_sweep._ingest_file", return_value=1) as ingest:
+        stats = drive_sweep.sweep_user(USER, "/fake/sa.json", kb, _anth(), freshness_days=30, dry_run=False)
+    return stats, ingest, kb
+
+
+def _f(fid, name, mime, parent):
+    return {"id": fid, "name": name, "mimeType": mime, "modifiedTime": "2026-09-04T12:00:00Z", "size": "5000", "parents": [parent]}
+
+
+class TestSweepUser:
+    def test_skips_markdown_in_tree_keeps_everything_else(self):
         listed = [
-            {"id": "cap1", "name": "2026-09-04_cowork-session_cb995639.md", "mimeType": "text/markdown",
-             "modifiedTime": "2026-09-04T12:00:00Z", "size": "5000", "parents": ["CAP"]},
-            {"id": "mem1", "name": "decisions.md", "mimeType": "text/markdown",
-             "modifiedTime": "2026-09-04T12:00:00Z", "size": "5000", "parents": ["MEM"]},
-            {"id": "loose1", "name": "vendor.txt", "mimeType": "text/plain",
-             "modifiedTime": "2026-09-04T12:00:00Z", "size": "5000", "parents": ["LOOSE"]},
+            _f("cap1", "2026-09-04_cowork-session_cb995639.md", "text/markdown", "CAP"),
+            _f("mem1", "decisions.md", "text/markdown", "MEM"),
+            _f("rcpt", "2026-09-08_hjrg_receipt.pdf", "application/pdf", "ACC"),
+            _f("old1", "vendor-agreement-2024.pdf", "application/pdf", "OLD"),
+            _f("loose1", "vendor.txt", "text/plain", "LOOSE"),
         ]
-        flat = MagicMock()
-        flat.files.return_value.list.return_value.execute.return_value = {"files": listed, "nextPageToken": None}
-        flat.files.return_value.get = svc.get
-        kb = MagicMock(); kb.get_sync_state.return_value = None; kb.get_checkpoint.return_value = None
-        anth = MagicMock()
-        anth.messages.create.return_value.content = [MagicMock(text='{"score": 9, "entity": "FNDR", "summary": "x", "discard_reason": ""}')]
-        user = {"email": "harrison@hjrglobal.com", "name": "Harrison", "entity_default": "FNDR"}
-        with patch("cora.connectors.drive_sweep._build_drive_service", return_value=flat), \
-             patch("cora.connectors.drive_sweep._build_sheets_service", return_value=None), \
-             patch("cora.connectors.drive_sweep._expanded_excluded_folder_ids",
-                   return_value=(frozenset(kb_exclusions.KB_EXCLUDED_FOLDER_IDS), True)), \
-             patch("cora.connectors.drive_sweep._extract_content", return_value="Meaningful business content " * 20), \
-             patch("cora.connectors.drive_sweep._ingest_file", return_value=1) as ingest:
-            stats = drive_sweep.sweep_user(user, "/fake/sa.json", kb, anth, freshness_days=30, dry_run=False)
-        assert stats["founders_os_owned_skipped"] == 1
-        ingested = {c[0][1]["id"] for c in ingest.call_args_list}
-        assert ingested == {"mem1", "loose1"}          # the capture file is founders_os's; memory/ + loose stay
+        stats, ingest, kb = _sweep(listed, _Tree(PARENTS))
+        assert stats["static_md_owned_skipped"] == 2
+        assert {c[0][1]["id"] for c in ingest.call_args_list} == {"rcpt", "old1", "loose1"}
+        kb.set_sync_state.assert_called_once()                       # clean run -> watermark advances
+
+    def test_unresolved_ancestry_holds_the_watermark(self):
+        listed = [_f("rcpt", "receipt.pdf", "application/pdf", "ACC"), _f("loose1", "vendor.txt", "text/plain", "LOOSE")]
+        stats, ingest, kb = _sweep(listed, _Tree(PARENTS, fail_get={"HJRG"}))
+        assert stats["ancestry_unresolved_skipped"] == 1
+        assert {c[0][1]["id"] for c in ingest.call_args_list} == {"loose1"}
+        kb.set_sync_state.assert_not_called()                        # held -> re-enumerated next run
+        kb.delete_checkpoint.assert_called()                         # the resume checkpoint still clears
 
 
 # ── the parity probe (read-only acceptance check) ────────────────────────────

@@ -81,7 +81,8 @@ _MUST_STAY_WITH_EXISTING = [
 
 
 def _force_for(message: str) -> str | None:
-    """Exactly what _dispatch_qa computes, in the same precedence order."""
+    """Exactly what _dispatch_qa computes, in the same precedence order (the
+    self-inventory branch is LAST -- I4 / D-051 lens E; a grant turn skips it)."""
     if capp._code_queue_capture_intent(message):
         return "cora_queue_code_session"
     if capp._delegate_work_intent(message):
@@ -89,7 +90,37 @@ def _force_for(message: str) -> str | None:
     staged = capp._staged_write_force_tool(message)
     if staged:
         return staged
-    return capp._asana_destructive_intent(message)
+    asana = capp._asana_destructive_intent(message)
+    if asana:
+        return asana
+    return capp._self_inventory_force(message)
+
+
+# I4 (cq-3542e1b095b2): the self-inventory branch's own positives ...
+_MUST_FORCE_INVENTORY = [
+    ("do you have access to all the Cowork Cascade knowledge now as well?", "cora_self_inventory"),
+    ("Cora, are you ingesting the 08-Lexington session captures?", "cora_self_inventory"),
+    ("what's in your knowledge base?", "cora_self_inventory"),
+]
+# ... and the write / command turns it must never steal (D-051 lens E #1: the
+# first cut displaced every one of these).
+_MUST_STAY_WITH_EXISTING_INVENTORY = [
+    ("Complete the 'send Larry the deck' task -- the deck is in your knowledge base right",
+     "asana_complete_task"),
+    ("Mark the Sprouts task done since the appeal letter is in your memory now",
+     "asana_complete_task"),
+    ("Delete the task 'confirm Cora has Drive access'. It was created because we weren't sure "
+     "whether the folders were in your index", "asana_delete_task"),
+    ("create a task for Tommy to check whether the Kroger files are in your sources",
+     "asana_create_task"),
+    ("create a task: audit which mailboxes are in your index", "asana_create_task"),
+    ("DM Tommy that the Q3 numbers are in your knowledge base", "slack_send_dm"),
+    ("remember that the Sprouts folder is in your sources now", "cora_remember"),
+    ("draft an email to Larry saying the deck is in your knowledge base", "gmail_create_draft"),
+    ("queue a code session: do you have access to the Drive folder? the tool double-posts",
+     "cora_queue_code_session"),
+    ("delegate a job: research which of our sources can you see", "cora_delegate_work"),
+]
 
 
 @pytest.fixture(autouse=True)
@@ -103,6 +134,14 @@ def _lexicon_off(monkeypatch):
 class TestSafeSet:
     @pytest.mark.parametrize("message,expected", _MUST_FORCE)
     def test_must_force(self, message, expected):
+        assert _force_for(message) == expected
+
+    @pytest.mark.parametrize("message,expected", _MUST_FORCE_INVENTORY)
+    def test_inventory_forces_its_own_positives(self, message, expected):
+        assert _force_for(message) == expected
+
+    @pytest.mark.parametrize("message,expected", _MUST_STAY_WITH_EXISTING_INVENTORY)
+    def test_inventory_never_displaces_a_write_or_command(self, message, expected):
         assert _force_for(message) == expected
 
     @pytest.mark.parametrize("message", _MUST_NOT_FORCE)

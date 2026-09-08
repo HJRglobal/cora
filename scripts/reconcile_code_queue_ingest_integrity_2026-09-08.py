@@ -19,8 +19,9 @@ stale-positive incident is why this step exists).
                        the ancestry-walk exclusion + purge --impersonate/--computers-root.
       cq-bd6eab1fcb44  folded into I3: purge_dashboard_kb walks KB_DASHBOARD_FOLDER_IDS only.
       cq-3542e1b095b2  I4 cora_self_inventory tool + the "do you have X" force route.
-      cq-12fd5d76fd04  I5 the flat sweep skips founders_os-owned files (one entity tag
-                       per capture file) + the two-door parity probe.
+      cq-12fd5d76fd04  I5 the flat sweep leaves MARKDOWN inside the Founder-OS tree to
+                       the static_md door (one entity tag per capture file) + the
+                       two-door parity probe.
     SUPERSEDED
       cq-b80c5bc5be7a  by cq-a0da505f8e5f (LOCATED: the door is the Computers backup,
                        not a stray copy of the Scheduled store).
@@ -40,6 +41,8 @@ Run (from the repo root, AFTER the FF-merge):
 from __future__ import annotations
 
 import argparse
+import inspect
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -78,9 +81,16 @@ def _i2_present() -> str | None:
     from cora import phi_guard, session_capture
     if not hasattr(phi_guard, "is_prose_phi_risk") or not hasattr(session_capture, "route_capture"):
         return "I2 prose screen / route_capture missing on this tree"
-    src = (_REPO_ROOT / "src" / "cora" / "session_capture.py").read_text(encoding="utf-8")
-    if 'entity = "LEX" if not entity.startswith("LEX") else entity' in src:
-        return "I2 the LEX re-home override is still present in session_capture.py"
+    # BEHAVIOURAL, not a grep for the old override string (a rephrased re-home would
+    # pass a grep; D-051 lens F #7): a non-LEX distill with a strict-screen trip must
+    # stay non-LEX and un-quarantined; a value-shaped hit must quarantine.
+    try:
+        if session_capture.route_capture("F3E", "review the care plan and the diagnosis notes") != ("F3E", False, False):
+            return "I2 route_capture re-homes / quarantines a topic-word non-LEX distill"
+        if session_capture.route_capture("F3E", "client Marcus Johnson was diagnosed with autism")[2] is not True:
+            return "I2 route_capture does not quarantine a value-shaped PHI hit"
+    except Exception as exc:  # noqa: BLE001
+        return f"I2 route_capture raised ({exc})"
     if not (_REPO_ROOT / "scripts" / "refile_misrouted_session_captures.py").exists():
         return "I2 re-file script missing"
     return None
@@ -104,10 +114,18 @@ def _i3_present() -> str | None:
     return None
 
 
+_DASHBOARD_FOLDERS_LINE = re.compile(r"^\s*folders(?:\s*:\s*[^=]+?)?\s*=\s*(.+)$", re.MULTILINE)
+
+
 def _dashboard_purge_scoped() -> str | None:
     src = (_REPO_ROOT / "scripts" / "purge_dashboard_kb.py").read_text(encoding="utf-8")
-    if "KB_DASHBOARD_FOLDER_IDS" not in src or "list(KB_EXCLUDED_FOLDER_IDS)" in src:
-        return "cq-bd6eab1fcb44 fold missing: purge_dashboard_kb still walks the whole exclusion set"
+    m = _DASHBOARD_FOLDERS_LINE.search(src)
+    if not m:
+        return "cq-bd6eab1fcb44 fold: purge_dashboard_kb has no `folders = ...` assignment"
+    rhs = m.group(1)
+    # the ASSIGNMENT itself must draw from the dashboard set and not the exclusion set
+    if "KB_DASHBOARD_FOLDER_IDS" not in rhs or "KB_EXCLUDED_FOLDER_IDS" in rhs:
+        return f"cq-bd6eab1fcb44 fold missing: purge_dashboard_kb walks `{rhs.strip()}`"
     return None
 
 
@@ -119,15 +137,30 @@ def _i4_present() -> str | None:
     if "cora_self_inventory" not in td._GLOBAL_CORE_TOOLS or "cora_self_inventory" not in td._TOOL_FUNCTIONS:
         return "I4 cora_self_inventory is not wired on this tree"
     src = (_REPO_ROOT / "src" / "cora" / "app.py").read_text(encoding="utf-8")
-    if 'force_tool = "cora_self_inventory"' not in src:
-        return "I4 force route missing in app.py"
+    # REACHABLE shape, not the bare assignment string: the branch condition followed
+    # (comments allowed) by the assignment, inside _dispatch_qa (lens F #7: an
+    # `elif False and ...` or a dead copy would pass a substring check)
+    body = src[src.find("def _dispatch_qa("):]
+    if not re.search(
+        r"if force_tool is None and inventory_turn:\n(?:\s*#[^\n]*\n)*\s*force_tool = \"cora_self_inventory\"",
+        body,
+    ):
+        return "I4 force route missing or unreachable in app._dispatch_qa"
+    if "inventory_turn = bool(user_id) and retrieval_grant is None and _self_inventory_force(user_message) is not None" not in body:
+        return "I4 the inventory predicate is not computed in _dispatch_qa"
     return None
 
 
 def _i5_present() -> str | None:
     from cora.connectors import drive_sweep
-    if not hasattr(drive_sweep, "_founders_os_owner_entity"):
-        return "I5 founders_os-owned skip missing in drive_sweep"
+    # the skip must be WIRED into sweep_user, not merely defined (lens F #7: a helper
+    # left behind by a merge conflict passed a hasattr check)
+    try:
+        body = inspect.getsource(drive_sweep.sweep_user)
+    except (OSError, TypeError) as exc:
+        return f"I5 cannot read sweep_user source ({exc})"
+    if "_file_disposition(" not in body or '"static_md_owned"' not in body:
+        return "I5 the static_md-owned skip is not wired into drive_sweep.sweep_user"
     if not (_REPO_ROOT / "scripts" / "probe_two_door_entity_parity.py").exists():
         return "I5 parity probe missing"
     return None
@@ -151,7 +184,7 @@ SHIPPED: dict[str, str] = {
     "cq-a0da505f8e5f": "I3 Computers backup roots pinned walk-only + ancestry walk + purge flags",
     "cq-bd6eab1fcb44": "folded into I3: purge_dashboard_kb walks the dashboard set only",
     "cq-3542e1b095b2": "I4 cora_self_inventory tool + 'do you have X' force route",
-    "cq-12fd5d76fd04": "I5 flat sweep skips founders_os-owned files + parity probe",
+    "cq-12fd5d76fd04": "I5 flat sweep leaves Founder-OS markdown to static_md + parity probe",
 }
 SUPERSEDED: dict[str, tuple[str, str]] = {
     "cq-b80c5bc5be7a": ("cq-a0da505f8e5f", "LOCATED: the door is the Drive Computers backup, closed by the I3 pin"),
@@ -185,6 +218,16 @@ def _record(cq_id: str, transition: str, commit: str) -> None:
         "event": "reconciled", "ts": code_queue._now_iso(), "id": cq_id,
         "transition": transition, "bundle_id": BUNDLE_ID, "branch": BRANCH, "commit": commit,
     })
+
+
+def _record_safe(cq_id: str, transition: str, commit: str) -> str | None:
+    """_record, reporting a failure INSTEAD of letting it read as a failed transition:
+    the queue write already succeeded; only the provenance row is missing."""
+    try:
+        _record(cq_id, transition, commit)
+        return None
+    except Exception as exc:  # noqa: BLE001
+        return f"{type(exc).__name__}: {_ascii(exc)}"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -227,8 +270,11 @@ def main(argv: list[str] | None = None) -> int:
         try:
             outcome, msg = code_queue.process_queue_action(code_queue.ACTION_MARK_SHIPPED, cq_id, HARRISON_ID)
             if outcome == "shipped":
-                _record(cq_id, "SHIPPED", commit)
-                print(f"  SHIPPED  {cq_id}  {label}  -> {_ascii(msg)}")
+                rec_err = _record_safe(cq_id, "SHIPPED", commit)
+                print(f"  SHIPPED  {cq_id}  {label}  -> {_ascii(msg)}"
+                      + (f"  [provenance record FAILED: {rec_err}]" if rec_err else ""))
+                if rec_err:
+                    rc = 1
             else:
                 print(f"  NOT SHIPPED  {cq_id}  {label}  -> {outcome}: {_ascii(msg)}")
                 rc = 1
@@ -260,8 +306,11 @@ def main(argv: list[str] | None = None) -> int:
             continue
         try:
             if code_queue.supersede_item(loser, winner):
-                _record(loser, f"SUPERSEDED by {winner}", commit)
-                print(f"  SUPERSEDED  {loser}  by {winner}  ({label})")
+                rec_err = _record_safe(loser, f"SUPERSEDED by {winner}", commit)
+                print(f"  SUPERSEDED  {loser}  by {winner}  ({label})"
+                      + (f"  [provenance record FAILED: {rec_err}]" if rec_err else ""))
+                if rec_err:
+                    rc = 1
             else:
                 print(f"  NOT SUPERSEDED  {loser}  -> supersede_item returned False (ids missing or already superseded)")
                 rc = 1

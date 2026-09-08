@@ -399,7 +399,7 @@ def test_task_name_redacted_when_name_trips_screen(roots):
     assert (roots["zx"] / "cowork-scheduled-tasks" / "cora-mirror-cowork-cora-lex-lbhs-digest.md").exists()
 
 
-def test_skills_index_row_absent_when_body_quarantined(roots):
+def test_skills_index_row_absent_when_body_quarantined(roots, monkeypatch):
     """H3: a skill whose body is quarantined must not leave an INDEX row (whose
     description would leak the screened text)."""
     # `morning` is mirrored (skills.allow) and carries NO allow_files opt-in, so the
@@ -409,6 +409,12 @@ def test_skills_index_row_absent_when_body_quarantined(roots):
     # on a skill the live allowlist may release.)
     _skill(roots["skills"], "morning", desc="handles the LEX-LTS census", body="clean body")
     _skill(roots["skills"], "wrap-it", desc="closes a session", body="clean")
+    # HERMETIC (D-051 lens F #8): main() reads the LIVE yaml via load_config(), whose
+    # allow_files Harrison edits -- pin an EMPTY opt-in list for this run so no skill
+    # the live allowlist may release can ever turn this assertion into a false red.
+    cfg = m.load_config()
+    cfg.allow_files = {}
+    monkeypatch.setattr(m, "load_config", lambda path=None: cfg)
     _run(["--apply", "--only", "skills"])
     assert not (roots["zk"] / "skills" / "morning.SKILL.md").exists()  # quarantined (LEX in desc)
     idx = (roots["zk"] / "skills" / "INDEX.md").read_text(encoding="utf-8")

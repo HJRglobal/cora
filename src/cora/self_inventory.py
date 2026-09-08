@@ -1,6 +1,7 @@
 """Deterministic self-inventory: WHAT Cora ingests, through WHICH doors, what is
 EXCLUDED, and her own scheduled cadence -- read from live signals, never from
-the knowledge base (ingest-integrity bundle I4, cq-3542e1b095b2, 2026-09-08).
+the knowledge base (ingest-integrity bundle I4, cq-3542e1b095b2, 2026-09-08;
+D-051 lens-E remediation the same day).
 
 THE DEFECT. On 9/3 Cora denied having "Cowork Cascade knowledge" three times
 and on 9/4 affirmed it with invented specifics. A meta-question about her own
@@ -13,8 +14,14 @@ of absence. The fix is a deterministic listing she consults BEFORE any
 
 WHAT IS LISTED (every line is a live read; nothing here is retrieved):
   * ingest DOORS -- every ``source`` the KB holds with its chunk count and the
-    sync watermarks the KB records for it (``sync_state``), plus the gmail
-    per-account watermark file;
+    sync watermarks the KB records for it (``sync_state``; a watermark counts as
+    FRESH only inside 48h -- a 97-day-old founders_os key used to read as fresh),
+    plus the gmail per-account watermark file;
+  * LIVE TOOL CONNECTORS -- the tool families offered in the asker's channel
+    (HubSpot, Asana, QBO, Calendar, Shopify ...). These are NOT knowledge-base
+    sources; the D-051 review showed the first cut turned "can you access
+    HubSpot?" into "HubSpot is not one of my sources" while hubspot_* tools sat
+    in the model's own tool list;
   * her SCHEDULED TASKS -- the live Task Scheduler registry (``schtasks
     /Query /FO CSV /V``, Cora tasks only, cached 10 min) with next/last run,
     cadence and last result, overlaid with the run-marker ledger
@@ -24,19 +31,39 @@ WHAT IS LISTED (every line is a live read; nothing here is retrieved):
     name-skipped subtree folders, the title belts, and the allowlisted views;
   * ENTITY PARTITIONS -- chunk counts per entity;
   * the claude-workspace MIRROR parity report (path + generated stamp + per-class
-    mirrored counts) and the canonical pointer for the Cowork / Cascade question.
+    mirrored counts) and the canonical pointer for the Cowork / Cascade question
+    -- rendered as an affirmation ONLY while the static_md door and a mirror
+    signal are both live; otherwise as "the doors exist by design, no live
+    signal this turn" (a constant "YES" would reproduce the 9/4 mode the moment
+    a lane went dark).
 
 SCOPE. ``detail=True`` (founder channels + Harrison) lists mailbox addresses,
-folder ids and every task; other channels get door names, counts and the ingest
-tasks only -- the inventory never becomes a per-user roster leak.
+folder ids, file paths and every task; other channels get door names, counts,
+the asker's own partition and the ingest lanes only -- the inventory never
+becomes a per-user roster leak, and an NDA'd project's name never reaches an
+unrelated channel.
+
+ROUTING. ``is_self_inventory_question`` is a grammar for questions about
+SOURCES and INGESTION -- "do you have access to the Cowork Cascade knowledge",
+"are you ingesting the session captures", "what's in your knowledge base" --
+and deliberately NOT for questions about CONTENT ("do you have the EVV docs",
+"have you seen the Sprouts contract", "what data do you have on Kroger") or
+about LIVE SYSTEMS ("can you access HubSpot"): the object must be a source
+zone or the knowledge base itself, an object followed by a specifier tail
+("... transcript FROM the Gotham call", "... thread WHERE Matt approved") is
+content, and an imperative write ("complete the task -- the deck is in your
+knowledge base right") is never a meta-question. The D-051 lens-E measurement
+of the first cut: 27 of 50 realistic asks hijacked, 17 of 28 acceptance
+phrasings missed, 7 staged-write / Asana turns displaced.
 
 WIRING. ``app._dispatch_qa`` forces the ``cora_self_inventory`` tool (F-23
-tool_choice pattern) when ``is_self_inventory_question`` matches, so the listing
-is in context before the model composes; normal KB retrieval still runs (a fact
-question that happens to be phrased "do you have ..." must still be answered from
-retrieval -- the inventory says which DOOR, the retrieval says WHAT). The tool's
-output carries the reply-format rule: a miss is "not in my sources" with the
-door named, never "I don't have that knowledge".
+tool_choice pattern) when the predicate matches -- BELOW the code-queue,
+delegate, staged-write and Asana forces (an explicit command or write always
+wins), never on a Tier-2 retrieval-grant turn, and the semantic-cache READ is
+bypassed for the turn so a cached non-inventory answer cannot pre-empt it.
+Normal KB retrieval still runs (the inventory says which DOOR, the retrieval
+says WHAT). The tool's output carries the reply-format rule: a miss is "not in
+my sources" with the door named, never "I don't have that knowledge".
 """
 from __future__ import annotations
 
@@ -65,7 +92,12 @@ FOUNDER_OS_ROOT = Path(_fos_env) if _fos_env else Path(r"G:\My Drive\HJR-Founder
 PARITY_REPORT_REL = Path("_shared") / "claude-workspace-mirror" / "PARITY-REPORT.md"
 GMAIL_WATERMARKS_PATH = _REPO_ROOT / "data" / "cache" / "gmail-thread-watermarks.json"
 
-#: The canonical answer for the question class that produced this tool.
+#: A sync watermark older than this is STALE (the founders_os door had 66-97 day
+#: old keys that the first cut counted as "fresh" because they were non-null).
+FRESH_HOURS = 48
+
+#: The canonical answer for the question class that produced this tool -- rendered
+#: ONLY while both doors show a live signal (see COWORK_CASCADE_POINTER_DARK).
 COWORK_CASCADE_POINTER = (
     "For 'do you have the Cowork / Cascade / Claude-workspace knowledge': YES by two "
     "doors -- the static_md sync of the Founder OS tree (CLAUDE.md, memory/, playbooks, "
@@ -76,74 +108,141 @@ COWORK_CASCADE_POINTER = (
     "Cora's own build docs and system prompts (_shared/projects/cora, D-057), scheduled-"
     "task BODIES and Code memory (ZONE-X). Not available: live Cowork session state."
 )
+COWORK_CASCADE_POINTER_DARK = (
+    "For 'do you have the Cowork / Cascade / Claude-workspace knowledge': the two doors "
+    "that carry it BY DESIGN are the static_md sync of the Founder OS tree and the "
+    "claude-workspace mirror under _shared/claude-workspace-mirror/ -- but this turn shows "
+    "NO live signal for {which}. Say the doors exist by design and that you cannot confirm "
+    "they are live right now; do NOT affirm with specifics, do NOT deny having the "
+    "knowledge. Cite PARITY-REPORT.md by path for counts."
+)
 
 REPLY_FORMAT = (
     "REPLY FORMAT (binding): answer 'do you have / do you know about / are you ingesting X' "
-    "from THIS inventory, not from retrieved chunks. If X names a source, folder, tool, "
-    "channel or document class: say which DOOR it arrives through (or that it is EXCLUDED "
-    "by design, naming the exclusion). If X is a fact and the retrieved knowledge below has "
-    "nothing: say 'not in my sources' and name the doors that WOULD carry it -- never say "
-    "'I don't have that knowledge' from a search miss, never invent a source, never "
-    "mention chunk numbers or context blocks. Cite PARITY-REPORT.md for mirror counts. "
-    "Do not queue a code session for a question about your own sources."
+    "from THIS inventory, not from retrieved chunks. This inventory lists KNOWLEDGE-BASE "
+    "doors; the LIVE TOOL CONNECTORS line lists systems you reach through tools (HubSpot, "
+    "Asana, QuickBooks, Calendar, Shopify ...) -- if X is one of those, the answer is YES "
+    "via that tool, never 'not in my sources'. If X names a source, folder, channel or "
+    "document class: say which DOOR it arrives through (or that it is EXCLUDED by design, "
+    "naming the exclusion). If X is a fact and the retrieved knowledge below has nothing: "
+    "say 'not in my sources' and name the doors that WOULD carry it -- never say 'I don't "
+    "have that knowledge' from a search miss, never invent a source, never mention chunk "
+    "numbers or context blocks. Cite PARITY-REPORT.md for mirror counts. Do not queue a "
+    "code session for a question about your own sources."
 )
 
 # ── routing predicate (unit-tested in tests/test_self_inventory.py) ──────────
 # Every quantified class is bounded; no nested quantifiers (ReDoS discipline).
 _LEAD = (r"^\s*(?:<@[A-Z0-9]{1,20}>\s*[,:\-]?\s*)?"
-         r"(?:(?:hey|hi|ok|okay|so|quick\s+question)[,\s]*)?"      # greeting before the name ...
-         r"(?:@?cora[,:\-]?\s*)?"
-         r"(?:(?:hey|hi|ok|okay|so)[,\s]*)?")                       # ... or after it
-# Source-class nouns: systems, plural collections, knowledge words. Singular
-# concrete things (a file, a meeting, a number) are deliberately absent so
-# "do you have Tommy's phone number" / "do you know when the meeting is" stay
-# ordinary questions.
+         r"(?:(?:hey|hi|hello|yo|ok|okay|so)[,!\s]*)?"           # greeting before the name ...
+         r"(?:@?cora\b[\s,:!.\-\u2014\u2013]*)?"                 # ... the name + any punctuation ...
+         r"(?:(?:hey|hi|hello|ok|okay|so)[,!\s]*)?"              # ... or after it ...
+         r"(?:(?:quick\s+(?:question|q)|question|one\s+more(?:\s+thing)?)[\s,:!.\-\u2014\u2013]*)?")
+_YOU = r"(?:you|u|ya)"
+_ADV = r"(?:(?:still|also|now|already|actually|even|really|currently)\s+){0,2}"
+# SOURCE-ZONE nouns: systems, collections, knowledge words -- things that ARE a
+# source, never a concrete item ("the notes", "the emails about X", "the EVV docs"
+# are content questions answered by retrieval). Live tool systems (hubspot /
+# asana / qbo / shopify / calendar / web) are deliberately ABSENT: the model has
+# those tools in its list and answers "can you access HubSpot" from it.
 _SOURCE_NOUN = (
-    r"(?:knowledge(?:\s+base)?|kb|corpus|sources?|doors?|feeds?|folders?|files|docs|documents|"
-    r"notes|captures?|transcripts|emails|inbox(?:es)?|mailbox(?:es)?|slack|channels|drive|gmail|"
-    r"calendars?|fireflies|meetings|asana|notion|hubspot|shopify|memory|memories|canon|decisions|"
-    r"decision\s+log|playbooks?|skills?|cowork|cascade|backfill|mirror|claude[- ]workspace|"
-    r"ingest\w{0,6}|index\w{0,6}|sync\w{0,6}|access)"
+    r"(?:knowledge(?:\s+base)?|kb|corpus|index|sources?|doors?|feeds?|inputs?|"
+    r"folders?|founder[- ]?(?:os|drive)|drive|mailbox(?:es)?|inbox(?:es)?|"
+    r"(?:my|our|the\s+team'?s?)\s+emails?|email\s+(?:sweep|history|archive)|"
+    r"slack|channels?\s+(?:sweep|history)|fireflies|gmail|notion|"
+    r"session[- ]captures?|captures|transcripts|playbooks?|skills?|memory|memories|canon|"
+    r"decisions?\s+log|cowork|cascade|mirror|claude[- ]workspace|"
+    r"backfill|ingest\w{0,6}|index\w{0,6}|sync\w{0,6}|sweeps?|"
+    r"computers?\s+backups?|backups?|downloads|desktop|"
+    r"(?:cowork|cascade|claude|code|session)\s+(?:stuff|material|knowledge|docs|notes|history))"
 )
+# An object followed by a specifier is a CONTENT question ("the fireflies transcript
+# FROM the Gotham call", "the slack thread WHERE Matt approved the PO").
+_TAIL = r"(?![^\n]{0,40}?\b(?:from|about|for|re|regarding|on|where|when|that|which|of|between)\b)"
 _P_HAVE_KNOW = re.compile(
-    _LEAD + r"(?:do|did|can|could|would)\s+you\s+(?:(?:still|also|now|already|actually|even|really)\s+){0,2}"
-    r"(?:have|know|see|access|ingest|index|read|track|hold|store|sync|remember|cover|include|"
-    r"search|retrieve|pull|reach)\b[^\n]{0,80}?\b" + _SOURCE_NOUN + r"\b",
+    _LEAD + r"(?:do|did|can|could|would|don't|dont|do\s+not)\s+" + _YOU + r"\s+" + _ADV
+    + r"(?:have|know\s+(?:about|of)|know|see|access|ingest|index|read|hold|store|sync|remember|"
+    r"cover|include|search|retrieve|pull|reach|get|track)\b[^\n]{0,60}?\b" + _SOURCE_NOUN + r"\b" + _TAIL,
     re.IGNORECASE,
 )
 _P_ARE_YOU = re.compile(
-    _LEAD + r"are\s+you\s+(?:(?:still|also|now|already|actually|even)\s+){0,2}"
-    r"(?:ingesting|indexing|syncing|synced|reading|tracking|pulling|watching|monitoring|sweeping|"
-    r"capturing|mirroring|connected|hooked\s+up|plugged\s+in)\b",
+    _LEAD + r"are\s+" + _YOU + r"\s+" + _ADV
+    + r"(?:ingesting|indexing|syncing|synced\s+(?:to|with)|sweeping|mirroring|capturing|harvesting|"
+    r"pulling\s+in|picking\s+up|reading\s+from|connected\s+to|hooked\s+up\s+to|plugged\s+in(?:to)?|"
+    r"watching|tracking|monitoring)\b[^\n]{0,60}?\b" + _SOURCE_NOUN + r"\b" + _TAIL,
     re.IGNORECASE,
 )
 _P_WHAT_SOURCES = re.compile(
-    r"\b(?:what|which)\s+(?:sources|doors|folders|files|feeds|systems|channels|data|knowledge|"
-    r"inboxes|mailboxes|drives)\s+(?:do|did|can|are|have)\s+you\b",
+    r"\b(?:what|which)\s+(?:(?:knowledge|data)\s+sources|sources|doors|folders|feeds|systems|inboxes|"
+    r"mailboxes|drives|(?:slack\s+)?channels)\s+(?:do|did|can|are|have|does)\s+" + _YOU + r"\s+" + _ADV
+    + r"(?:have|ingest\w*|index\w*|read|sweep\w*|sync\w*|pull|see|know|cover|track|monitor|get|access|use|"
+    r"draw)\b",
+    re.IGNORECASE,
+)
+_P_YOUR_SOURCES = re.compile(
+    r"\b(?:what|which|where)\s+(?:are|is|do|does|did)\s+(?:all\s+)?your\s+(?:knowledge|kb|knowledge\s+base|"
+    r"corpus|index|sources|doors|feeds|inputs|data\s+sources)\b",
     re.IGNORECASE,
 )
 _P_IN_YOUR = re.compile(
-    r"\b(?:is|are|was|were)\b[^\n]{0,80}?\bin\s+your\s+(?:kb|knowledge(?:\s+base)?|sources|index|"
-    r"memory|corpus|brain)\b",
+    r"\b(?:is|are|was|were|isn't|aren't|what's|whats|what\s+is|what\s+are|does|do)\b[^\n]{0,80}?"
+    r"\b(?:in|inside|part\s+of|available\s+(?:in|to))\s+your\s+(?:kb|knowledge(?:\s+base)?|sources|index|"
+    r"memory|corpus|brain|training)\b",
+    re.IGNORECASE,
+)
+_P_YOUR_KNOWLEDGE_INCLUDES = re.compile(
+    r"\b(?:does|do|did|will|would)\s+your\s+(?:knowledge|kb|knowledge\s+base|sources|index|corpus|memory)\s+"
+    r"(?:include|cover|have|contain|reach|extend\s+to|know\s+about)\b",
+    re.IGNORECASE,
+)
+_P_AVAILABLE_TO_YOU = re.compile(
+    r"\b(?:is|are|was|were)\b[^\n]{0,80}?\b(?:available|visible|accessible|exposed)\s+to\s+" + _YOU + r"\b",
     re.IGNORECASE,
 )
 _P_HAVE_YOU = re.compile(
-    _LEAD + r"have\s+you\s+(?:(?:already|ever|since|now)\s+)?(?:ingested|indexed|read|seen|synced|"
-    r"captured|swept|mirrored|picked\s+up|pulled\s+in)\b",
+    _LEAD + r"(?:have|had|haven't|havent)\s+" + _YOU + r"\s+(?:(?:already|ever|since|now|actually)\s+)?"
+    r"(?:got|been\s+given|been\s+fed|ingested|indexed|read|seen|synced|captured|swept|mirrored|picked\s+up|"
+    r"pulled\s+in|got\s+access\s+to|gained\s+access\s+to)\b[^\n]{0,60}?\b" + _SOURCE_NOUN + r"\b" + _TAIL,
     re.IGNORECASE,
 )
 _P_ACCESS_TO = re.compile(
-    r"\b(?:do|did|don't|do\s+not)\s+you\s+(?:(?:still|also|now|already|actually|even|really)\s+){0,2}"
-    r"have\s+access\s+to\b",
+    r"\b(?:do|did|don't|dont|do\s+not|can|could|can't|cant)\s+" + _YOU + r"\s+" + _ADV
+    + r"(?:have\s+access\s+to|access|get\s+(?:to|at|into)|see\s+into|reach|read)\b[^\n]{0,60}?\b"
+    + _SOURCE_NOUN + r"\b" + _TAIL,
+    re.IGNORECASE,
+)
+_P_TAG = re.compile(
+    r"\b" + _YOU + r"\s+(?:don't|dont|do\s+not|didn't|never)\s+(?:have|see|get|ingest|index|read)\b[^\n]{0,60}?\b"
+    + _SOURCE_NOUN + r"\b[^\n]{0,25}?\b(?:do|did)\s+" + _YOU + r"\b",
+    re.IGNORECASE,
+)
+_P_WHICH_OF = re.compile(
+    r"\bwhich\s+of\s+(?:the|these|those|our|all)\b[^\n]{0,50}?\b" + _SOURCE_NOUN + r"\b[^\n]{0,40}?\bcan\s+"
+    + _YOU + r"\s+(?:see|access|read|reach|search|use)\b",
+    re.IGNORECASE,
+)
+# An IMPERATIVE WRITE is never a meta-question, however the sentence continues
+# ("complete the task -- the deck is in your knowledge base right"). Same
+# start-anchored shape as the staged-write / Asana detectors it must yield to.
+_IMPERATIVE_WRITE_RE = re.compile(
+    _LEAD + r"(?:please\s+|pls\s+|can\s+you\s+|could\s+you\s+|go\s+ahead\s+and\s+)?"
+    r"(?:complete|mark|delete|remove|create|add|make|dm|slack|message|msg|draft|compose|write|send|email|"
+    r"remember|note|schedule|book|update|move|assign|queue|delegate|close|reopen|archive|post|reply|forward|"
+    r"set|change|rename|log|record|save|cancel|finish|ship|file)\b",
     re.IGNORECASE,
 )
 
-_INTENT_PATTERNS = (_P_HAVE_KNOW, _P_ARE_YOU, _P_WHAT_SOURCES, _P_IN_YOUR, _P_HAVE_YOU, _P_ACCESS_TO)
+_INTENT_PATTERNS = (
+    _P_HAVE_KNOW, _P_ARE_YOU, _P_WHAT_SOURCES, _P_YOUR_SOURCES, _P_IN_YOUR, _P_YOUR_KNOWLEDGE_INCLUDES,
+    _P_AVAILABLE_TO_YOU, _P_HAVE_YOU, _P_ACCESS_TO, _P_TAG, _P_WHICH_OF,
+)
 
 
 def is_self_inventory_question(text: str) -> bool:
     """True when *text* asks Cora about her OWN sources / doors / coverage."""
     if not text or len(text) > 2000:
+        return False
+    if _IMPERATIVE_WRITE_RE.search(text):
         return False
     return any(p.search(text) for p in _INTENT_PATTERNS)
 
@@ -152,45 +251,49 @@ def is_self_inventory_question(text: str) -> bool:
 _REGISTRY_CACHE: dict[str, Any] = {"at": 0.0, "rows": None}
 _REGISTRY_TTL_S = 600
 _REGISTRY_LOCK = threading.Lock()
-_TASK_NAME_RE = re.compile(r"cora", re.IGNORECASE)
+# "Cora - X", "cowork-cora-x", "\cora-watchdog" -- never "Decorator Update Task"
+_TASK_NAME_RE = re.compile(r"(?:^|[\s\-_\\])cora(?:$|[\s\-_])", re.IGNORECASE)
 
 
 def read_task_registry(timeout: float = 12.0, *, now: float | None = None) -> list[dict[str, str]]:
     """Cora's scheduled tasks from the LIVE registry (``schtasks /Query /FO CSV /V``).
 
     Cached for 10 minutes (the registry changes rarely; a Slack turn must not pay
-    a Task Scheduler round-trip every time). Empty list on any failure -- the
-    inventory then says the registry was unavailable, never that there are no tasks.
+    a Task Scheduler round-trip every time). The spawn runs INSIDE the lock so two
+    concurrent cold calls cost one query, not two. Empty list on any failure --
+    the inventory then says the registry was unavailable, never that there are no
+    tasks.
     """
     now = time.time() if now is None else now
     with _REGISTRY_LOCK:
         rows = _REGISTRY_CACHE.get("rows")
         if rows is not None and now - float(_REGISTRY_CACHE.get("at", 0.0)) < _REGISTRY_TTL_S:
             return list(rows)
-    if os.name != "nt":
-        return []
-    try:
-        out = subprocess.run(
-            ["schtasks", "/Query", "/FO", "CSV", "/V"],
-            capture_output=True, text=True, timeout=timeout, creationflags=_NO_WINDOW,
-            encoding="utf-8", errors="replace",
-        ).stdout
-    except Exception as exc:  # noqa: BLE001 -- best effort
-        log.warning("self_inventory: schtasks query failed: %s", exc)
-        return []
-    rows = parse_schtasks_csv(out)
-    with _REGISTRY_LOCK:
+        if os.name != "nt":
+            return []
+        try:
+            out = subprocess.run(
+                ["schtasks", "/Query", "/FO", "CSV", "/V"],
+                capture_output=True, text=True, timeout=timeout, creationflags=_NO_WINDOW,
+                encoding="utf-8", errors="replace",
+            ).stdout
+        except Exception as exc:  # noqa: BLE001 -- best effort
+            log.warning("self_inventory: schtasks query failed: %s", exc)
+            return []
+        rows = parse_schtasks_csv(out)
         _REGISTRY_CACHE["rows"] = list(rows)
         _REGISTRY_CACHE["at"] = now
-    return rows
+        return rows
 
 
 def parse_schtasks_csv(text: str) -> list[dict[str, str]]:
     """Parse ``schtasks /FO CSV /V`` output into compact dicts, Cora tasks only.
-    The verbose listing repeats the header row per task -- those are skipped."""
-    rows: list[dict[str, str]] = []
+    The verbose listing repeats the header row per task -- those are skipped -- and
+    lists a task once PER TRIGGER, so a two-trigger task is folded to one row
+    (``triggers`` counts them; the earliest next run is kept)."""
+    rows: dict[str, dict[str, str]] = {}
     if not text:
-        return rows
+        return []
     reader = csv.reader(io.StringIO(text))
     header: list[str] | None = None
     for rec in reader:
@@ -205,7 +308,7 @@ def parse_schtasks_csv(text: str) -> list[dict[str, str]]:
         name = str(d.get("TaskName", "")).lstrip("\\")
         if not _TASK_NAME_RE.search(name):
             continue
-        rows.append({
+        row = {
             "name": name,
             "state": str(d.get("Scheduled Task State", "") or d.get("Status", "")),
             "status": str(d.get("Status", "")),
@@ -216,9 +319,19 @@ def parse_schtasks_csv(text: str) -> list[dict[str, str]]:
             "start_time": str(d.get("Start Time", "")),
             "days": str(d.get("Days", "")),
             "repeat_every": str(d.get("Repeat: Every", "")),
-        })
-    rows.sort(key=lambda r: r["name"].lower())
-    return rows
+            "triggers": "1",
+        }
+        prev = rows.get(name)
+        if prev is None:
+            rows[name] = row
+        else:
+            prev["triggers"] = str(int(prev.get("triggers", "1")) + 1)
+            # a second trigger adds a second start time to the cadence phrase
+            if row["start_time"] and row["start_time"] not in prev["start_time"]:
+                prev["start_time"] = f"{prev['start_time']} + {row['start_time']}".strip(" +")
+    out = list(rows.values())
+    out.sort(key=lambda r: r["name"].lower())
+    return out
 
 
 def cadence_of(row: dict[str, str]) -> str:
@@ -285,25 +398,75 @@ def read_parity_report(root: Path = FOUNDER_OS_ROOT, timeout: float = 3.0) -> di
     return out
 
 
+# Live tool families, by tool-name shape. Read from tool_dispatch.tools_for_entity
+# at call time so the list is exactly what the model is offered in that channel.
+_TOOL_FAMILIES: tuple[tuple[str, Callable[[str], bool]], ...] = (
+    ("HubSpot CRM (live deals / contacts)", lambda n: "hubspot" in n),
+    ("Asana (live tasks)", lambda n: n.startswith("asana_")),
+    ("QuickBooks Online (live P&L / balance sheet / AR-AP)", lambda n: n.startswith("qbo_")),
+    ("Google Calendar (live events)", lambda n: n.startswith("calendar_")),
+    ("Gmail (own-inbox reads / drafts)", lambda n: n.startswith("gmail_")),
+    ("Cash-flow sheets (live weekly forecast)", lambda n: n.startswith("financial_")),
+    ("Shopify (live orders / inventory)", lambda n: "shopify" in n),
+    ("Deposco warehouse (live)", lambda n: "deposco" in n),
+    ("Ads performance (live)", lambda n: n.startswith("ads_")),
+    ("Influencer / fighter tracker (live)", lambda n: n.startswith(("influencer_", "fighter_"))),
+    ("Slack DM send (staged)", lambda n: n == "slack_send_dm"),
+    ("Personal notes (owner-only store)", lambda n: n in ("cora_remember", "cora_my_notes")),
+)
+_WEB_CONNECTOR_NOTE = "Web search / fetch (gated per turn; explicit web intent; off in LEX by default)"
+
+
+def live_tool_families(entity: str | None) -> list[str]:
+    """Human labels for the tool families offered in *entity*'s channel (fail-soft)."""
+    try:
+        from cora.tools import tool_dispatch as td
+        names = {t["name"] for t in td.tools_for_entity((entity or "FNDR").upper())}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("self_inventory: tool list unavailable: %s", exc)
+        return []
+    fams = [label for label, pred in _TOOL_FAMILIES if any(pred(n) for n in names)]
+    fams.append(_WEB_CONNECTOR_NOTE)
+    return fams
+
+
 # ── inventory build ──────────────────────────────────────────────────────────
 _SOURCE_DOOR_NOTES: dict[str, str] = {
     "static_md": "nightly 04:00 + midday 12:20 AZ walk of the Founder OS tree (.md + bootstrap.txt), entity by folder",
-    "drive_sweep": "Drive files -- founders_os tree (entity by folder) + per-user flat sweeps",
+    "drive_sweep": "Drive files -- founders_os tree (entity by folder) + per-user flat sweeps (markdown inside the Founder OS tree left to static_md)",
     "drive_asset": "Drive file stubs (name/path/owner) for non-text files",
     "gmail": ("per-mailbox threaded sweep (roster in monitored-email-accounts.yaml); watermarks live in "
               "data/cache/gmail-thread-watermarks.json (listed below), not in the KB"),
     "slack": ("nightly channel sweep (bot-authored lines tagged, never canon); watermark kept by the "
               "channel-sweep task, not in the KB"),
-    "fireflies": "meeting transcripts (COPA titles excluded)",
+    "fireflies": "meeting transcripts (one NDA'd project's meetings excluded by title)",
     "asana": "task sync",
     "notion": "Notion pages",
     "lex_dump_folder": "LEX dump folder (DDD/EVV manuals), daily 04:45 AZ",
     "user_note": "personal notes -- owner-only; EXCLUDED from every shared retrieval by construction",
 }
+_PATH_TOKEN_RE = re.compile(r"\S+\.(?:json|yaml|yml|md|txt)\b")
 
-_INGEST_TASK_HINT_RE = re.compile(
-    r"kb-sync|sweep|capture|mirror|dump|extractor|harvest|static|gmail|slack|fireflies|asana|notion|"
-    r"drive|ingest|hygiene|backfill|assets", re.IGNORECASE)
+# Ingest lanes by NAME: a positive family AND no writer/notifier token. The first
+# cut's single hint regex ("asana|sweep|capture ...") admitted the Asana nudge
+# writer, the revops send lane, the decision-capture inbox and the coverage DM
+# nudges as "ingest lanes" while missing the attachment filer and the
+# inventory-state sync (D-051 lens E #7).
+_INGEST_TASK_RE = re.compile(
+    r"kb-sync|drive[ -]sweep|founders-os|session-capture|claude-mirror|channel-sweep|dump[ -]folder|"
+    r"attachment[ -]filer|inventory-state-sync|drive-extractor|backfill|kb-hygiene|assets|static|ingest|harvest",
+    re.IGNORECASE,
+)
+_NON_INGEST_TASK_RE = re.compile(
+    r"nudge|revops|decision-capture|coverage|completion-sweep|digest|briefing|synthesis|memo|report|alert|"
+    r"monitor|health|scan|review|autofill|reconciliation|knowledge-check|deliverable|metrics|token|backup|"
+    r"compaction|watchdog|service|security|pulse|spy|linkedin|influencer",
+    re.IGNORECASE,
+)
+
+
+def is_ingest_task(name: str) -> bool:
+    return bool(_INGEST_TASK_RE.search(name)) and not _NON_INGEST_TASK_RE.search(name)
 
 
 def _hours_ago(epoch: float | int | None, now: float) -> str:
@@ -316,20 +479,41 @@ def _hours_ago(epoch: float | int | None, now: float) -> str:
         return "?"
 
 
+def _is_fresh(epoch: Any, now: float) -> bool:
+    try:
+        return bool(epoch) and (now - float(epoch)) <= FRESH_HOURS * 3600
+    except (TypeError, ValueError):
+        return False
+
+
 def build_inventory(
     *,
     kb: Any,
     kb_lock: Any = None,
     detail: bool,
-    registry_reader: Callable[[], list[dict[str, str]]] = read_task_registry,
-    markers_reader: Callable[[], dict[str, dict]] = run_marker.latest_by_task,
-    gmail_reader: Callable[[], dict[str, Any]] = read_gmail_watermarks,
-    parity_reader: Callable[[], dict[str, Any]] = read_parity_report,
+    entity: str | None = None,
+    registry_reader: Callable[[], list[dict[str, str]]] | None = None,
+    markers_reader: Callable[[], dict[str, dict]] | None = None,
+    gmail_reader: Callable[[], dict[str, Any]] | None = None,
+    parity_reader: Callable[[], dict[str, Any]] | None = None,
+    connectors_reader: Callable[[str | None], list[str]] | None = None,
     now: float | None = None,
 ) -> dict[str, Any]:
-    """Assemble the inventory from live signals. Every section fail-soft."""
+    """Assemble the inventory from live signals. Every section fail-soft.
+
+    The readers default to the module functions AT CALL TIME (not at def time),
+    so a test that monkeypatches ``self_inventory.read_task_registry`` really
+    stubs the read -- the first cut bound the originals as default arguments and
+    the "stubbed" unit test spawned schtasks and read G: (D-051 lens F #4).
+    """
+    registry_reader = registry_reader or read_task_registry
+    markers_reader = markers_reader or run_marker.latest_by_task
+    gmail_reader = gmail_reader or read_gmail_watermarks
+    parity_reader = parity_reader or read_parity_report
+    connectors_reader = connectors_reader or live_tool_families
     now = time.time() if now is None else now
-    inv: dict[str, Any] = {"detail": detail, "generated_at": datetime.fromtimestamp(now, tz=timezone.utc).isoformat()}
+    inv: dict[str, Any] = {"detail": detail, "entity": (entity or "").upper() or None,
+                           "generated_at": datetime.fromtimestamp(now, tz=timezone.utc).isoformat()}
 
     # 1. KB doors + partitions + sync watermarks
     stats: dict[str, Any] = {}
@@ -359,25 +543,37 @@ def build_inventory(
                or (src == "drive_asset" and key == "drive_assets") or base_key == src:
                 marks.append((key, val[0] if isinstance(val, (tuple, list)) and val else None))
         if marks:
-            fresh = [m for m in marks if m[1]]
+            fresh = [m for m in marks if _is_fresh(m[1], now)]
             door["watermarks"] = len(marks)
             door["watermarks_fresh"] = len(fresh)
-            door["newest_sync"] = _hours_ago(max((m[1] for m in fresh), default=None), now)
+            door["watermarks_stale_keys"] = [k for k, v in marks if not _is_fresh(v, now)]
+            newest = max((m[1] for m in marks if m[1]), default=None)
+            door["newest_sync"] = _hours_ago(newest, now)
             if detail:
                 door["watermark_keys"] = [f"{k} ({_hours_ago(v, now)})" for k, v in marks]
         doors.append(door)
     inv["doors"] = doors
-    gm = gmail_reader() or {}
+    try:
+        gm = gmail_reader() or {}
+    except Exception:  # noqa: BLE001
+        gm = {}
     if gm:
         inv["gmail_accounts"] = len(gm)
-        fresh = [v for v in gm.values() if isinstance(v, (int, float)) and v > 0]
-        inv["gmail_newest_sync"] = _hours_ago(max(fresh), now) if fresh else "unknown"
+        epochs = [v for v in gm.values() if isinstance(v, (int, float)) and v > 0]
+        inv["gmail_newest_sync"] = _hours_ago(max(epochs), now) if epochs else "unknown"
+        inv["gmail_stale_accounts"] = sum(1 for v in gm.values() if not _is_fresh(v, now))
         if detail:
             # the sweep file stores epoch seconds per mailbox; render them as ages
             inv["gmail_watermarks"] = {
                 str(k): (_hours_ago(v, now) if isinstance(v, (int, float)) else str(v)[:19])
                 for k, v in sorted(gm.items())
             }
+
+    # 1b. Live tool connectors -- NOT knowledge sources
+    try:
+        inv["live_connectors"] = list(connectors_reader(inv["entity"]) or [])
+    except Exception:  # noqa: BLE001
+        inv["live_connectors"] = []
 
     # 2. Scheduled tasks (live registry) + run markers
     try:
@@ -395,7 +591,7 @@ def build_inventory(
             "name": name, "state": row.get("state", ""), "cadence": cadence_of(row),
             "next_run": row.get("next_run", ""), "last_run": row.get("last_run", ""),
             "last_result": row.get("last_result", ""),
-            "ingest": bool(_INGEST_TASK_HINT_RE.search(name)),
+            "ingest": is_ingest_task(name),
         }
         mk = markers.get(name)
         if mk:
@@ -419,21 +615,37 @@ def build_inventory(
         "Cora build workspace (D-057)": ["/".join(kb_exclusions._CORA_WORKSPACE_SEGMENTS)],
         "static-tree skips": ["_brain/swept", "_delegated-work", "_archive", "dot-dirs", "PHI segments (consumers/clients/phi/clinical/ehr)"],
     }
+    # the generic belt list is safe for every channel; the NDA'd project's own token is founder-level
     inv["title_belts"] = [
         "Cora build/audit docs: a `cora-` token + a build keyword (forensic/rebuild/audit/review/cascade/mirror/quarantine ...)",
         "Generated finance files: date-prefixed forecast/actuals/cashflow-worksheet names, forecast-assist",
-        "NDA'd COPA meetings: whole-word `copa` in a meeting title",
+        "NDA'd project meetings: a whole-word project token in a meeting title (token founder-level)",
         "Banking identifiers: routing/SWIFT/IBAN/account values are REDACTED at every chunk egress (deep link kept)",
+    ]
+    inv["title_belts_founder"] = [
+        b.replace("(token founder-level)", "(token: `copa`)") for b in inv["title_belts"]
     ]
     inv["allowlisted_views"] = sorted(kb_exclusions._KB_ALLOWLIST_BASENAMES)
     inv["drive_skip_folder_names"] = sorted(_drive_skip_names())
 
-    # 4. Mirror parity + canonical pointer
+    # 4. Mirror parity + canonical pointer (live-gated)
     try:
         inv["parity"] = parity_reader() or {"available": False}
     except Exception as exc:  # noqa: BLE001
         inv["parity"] = {"available": False, "error": str(exc)}
-    inv["cowork_cascade_pointer"] = COWORK_CASCADE_POINTER
+    static_live = any(d["source"] == "static_md" for d in doors)
+    mirror_task = any("claude-mirror" in (t.get("name") or "").lower() for t in tasks)
+    mirror_live = bool(inv["parity"].get("available")) or mirror_task
+    inv["cowork_cascade_live"] = bool(static_live and mirror_live)
+    if inv["cowork_cascade_live"]:
+        inv["cowork_cascade_pointer"] = COWORK_CASCADE_POINTER
+    else:
+        dark = []
+        if not static_live:
+            dark.append("the static_md door (no static_md chunks read this turn)")
+        if not mirror_live:
+            dark.append("the claude-workspace mirror (parity report unreadable and no mirror task in the registry)")
+        inv["cowork_cascade_pointer"] = COWORK_CASCADE_POINTER_DARK.format(which=" and ".join(dark) or "a door")
     return inv
 
 
@@ -446,6 +658,11 @@ def _drive_skip_names() -> frozenset[str]:
 
 
 # ── rendering ────────────────────────────────────────────────────────────────
+def _channel_note(note: str) -> str:
+    """A door note without repo / Drive file paths (founder-level metadata)."""
+    return _PATH_TOKEN_RE.sub("a founder-level file", note)
+
+
 def render_inventory(inv: dict[str, Any]) -> str:
     detail = bool(inv.get("detail"))
     lines: list[str] = ["Cora self-inventory (live signals; deterministic -- not retrieved from the KB):"]
@@ -454,19 +671,46 @@ def render_inventory(inv: dict[str, Any]) -> str:
     else:
         lines.append(f"- Knowledge base: {inv.get('total_chunks', 0):,} chunks.")
     lines.append("")
-    lines.append("INGEST DOORS (source | chunks | last sync the KB knows | how it arrives):")
+    lines.append(f"INGEST DOORS (source | chunks | newest sync the KB knows | watermarks fresh within {FRESH_HOURS}h | how it arrives):")
     for d in inv.get("doors", []):
         sync = d.get("newest_sync", "no watermark in KB")
-        wm = f" [{d.get('watermarks_fresh', 0)}/{d.get('watermarks', 0)} watermarks fresh]" if d.get("watermarks") else ""
-        lines.append(f"- {d['source']} | {d['chunks']:,} | {sync}{wm} | {d.get('note', '')}")
+        wm = ""
+        if d.get("watermarks"):
+            n_stale = len(d.get("watermarks_stale_keys") or [])
+            wm = f" [{d.get('watermarks_fresh', 0)}/{d.get('watermarks', 0)} fresh" + (f"; {n_stale} STALE" if n_stale else "") + "]"
+        note = d.get("note", "") if detail else _channel_note(d.get("note", ""))
+        lines.append(f"- {d['source']} | {d['chunks']:,} | {sync}{wm} | {note}")
         if detail and d.get("watermark_keys"):
             lines.append("    keys: " + "; ".join(d["watermark_keys"][:40]))
+        if detail and d.get("watermarks_stale_keys"):
+            lines.append("    STALE (older than %dh): %s" % (FRESH_HOURS, "; ".join(d["watermarks_stale_keys"][:40])))
     if inv.get("gmail_accounts"):
-        lines.append(f"- gmail sweep watermark file: {inv['gmail_accounts']} mailboxes tracked, newest sync "
-                     f"{inv.get('gmail_newest_sync', 'unknown')}"
+        stale = inv.get("gmail_stale_accounts", 0)
+        lines.append(f"- gmail sweep watermarks: {inv['gmail_accounts']} mailboxes tracked, newest sync "
+                     f"{inv.get('gmail_newest_sync', 'unknown')}" + (f", {stale} STALE (>{FRESH_HOURS}h)" if stale else "")
                      + (" -- " + "; ".join(f"{k} {v}" for k, v in list(inv.get("gmail_watermarks", {}).items())[:40]) if detail else ""))
     lines.append("")
-    lines.append("ENTITY PARTITIONS (chunks): " + ", ".join(f"{k} {v:,}" for k, v in inv.get("by_entity", {}).items()))
+    conns = inv.get("live_connectors") or []
+    if conns:
+        lines.append("LIVE TOOL CONNECTORS in this channel (NOT knowledge-base sources -- 'can you access HubSpot / "
+                     "Asana / QuickBooks / the calendar / Shopify' is answered YES from this list, never 'not in my "
+                     "sources'): " + "; ".join(conns))
+    else:
+        lines.append("LIVE TOOL CONNECTORS: tool list unavailable this turn -- answer live-system questions from the "
+                     "tools you were offered, never from this inventory.")
+    lines.append("")
+    by_entity = inv.get("by_entity", {}) or {}
+    if detail:
+        lines.append("ENTITY PARTITIONS (chunks): " + ", ".join(f"{k} {v:,}" for k, v in by_entity.items()))
+    else:
+        # a channel learns its OWN partition size and the total -- not how large
+        # another entity's (e.g. the LEX) partition is
+        ent = inv.get("entity") or ""
+        parent = ent.split("-")[0] if ent else ""
+        own = {k: v for k, v in by_entity.items() if k in (ent, parent)}
+        own_txt = ", ".join(f"{k} {v:,}" for k, v in own.items()) or "n/a"
+        lines.append(f"ENTITY PARTITIONS: {len(by_entity)} entity partitions; this channel's: {own_txt} "
+                     f"(other partitions' sizes are founder-level)")
     lines.append("")
     excl = inv.get("excluded_folders", [])
     if detail:
@@ -486,7 +730,8 @@ def render_inventory(inv: dict[str, Any]) -> str:
                      f"{n_roots} PC backup roots) plus the static-tree skips (_brain/swept, _delegated-work, "
                      f"_archive, PHI segments). Folder names and ids are founder-level.")
     lines.append("Drive subtree names skipped in the Founder-OS walk: " + ", ".join(inv.get("drive_skip_folder_names", [])))
-    lines.append("Title belts: " + " | ".join(inv.get("title_belts", [])))
+    belts = inv.get("title_belts_founder" if detail else "title_belts", inv.get("title_belts", []))
+    lines.append("Title belts: " + " | ".join(belts))
     lines.append("Allowlisted views ingested despite the Cora-workspace exclusion: " + ", ".join(inv.get("allowlisted_views", [])))
     lines.append("")
     tasks = inv.get("tasks", [])
@@ -501,17 +746,20 @@ def render_inventory(inv: dict[str, Any]) -> str:
             lines.append(f"- {t['name']} | {t['state']} | {t['cadence']} | next {t['next_run']} | last result {t['last_result']} | {wrote}")
     lines.append("")
     p = inv.get("parity", {}) or {}
+    path_txt = p.get("path") if detail else "PARITY-REPORT.md (path founder-level)"
     if p.get("available"):
         cls = ", ".join(f"{k} {v.get('mirrored')} mirrored/{v.get('quarantined')} quarantined" for k, v in (p.get("classes") or {}).items())
         lines.append(f"CLAUDE-WORKSPACE MIRROR: PARITY-REPORT.md generated {p.get('generated', '?')} -- {cls}"
                      + (f"; quarantined total {p['quarantined_total']}" if "quarantined_total" in p else "")
-                     + f" ({p.get('path')})")
+                     + f" ({path_txt})")
     else:
-        lines.append(f"CLAUDE-WORKSPACE MIRROR: PARITY-REPORT.md not readable this turn ({p.get('error', 'absent')}) -- cite it by path: {p.get('path', PARITY_REPORT_REL)}")
+        lines.append(f"CLAUDE-WORKSPACE MIRROR: PARITY-REPORT.md not readable this turn ({p.get('error', 'absent')}) -- cite it by path: "
+                     f"{path_txt if detail else PARITY_REPORT_REL}")
     lines.append("")
     lines.append(inv.get("cowork_cascade_pointer", COWORK_CASCADE_POINTER))
     lines.append("")
     lines.append(REPLY_FORMAT)
     if not detail:
-        lines.append("(Mailbox addresses, watermark keys and the non-ingest task list are founder-level -- ask in a founder channel.)")
+        lines.append("(Mailbox addresses, watermark keys, file paths, other partitions' sizes and the non-ingest task list "
+                     "are founder-level -- ask in a founder channel.)")
     return "\n".join(lines)

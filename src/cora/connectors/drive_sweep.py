@@ -621,6 +621,11 @@ def _ancestor_chain(
         chain.append((fid, str(entry.get("name") or "")))
         parents = entry.get("parents") or []
         fid = parents[0] if parents else None
+    if fid and (fid in seen or len(seen) >= max_nodes):
+        # The loop stopped with a next hop still pending (a cycle or the node
+        # bound): the chain is PARTIAL, so it must not read as "not excluded"
+        # (D-051 lens D #5 -- fail closed, like an API failure).
+        complete = False
     return chain, complete
 
 
@@ -635,21 +640,38 @@ def _any_ancestor_excluded(
     return any(fid in KB_EXCLUDED_FOLDER_IDS for fid, _name in chain)
 
 
+def _is_markdown(mime_type: str | None, filename: str | None) -> bool:
+    return (mime_type or "").lower() == "text/markdown" or (filename or "").lower().endswith(".md")
+
+
 def _file_disposition(
     service: Any, parents: list[str] | None, expanded: frozenset[str],
-    complete: bool, cache: dict,
+    complete: bool, cache: dict, *, mime_type: str = "", filename: str = "",
 ) -> str | None:
     """Why a flat-sweep file must be SKIPPED, or None to ingest it.
 
     ``"excluded"``        a parent is in the expanded exclusion set (fast path), or
                           an ancestor is any pinned id -- incl. the parentless
                           Computers backup roots, which only the walk can see;
-    ``"unresolved"``      the ancestry could not be resolved this run (fail-closed);
-    ``"founders_os_owned"`` the file sits under an entity-mapped top folder of the
-                          HJR-Founder-OS tree, which sweep_founders_os already
-                          ingests with the FOLDER-deterministic entity (I5,
-                          cq-12fd5d76fd04); the flat sweep's Haiku-tagged twin of
-                          the same file id used to overwrite it with FNDR/F3E.
+    ``"unresolved"``      the ancestry could not be resolved this run (fail-closed;
+                          the caller HOLDS the watermark so the file is retried);
+    ``"static_md_owned"`` a MARKDOWN file inside the HJR-Founder-OS tree. The
+                          static_md sync ingests every .md under the tree with the
+                          FOLDER-deterministic entity and its own exclusions
+                          (_brain/swept, _archive, PHI segments, the Cora
+                          workspace), so the flat sweep's Haiku-tagged drive_sweep
+                          twin only ever added a second, wrongly-tagged copy of the
+                          same document (I5, cq-12fd5d76fd04: 64 of 411 capture
+                          files disagreed) -- and for the _brain/swept digests a
+                          self-poisoning copy. Non-markdown files (PDF / xlsx /
+                          Docs / Sheets) STAY on the flat sweep: the D-051 lens-D
+                          measurement (2026-09-08) found sweep_founders_os
+                          budget-interrupted for 37 consecutive runs (one entity
+                          done, ten deferred; watermarks only for F3E/HJRPROD/OSN),
+                          so the flat sweep is the only door actually ingesting
+                          most non-.md Founder-OS content -- 14,337 files incl.
+                          7,928 filed receipts/invoices. A "founders_os owns the
+                          tree" skip would have been a silent ingestion cliff.
 
     The walk runs whenever expansion was incomplete OR walk-only roots are pinned
     (always, in production) -- the expanded set is the fast path, no longer the
@@ -665,28 +687,12 @@ def _file_disposition(
     chain, ok = _ancestor_chain(service, parents, cache)
     if not ok:
         return "unresolved"
-    if any(fid in KB_EXCLUDED_FOLDER_IDS for fid, _name in chain):
+    ids = {fid for fid, _name in chain}
+    if ids & KB_EXCLUDED_FOLDER_IDS:
         return "excluded"
-    owner = _founders_os_owner_entity(chain)
-    if owner:
-        return "founders_os_owned"
+    if FOUNDERS_OS_ROOT_ID in ids and _is_markdown(mime_type, filename):
+        return "static_md_owned"
     return None
-
-
-def _founders_os_owner_entity(chain: list[tuple[str, str]]) -> str | None:
-    """The entity sweep_founders_os would assign to a file whose ancestry runs
-    through the HJR-Founder-OS root -- i.e. the entity mapped to the TOP-LEVEL
-    folder directly under the root -- or None when the file is not in that tree,
-    sits at the root itself, or its top folder is unmapped (memory/, _brain/ ...
-    which founders_os skips and the flat sweep therefore keeps covering)."""
-    ids = [fid for fid, _name in chain]
-    if FOUNDERS_OS_ROOT_ID not in ids:
-        return None
-    root_at = ids.index(FOUNDERS_OS_ROOT_ID)
-    if root_at == 0:
-        return None  # the file's direct parent IS the root -> founders_os never sweeps it
-    top_name = chain[root_at - 1][1]
-    return _founders_os_entity_for(top_name) if top_name else None
 
 
 def _file_under_excluded_folder(
@@ -812,7 +818,8 @@ def sweep_user(
     # expansion did not complete, fall back to per-file ancestor resolution
     # (fail-closed -- never ingest with a partial denylist).
     excluded_folders, _excl_complete = _expanded_excluded_folder_ids(service)
-    _folder_parent_cache: dict[str, list[str]] = {}
+    _folder_parent_cache: dict[str, dict] = {}
+    unresolved_any = False   # any file skipped as "unresolved" -> hold the watermark
 
     # Build Drive files.list query
     q = (
@@ -888,25 +895,30 @@ def sweep_user(
             disposition = _file_disposition(
                 service, file_meta.get("parents"), excluded_folders,
                 _excl_complete, _folder_parent_cache,
+                mime_type=file_meta.get("mimeType", ""), filename=filename,
             )
             if disposition == "excluded":
                 stats.setdefault("dashboard_excluded_skipped", 0)
                 stats["dashboard_excluded_skipped"] += 1
                 continue
             if disposition == "unresolved":
-                log.warning("drive_sweep: ancestry unresolved for %s (%s) -- skipped this run (fail-closed)",
-                            filename, file_id)
+                # Fail-closed for THIS run, and the watermark is HELD below so the
+                # file is re-enumerated next run (D-051 lens D #2: advancing the
+                # watermark past an unresolved file would drop it forever).
+                log.warning("drive_sweep: ancestry unresolved for %s (%s) -- skipped this run (fail-closed); "
+                            "watermark held", filename, file_id)
                 stats.setdefault("ancestry_unresolved_skipped", 0)
                 stats["ancestry_unresolved_skipped"] += 1
+                unresolved_any = True
                 continue
-            if disposition == "founders_os_owned":
-                # I5 (cq-12fd5d76fd04): a file inside an entity-mapped Founder-OS top
-                # folder is sweep_founders_os's -- it tags by FOLDER and applies the
-                # LEX PHI guard; this Haiku-tagged twin of the same file id used to
-                # overwrite that row (last writer wins) with FNDR/F3E, so the two doors
-                # disagreed on 64 of 411 capture files (measured 2026-09-08).
-                stats.setdefault("founders_os_owned_skipped", 0)
-                stats["founders_os_owned_skipped"] += 1
+            if disposition == "static_md_owned":
+                # I5 (cq-12fd5d76fd04): a markdown file inside the Founder-OS tree is
+                # the static_md sync's (folder-deterministic entity + its own
+                # exclusions); this Haiku-tagged drive twin of the same document only
+                # ever disagreed with it (64 of 411 capture files on 2026-09-08) or,
+                # for _brain/swept digests, self-poisoned every partition.
+                stats.setdefault("static_md_owned_skipped", 0)
+                stats["static_md_owned_skipped"] += 1
                 continue
 
             # Skip very small files (likely empty/template)
@@ -983,13 +995,25 @@ def sweep_user(
         if not page_token:
             break
 
-    # Advance watermark only on successful (non-dry-run) sweep
-    if not dry_run:
+    # Advance watermark only on a successful (non-dry-run) sweep -- and only when
+    # every file's ancestry resolved: an "unresolved" skip is fail-closed for the
+    # run, and holding the watermark is what makes it a retry rather than a silent
+    # permanent drop (the file's modifiedTime would otherwise fall below the next
+    # cutoff). The re-enumeration next run is idempotent (upsert replace-on-conflict).
+    if not dry_run and unresolved_any:
+        log.warning("drive_sweep: %s -- %d file(s) had unresolved ancestry; watermark HELD at the previous "
+                    "value so they are re-enumerated next run", email,
+                    stats.get("ancestry_unresolved_skipped", 0))
+    elif not dry_run:
         try:
             kb.set_sync_state(watermark_key, int(run_start.timestamp()))
         except Exception as exc:
             log.warning("drive_sweep: could not advance watermark for %s: %s", email, exc)
-        # Sweep completed — clear the checkpoint so the next run starts fresh
+    if not dry_run:
+        # Enumeration COMPLETED (every page consumed) -- clear the resume
+        # checkpoint whether or not the watermark advanced. A held watermark with
+        # a stale {"page_token": None} checkpoint would make the next run log
+        # "resuming from checkpoint" and inflate files_processed, for nothing.
         try:
             kb.delete_checkpoint(checkpoint_key)
         except Exception as exc:
@@ -997,10 +1021,13 @@ def sweep_user(
 
     log.info(
         "drive_sweep: %s done -- enumerated=%d extracted=%d ingested=%d "
-        "phi_skipped=%d noise=%d dedup=%d",
+        "phi_skipped=%d noise=%d dedup=%d excluded_folder=%d static_md_owned=%d "
+        "ancestry_unresolved=%d cora_internal=%d",
         email,
         stats["files_enumerated"], stats["files_extracted"], stats["chunks_ingested"],
         stats["phi_skipped"], stats["noise_filtered"], stats["dedup_skipped"],
+        stats.get("dashboard_excluded_skipped", 0), stats.get("static_md_owned_skipped", 0),
+        stats.get("ancestry_unresolved_skipped", 0), stats.get("cora_internal_skipped", 0),
     )
     return stats
 
@@ -1051,16 +1078,20 @@ def run_sweep(
         )
         aggregate["accounts_swept"] += 1
         for k in ("files_enumerated", "files_extracted", "chunks_ingested",
-                  "phi_skipped", "noise_filtered", "dedup_skipped"):
-            aggregate[k] += stats.get(k, 0)
+                  "phi_skipped", "noise_filtered", "dedup_skipped",
+                  "dashboard_excluded_skipped", "static_md_owned_skipped",
+                  "ancestry_unresolved_skipped"):
+            aggregate[k] = aggregate.get(k, 0) + stats.get(k, 0)
 
     log.info(
         "drive_sweep: COMPLETE -- accounts=%d enumerated=%d extracted=%d "
-        "ingested=%d phi_skipped=%d noise=%d dedup=%d",
+        "ingested=%d phi_skipped=%d noise=%d dedup=%d excluded_folder=%d "
+        "static_md_owned=%d ancestry_unresolved=%d",
         aggregate["accounts_swept"], aggregate["files_enumerated"],
         aggregate["files_extracted"], aggregate["chunks_ingested"],
         aggregate["phi_skipped"], aggregate["noise_filtered"],
-        aggregate["dedup_skipped"],
+        aggregate["dedup_skipped"], aggregate.get("dashboard_excluded_skipped", 0),
+        aggregate.get("static_md_owned_skipped", 0), aggregate.get("ancestry_unresolved_skipped", 0),
     )
     return aggregate
 

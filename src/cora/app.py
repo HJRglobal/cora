@@ -952,7 +952,10 @@ def _self_inventory_force(text: str) -> str | None:
     own corpus is answered from the deterministic inventory, forced via tool_choice
     so the listing is in context BEFORE the model composes -- never from a semantic
     miss (Doctrine 3). Retrieval still runs on the turn: a fact phrased "do you
-    have ..." is answered from retrieval, the inventory names the door."""
+    have ..." is answered from retrieval, the inventory names the door. The
+    predicate itself refuses imperative writes and content / live-system objects
+    (see self_inventory); _dispatch_qa additionally orders this force LAST and
+    skips it on a retrieval-grant turn."""
     return "cora_self_inventory" if self_inventory.is_self_inventory_question(text or "") else None
 
 
@@ -1444,10 +1447,16 @@ def _dispatch_qa(
     # dependency). The time-sensitive fallback still uses the cache: it only
     # attaches on a KB miss, so a cache hit means the KB DID have the answer.
     web_intent = web_guard.is_web_intent(user_message)
+    # I4 / D-051 lens E #5: a question about Cora's OWN sources must reach the
+    # deterministic inventory, never a (<=30-min) cached answer to a similar
+    # phrasing that was composed WITHOUT it -- the force below runs after the
+    # cache read, so the read is bypassed here on the same predicate. Never on a
+    # Tier-2 grant turn (the grant owns that turn; lens E #9).
+    inventory_turn = bool(user_id) and retrieval_grant is None and _self_inventory_force(user_message) is not None
     # Grant-path responses contain owner-private mail/file content — they must
     # never be served from (or stored into) the shared semantic cache, where a
     # different user's similar question would replay them.
-    if not hints.bypass_cache and retrieval_grant is None and not web_intent:
+    if not hints.bypass_cache and retrieval_grant is None and not web_intent and not inventory_turn:
         try:
             question_embedding = kb_embeddings.embed_query(user_message)
             cached_response = sc.get_cache().lookup(entity, question_embedding)
@@ -1635,16 +1644,6 @@ def _dispatch_qa(
             force_tool = "cora_delegate_work"
             log.info("delegate-work intent -> forcing tool channel=#%s user=%s",
                      channel_name, user_id)
-        elif _self_inventory_force(user_message):
-            # I4 (cq-3542e1b095b2): a question about Cora's OWN sources / doors /
-            # coverage is answered from the deterministic inventory, not from a
-            # semantic miss. Ordered BELOW the code-queue / delegate commands (an
-            # explicit command wins) and ABOVE the staged-write + Asana forces (a
-            # meta-question is never a write). Forcing also pins Sonnet and keeps
-            # the turn out of the shared cache (both keyed on force_tool below).
-            force_tool = "cora_self_inventory"
-            log.info("self-inventory intent -> forcing tool channel=#%s user=%s",
-                     channel_name, user_id)
         else:
             # S6 rider (cq-904f849bc59a): the Class-B staged-write intents.
             # Ordered ABOVE the Asana force and BELOW code-queue/delegate. All
@@ -1658,6 +1657,21 @@ def _dispatch_qa(
                          force_tool, channel_name, user_id)
             else:
                 force_tool = _asana_destructive_intent(user_message)
+                if force_tool is None and inventory_turn:
+                    # I4 (cq-3542e1b095b2): a question about Cora's OWN sources /
+                    # doors / coverage is answered from the deterministic inventory,
+                    # not from a semantic miss. Ordered LAST: an explicit command
+                    # (code-queue / delegate) and every write intent (staged-write /
+                    # Asana) win -- the D-051 lens-E measurement found the first cut,
+                    # placed ABOVE the write forces with unanchored patterns, stealing
+                    # asana_complete_task / slack_send_dm / cora_remember turns
+                    # ("complete the task -- the deck is in your knowledge base right"),
+                    # the D-158 phantom-preview class. Forcing also pins Sonnet and
+                    # keeps the turn out of the shared cache (both keyed on force_tool
+                    # below); the cache READ was bypassed above on the same predicate.
+                    force_tool = "cora_self_inventory"
+                    log.info("self-inventory intent -> forcing tool channel=#%s user=%s",
+                             channel_name, user_id)
     # F-23 Slice 3: a bare affirmative broadens the phantom-write guard so a fabricated
     # "Confirmed -- task deleted" (with no write sentinel) is corrected. Gated on NO
     # pending write existing (review HIGH #3/#4, MED #5): if a pending exists and a bare

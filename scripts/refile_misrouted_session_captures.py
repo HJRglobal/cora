@@ -77,6 +77,7 @@ import logging
 import os
 import re
 import sys
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -98,7 +99,8 @@ LEX_FOLDER = scap.ENTITY_FOLDERS["LEX"]                     # 08-Lexington-Servi
 CAPTURES_DIRNAME = "_session-captures"
 _HAIKU_MODEL = "claude-haiku-4-5"
 _MAX_NOTE_CHARS = 12_000
-_LARGE_SWEEP_FILES = 100                                    # D-087 LARGE threshold
+_LARGE_SWEEP_FILES = 100                                    # D-087 LARGE threshold (files)
+_LARGE_SWEEP_CHUNKS = 500                                   # D-087 LARGE threshold (chunks, twins included)
 
 # The harvester's filename shape: YYYY-MM-DD_<surface>_<8 hex>.md
 _HARVESTER_NAME_RE = re.compile(
@@ -114,7 +116,7 @@ _CLASSIFY_PROMPT = """You are re-classifying a distilled work-session note for a
 
 Valid entity codes: HJRG, F3E, F3C, UFL, HJRPROD, HJRP, BDM, LEX, OSN, FNDR (FNDR = founder / cross-entity / infra / personal). LEX = Lexington Services (a care provider). The session's working directory suggests: {default_entity}.
 
-Return ONLY a JSON object: {{"entity": "<the single entity code this note is MOST about; use {default_entity} if unclear>"}}
+Return ONLY a JSON object: {{"entity": "<the single entity code this note is MOST about>"}}. If you genuinely cannot tell, answer {{"entity": "UNSURE"}} -- never guess.
 
 Rules: a note ABOUT Cora's own build, Cora's code, tests, PHI guards or Lexington's data handling is FNDR unless it is about Lexington's business operations. A note about Lexington's clients, staff, website, programs or billing is LEX.
 
@@ -142,6 +144,7 @@ class Row:
     kb_static_chunks: int = 0
     kb_drive_chunks: int = 0
     kb_drive_entities: list[str] = field(default_factory=list)
+    topic: str = ""                       # the note's header topic -- the reviewer's eyeball column
     # apply-time outcome (APPLIED record only)
     result: str = ""
 
@@ -283,8 +286,10 @@ def classify_entity(note_text: str, default_entity: str, client: Any,
         obj = json.loads(raw[start:end + 1])
     except json.JSONDecodeError:
         return None
-    ent = str((obj or {}).get("entity", "") or "").strip().upper()
+    ent = scap.normalize_entity((obj or {}).get("entity", ""))
     ent = _ENTITY_ALIASES.get(ent, ent)
+    if ent in ("UNSURE", "UNKNOWN", "UNCLEAR", "?"):
+        return None                       # an honest UNSURE holds the file (D-051 lens A #2)
     return ent if ent in scap.VALID_ENTITIES else None
 
 
@@ -314,7 +319,7 @@ def load_drive_capture_index(conn) -> DriveIndex:
     for cid, title, ent, src in conn.execute(
         "SELECT chunk_id, title, entity, source FROM knowledge_chunks "
         "WHERE source IN ('drive_sweep','drive_asset') "
-        "AND (title LIKE '%_code-session_%' OR title LIKE '%_cowork-session_%')"
+        "AND (title GLOB '*_code-session_*' OR title GLOB '*_cowork-session_*')"   # GLOB: `_` is literal
     ):
         t = str(title or "")
         if _HARVESTER_NAME_RE.match(t):
@@ -333,12 +338,30 @@ def kb_counts_for(conn, static_ids: list[str], filename: str,
     return int(n_static), len(drive_rows), sorted({ent for _cid, ent, _src in drive_rows})
 
 
-def select_chunk_ids(conn, static_ids: list[str], filename: str, drive_index: DriveIndex) -> list[str]:
+def select_chunk_ids(conn, static_ids: list[str], filename: str, drive_index: DriveIndex,
+                     target_entity: str | None = None) -> list[str]:
+    """The LEX static rows of the file + its Drive-door rows carrying the MISFILED
+    tag (LEX*). A Drive row already tagged with the TARGET entity is correct and
+    stays (the Drive door matches by TITLE, so two distinct Drive files can share a
+    harvester filename -- D-051 lens B #4)."""
     ph = ",".join("?" * len(static_ids))
     ids = [r[0] for r in conn.execute(
         f"SELECT chunk_id FROM knowledge_chunks WHERE source='static_md' AND source_id IN ({ph})",
         static_ids).fetchall()]
-    ids += [cid for cid, _ent, _src in drive_index.get(filename, [])]
+    drive_rows = drive_index.get(filename, [])
+    file_ids = {str(src) for _cid, _ent, src in drive_rows}
+    if len(drive_rows) and len(conn.execute(
+            "SELECT DISTINCT source_id FROM knowledge_chunks WHERE title = ? AND source IN ('drive_sweep','drive_asset')",
+            (filename,)).fetchall()) > 1:
+        log.warning("%s: more than one Drive file id shares this title -- only LEX-tagged rows are purged", filename)
+    for cid, ent, _src in drive_rows:
+        if str(ent).upper().startswith("LEX"):
+            ids.append(cid)
+        elif target_entity and str(ent).upper() == str(target_entity).upper():
+            continue                       # already right -- keep
+        else:
+            ids.append(cid)                # a third, wrong tag (e.g. FNDR twin of an F3E note): remove
+    del file_ids
     return list(dict.fromkeys(ids))
 
 
@@ -349,7 +372,7 @@ def find_twin_disagreements(conn, exclude_filenames: set[str], drive_index: Driv
     static: dict[str, set[str]] = {}
     for sid, ent in conn.execute(
         "SELECT source_id, entity FROM knowledge_chunks WHERE source='static_md' "
-        "AND (source_id LIKE '%_session-captures%')"
+        "AND source_id GLOB '*_session-captures*'"
     ):
         base = str(sid).replace("\\", "/").rsplit("/", 1)[-1]
         if _HARVESTER_NAME_RE.match(base):
@@ -371,16 +394,26 @@ def select_twin_chunk_ids(twin: TwinRow, drive_index: DriveIndex) -> list[str]:
     return [cid for cid, ent, _src in drive_index.get(twin.filename, []) if ent != twin.static_entity]
 
 
+def static_entity_now(conn, filename: str) -> str | None:
+    """The folder entity the static_md door holds for *filename* RIGHT NOW (None when
+    absent or ambiguous) -- re-checked at apply so a twin decided at dry-run time is
+    never executed against a file the static sync has since re-homed."""
+    ents = {str(e) for (e,) in conn.execute(
+        "SELECT DISTINCT entity FROM knowledge_chunks WHERE source='static_md' AND source_id GLOB ?",
+        (f"*{filename}",))}
+    return next(iter(ents)) if len(ents) == 1 else None
+
+
 def partition_counts(conn) -> dict[str, Any]:
     """Capture-chunk counts per entity per door -- the D-257 before/after output."""
     out: dict[str, Any] = {"static_md": {}, "drive": {}}
     for ent, n in conn.execute(
         "SELECT entity, count(*) FROM knowledge_chunks WHERE source='static_md' "
-        "AND source_id LIKE '%_session-captures%' GROUP BY entity"):
+        "AND source_id GLOB '*_session-captures*' GROUP BY entity"):
         out["static_md"][str(ent)] = int(n)
     for ent, n in conn.execute(
         "SELECT entity, count(*) FROM knowledge_chunks WHERE source IN ('drive_sweep','drive_asset') "
-        "AND (title LIKE '%_code-session_%' OR title LIKE '%_cowork-session_%') GROUP BY entity"):
+        "AND (title GLOB '*_code-session_*' OR title GLOB '*_cowork-session_*') GROUP BY entity"):
         out["drive"][str(ent)] = int(n)
     return out
 
@@ -485,7 +518,7 @@ def build_plan(conn, root: Path, ledger_path: Path, client: Any, *, limit: int |
             reason += f" (raw answer: {raw_out['raw']!r})"
         row = Row(rel, path.name, sha, str(led.get("session_id") or info["session_id"] or ""),
                   str(led.get("captured_at", "")), info["entity"], cwd_entity,
-                  target or "", action, reason)
+                  target or "", action, reason, topic=str(info.get("topic") or "")[:80])
         if action in ("MOVE", "QUARANTINE"):
             dst = dest_for(action, target or "FNDR", path.name, root)
             assert_dst_allowed(dst, root)
@@ -494,8 +527,15 @@ def build_plan(conn, root: Path, ledger_path: Path, client: Any, *, limit: int |
             row.kb_static_chunks, row.kb_drive_chunks, row.kb_drive_entities = kb_counts_for(
                 conn, row.static_source_ids, path.name, drive_index)
         rows.append(row)
-    moved_names = {r.filename for r in rows if r.action in ("MOVE", "QUARANTINE")}
-    twins = find_twin_disagreements(conn, moved_names, drive_index)
+    if limit:
+        # a partial file list cannot decide the corpus-wide twin pass: a not-yet-
+        # planned misfiled file's CORRECT Drive tag would read as the disagreement
+        log.info("twin pass skipped under --limit (partial plan)")
+        return rows, []
+    # exclude every file that is moving, quarantined OR HELD: for a held misfiled
+    # file the static (LEX) row is the WRONG one and its Drive twin the right one
+    excluded = {r.filename for r in rows if r.action in ("MOVE", "QUARANTINE", "HOLD")}
+    twins = find_twin_disagreements(conn, excluded, drive_index)
     return rows, twins
 
 
@@ -530,11 +570,11 @@ def write_intent(path: Path, root: Path, rows: list[Row], twins: list[TwinRow],
     txt = path.with_suffix(".txt")
     lines = [f"# re-file INTENT {payload['generated_at']}  root={root}",
              f"# {json.dumps(payload['summary'])}", "",
-             f"{'ACTION':10} {'TARGET':8} {'static':>6} {'drive':>6}  file  ->  destination / reason"]
+             f"{'ACTION':10} {'TARGET':8} {'static':>6} {'drive':>6}  file  |  topic  ->  destination / reason"]
     for r in rows:
         dst = r.dst_rel or "-"
         lines.append(f"{r.action:10} {r.target_entity or '-':8} {r.kb_static_chunks:6d} {r.kb_drive_chunks:6d}  "
-                     f"{r.filename}  ->  {dst}  [{r.reason}]")
+                     f"{r.filename}  |  {(r.topic or '(no topic)')[:60]}  ->  {dst}  [{r.reason}]")
     lines.append("")
     lines.append(f"# twin disagreements (Drive-door rows whose entity != the folder entity): {len(twins)}")
     for t in twins:
@@ -551,18 +591,37 @@ def load_intent(path: Path) -> dict[str, Any]:
     return data
 
 
-def _bounded_unlink(path: Path) -> None:
-    drive_io._run_bounded(lambda: os.unlink(path), drive_io.TIMEOUT_SECONDS)
+def _bounded_unlink(path: Path, attempts: int = 3) -> None:
+    """Unlink through the bounded Drive I/O shim, retried (the Drive client holds a
+    just-read file open for a moment; the second try succeeds)."""
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            drive_io._run_bounded(lambda: os.unlink(path), drive_io.TIMEOUT_SECONDS)
+            return
+        except FileNotFoundError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            time.sleep(0.5 * (i + 1))
+    raise RuntimeError(f"unlink failed after {attempts} attempts: {last}")
 
 
 def apply_rows(conn, kb: Any, root: Path, ledger_path: Path, rows: list[Row], twins: list[TwinRow],
                *, accept_delta: bool) -> dict[str, Any]:
-    """Execute the reviewed rows. Every row: hash-check -> write dst -> unlink src ->
-    purge chunks -> (MOVE only) re-ingest -> ledger row. Per-row soft failure."""
+    """Execute the reviewed rows. Per row, in a CONVERGENT order (D-051 lens B #1):
+    gates -> hash-check (a changed file is re-DECIDED under --accept-delta, never
+    executed on the stale decision) -> KB purge of the LEX rows FIRST -> write dst
+    (skipped when an interrupted earlier run already wrote the identical text) ->
+    unlink src (retried) -> (MOVE only) re-ingest -> ledger row. Any interruption
+    leaves a state the NEXT run recognises and finishes: src gone + dst present =
+    already applied; src present + identical dst = resume; a purge with no file
+    move is healed by the nightly static sync (it re-ingests the still-LEX file).
+    Per-row soft failure with rollback; the batch continues."""
     when = datetime.now(timezone.utc).isoformat()
     drive_index = load_drive_capture_index(conn)
     totals: dict[str, int] = {}
-    n_moved = n_quar = n_reingested = n_skipped = 0
+    n_moved = n_quar = n_reingested = n_skipped = n_resumed = 0
     for r in rows:
         if r.action not in ("MOVE", "QUARANTINE"):
             r.result = "untouched"
@@ -573,25 +632,50 @@ def apply_rows(conn, kb: Any, root: Path, ledger_path: Path, rows: list[Row], tw
             assert_src_allowed(src, root)
             assert_dst_allowed(dst, root)
             if not src.exists():
-                r.result = "src-missing"; n_skipped += 1
+                if dst.exists():
+                    r.result = "already-applied (src gone, dst present -- an earlier run finished this row)"
+                    n_resumed += 1
+                else:
+                    r.result = "src-missing"; n_skipped += 1
                 continue
             text = drive_io.read_text(str(src), encoding="utf-8")
             sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
-            if sha != r.sha256 and not accept_delta:
-                r.result = "content-changed-since-dry-run (skipped; --accept-delta to force)"
-                n_skipped += 1
-                continue
-            if dst.exists():
-                r.result = "dst-exists (skipped)"; n_skipped += 1
-                continue
+            if sha != r.sha256:
+                if not accept_delta:
+                    r.result = "content-changed-since-dry-run (skipped; --accept-delta to force)"
+                    n_skipped += 1
+                    continue
+                # --accept-delta: the CONTENT is new, so the decision is re-derived from
+                # it -- the dry-run's action is never executed on text nobody eyeballed
+                action_now, reason_now = decide(r.target_entity or None, text)
+                if action_now != r.action:
+                    r.result = (f"decision-changed-since-dry-run (was {r.action}, now {action_now}: "
+                                f"{reason_now}) -- skipped; re-run the dry-run")
+                    n_skipped += 1
+                    continue
             new_text = rewrite_note(text, r.target_entity, r.action, r.src_rel, when)
-            drive_io.write_text_atomic(dst, new_text, encoding="utf-8")
-            _bounded_unlink(src)
-            ids = select_chunk_ids(conn, r.static_source_ids, r.filename, drive_index)
+            resumed = False
+            if dst.exists():
+                existing = drive_io.read_text(str(dst), encoding="utf-8")
+                # the provenance line carries a timestamp -- compare with it neutralised
+                if _strip_when(existing) != _strip_when(new_text):
+                    r.result = "dst-exists-with-different-content (skipped; resolve by hand)"
+                    n_skipped += 1
+                    continue
+                resumed = True
+                new_text = existing        # keep the earlier run's stamp
+            # 1. KB first: the LEX rows of this file + its misfiled Drive twins
+            ids = select_chunk_ids(conn, r.static_source_ids, r.filename, drive_index, r.target_entity)
             if ids:
                 t = delete_chunks(conn, ids)
                 for k, v in t.items():
                     totals[k] = totals.get(k, 0) + int(v)
+            # 2. the file: write (unless resuming), then unlink the source
+            if not resumed:
+                drive_io.write_text_atomic(dst, new_text, encoding="utf-8")
+            _bounded_unlink(src)
+            if resumed:
+                n_resumed += 1
             if r.action == "MOVE" and kb is not None:
                 try:
                     from cora.knowledge_base.store import Document
@@ -613,7 +697,7 @@ def apply_rows(conn, kb: Any, root: Path, ledger_path: Path, rows: list[Row], tw
                 "refiled_from": str(src), "refiled_at": when, "captured_at": r.captured_at,
                 "surface": "refile",
             }, ledger_path)
-            r.result = "moved" if r.action == "MOVE" else "quarantined"
+            r.result = ("moved" if r.action == "MOVE" else "quarantined") + (" (resumed)" if resumed else "")
             if r.action == "MOVE":
                 n_moved += 1
             else:
@@ -621,11 +705,21 @@ def apply_rows(conn, kb: Any, root: Path, ledger_path: Path, rows: list[Row], tw
         except GateTripped:
             raise
         except Exception as exc:  # noqa: BLE001 -- per-row soft failure, batch continues
+            try:
+                conn.rollback()
+            except Exception:  # noqa: BLE001
+                pass
             r.result = f"error: {exc}"
             n_skipped += 1
             log.error("row FAILED %s: %s", r.filename, exc)
-    n_twin_chunks = 0
+    n_twin_chunks = n_twin_stale = 0
     for t in twins:
+        # re-verify at apply time: the static door must still say what the dry-run saw
+        now_ent = static_entity_now(conn, t.filename)
+        if now_ent != t.static_entity:
+            t.result = f"skipped: static entity is now {now_ent!r} (dry-run saw {t.static_entity!r})"
+            n_twin_stale += 1
+            continue
         ids = select_twin_chunk_ids(t, drive_index)
         if ids:
             tt = delete_chunks(conn, ids)
@@ -633,8 +727,16 @@ def apply_rows(conn, kb: Any, root: Path, ledger_path: Path, rows: list[Row], tw
                 totals[k] = totals.get(k, 0) + int(v)
             n_twin_chunks += len(ids)
         t.result = f"deleted {len(ids)} chunk(s)"
-    return {"moved": n_moved, "quarantined": n_quar, "reingested": n_reingested,
-            "skipped": n_skipped, "twin_chunks_deleted": n_twin_chunks, "delete_totals": totals}
+    return {"moved": n_moved, "quarantined": n_quar, "reingested": n_reingested, "resumed": n_resumed,
+            "skipped": n_skipped, "twin_chunks_deleted": n_twin_chunks, "twins_skipped_stale": n_twin_stale,
+            "delete_totals": totals}
+
+
+_WHEN_RE = re.compile(r"\d{4}-\d{2}-\d{2}T[0-9:.+\-]+")
+
+
+def _strip_when(text: str) -> str:
+    return _WHEN_RE.sub("<when>", text)
 
 
 def write_applied(path: Path, intent_path: Path, rows: list[Row], twins: list[TwinRow],
@@ -735,10 +837,13 @@ def main(argv: list[str] | None = None) -> int:
     if str(data.get("founder_os_root")) != str(root):
         log.error("REFUSED: manifest root %s != --root %s", data.get("founder_os_root"), root)
         return 1
-    if (len(actionable) > _LARGE_SWEEP_FILES) and live_bot_is_fresh() and not args.allow_live:
-        log.error("REFUSED: %d files is a LARGE sweep (D-087 >%d) and the live bot's heartbeat is fresh -- "
-                  "run inside the restart's stop window, or pass --allow-live.",
-                  len(actionable), _LARGE_SWEEP_FILES)
+    total_chunks = (sum(r.kb_static_chunks + r.kb_drive_chunks for r in actionable)
+                    + sum(t.drive_chunks for t in twins))
+    is_large = len(actionable) > _LARGE_SWEEP_FILES or total_chunks > _LARGE_SWEEP_CHUNKS
+    if is_large and live_bot_is_fresh() and not args.allow_live:
+        log.error("REFUSED: %d files / %d chunks is a LARGE sweep (D-087 >%d files or >%d chunks) and the "
+                  "live bot's heartbeat is fresh -- run inside the restart's stop window, or pass --allow-live.",
+                  len(actionable), total_chunks, _LARGE_SWEEP_FILES, _LARGE_SWEEP_CHUNKS)
         return 1
     for r in actionable:  # every path gate BEFORE any write
         try:

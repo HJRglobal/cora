@@ -20,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import re
+import time
 
 # ---------------------------------------------------------------------------
 # Visibility CPA exclusion
@@ -754,12 +755,18 @@ def non_lex_phi_backstop_trips_individual(
 #                     "root-cause diagnosis of the checkout failure")
 #   program_id     -- a payer/programme NAME immediately followed by an id NUMBER
 #                     (the beneficiary-number shape from is_phi_risk_person_linked)
+#   ssn            -- a Social Security number VALUE
+#   person_id      -- a person-noun id ("Member ID 84213365")
 #   dx_individual  -- a diagnosis term or medication NAME tied to a SPECIFIC
-#                     non-staff individual (care-noun-governed name or non-staff
-#                     possessive); a bare product/topic mention is not PHI
+#                     non-staff individual (care-noun-governed name incl. the
+#                     "Client: Name" colon shape, a non-staff possessive, or a
+#                     first-name SUBJECT with a clinical predicate); a bare
+#                     product/topic mention is not PHI
 #   billing_individual -- named billing/authorization/eligibility tied to a
-#                     Lexington/Medicaid programme AND a care-noun-GOVERNED name
-#                     (the tag-scoped leg of non_lex_phi_backstop_trips_individual)
+#                     Lexington/Medicaid programme AND a specific individual (a
+#                     care-noun-governed name or a NON-STAFF possessive)
+# The staff roster defaults to org_roles + Cora (``_default_allowed_names``) so a
+# staff possessive / staff first name never reads as a care recipient.
 #
 # Measured on the same 116 transcripts: the composite fires on ~9, none of them
 # in the 9/3 or 9/4 misfiled sets (tests/test_leak2_live_fixtures.py pins the
@@ -767,6 +774,66 @@ def non_lex_phi_backstop_trips_individual(
 # QUARANTINED note (held, founder-only, alerted) -- never a mis-filed one.
 # is_phi_risk / is_clinical_phi / is_lex_billing_status_phi are UNCHANGED.
 _DIAGNOSED_WITH_STRICT_RE = re.compile(r"\bdiagnosed\s+with\b", re.IGNORECASE)
+# D-051 lens A (2026-09-08) -- value shapes the first cut missed:
+#   ssn        -- a Social Security number VALUE (cue + 9 digits, or the dashed 3-2-4 shape)
+#   person_id  -- a person-noun id ("Member ID 84213365", "client #: 90012345")
+_SSN_VALUE_RE = re.compile(
+    r"\b(?:ssn|social\s+security(?:\s+(?:number|no\.?|#))?)\b[\s:#]{0,6}\d{3}-?\d{2}-?\d{4}\b"
+    r"|\b\d{3}-\d{2}-\d{4}\b",
+    re.IGNORECASE,
+)
+_PERSON_ID_RE = re.compile(
+    r"\b(?:member|client|patient|beneficiary|recipient|consumer|participant)\s+(?:id|number|no\.|#)\s*[:#]?\s*\d{5,}\b",
+    re.IGNORECASE,
+)
+# A first-name SUBJECT with a clinical predicate ("Marcus is on risperidone", "Sofia
+# was diagnosed ...", "Jalen takes melatonin") -- no possessive, no care noun, so the
+# other individual legs never saw it. Pronouns / sentence-openers are stop-listed and
+# rostered staff are spared (the roster now defaults to org_roles + Cora).
+_NAME_SUBJECT_CLINICAL_RE = re.compile(
+    r"\b([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]+)?)\s+(?:is|was|takes|took|started|stopped|has|had|got|needs|remains|stays)\b"
+)
+# A two-token PERSON possessive ("Bob Smith's") -- never a contraction ("It's",
+# "Here's"), a brand ("Walmart's") or a verb-led fragment ("On Harrison's",
+# "Review Trent's"): measured on the 23 live misfiled transcripts, the loose
+# _NAME_POSSESSIVE_RE variant re-quarantined 7 of them.
+_PERSON_POSSESSIVE_RE = re.compile(r"\b([A-Z][a-z]+\s+[A-Z][a-z]+)['\u2019]s\b")
+_POSSESSIVE_FIRST_STOP = frozenset({
+    "on", "review", "paste", "confirmed", "hold", "scoped", "audit", "today", "here", "that", "it", "what",
+    "where", "who", "the", "this", "let", "check", "update", "see", "read", "open", "run", "fix", "use", "note",
+    "per", "from", "for", "with", "and", "but", "or", "if", "when", "then", "so", "also", "now", "next", "last",
+    "first", "yes", "no", "ok", "okay", "done", "verify", "verified", "add", "remove", "keep", "drop", "move",
+    "send", "draft", "ask", "tell", "show", "list", "count", "why", "how", "because", "since", "after", "before",
+})
+_POSSESSIVE_ADMIN_WINDOW = 40
+_NAME_SUBJECT_STOPWORDS = frozenset({
+    "she", "he", "it", "this", "that", "the", "there", "they", "we", "you", "who", "which", "what",
+    "everyone", "someone", "nobody", "nothing", "everything", "cora", "claude", "sonnet", "haiku", "opus",
+    "one", "each", "all", "none", "our", "your", "his", "her", "their", "its",
+})
+_STAFF_ROSTER_CACHE: dict = {"at": 0.0, "names": frozenset()}
+_STAFF_ROSTER_TTL_S = 300.0
+_ALWAYS_ALLOWED_NAMES = frozenset({"Cora", "Claude", "Harrison Rogers"})
+
+
+def _default_allowed_names() -> set[str]:
+    """The staff roster the prose screen spares by default: org_roles names + Cora
+    herself. Without it the dx/med leg was vacuous on a Cora session ("Cora's
+    melatonin recommendation for the F3E Recovery SKU" read as a care recipient)
+    and every staff possessive on the billing leg was an individual. Cached 5 min;
+    fail-soft to the fixed names (empty roster = over-quarantine, the safe side)."""
+    now = time.time()
+    if now - float(_STAFF_ROSTER_CACHE.get("at", 0.0)) < _STAFF_ROSTER_TTL_S and _STAFF_ROSTER_CACHE.get("names"):
+        return set(_STAFF_ROSTER_CACHE["names"])
+    names: set[str] = set(_ALWAYS_ALLOWED_NAMES)
+    try:
+        from cora import org_roles
+        names |= {r.name for r in org_roles.all_roles() if getattr(r, "name", "")}
+    except Exception:  # noqa: BLE001
+        pass
+    _STAFF_ROSTER_CACHE["names"] = frozenset(names)
+    _STAFF_ROSTER_CACHE["at"] = now
+    return names
 
 
 def _program_id_tail_present(text: str) -> bool:
@@ -786,28 +853,73 @@ def _program_id_tail_present(text: str) -> bool:
 # Services", "Parent Company", "Member Portal") are stop-listed, and rostered staff
 # names are spared exactly as the other individual legs spare them.
 _PROSE_CARE_NOUN_NAME_RE = re.compile(
-    r"\b(?i:client|patient|member|individual|participant|recipient|consumer|guardian|parent)"
-    r"\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b"
+    r"\b((?i:client|patient|member|individual|participant|recipient|consumer|guardian|parent))"
+    r"(?:\s*:\s*|\s+)([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b"    # "Client: Marcus" (the colon shape) too
 )
 _PROSE_GOVERNED_STOPWORDS = frozenset({
     "services", "service", "company", "portal", "name", "names", "records", "record", "data",
     "care", "status", "billing", "authorization", "management", "relations", "success",
     "support", "list", "id", "number", "count", "mix", "base", "file", "files", "intake",
     "enrollment", "eligibility", "assessment", "review", "handbook", "guide", "faq",
+    # D-051 lens A: Title-case common nouns a Cora / ops session writes after a care noun
+    "team", "teams", "drive", "folder", "folders", "account", "accounts", "onboarding", "experience",
+    "journey", "feedback", "survey", "surveys", "retention", "acquisition", "roster", "profile",
+    "profiles", "form", "forms", "agreement", "agreements", "contract", "contracts", "invoice",
+    "invoices", "meeting", "meetings", "update", "updates", "notes", "note", "email", "emails",
+    "call", "calls", "work", "request", "requests", "referral", "referrals", "outreach",
+    "communication", "communications", "engagement", "satisfaction", "testimonial", "testimonials",
+    "story", "stories", "spotlight", "program", "programs", "home", "homes", "housing", "transport",
+    "transportation", "schedule", "schedules", "coordinator", "coordinators", "advocate", "advocates",
+    "rights", "choice", "directed", "centered", "focused", "first", "plan", "plans", "goals",
+    "outcomes", "education", "training", "handbooks", "manual", "manuals", "policy", "policies",
+    "portal", "dashboard", "pipeline", "funnel", "segment", "segments", "persona", "personas",
 })
 
 
 def _prose_governed_name(text: str, allowed_names: set[str] | None = None) -> bool:
     """A care noun (any case) governing a Title-case NAME that is neither a
-    stop-listed common noun nor a rostered staff name."""
+    stop-listed common noun nor a rostered staff name. "recipient <Name>" is
+    skipped -- on a finance doc it is the wire PAYEE (the same D-051 re-gate
+    exclusion _names_governed_care_recipient carries)."""
     full, first = _staff_name_index(allowed_names)
     for m in _PROSE_CARE_NOUN_NAME_RE.finditer(text):
-        name = m.group(1)
+        if m.group(1).lower() == "recipient":
+            continue
+        name = m.group(2)
         if name.split()[0].lower() in _PROSE_GOVERNED_STOPWORDS:
             continue
         if _is_staff_name(name, full, first):
             continue
         return True
+    return False
+
+
+def _possessive_person_near_admin_term(text: str, allowed_names: set[str] | None = None) -> bool:
+    """A non-staff two-token PERSON possessive within 40 chars of a LEX admin term
+    ("Bob Smith's authorization is pending") -- the billing leg's possessive variant."""
+    full, first = _staff_name_index(allowed_names)
+    for m in _PERSON_POSSESSIVE_RE.finditer(text):
+        name = m.group(1)
+        if name.split()[0].lower() in _POSSESSIVE_FIRST_STOP or _is_staff_name(name, full, first):
+            continue
+        lo = max(0, m.start() - _POSSESSIVE_ADMIN_WINDOW)
+        hi = min(len(text), m.end() + _POSSESSIVE_ADMIN_WINDOW)
+        if _LEX_ADMIN_TERM_RE.search(text, lo, hi):
+            return True
+    return False
+
+
+def _name_subject_clinical(text: str, allowed_names: set[str] | None = None) -> bool:
+    """"<Name> is on <med>" / "<Name> was diagnosed" -- a non-staff first-name
+    subject with a clinical predicate and a med / dx term within 60 chars."""
+    full, first = _staff_name_index(allowed_names)
+    for m in _NAME_SUBJECT_CLINICAL_RE.finditer(text):
+        name = m.group(1)
+        if name.split()[0].lower() in _NAME_SUBJECT_STOPWORDS or _is_staff_name(name, full, first):
+            continue
+        window = text[m.start(): m.end() + 60]
+        if _MED_NAME_RE.search(window) or _CLINICAL_DX_RE.search(window) or _DIAGNOSED_WITH_STRICT_RE.search(window):
+            return True
     return False
 
 
@@ -819,27 +931,49 @@ def prose_phi_legs(text: str, allowed_names: set[str] | None = None) -> list[str
         return []
     legs: list[str] = []
     try:
+        # the roster: org_roles + the fixed names by default; Cora / Claude are never
+        # care recipients even when a caller passes its own roster
+        allowed_names = (set(allowed_names) if allowed_names is not None else _default_allowed_names()) \
+            | set(_ALWAYS_ALLOWED_NAMES)
         if _DOB_RE.search(text):
             legs.append("dob")
+        if _SSN_VALUE_RE.search(text):
+            legs.append("ssn")
         if _ICD10_RE.search(text):
             legs.append("icd10")
         if _DIAGNOSED_WITH_STRICT_RE.search(text):
             legs.append("diagnosed_with")
         if _program_id_tail_present(text):
             legs.append("program_id")
+        if _PERSON_ID_RE.search(text):
+            legs.append("person_id")
         if (_CLINICAL_DX_RE.search(text) or _MED_NAME_RE.search(text)) and (
             _reveals_individual_care_recipient(text, allowed_names)
             or _prose_governed_name(text, allowed_names)
+            or _name_subject_clinical(text, allowed_names)
         ):
             legs.append("dx_individual")
         if is_lex_billing_status_phi(text) and is_lex_program_context(text) and (
             _names_governed_care_recipient(text, allowed_names)
             or _prose_governed_name(text, allowed_names)
+            # a NON-STAFF two-token PERSON possessive next to the admin term counts too
+            # ("Bob Smith's authorization is pending" in a Lexington context); staff
+            # possessives are spared by the default roster (D-051 lens A)
+            or _possessive_person_near_admin_term(text, allowed_names)
         ):
             legs.append("billing_individual")
     except Exception:  # noqa: BLE001 -- a screen never raises; fail closed
         legs.append("error")
     return legs
+
+
+def has_bare_clinical_dx_term(text: str) -> bool:
+    """A curated clinical DIAGNOSIS term appears (autism / ADHD / schizophrenia ...),
+    regardless of any individual. For PUBLISHED surfaces (the claude-workspace
+    mirror) that must not carry a diagnosis word at all. Deliberately NOT the
+    "diagnosis of X" phrase (an ops session's root-cause diagnosis) and NOT bare
+    medication names (F3E / OSN product copy: melatonin, caffeine)."""
+    return bool(text) and bool(_CLINICAL_DX_RE.search(text))
 
 
 def is_prose_phi_risk(text: str, allowed_names: set[str] | None = None) -> bool:

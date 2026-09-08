@@ -575,6 +575,25 @@ def distill(text: str, default_entity: str, *, phi: bool,
     return _parse_distilled(raw, default_entity)
 
 
+#: Haiku answers "LEXINGTON" / "F3 Energy" / "Founder" often enough that a strict
+#: VALID_ENTITIES check silently fell back to the cwd default (D-051 lens A).
+ENTITY_ALIASES: dict[str, str] = {
+    "F3": "F3E", "F3 ENERGY": "F3E", "F3-ENERGY": "F3E", "F3ENERGY": "F3E",
+    "LEXINGTON": "LEX", "LEXINGTON SERVICES": "LEX", "LEX SERVICES": "LEX",
+    "FOUNDER": "FNDR", "FOUNDER OS": "FNDR", "FOUNDER-OS": "FNDR", "FNDR-OS": "FNDR", "PERSONAL": "FNDR",
+    "HJR": "HJRG", "HJR GLOBAL": "HJRG", "HJR-GLOBAL": "HJRG",
+    "OSN NUTRITION": "OSN", "ONE STOP NUTRITION": "OSN",
+    "HJR PRODUCTIONS": "HJRPROD", "HJR PROPERTIES": "HJRP",
+    "F3 COMMUNITY": "F3C", "UNITED FIGHT LEAGUE": "UFL",
+}
+
+
+def normalize_entity(raw: str) -> str:
+    """Upper-cased, alias-folded entity code (may still be invalid -- caller checks)."""
+    ent = str(raw or "").strip().upper().strip(".,;:")
+    return ENTITY_ALIASES.get(ent, ent)
+
+
 def _parse_distilled(raw: str, default_entity: str) -> dict[str, Any] | None:
     """Parse Haiku's JSON output, normalize + validate the entity. None on failure."""
     if raw.startswith("```"):
@@ -589,7 +608,7 @@ def _parse_distilled(raw: str, default_entity: str) -> dict[str, Any] | None:
     if not isinstance(obj, dict):
         return None
 
-    entity = str(obj.get("entity", "") or "").strip().upper()
+    entity = normalize_entity(obj.get("entity", ""))
     if entity not in VALID_ENTITIES:
         entity = default_entity
 
@@ -1002,7 +1021,10 @@ def _batch_distill(pending: list[tuple[ParsedSession, str, str]]) -> dict[str, A
             # finalize loop distills it inline). Batch results are retrievable
             # Anthropic-side for 29 days by API key; PHI-bearing distills must
             # not gain that at-rest copy.
-            if phi_guard.is_phi_risk(session.text):
+            # Both screens: the strict ingestion screen AND the value-shaped prose
+            # screen -- a transcript either one flags must not gain the 29-day
+            # at-rest batch copy (D-051 lens A).
+            if phi_guard.is_phi_risk(session.text) or phi_guard.is_prose_phi_risk(session.text):
                 skipped_phi += 1
                 continue
             default_entity = entity_from_cwd(session.cwd)

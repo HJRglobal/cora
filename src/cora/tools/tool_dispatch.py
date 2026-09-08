@@ -8476,7 +8476,7 @@ def _tool_cora_self_inventory(slack_user_id: str, entity: str, _input: dict) -> 
         log.warning("cora_self_inventory: shared KB unavailable: %s", exc)
         kb, kb_lock = None, None
     try:
-        inv = self_inventory.build_inventory(kb=kb, kb_lock=kb_lock, detail=detail)
+        inv = self_inventory.build_inventory(kb=kb, kb_lock=kb_lock, detail=detail, entity=entity)
         text = self_inventory.render_inventory(inv)
     except Exception as exc:  # noqa: BLE001 -- never a crash, never an improvised inventory
         log.warning("cora_self_inventory failed: %s", exc)
@@ -12001,12 +12001,15 @@ TOOL_DEFINITIONS = [
             "chunk counts and last-sync times, every pinned exclusion (Drive folder ids + "
             "names), the path/title exclusion rules, the allowlisted views, the entity "
             "partitions, her own scheduled-task cadence (live registry + run markers), and "
-            "the claude-workspace mirror parity report. Call this FIRST for ANY question "
-            "about what Cora has, knows, ingests, indexes, can see or has access to -- 'do "
-            "you have access to X', 'do you know about the Cowork/Cascade knowledge', 'are "
-            "you ingesting Y', 'is Z in your knowledge base', 'what sources do you read'. "
-            "A knowledge-absence claim must cite this inventory; a semantic-search miss is "
-            "NEVER evidence of absence. Read-only; never queue a code session for it."
+            "the claude-workspace mirror parity report, and the LIVE TOOL CONNECTORS offered "
+            "in this channel. Call this for questions about what Cora INGESTS or holds in her "
+            "KNOWLEDGE BASE -- 'do you have access to the Cowork/Cascade knowledge', 'are you "
+            "ingesting the session captures', 'is Z in your knowledge base', 'what sources do "
+            "you read'. NOT for content questions ('do you have the EVV docs' -- retrieval "
+            "answers that) and NOT for live systems ('can you access HubSpot / Asana / QBO / "
+            "the calendar / Shopify' -- answer YES from your own tool list). A knowledge-"
+            "absence claim must cite this inventory; a semantic-search miss is NEVER evidence "
+            "of absence. Read-only; never queue a code session for it."
         ),
         "input_schema": {
             "type": "object",

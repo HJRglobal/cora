@@ -376,6 +376,13 @@ def screen_reason(text: str, cfg: Config) -> str | None:
     legs = phi_guard.prose_phi_legs(text)
     if legs:
         return f"phi ({','.join(legs)})"
+    # A mirrored file is PUBLISHED to a shared Drive zone, so a bare clinical
+    # DIAGNOSIS term quarantines it too -- the prose screen alone lets "the member
+    # has autism" through (D-051 lens A). Curated dx terms only: the "diagnosis of
+    # X" phrase is the ops-sense trip token the cq-e4b0d20a313f fold removed, and
+    # bare med names are F3E / OSN product copy.
+    if phi_guard.has_bare_clinical_dx_term(text):
+        return "phi (clinical-term)"
     if _LEX_TOKEN_RE.search(text):
         return "lex-token"
     low = text.lower()

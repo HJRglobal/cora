@@ -48,6 +48,7 @@ from .finance_doc_classifier import is_financial_document
 from .historical_access import AccessDecision, PASS
 from .phi_guard import is_phi_risk
 from . import email_citation  # S1: shared email citation
+from . import banking_identifiers  # I1 / D-051 lens C: chunk-egress redaction
 
 log = logging.getLogger(__name__)
 
@@ -201,7 +202,13 @@ def format_finance_chunks(results: list, target_label: str, filed_links: dict[st
                 ).strftime("%Y-%m-%d")
             except (OSError, ValueError, OverflowError):
                 pass
-        head = f"## [{i}] {r.title or r.source_id} | {date_str} | mailbox: {owner}"
+        # I1 / D-051 lens C: THE cross-mailbox path -- the finance allowlist pulls
+        # financial_document chunks from ANY mailbox, and vendor invoices carry
+        # ACH footers (drive_sweep F3E: 4,204 such chunks measured 2026-09-08).
+        # Same belt as the shared renderer; the "Filed:" link still carries the
+        # reader to the document.
+        title_txt = banking_identifiers.redact_title(r.title or r.source_id)
+        head = f"## [{i}] {title_txt} | {date_str} | mailbox: {owner}"
         if getattr(r, "author", ""):
             head += f" | from: {r.author}"
         # S1: a finance citation without a last-message date is exactly the class
@@ -223,7 +230,11 @@ def format_finance_chunks(results: list, target_label: str, filed_links: dict[st
         lines.extend([head, ""])
         if filed:
             lines.append(f"Filed: {filed}")
-        lines.extend([(r.content or "").strip(), ""])
+        body, n_redacted = banking_identifiers.redact_banking_identifiers((r.content or "").strip())
+        if n_redacted:
+            log.warning("banking-identifier redaction (finance renderer): %d identifier(s) "
+                        "redacted from chunk %s | %s", n_redacted, r.source, title_txt)
+        lines.extend([body, ""])
     return "\n".join(lines)
 
 
