@@ -68,7 +68,7 @@ from pathlib import Path
 from typing import Any
 
 from cora import context_loader as cl
-from cora import drive_io, historical_access
+from cora import banking_identifiers, drive_io, historical_access
 from cora.knowledge_base import embeddings
 from cora.knowledge_base.store import KnowledgeBase
 
@@ -202,6 +202,19 @@ def _result_dict(r: Any) -> dict[str, Any]:
             date = datetime.date.fromtimestamp(r.date_modified).isoformat()
         except (OSError, ValueError, OverflowError):
             date = None
+    # I1 (cq-c89cfab00b1f): the structured `content` is the plugin surface the
+    # 9/4 probe leaked through -- redact here too (the `text` rendering goes
+    # through context_loader._format_kb_chunks, which redacts on its own). The
+    # deep link is untouched so the consumer can open the source document.
+    content, n_redacted = banking_identifiers.redact_banking_identifiers(
+        (getattr(r, "content", "") or "").strip()
+    )
+    if n_redacted:
+        log.warning(
+            "MCP banking-identifier redaction: %d identifier(s) redacted from chunk %s | %s",
+            n_redacted, getattr(r, "source", ""),
+            (getattr(r, "title", "") or getattr(r, "source_id", "")),
+        )
     return {
         "source": getattr(r, "source", ""),
         "entity": getattr(r, "entity", ""),
@@ -209,7 +222,8 @@ def _result_dict(r: Any) -> dict[str, Any]:
         "date": date,
         "distance": round(getattr(r, "distance", 0.0), 4),
         "deep_link": getattr(r, "deep_link", "") or "",
-        "content": (getattr(r, "content", "") or "").strip(),
+        "content": content,
+        "banking_redactions": n_redacted,
     }
 
 
@@ -279,12 +293,15 @@ def kb_search(query: str, entity: str | None = None, limit: int | None = None) -
     relevant, _ = historical_access.apply_tier1(relevant, _founder_emails(), False)
     relevant = _scrub_for_founder_surface(relevant, kb_entity)
 
+    rows = [_result_dict(r) for r in relevant]
     return {
         "query": query,
         "entity_searched": kb_entity,
         "count": len(relevant),
         "provenance": _KB_PROVENANCE,
-        "results": [_result_dict(r) for r in relevant],
+        "results": rows,
+        # I1: total identifiers redacted across the returned chunks (0 = untouched).
+        "banking_redactions": sum(int(row.get("banking_redactions", 0)) for row in rows),
         "text": _render_kb_text(relevant, _KB_PROVENANCE),
     }
 

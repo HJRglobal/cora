@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 from cora import historical_access, user_notes, phi_guard, org_roles, drive_io
+from cora import banking_identifiers  # I1 (cq-c89cfab00b1f): chunk-egress redaction
 from cora.dynamic_answers import available_dynamic_entities, load_dynamic_answers
 from . import email_citation  # S1: shared email citation
 
@@ -1077,7 +1078,19 @@ def _format_kb_chunks(chunks: list) -> str:
             f"{thread_note}{link_block}{bot_label}"
         )
         lines.append("")
-        lines.append(r.content.strip())
+        # I1 (cq-c89cfab00b1f): banking identifiers (routing / SWIFT / IBAN /
+        # account numbers) never enter LLM context or the MCP text rendering --
+        # the value is replaced, the label and the deep link survive. This is
+        # the ONE renderer every retrieval consumer goes through (main path,
+        # cross-entity fallback, MCP text), so the belt cannot be bypassed by a
+        # new caller. n == 0 is a byte-identical pass-through.
+        body, n_redacted = banking_identifiers.redact_banking_identifiers(r.content.strip())
+        if n_redacted:
+            log.warning(
+                "banking-identifier redaction: %d identifier(s) redacted from chunk %s | %s",
+                n_redacted, r.source, title,
+            )
+        lines.append(body)
         lines.append("")
 
     return "\n".join(lines)
