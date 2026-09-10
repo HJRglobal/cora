@@ -6,7 +6,10 @@ A PENDING entry is auto-dismissed ONLY once it has been DM'd to Harrison
 (Friday evening -> Monday 7am review) is not silently dropped before he sees it.
 """
 
+import logging
 from datetime import datetime, timedelta, timezone
+
+import pytest
 
 import scripts.run_knowledge_review as rkr
 
@@ -832,3 +835,53 @@ def test_owner_item_line_resolves_raw_slack_id():
         1,
     )
     assert "U0B3V5RHT3P" not in line
+
+
+# == D-051 lens E F1 (2026-09-09): a "dry run" executed one Asana complete + three creates
+def test_dry_run_never_executes_an_approved_update(tmp_path, monkeypatch, caplog):
+    """The 17:48 AZ --dry-run on 9/9 completed a real Asana task, created three, posted to
+    #hjrg-leadership, and -- because the resolve IS dry-run-gated -- left all four rows
+    PENDING for the next live run to execute AGAIN. A dry run performs zero connector
+    writes and touches no state."""
+    import importlib
+    from unittest.mock import MagicMock
+    kr = importlib.import_module("cora.knowledge_review")
+
+    (tmp_path / "proposed.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "reply.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setattr(kr, "_PROPOSED_UPDATES_PATH", tmp_path / "proposed.jsonl")
+    monkeypatch.setattr(kr, "_REPLY_LOG_PATH", tmp_path / "reply.jsonl")
+    kr._SEEN_IDS_CACHE = None
+    kr._ARCHIVE_IDS_CACHE = None
+    monkeypatch.setattr(rkr, "_LOCK_PATH", tmp_path / "kr.lock")
+    monkeypatch.setattr(rkr, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(rkr, "_MECHANICAL_BATCH_STATE_PATH", tmp_path / "batch.json")
+    monkeypatch.setattr(rkr, "_attach_coras_read", lambda items, log: None)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+    monkeypatch.setenv("CORA_AUTOWRITE_LIVE", "off")
+
+    update = {"update_id": "pass5:drive:7064e075", "update_type": "asana_task", "state": "PENDING",
+              "description": "[HJRP] Drive doc suggests missing task: Collect $1,500 remainder",
+              "payload": {"suggested_task_name": "Collect $1,500 remainder"}}
+    reaction = {"action": "APPROVED", "channel_id": "D1", "message_ts": "111.222",
+                "reactor_id": "U0B2RM2JYJ1", "reaction": "+1"}
+    monkeypatch.setattr(rkr, "correlate_reactions_to_updates", lambda: [(update, reaction)])
+    executor = MagicMock(side_effect=AssertionError("a dry run executed a connector write"))
+    monkeypatch.setattr(rkr, "_execute_approved_update", executor)
+    resolve = MagicMock(side_effect=AssertionError("a dry run resolved a row"))
+    monkeypatch.setattr(rkr, "resolve_update", resolve)
+    ack = MagicMock(side_effect=AssertionError("a dry run acked a card"))
+    monkeypatch.setattr(rkr, "_ack_correlated_reaction", ack)
+    monkeypatch.setattr(rkr, "send_dm_to_harrison", lambda *a, **k: pytest.fail("dry run sent a DM"))
+    monkeypatch.setattr(rkr, "send_individual_dms", lambda *a, **k: pytest.fail("dry run sent DMs"))
+    monkeypatch.setattr(rkr, "_route_operational_to_owners", lambda *a, **k: 0)
+
+    caplog.set_level(logging.INFO, logger="knowledge-review")
+    monkeypatch.setattr("sys.argv", ["run_knowledge_review.py", "--dry-run"])
+    rkr.main()
+
+    executor.assert_not_called()
+    resolve.assert_not_called()
+    ack.assert_not_called()
+    assert any("[DRY RUN] would execute [asana_task] pass5:dr" in r.getMessage() for r in caplog.records)
+    assert not (tmp_path / "batch.json").exists()

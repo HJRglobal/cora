@@ -213,6 +213,15 @@ def main() -> None:
     # Provable instance identity: a restart is verified by a NEW start row with a
     # DIFFERENT pid, never by a restart script's exit code.
     instance_ledger.record_start(log_file=log_file)
+    # Code #12 S3' coverage (D-051 lens A MED #3 / lens E F2): record that the two
+    # egress seam rails are ARMED in this process, so the observe-week counter can
+    # tell "zero firings while armed for the full window" from "zero because the
+    # rail was not deployed" -- a silence is not a clean read. Fail-soft.
+    try:
+        from . import egress_rails
+        egress_rails.record_armed(log_to=log)
+    except Exception:  # noqa: BLE001 -- a breadcrumb never blocks startup
+        log.warning("egress-rails armed record failed (non-fatal)", exc_info=True)
 
     # Pre-warm all entity contexts in background so first requests don't pay the
     # cold-cache penalty (Google Drive read per entity, up to 2s each).

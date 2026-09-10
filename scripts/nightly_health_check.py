@@ -2011,11 +2011,16 @@ def check_code_queue_ledger_integrity() -> CheckResult:
                            f"Could not reconcile the ledger: {exc}")
     orphans = rep.get("orphans") or []
     unknown = rep.get("unknown_event_types") or {}
-    if not orphans and not unknown:
+    unparseable = int(rep.get("unparseable") or 0)
+    if not orphans and not unknown and not unparseable:
         return CheckResult("Code-queue ledger integrity", "ok",
                            f"{rep.get('raw_ids', '?')} ids in the raw ledger, all fold "
-                           f"({rep.get('folded_ids', '?')} captured); no unknown event kinds.")
+                           f"({rep.get('folded_ids', '?')} captured); no unknown event kinds; "
+                           "every line parses.")
     parts = []
+    if unparseable:
+        # D-051 lens B MED #3: a torn line is a LOST event the fold skips silently.
+        parts.append(f"{unparseable} unparseable line(s) -- lost events (a torn append?)")
     if orphans:
         parts.append(f"{len(orphans)} orphan id(s) with events but no `captured` (fold "
                      f"drops them): " + "; ".join(
@@ -2054,6 +2059,34 @@ def check_proposed_priority_aging() -> CheckResult:
                        f"{len(aged)} PROPOSED P0/P1-class item(s) undecided for >= "
                        f"{code_queue.PROPOSED_PRIORITY_AGING_DAYS}d -- they ride the Monday "
                        f"menu's PROPOSED coverage (approve / park / dismiss): {detail}{more}. {ctx}.")
+
+
+def check_parked_aging() -> CheckResult:
+    """C3 (Code #12; D-051 lens B HIGH #2): WARN on PARKED rows whose trigger has
+    FIRED -- the resume date passed, or the ask recurred since parking -- and that
+    no human has re-triaged. A PARKED row leaves every menu section by design, so
+    the Monday menu was its only surface and no gauge watched it: one park tap could
+    silence a recurring P0 ask indefinitely. Ids, never titles."""
+    try:
+        from cora import code_queue
+        rep = code_queue.parked_aging()
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult("PARKED triggers", "warn", f"Could not scan the code queue: {exc}")
+    due = rep.get("due") or []
+    total = rep.get("parked_total", "?")
+    if not due:
+        return CheckResult("PARKED triggers", "ok",
+                           f"No parked item has a fired trigger ({total} parked).")
+    detail = "; ".join(
+        f"{d['id']} [{d['severity']}/{d['entity']}] "
+        + (f"re-asked x{d['parked_recurrences']}" if d.get("parked_recurrences")
+           else f"due {d.get('park_until') or '?'}")
+        + f", parked {d.get('days_parked', '?')}d" for d in due[:5])
+    more = f" (+{len(due) - 5} more)" if len(due) > 5 else ""
+    return CheckResult("PARKED triggers", "warn",
+                       f"{len(due)} parked item(s) with a fired trigger await re-triage (the "
+                       f"Monday menu offers Re-queue / Park again / Dismiss w/ note): "
+                       f"{detail}{more}. {total} parked in all.")
 
 
 def check_egress_rails(now: datetime | None = None) -> CheckResult:
@@ -2254,6 +2287,9 @@ def main() -> int:
 
     log.info("Checking PROPOSED P0/P1-class aging...")
     all_results.append(check_proposed_priority_aging())
+
+    log.info("Checking PARKED rows whose trigger has fired...")
+    all_results.append(check_parked_aging())
 
     log.info("Reading the egress-rail observe week (sentinel + phantom-write-claim)...")
     all_results.append(check_egress_rails())

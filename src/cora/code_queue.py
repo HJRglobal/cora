@@ -111,6 +111,13 @@ def is_priority_severity(severity: str | None) -> bool:
 # it (used by the embedding paraphrase layer). Terminal statuses are excluded so a
 # dismissed/shipped item never absorbs a genuinely fresh ask.
 _OPEN_STATUSES = frozenset({"PROPOSED", "APPROVED", "STAGED", "SNOOZED", "BLOCKED", "PARKED"})
+# A PARKED row is open but INVISIBLE -- it leaves every menu section until its
+# trigger -- so a deliberate re-ask must never dedup into it silently (D-051 lens B
+# HIGH #2: one park tap could have silenced a recurring P0 ask until 2099). It is
+# not a merge target: an explicit re-ask mints a fresh row, and a passive
+# recurrence on a parked row is COUNTED as its trigger (see _parked_rows).
+_MERGE_TARGET_STATUSES = _OPEN_STATUSES - {"PARKED"}
+PARK_MAX_DAYS = 90            # every park has a review horizon; no 2099 parks (lens B)
 
 # Block Kit action ids (own namespace; handled by app.py wrappers)
 ACTION_APPROVE = "code_queue_approve"
@@ -549,6 +556,10 @@ def _fold_items() -> dict[str, dict[str, Any]]:
         if et == "recurrence":
             rec["count"] = int(rec.get("count", 1)) + 1
             rec["last_seen"] = ev.get("ts")
+            if rec.get("status") == "PARKED":
+                # C3 / D-051 lens B: a new sighting of a PARKED row is its trigger --
+                # the Monday menu promotes it to DUE (never a silent count bump).
+                rec["parked_recurrences"] = int(rec.get("parked_recurrences") or 0) + 1
             ev_ev = ev.get("evidence")
             if ev_ev:
                 ev_list = rec.get("evidence") or []
@@ -593,6 +604,9 @@ def _fold_items() -> dict[str, dict[str, Any]]:
             recs = list(rec.get("reconciled") or [])
             if len(recs) < 10:
                 recs.append({k: ev.get(k) for k in ("transition", "bundle_id", "branch", "commit", "ts")})
+            else:
+                # D-051 lens B LOW: the cap is COUNTED, never a silent drop.
+                rec["reconciled_dropped"] = int(rec.get("reconciled_dropped") or 0) + 1
             rec["reconciled"] = recs
             for k in ("bundle_id", "branch", "commit"):
                 if ev.get(k) and not rec.get(k):
@@ -639,7 +653,9 @@ def _fold_items() -> dict[str, dict[str, Any]]:
             rec["park_reason"] = str(ev.get("reason") or "")
             rec["park_until"] = str(ev.get("until") or "")
             rec["park_event"] = str(ev.get("trigger_event") or "")
+            rec["park_horizon"] = bool(ev.get("review_horizon"))
             rec["parked_at"] = ev.get("ts")
+            rec["parked_recurrences"] = 0
         elif et == "dm_sent":
             rec["dm_channel_id"] = ev.get("dm_channel_id", "")
             rec["dm_message_ts"] = ev.get("dm_message_ts", "")
@@ -660,11 +676,25 @@ def ledger_integrity(path: Path | None = None) -> dict[str, Any]:
     no `captured` event (the 7/30 cleanup removed a captured row and left 7
     descendants; a hand-written row used an invented kind); an UNKNOWN kind is one
     the reducer does not model. Both are the population the fold drops. Reads the
-    RAW file (never the fold) so the two can be compared. Raises on an unreadable
-    ledger -- blind must never read as clean (the priority-kickoff monitor's rule).
+    RAW file (never the fold) so the two can be compared. Raises FileNotFoundError
+    on a MISSING ledger and counts every unparseable line (`unparseable`) -- blind
+    must never read as clean (D-051 lens B MED #3: the first cut delegated to
+    _read_jsonl, which returns [] for a missing file and skips torn lines, so a
+    0-byte ledger reported '0 ids, all fold' and the health check said ok).
     """
     p = Path(path) if path is not None else Path(_EVENT_LEDGER)
-    events = _read_jsonl(p)
+    if not p.exists():
+        raise FileNotFoundError(f"code-queue ledger missing: {p}")
+    events: list[dict[str, Any]] = []
+    unparseable = 0
+    for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            unparseable += 1  # a torn line is a LOST event, and the fold skips it silently
     captured: set[str] = set()
     per_id: dict[str, dict[str, Any]] = {}
     unknown: dict[str, int] = {}
@@ -691,6 +721,7 @@ def ledger_integrity(path: Path | None = None) -> dict[str, Any]:
         "orphans": orphans,
         "unknown_event_types": unknown,
         "unknown_event_ids": unknown_ids,
+        "unparseable": unparseable,
     }
 
 
@@ -716,6 +747,24 @@ def proposed_priority_aging(days: int = PROPOSED_PRIORITY_AGING_DAYS) -> dict[st
     return {"aged_priority": out, "aged_total": len(aged), "proposed_total": len(proposed)}
 
 
+def parked_aging() -> dict[str, Any]:
+    """{due: [{id, severity, entity, park_until, parked_recurrences, days_parked}],
+     parked_total: n} -- PARKED rows whose resume date has passed or that were
+    re-asked since parking (either is the trigger): the population the Monday menu
+    is the ONLY surface for, watched by no gauge until now (D-051 lens B HIGH #2).
+    Raises on a ledger read failure (blind != clean)."""
+    items = load_items()
+    parked = [it for it in items if it.get("status") == "PARKED"]
+    due, _waiting = _parked_rows(parked, _now())
+    out = [{"id": it.get("id", ""), "severity": it.get("severity", ""),
+            "entity": it.get("entity", ""), "park_until": str(it.get("park_until") or "")[:10],
+            "parked_recurrences": int(it.get("parked_recurrences") or 0),
+            "days_parked": _age_days(it.get("parked_at") or it.get("ts"))}
+           for it in due]
+    out.sort(key=lambda r: -r["days_parked"])
+    return {"due": out, "parked_total": len(parked)}
+
+
 _KNOWN_IDS_CACHE: dict[str, Any] = {"key": None, "ids": frozenset()}
 
 
@@ -732,7 +781,10 @@ def known_ids() -> frozenset[str]:
         st = Path(path).stat()
         key = (str(path), st.st_mtime_ns, st.st_size)
     except FileNotFoundError:
-        return frozenset()  # a ledger that has never been written knows NO id
+        # D-051 lens C F6: a MISSING ledger is "cannot check", never "every id is
+        # fabricated" -- an empty reference set would redact every real id under
+        # ENFORCE. None tells the screen to skip the family with a WARNING.
+        return None  # type: ignore[return-value]
     except OSError:
         raise  # unreadable (not missing): the screen skips the family with a WARNING
     with _LEDGER_LOCK:
@@ -841,6 +893,11 @@ def _lex_safe_view(it: dict[str, Any]) -> dict[str, Any]:
         it["fix_sketch"] = ""
         if it.get("prompt_path"):
             it["prompt_path"] = _LEX_REDACTED_PROMPT_PATH
+        # C3 typed fields (park reason / event, dismissal evidence) are PHI-screened
+        # at write time; the LEX blanket still applies at egress (D-051 lens A LOW #11).
+        for k in ("park_reason", "park_event", "dismiss_reason"):
+            if it.get(k):
+                it[k] = "[LEX -- withheld]"
     return it
 
 
@@ -933,11 +990,11 @@ def _capture(rec: dict[str, Any], *, initial_status: str = "PROPOSED",
         # (APPROVED/PROPOSED) item. Other signals keep the existing dedup-onto-any behavior.
         if existing_id and signal == "explicit":
             cand = get_item(existing_id)
-            if not (cand and cand.get("status") in _OPEN_STATUSES):
+            if not (cand and cand.get("status") in _MERGE_TARGET_STATUSES):
                 existing_id = None
         if existing_id is None and emb_id:
             cand = get_item(emb_id)
-            if cand and cand.get("status") in _OPEN_STATUSES:
+            if cand and cand.get("status") in _MERGE_TARGET_STATUSES:
                 existing_id = emb_id  # semantic paraphrase of a still-open item
         if existing_id:
             _append_event({
@@ -1462,16 +1519,22 @@ def item_surface_fields(rec: dict[str, Any]) -> dict[str, Any]:
     kickoff = bool(rec.get("prompt_path"))
     card = bool(rec.get("dm_message_ts"))
     cid = str(rec.get("id") or "?")
+    # The line is read on the KB-ingested backlog by anyone (and by Cora answering
+    # anyone), so it names WHO types the verb (D-051 lens A LOW #12) and only offers
+    # a card tap when a card exists (lens F MED #2 -- a seeded PROPOSED row has none).
     if status in _TERMINAL_STATUSES:
         how = f"closed ({status})"
     elif kickoff:
         how = "already staged -- the kickoff is on disk"
     elif status == "PROPOSED":
-        how = (f"approve first (tap Queue on its card, or reply `approve {cid}` in your Cora "
-               f"DM), then reply `stage {cid}`")
+        how = ("approve first ("
+               + ("tap Queue on its card, or " if card else "")
+               + f"Harrison replies `approve {cid}` in a Cora DM"
+               + ("" if card else " -- no card, a seeded item")
+               + f"), then Harrison replies `stage {cid}`")
     else:
-        how = f"reply `stage {cid}` in your Cora DM"
-        how += (" or tap Stage prompt on its card" if card else
+        how = f"Harrison replies `stage {cid}` in a Cora DM"
+        how += (" or taps Stage prompt on its card" if card else
                 " (no card -- a seeded item; it also closes at step 7.5 when a session ships it)")
     return {"kickoff": kickoff, "card": card, "how_to_stage": how}
 
@@ -1655,10 +1718,21 @@ def _is_seed_shaped(rec: dict[str, Any]) -> bool:
     kb_eval_*), so keying the seed body on the label alone would have floored
     every non-"explicit" seed. Rows seeded after this change also carry
     ``seeded: True``; the shape rule is what covers the legacy rows."""
-    if rec.get("seeded") is True:
-        return True
     summary = str(rec.get("summary") or "").strip()
+    title = str(rec.get("title") or "").strip()
+    has_body = bool(summary) or bool(title and title != _LEX_REDACTED_TITLE)
+    if rec.get("seeded") is True:
+        # The flag says a seed wrote it; the floor still needs SOMETHING to build
+        # from (D-051 lens A LOW #10) -- a LEX seed is redacted at rest, so for it
+        # the permalink stays the only door, like every other LEX row.
+        return has_body
     if not summary:
+        return False
+    if str(rec.get("reporter") or "") != HARRISON_ID:
+        # Legacy seeds all carry seed_item's reporter; a passive capture never
+        # does -- so a future channel-less capture cannot satisfy the shape
+        # (D-051 lens B LOW: value-equality on note == summary[:200] alone was
+        # satisfiable by a deflection capture with channel_id "").
         return False
     for e in (rec.get("evidence") or []):
         if not isinstance(e, dict):
@@ -1688,7 +1762,16 @@ def has_evidence(rec: dict[str, Any]) -> bool:
         if str(rec.get("summary") or "").strip():
             return True
         for e in (rec.get("evidence") or []):
-            if isinstance(e, dict) and str(e.get("note") or "").strip():
+            if not isinstance(e, dict):
+                continue
+            if str(e.get("note") or "").strip():
+                return True
+            if str(e.get("channel_id") or "").strip():
+                # A human TYPED this ask (cora_queue_code_session) in a known
+                # channel; redaction of its body is Cora's own act, not missing
+                # provenance (D-051 lens B MED #7 -- every LEX explicit ask was
+                # floored because queue_explicit wrote ts="" and the LEX scrub
+                # drops the note). The kickoff names the channel pointer.
                 return True
     return False
 
@@ -1701,11 +1784,13 @@ def no_evidence_message(rec: dict[str, Any]) -> str:
             f"stage it anyway (the deliberate override).")
 
 
-def _evidence_block(items: list[dict[str, Any]]) -> list[str]:
+def _evidence_block(items: list[dict[str, Any]], *, override: bool = False) -> list[str]:
     """`## 0. Evidence` lines populated from seed provenance: every permalink, the
     seed text (representative / summary / explicit notes), and the classifier
     fields (kind, severity, signal, subsystem, reporter, count, captured date).
-    An item with nothing says so -- never a fabricated pointer."""
+    An item with nothing says so -- never a fabricated pointer. ``override`` is
+    True only when the founder's typed `stage` verb bypassed the floor (D-051 lens
+    B HIGH #1: the sentence used to CLAIM an override for every floored item)."""
     lines: list[str] = []
     for it in items:
         cid = it.get("id", "?")
@@ -1729,9 +1814,20 @@ def _evidence_block(items: list[dict[str, Any]]) -> list[str]:
             note = str(e.get("note") or "").strip()
             if note and note != rep:
                 lines.append(f"    - note: {note[:400]}")
+            ch = str(e.get("channel_id") or "").strip()
+            if (ch and not str(e.get("ts") or "").strip()
+                    and str(it.get("signal") or "").lower() == "explicit"):
+                # Only for a human-TYPED ask: the channel it was typed in is a real
+                # pointer (the LEX door, lens B MED #7). A passive capture's
+                # channel-only row renders no pointer at all -- that half-pointer was
+                # the cq-89fdad5f0f86 artifact and stays pinned out.
+                lines.append(f"    - channel pointer: <slack://channel?id={ch}> (no message ts; "
+                             "find the typed ask in that channel)")
         if not has_evidence(it):
-            lines.append("    - EVIDENCE: none on the item (no Slack permalink, no seed body) "
-                         "-- staged by the founder's override; attach the thread before firing.")
+            lines.append("    - EVIDENCE: none on the item (no Slack permalink, no seed body)"
+                         + (" -- staged by the founder's typed override; attach the thread "
+                            "before firing." if override else
+                            " -- attach the thread before firing."))
     return lines
 
 
@@ -1756,7 +1852,7 @@ Be concise. Do NOT invent facts beyond the evidence. Output MARKDOWN only.
 """
 
 
-def _deterministic_prompt(items: list[dict[str, Any]], slug: str) -> str:
+def _deterministic_prompt(items: list[dict[str, Any]], slug: str, *, override: bool = False) -> str:
     today = _now().strftime("%Y-%m-%d")
     lines = [
         f"# Cora Code prompt -- {slug} ({today})",
@@ -1768,7 +1864,7 @@ def _deterministic_prompt(items: list[dict[str, Any]], slug: str) -> str:
         "## 0. Evidence",
         "",
     ]
-    lines += _evidence_block(items)
+    lines += _evidence_block(items, override=override)
     lines += [
         "",
         "## 1. Deliverables",
@@ -1796,7 +1892,8 @@ def _deterministic_prompt(items: list[dict[str, Any]], slug: str) -> str:
 
 
 def generate_kickoff_prompt(items: list[dict[str, Any]], *, slug: str | None = None,
-                            meta_out: dict[str, Any] | None = None) -> str | None:
+                            meta_out: dict[str, Any] | None = None,
+                            override: bool = False) -> str | None:
     """Render a kickoff prompt for one item or a bundle and write it to the Founder-OS
     ``_notes`` folder (mount-resilient; fail-soft to the repo ``_notes``). Returns the
     written path (str) or None on total write failure. Model call is fail-soft: on any
@@ -1822,7 +1919,7 @@ def generate_kickoff_prompt(items: list[dict[str, Any]], *, slug: str | None = N
              f"{it.get('title')} :: fix: {it.get('fix_sketch', '')} :: id={it.get('id')}"
              for it in items]
             + ["", "EVIDENCE block (copy verbatim into Section 0):"]
-            + _evidence_block(items)
+            + _evidence_block(items, override=override)
         )
         try:
             import anthropic
@@ -1840,7 +1937,7 @@ def generate_kickoff_prompt(items: list[dict[str, Any]], *, slug: str | None = N
             log.warning("code_queue: prompt generation failed, using skeleton: %s", exc)
             body = None
     if not body:
-        body = _deterministic_prompt(items, slug)
+        body = _deterministic_prompt(items, slug, override=override)
 
     # Id-suffix the filename so two items with the same slug can never clobber each
     # other's prompt (day-one defect #4).
@@ -1860,6 +1957,19 @@ def _default_client_factory() -> Any:
         return None
     from slack_sdk import WebClient
     return WebClient(token=token)
+
+
+def _mrk(text: Any) -> str:
+    """Escape the three mrkdwn control characters in a TITLE rendered on a Slack
+    surface (D-051 lens F LOW #5): a captured title carrying `<` or `&` would
+    otherwise render as a broken link/entity. Titles only -- summaries may carry
+    sanctioned `<url|label>` links."""
+    return str(text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _safe_reason(it: dict[str, Any], key: str) -> str:
+    """A typed C3 reason for a Slack surface: LEX blanket, then mrkdwn escape."""
+    return _mrk(_lex_safe_view(it).get(key, ""))
 
 
 def build_item_card(rec: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
@@ -1884,7 +1994,7 @@ def build_item_card(rec: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     text = (
         f"*Code-session queue* -- {lead} {rec.get('kind', '?')} `{rec.get('severity', '?')}` "
         f"[{rec.get('entity', '?')}]\n"
-        f"*{rec.get('title', '(untitled)')}*\n"
+        f"*{_mrk(rec.get('title', '(untitled)'))}*\n"
         f"{rec.get('summary', '')}"
     )
     if rec.get("fix_sketch"):
@@ -2085,6 +2195,14 @@ def process_queue_action(action_id: str, cq_id: str, actor_id: str, *,
         return "dismissed", "🗑️ Dismissed -- this fingerprint won't resurface."
 
     if action_id == ACTION_LATER:
+        # D-051 lens B MED #5: Later had NO status guard -- a stale card button
+        # snoozed a SHIPPED row back into the backlog and silently replaced a PARK
+        # (reason + trigger gone from every surface). Terminal and PARKED refuse.
+        if status in _TERMINAL_STATUSES:
+            return "noop", f"Item is {status} -- not snoozing a terminal row."
+        if status == "PARKED":
+            return "noop", ("Item is PARKED (reason + trigger recorded) -- use Park again to "
+                            "change the trigger, or Re-queue / Dismiss w/ note to end the park.")
         snooze_until = (_now() + timedelta(days=SNOOZE_DAYS)).isoformat()
         _append_event({"event": "snoozed", "ts": _now_iso(), "id": cq_id,
                        "snooze_until": snooze_until})
@@ -2122,6 +2240,15 @@ def process_queue_action(action_id: str, cq_id: str, actor_id: str, *,
             return "noop", "Already shipped."
         bid = str(bundle_id or "").strip() or str(rec.get("bundle_id") or "").strip()
         if not bid:
+            if rec.get("prompt_path") or status in ("STAGED", "PARKED", "SNOOZED"):
+                # D-051 lens B MED #4: 18 of the 24 stale rows on the live menu were
+                # staged before bundle linkage existed -- there is no script to run
+                # for them. Name the one honest door such a row has.
+                return "refused", (
+                    f"Not marked shipped -- `{cq_id}` predates bundle linkage (no bundle/branch "
+                    f"on the row). Reply `ship {cq_id} <bundle-or-branch>` in your Cora DM to "
+                    "ship it with a stated reference, or run the shipping bundle's step-7.5 "
+                    "reconcile script.")
             return "refused", (
                 f"Not marked shipped -- `{cq_id}` carries no bundle/branch reference. "
                 "Run this bundle's step-7.5 reconcile script (it supplies bundle_id + "
@@ -2252,7 +2379,7 @@ def ensure_kickoff_staged(cq_id: str, *, override_evidence_floor: bool = False) 
             return "noop", str(fresh["prompt_path"])
         meta: dict[str, Any] = {}
         try:
-            path = generate_kickoff_prompt([fresh], meta_out=meta)
+            path = generate_kickoff_prompt([fresh], meta_out=meta, override=override_evidence_floor)
         except Exception as exc:  # noqa: BLE001 -- an approve must never crash on this
             log.exception("code_queue: kickoff generation crashed for %s", cq_id)
             return "error", f"generator crashed ({type(exc).__name__})"
@@ -2475,6 +2602,52 @@ _PARK_EVENT_MAX = 120
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
+def validate_park(reason: str, until: str = "", trigger_event: str = "", *,
+                  today=None) -> dict[str, str]:
+    """{modal block_id: error} for a park (empty = valid). PURE -- shared by
+    park_item and the app.py submit handler, so Slack can render the errors IN the
+    modal (response_action="errors") instead of closing it on a silent refusal
+    (D-051 lens F MED #3). Rules: a reason; a real YYYY-MM-DD date at most
+    PARK_MAX_DAYS out (lens B HIGH #2: a 2099 park was accepted); a date or an event."""
+    from datetime import date as _date
+    errors: dict[str, str] = {}
+    if not " ".join(str(reason or "").split()):
+        errors["cq_park_reason"] = "A park needs a reason -- say why it waits."
+    until_n = str(until or "").strip()
+    if until_n and not _DATE_RE.match(until_n):
+        errors["cq_park_until"] = "The resume date must be YYYY-MM-DD."
+    elif until_n:
+        try:
+            d = _date.fromisoformat(until_n)
+        except ValueError:
+            errors["cq_park_until"] = "The resume date must be a real YYYY-MM-DD date."
+        else:
+            today = today or _now().date()
+            if (d - today).days > PARK_MAX_DAYS:
+                errors["cq_park_until"] = (
+                    f"A park can wait at most {PARK_MAX_DAYS} days -- pick a nearer date, or "
+                    f"park on an event (it gets a {PARK_MAX_DAYS}-day review horizon).")
+    ev_n = " ".join(str(trigger_event or "").split())
+    if not until_n and not ev_n:
+        errors["cq_park_event"] = ("A park needs a trigger -- a resume date or the event that "
+                                  "resumes it.")
+    return errors
+
+
+def validate_dismiss_note(note: str) -> dict[str, str]:
+    """{modal block_id: error} for a dismiss-with-evidence (empty = valid). Pure;
+    the PHI screen is included so the modal can say why (fail-closed on error)."""
+    n = " ".join(str(note or "").split())
+    if not n:
+        return {"cq_dismiss_note": "A dismiss-with-evidence needs the evidence -- say why."}
+    try:
+        if phi_guard.is_any_phi_request(n):
+            return {"cq_dismiss_note": "Rejected -- the text tripped the PHI guard."}
+    except Exception:  # noqa: BLE001 -- fail closed
+        return {"cq_dismiss_note": "Rejected -- PHI check failed (fail-closed)."}
+    return {}
+
+
 def park_item(cq_id: str, actor_id: str, reason: str, *, until: str = "",
               trigger_event: str = "") -> tuple[str, str]:
     """Park an open item WITH a trigger: a reason plus a resume DATE (YYYY-MM-DD,
@@ -2490,25 +2663,33 @@ def park_item(cq_id: str, actor_id: str, reason: str, *, until: str = "",
         return "error", "That queue item no longer exists."
     if str(rec.get("status", "")).upper() in _TERMINAL_STATUSES:
         return "noop", f"Item is {rec['status']} -- not parking a terminal row."
+    errors = validate_park(reason, until, trigger_event)
+    if errors:
+        return "error", " ".join(errors.values())
     reason = " ".join(str(reason or "").split())[:_PARK_REASON_MAX]
-    if not reason:
-        return "error", "A park needs a reason -- say why it waits."
     until = str(until or "").strip()
-    if until and not _DATE_RE.match(until):
-        return "error", "The resume date must be YYYY-MM-DD."
     trigger_event = " ".join(str(trigger_event or "").split())[:_PARK_EVENT_MAX]
-    if not until and not trigger_event:
-        return "error", "A park needs a trigger -- a resume date or the event that resumes it."
     try:
         if phi_guard.is_any_phi_request(f"{reason} {trigger_event}"):
             return "error", "Park rejected -- the text tripped the PHI guard."
     except Exception:  # noqa: BLE001 -- fail closed
         return "error", "Park rejected -- PHI check failed (fail-closed)."
+    horizon = False
+    if not until:
+        # An event-only park never became due (D-051 lens B HIGH #2) -- it now
+        # carries a REVIEW HORIZON: it resurfaces at PARK_MAX_DAYS even if the
+        # event has not fired, so no park is indefinite.
+        until = (_now().date() + timedelta(days=PARK_MAX_DAYS)).isoformat()
+        horizon = True
     _append_event({"event": "parked", "ts": _now_iso(), "id": cq_id, "reason": reason,
-                   "until": until, "trigger_event": trigger_event})
+                   "until": until, "trigger_event": trigger_event, "review_horizon": horizon})
     _render_backlog_safe()
-    trig = " / ".join(x for x in (f"until {until}" if until else "", f"on: {trigger_event}" if trigger_event else "") if x)
-    return "parked", f"⏸ Parked ({trig}) -- {reason}"
+    trig = " / ".join(x for x in (
+        (f"review by {until}" if horizon else f"until {until}"),
+        f"on: {trigger_event}" if trigger_event else "") if x)
+    return "parked", f"⏸ Parked ({trig}) -- {reason}" + (
+        f" (a re-ask, or the {PARK_MAX_DAYS}-day review horizon, resurfaces it)" if horizon
+        else " (a re-ask, or the date, resurfaces it)")
 
 
 def dismiss_with_evidence(cq_id: str, actor_id: str, note: str, *,
@@ -2523,14 +2704,10 @@ def dismiss_with_evidence(cq_id: str, actor_id: str, note: str, *,
         return "error", "That queue item no longer exists."
     if str(rec.get("status", "")).upper() == "DISMISSED":
         return "noop", "Already dismissed."
+    errors = validate_dismiss_note(note)
+    if errors:
+        return "error", " ".join(errors.values())
     note = " ".join(str(note or "").split())[:_EVIDENCE_NOTE_MAX_CHARS]
-    if not note:
-        return "error", "A dismiss-with-evidence needs the evidence -- say why."
-    try:
-        if phi_guard.is_any_phi_request(note):
-            return "error", "Dismissal note rejected -- the text tripped the PHI guard."
-    except Exception:  # noqa: BLE001 -- fail closed
-        return "error", "Dismissal note rejected -- PHI check failed (fail-closed)."
     ev: dict[str, Any] = {"event": "dismissed", "ts": _now_iso(), "id": cq_id, "reason": note}
     if channel_id or ts:
         ev["evidence"] = {"channel_id": str(channel_id or ""), "ts": str(ts or "")}
@@ -2560,7 +2737,8 @@ def park_modal_view(cq_id: str, dm_channel: str, dm_ts: str) -> dict[str, Any]:
              "element": {"type": "plain_text_input", "action_id": "v", "multiline": True,
                          "max_length": _PARK_REASON_MAX}},
             {"type": "input", "block_id": "cq_park_until", "optional": True,
-             "label": {"type": "plain_text", "text": "Resume date (resurfaces on that Monday's menu)"},
+             "label": {"type": "plain_text",
+                       "text": f"Resume date (resurfaces on that Monday's menu; at most {PARK_MAX_DAYS} days out)"},
              "element": {"type": "datepicker", "action_id": "v"}},
             {"type": "input", "block_id": "cq_park_event", "optional": True,
              "label": {"type": "plain_text", "text": "...or the event that resumes it"},
@@ -2763,15 +2941,27 @@ _QUEUE_VERB_RE = re.compile(
     r"^\s*(stage|approve|dismiss)\s+(cq-[0-9a-f]{12})\s*$", re.IGNORECASE)
 
 
-def match_queue_verb(text: str) -> tuple[str, str] | None:
-    """(verb, cq_id) when *text* is EXACTLY a queue verb + id, else None."""
+# `ship <id> <bundle-or-branch>` (D-051 lens B MED #4): the one honest door for a
+# row staged before bundle linkage existed -- the C7 gate refuses a bare tap on it
+# and no reconcile script names it. Exact match; the reference is passed through as
+# the shipped event's bundle_id (and branch when it is path-shaped).
+_SHIP_VERB_RE = re.compile(
+    r"^\s*ship\s+(cq-[0-9a-f]{12})\s+([A-Za-z0-9][A-Za-z0-9._/+-]{2,79})\s*$", re.IGNORECASE)
+
+
+def match_queue_verb(text: str) -> tuple[str, ...] | None:
+    """(verb, cq_id) when *text* is EXACTLY a queue verb + id -- or ("ship", cq_id,
+    reference) for the ship verb -- else None."""
     m = _QUEUE_VERB_RE.match(str(text or ""))
-    if not m:
-        return None
-    return m.group(1).lower(), m.group(2).lower()
+    if m:
+        return m.group(1).lower(), m.group(2).lower()
+    m = _SHIP_VERB_RE.match(str(text or ""))
+    if m:
+        return "ship", m.group(1).lower(), m.group(2)
+    return None
 
 
-def apply_queue_verb(verb: str, cq_id: str, actor_id: str) -> tuple[str, str]:
+def apply_queue_verb(verb: str, cq_id: str, actor_id: str, arg: str = "") -> tuple[str, str]:
     """Run one typed queue verb DIRECTLY against the queue. The reply is the
     queue's OWN outcome string, verbatim; the model is never consulted.
 
@@ -2792,11 +2982,17 @@ def apply_queue_verb(verb: str, cq_id: str, actor_id: str) -> tuple[str, str]:
         return process_queue_action(ACTION_APPROVE, cid, actor_id)
     if v == "dismiss":
         return process_queue_action(ACTION_DISMISS, cid, actor_id)
+    if v == "ship":
+        ref = str(arg or "").strip()
+        if not ref:
+            return "error", "`ship <id> <bundle-or-branch>` needs the reference."
+        return process_queue_action(ACTION_MARK_SHIPPED, cid, actor_id, bundle_id=ref,
+                                    branch=ref if "/" in ref else "")
     return "error", f"Unknown queue verb: {verb!r}"
 
 
 def queue_explicit(user: str, entity: str, channel_id: str, request: str,
-                   is_founder: bool) -> tuple[str | None, str]:
+                   is_founder: bool, *, message_ts: str = "") -> tuple[str | None, str]:
     """Backend for the explicit tool's confirmed call. Returns (cq_id, outcome).
 
     outcome is one of:
@@ -2829,7 +3025,7 @@ def queue_explicit(user: str, entity: str, channel_id: str, request: str,
         "kind": "feature", "severity": "P2", "title": request[:120],
         "summary": request[:200], "subsystem_guess": "", "entity": entity,
         "signal": "explicit", "representative": request,
-        "evidence": [{"channel_id": channel_id, "ts": "", "note": request[:400]}],
+        "evidence": [{"channel_id": channel_id, "ts": str(message_ts or ""), "note": request[:400]}],
         "reporter": user,
     }
     cq_id = _capture(rec, initial_status="APPROVED" if is_founder else "PROPOSED",
@@ -2909,8 +3105,9 @@ def _proposed_coverage(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _parked_rows(items: list[dict[str, Any]], now: datetime) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """(due, waiting): a PARKED row whose resume date has passed is DUE; the rest
-    (future date, or an event trigger) are WAITING and list count-only."""
+    """(due, waiting): a PARKED row whose resume date has passed -- or that was
+    RE-ASKED since it was parked (a recurrence is the trigger, D-051 lens B HIGH
+    #2) -- is DUE; the rest are WAITING and list count-only."""
     today = now.date().isoformat()
     due: list[dict[str, Any]] = []
     waiting: list[dict[str, Any]] = []
@@ -2918,8 +3115,21 @@ def _parked_rows(items: list[dict[str, Any]], now: datetime) -> tuple[list[dict[
         if it.get("status") != "PARKED":
             continue
         until = str(it.get("park_until") or "")[:10]
-        (due if (until and until <= today) else waiting).append(it)
+        reasked = int(it.get("parked_recurrences") or 0) > 0
+        (due if ((until and until <= today) or reasked) else waiting).append(it)
     return due, waiting
+
+
+def _park_trigger_text(it: dict[str, Any]) -> str:
+    """'until <date>' / 'review by <date> / on: <event>' for one PARKED row."""
+    until = str(it.get("park_until") or "")[:10]
+    event = _safe_reason(it, "park_event")
+    parts = []
+    if until:
+        parts.append(("review by " if it.get("park_horizon") else "until ") + until)
+    if event:
+        parts.append(f"on: {event}")
+    return " / ".join(parts) or "(no trigger recorded)"
 
 
 def _ids(rows: list[dict[str, Any]]) -> list[str]:
@@ -2929,7 +3139,23 @@ def _ids(rows: list[dict[str, Any]]) -> list[str]:
 def _proposed_row_line(it: dict[str, Any]) -> str:
     age = _age_days(it.get("ts"))
     return (f"• `{it.get('severity', '?')}` {it.get('kind', '?')} [{it.get('entity', '?')}] "
-            f"{it.get('title', '')} (`{it.get('id', '?')}`) -- {age}d")
+            f"{_mrk(it.get('title', ''))} (`{it.get('id', '?')}`) -- {age}d")
+
+
+def _fit_plain(text: str, limit: int) -> str:
+    """Whole-line truncation for a fallback `text` field (D-051 lens F LOW #6):
+    the `[:2900]` slice cut the last line mid-word."""
+    if len(text) <= limit:
+        return text
+    note = "\n_(fallback text truncated -- the blocks carry the full card)_"
+    out: list[str] = []
+    used = 0
+    for ln in text.splitlines():
+        if used + len(ln) + 1 > limit - len(note):
+            break
+        out.append(ln)
+        used += len(ln) + 1
+    return "\n".join(out) + note
 
 
 _LISTING_MAX_CHARS = 2600   # one section block (Slack cap 3000); leaves room for the overflow note
@@ -3012,7 +3238,7 @@ def build_weekly_menu(*, carried_out: dict[str, Any] | None = None) -> tuple[str
         "approved": _ids(approved), "config": _ids(config_items),
         "stale_staged": _ids(stale_staged), "expired_snoozed": _ids(expired_snoozed),
         "parked_due": _ids(parked_due), "parked_waiting": _ids(parked_waiting),
-        "stale_actionable": [], "stale_listed": [],
+        "stale_actionable": [], "stale_listed": [], "stale_overflow": 0,
         "proposed_actionable": [], "proposed_listed": [], "proposed_overflow": 0,
         "proposed_aged": sum(1 for it in proposed_cov if _age_days(it.get("ts")) >= STALE_STAGED_DAYS),
         "proposed_priority": len(prio_rows),
@@ -3047,7 +3273,8 @@ def build_weekly_menu(*, carried_out: dict[str, Any] | None = None) -> tuple[str
     # Attention rows: due parks first (a trigger fired), then capped Keeps (they
     # need a decision, not another Keep), then the oldest stale rows, then expired snoozes.
     capped = [it for it in stale_staged if int(it.get("keep_count") or 0) >= KEEP_CAP]
-    uncapped = sorted([it for it in stale_staged if it not in capped],
+    capped_ids = {str(it.get("id")) for it in capped}
+    uncapped = sorted([it for it in stale_staged if str(it.get("id")) not in capped_ids],
                       key=lambda it: str(it.get("staged_at") or it.get("ts") or ""))
     attention_rows = parked_due + capped + uncapped + expired_snoozed
 
@@ -3068,7 +3295,7 @@ def build_weekly_menu(*, carried_out: dict[str, Any] | None = None) -> tuple[str
             ids_csv = ",".join(str(g.get("id", "")) for g in chunk)
             if len(chunk) == 1:
                 it = chunk[0]
-                sline = (f"• [{it.get('entity', '?')}] {it.get('title', '')} (`{it.get('id', '?')}`)"
+                sline = (f"• [{it.get('entity', '?')}] {_mrk(it.get('title', ''))} (`{it.get('id', '?')}`)"
                          f"\n_{format_surface_line(it)}_")
                 text_lines.append("- " + sline.splitlines()[0])
                 blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": sline[:2900]}})
@@ -3083,7 +3310,7 @@ def build_weekly_menu(*, carried_out: dict[str, Any] | None = None) -> tuple[str
             else:
                 theme = _bundle_theme(chunk)
                 eff = _effort(len(chunk))
-                titles = "; ".join(str(g.get("title", "")) for g in chunk[:6])
+                titles = "; ".join(_mrk(g.get("title", "")) for g in chunk[:6])
                 bline = f"*{theme}* ({len(chunk)} items, ~{eff}): {titles}"
                 text_lines.append("- " + bline)
                 blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": bline[:2900]}})
@@ -3101,7 +3328,7 @@ def build_weekly_menu(*, carried_out: dict[str, Any] | None = None) -> tuple[str
 
     if config_items:
         cline = "*No Code session needed (config):* " + "; ".join(
-            str(c.get("title", "")) for c in config_items[:8])
+            _mrk(c.get("title", "")) for c in config_items[:8])
         text_lines.append(cline)
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": cline[:2900]}})
 
@@ -3142,23 +3369,32 @@ def build_weekly_menu(*, carried_out: dict[str, Any] | None = None) -> tuple[str
         cid = str(it.get("id", ""))
         kc = int(it.get("keep_count") or 0)
         if it.get("status") == "PARKED":
-            sline = (f"⏰ park trigger reached ({str(it.get('park_until') or '')[:10]}): "
-                     f"{it.get('park_reason', '')} -- {it.get('title', '')} (`{cid}`)")
-            elements = [_btn(ACTION_APPROVE, "✅ Re-queue", cid, style="primary"),
-                        _btn(ACTION_MARK_SHIPPED, "🚢 Mark shipped", cid),
-                        _btn(ACTION_PARK, "⏸ Park again", cid),
-                        _btn(ACTION_DISMISS_NOTE, "🗑️ Dismiss w/ note", cid)]
+            nrec = int(it.get("parked_recurrences") or 0)
+            trig = (f"re-asked x{nrec} since parked" if nrec
+                    else str(it.get("park_until") or "")[:10])
+            sline = (f"⏰ park trigger reached ({trig}): "
+                     f"{_safe_reason(it, 'park_reason')} -- {_mrk(it.get('title', ''))} (`{cid}`)"
+                     f"\n_{format_surface_line(it)}_")
+            # No Mark-shipped button on a row with no bundle reference: the C7 gate
+            # would refuse the tap (D-051 lens B MED #4 -- 4 of 8 live buttons did).
+            elements = [_btn(ACTION_APPROVE, "✅ Re-queue", cid, style="primary")]
+            if it.get("bundle_id"):
+                elements.append(_btn(ACTION_MARK_SHIPPED, "🚢 Mark shipped", cid))
+            elements += [_btn(ACTION_PARK, "⏸ Park again", cid),
+                         _btn(ACTION_DISMISS_NOTE, "🗑️ Dismiss w/ note", cid)]
             block_id = f"cq_parked_{cid}"
         else:
             why = "STAGED >14d" if it.get("status") == "STAGED" else "snooze expired"
             capped_row = kc >= KEEP_CAP
             if capped_row:
-                sline = (f"⛔ KEPT x{kc} (capped) -- {why}: {it.get('title', '')} (`{cid}`) -- "
+                sline = (f"⛔ KEPT x{kc} (capped) -- {why}: {_mrk(it.get('title', ''))} (`{cid}`) -- "
                          f"park it with a trigger, ship it, or dismiss it")
             else:
-                sline = f"⏳ {why}: {it.get('title', '')} (`{cid}`)" + (f" -- kept x{kc}" if kc else "")
+                sline = f"⏳ {why}: {_mrk(it.get('title', ''))} (`{cid}`)" + (f" -- kept x{kc}" if kc else "")
+            if not it.get("bundle_id"):
+                sline += f" · to ship: `ship {cid} <bundle-or-branch>` in your Cora DM"
             sline += f"\n_{format_surface_line(it)}_"
-            elements = [_btn(ACTION_MARK_SHIPPED, "🚢 Mark shipped", cid)]
+            elements = [_btn(ACTION_MARK_SHIPPED, "🚢 Mark shipped", cid)] if it.get("bundle_id") else []
             if not capped_row:
                 elements.append(_btn(ACTION_KEEP, "Keep", cid))
             elements += [_btn(ACTION_PARK, "⏸ Park", cid), _btn(ACTION_DISMISS_NOTE, "🗑️ Dismiss w/ note", cid)]
@@ -3174,10 +3410,10 @@ def build_weekly_menu(*, carried_out: dict[str, Any] | None = None) -> tuple[str
             tag = ("park trigger reached" if it.get("status") == "PARKED"
                    else ("KEPT x%d (capped)" % kc if kc >= KEEP_CAP
                          else ("STAGED >14d" if it.get("status") == "STAGED" else "snooze expired")))
-            ll.append(f"• {tag}: {it.get('title', '')} (`{it.get('id', '?')}`)")
+            ll.append(f"• {tag}: {_mrk(it.get('title', ''))} (`{it.get('id', '?')}`)")
         lline, n_listed = _fit_listing(
-            f"*Also waiting on a decision ({len(list_rows)}) -- `dismiss <id>` in your Cora DM, "
-            f"or ship via the bundle's step-7.5 script:*",
+            f"*Also waiting on a decision ({len(list_rows)}) -- `dismiss <id>` or "
+            f"`ship <id> <bundle-or-branch>` in your Cora DM, or the bundle's step-7.5 script:*",
             ll, lambda k: f"_+{k} more in the generated backlog -- nothing dropped_")
         text_lines.append(lline.splitlines()[0])
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": lline}})
@@ -3185,15 +3421,13 @@ def build_weekly_menu(*, carried_out: dict[str, Any] | None = None) -> tuple[str
         carried["stale_overflow"] = len(list_rows) - n_listed
 
     if parked_waiting:
-        wl = [f"• {it.get('title', '')} (`{it.get('id', '?')}`) -- "
-              + (f"until {str(it.get('park_until') or '')[:10]}" if it.get("park_until")
-                 else f"on: {it.get('park_event', '')}")
-              for it in parked_waiting[:10]]
-        pline = f"*Parked ({len(parked_waiting)}), waiting on a trigger:*\n" + "\n".join(wl)
-        if len(parked_waiting) > 10:
-            pline += f"\n_+{len(parked_waiting) - 10} more parked rows in the backlog_"
+        wl = [f"• {_mrk(it.get('title', ''))} (`{it.get('id', '?')}`) -- {_park_trigger_text(it)}"
+              for it in parked_waiting]
+        pline, _n = _fit_listing(
+            f"*Parked ({len(parked_waiting)}), waiting on a trigger (a re-ask resurfaces any of them):*",
+            wl, lambda k: f"_+{k} more parked rows in the backlog -- nothing dropped_")
         text_lines.append(pline.splitlines()[0])
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": pline[:2900]}})
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": pline}})
 
     # Hard ceiling (Slack rejects > 50 blocks). By construction the allocator keeps us
     # under it, so a breach is a BUG: fail loud in the log, trim the tail rather than let
@@ -3239,7 +3473,7 @@ def maybe_send_weekly_menu(*, client_factory: Callable | None = None) -> bool:
             return False
         open_resp = client.conversations_open(users=[HARRISON_ID])
         resp = client.chat_postMessage(
-            channel=open_resp["channel"]["id"], text=text[:2900], blocks=blocks,
+            channel=open_resp["channel"]["id"], text=_fit_plain(text, 2900), blocks=blocks,
             unfurl_links=False, unfurl_media=False,
         )
         record_menu_run({"sent": True, "message_ts": str((resp or {}).get("ts", "")), **carried})
@@ -3282,6 +3516,18 @@ def stage_bundle(value: str, actor_id: str) -> tuple[str, str]:
             existing = next((r.get("prompt_path") for r in fresh if r and r.get("prompt_path")), "")
             return "noop", (f"Bundle already staged: `{existing}`" if existing
                             else "Bundle already staged.")
+        # C1 EVIDENCE FLOOR (D-051 lens B HIGH #1): the bundle button is the SAME
+        # Monday-menu surface as the 9/7 incident's singleton Stage button, and it
+        # bypassed the floor entirely (register_from_efficiency lands APPROVED rows
+        # with no pointer). Floored rows are refused by id; only the rest stage.
+        floored = [r for r in still if not has_evidence(r)]
+        still = [r for r in still if has_evidence(r)]
+        floored_ids = ", ".join(f"`{r['id']}`" for r in floored)
+        if not still:
+            return "no_evidence", (
+                f"NOT staged -- no item in this bundle carries evidence (no Slack permalink, "
+                f"no seed body): {floored_ids}. Attach the threads, or stage each deliberately "
+                "with `stage <id>` in your Cora DM (the override).")
         # Slug from the shared theme, NOT item #1 (defect #5).
         slug = _slug(_bundle_theme(still))
         meta: dict[str, Any] = {}
@@ -3297,7 +3543,9 @@ def stage_bundle(value: str, actor_id: str) -> tuple[str, str]:
             _append_event(ev)
         _render_backlog_safe()
         _dm_prompt_path(path)
-        return "staged", f"📝 Bundle prompt staged ({len(still)} items): `{path}`"
+        return "staged", (f"📝 Bundle prompt staged ({len(still)} items): `{path}`"
+                          + (f" -- {len(floored)} refused by the evidence floor (no permalink, "
+                             f"no seed body): {floored_ids}" if floored else ""))
     finally:
         _end_staging(keys)
 

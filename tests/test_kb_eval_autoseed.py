@@ -41,7 +41,20 @@ _SCRIPTS = str(Path(__file__).resolve().parents[1] / "scripts")
 if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 
+import os as _os
+
+_prev_eval_mode = _os.environ.get("CORA_EVAL_MODE")
 import run_kb_evals as ev  # noqa: E402
+# run_kb_evals sets CORA_EVAL_MODE=1 at IMPORT (correct for the CLI). In a pytest
+# session that import happens at COLLECTION, before any test runs, and the flag
+# makes tools_for_entity() return [] for every later test without its own delenv
+# guard (found 2026-09-09: 82 order-dependent failures in a targeted run; the full
+# suite was green only because test_kb_evals.py, collected next, pops it). Restore
+# the pre-import state here; the tests that need eval mode set it per test.
+if _prev_eval_mode is None:
+    _os.environ.pop("CORA_EVAL_MODE", None)
+else:
+    _os.environ["CORA_EVAL_MODE"] = _prev_eval_mode
 
 
 CASES = {"f3e-x": {"id": "f3e-x", "entity": "F3E", "question": "what is X?"}}

@@ -1131,7 +1131,7 @@ def test_cq_confirm_race_no_duplicate(qenv, monkeypatch):
 def _slow_counting_gen(counter):
     import time as _t
 
-    def _g(items, *, slug=None, meta_out=None):
+    def _g(items, *, slug=None, meta_out=None, **_kw):
         counter["n"] += 1
         _t.sleep(0.25)  # widen the TOCTOU window
         if meta_out is not None:

@@ -166,7 +166,7 @@ def test_request_shaped_checkpoints_use_the_request_union():
         # (+ its resume-event text) and a dismissal note, both typed by Harrison
         # into a modal and refused to his face on a hit. Same lane as apply_edit.
         'if phi_guard.is_any_phi_request(f"{reason} {trigger_event}"):',      # park_item
-        "if phi_guard.is_any_phi_request(note):",                             # dismiss_with_evidence
+        "if phi_guard.is_any_phi_request(n):",                                # validate_dismiss_note (the modal + dismiss_with_evidence share it)
     ):
         assert needle in src, needle
     assert src.count("is_any_phi_request(") == 4, (

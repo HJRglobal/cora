@@ -308,7 +308,9 @@ def is_inventory_write_channel(channel_name: str | None) -> bool:
 _INV_CHANNEL_ID_CACHE: dict[str, object] = {"at": 0.0, "value": None}
 
 
-def inventory_write_channel_ids() -> set[str]:
+def _inventory_write_channel_index() -> dict[str, str]:
+    """{slack_channel_id: ENTITY} for every configured write channel that names
+    both. Same TTL as the name set; a failed/empty load is never cached."""
     now = time.monotonic()
     cached = _INV_CHANNEL_ID_CACHE.get("value")
     if cached is not None and (now - float(_INV_CHANNEL_ID_CACHE["at"])) < _INV_CHANNEL_TTL:
@@ -316,27 +318,120 @@ def inventory_write_channel_ids() -> set[str]:
     try:
         import yaml
         if not _INV_CHANNEL_CFG_PATH.exists():
-            return set()
+            return {}
         data = yaml.safe_load(_INV_CHANNEL_CFG_PATH.read_text(encoding="utf-8")) or {}
-        value = {
-            str(v.get("slack_channel_id") or "").strip()
-            for k, v in (data.get("channels") or {}).items()
-            if isinstance(v, dict) and str(v.get("slack_channel_id") or "").strip()
-        }
+        value: dict[str, str] = {}
+        for _k, v in (data.get("channels") or {}).items():
+            if not isinstance(v, dict):
+                continue
+            cid = str(v.get("slack_channel_id") or "").strip()
+            ent = str(v.get("entity") or "").strip().upper()
+            if cid and ent:
+                value[cid] = ent
     except Exception:  # noqa: BLE001 -- a guard input helper never raises
-        return set()
+        return {}
     if value:  # never cache an empty/failed load
         _INV_CHANNEL_ID_CACHE.update({"at": now, "value": value})
     return value
 
 
+def inventory_write_channel_ids(entity: str | None = None) -> set[str]:
+    """Slack IDs of the configured write channels (`slack_channel_id`), optionally
+    only those whose configured `entity` matches -- the membership authority for an
+    F3E write is the membership of F3E's channel(s), never of some other entity's
+    inventory channel that happens to be configured (D-051 lens C F4). A channel
+    with no `entity` is never returned."""
+    idx = _inventory_write_channel_index()
+    if entity is None:
+        return set(idx)
+    want = str(entity or "").strip().upper()
+    return {cid for cid, ent in idx.items() if ent == want}
+
+
+def is_inventory_write_channel_id(channel_id: str | None, *, entity: str | None = None) -> bool:
+    """True when this Slack channel ID is a configured write channel (of `entity`,
+    when given). The G1 grant keys on the immutable ID, not the resolved name
+    (D-051 lens C F5: a name rides a 30-min cache and can be re-taken after an
+    archive; the id cannot)."""
+    cid = str(channel_id or "").strip()
+    return bool(cid) and cid in inventory_write_channel_ids(entity)
+
+
+def inventory_write_channel_entity(channel_id: str | None) -> str:
+    """The configured entity of a write channel id, '' when unknown."""
+    return _inventory_write_channel_index().get(str(channel_id or "").strip(), "")
+
+
+def inventory_write_channel_names(entity: str | None = None) -> set[str]:
+    """The configured write-channel NAMES (the YAML keys), optionally only those of
+    `entity` -- for user-facing refusal text (D-051 lens A LOW #9). Read on the
+    refusal path only, so no cache; a failed load is an empty set (never raises)."""
+    try:
+        import yaml
+        if not _INV_CHANNEL_CFG_PATH.exists():
+            return set()
+        data = yaml.safe_load(_INV_CHANNEL_CFG_PATH.read_text(encoding="utf-8")) or {}
+        want = str(entity or "").strip().upper()
+        out: set[str] = set()
+        for name, v in (data.get("channels") or {}).items():
+            if not isinstance(v, dict):
+                continue
+            ent = str(v.get("entity") or "").strip().upper()
+            if entity is None or ent == want:
+                out.add(str(name).strip().lstrip("#"))
+        return out
+    except Exception:  # noqa: BLE001 -- a guard input helper never raises
+        return set()
+
+
 def is_inventory_write_intent(text: str) -> bool:
     """Either form of an office-inventory WRITE request: the rigid template
     (is_inventory_adjustment_request) or the prose form (is_inventory_write_request).
-    The G1 in-channel grant keys on this together with the channel, so a QUESTION
-    posted in the write channel by a non-roster member is still governed by the
-    ordinary entity gate."""
+    Recognition only -- the GRANT predicate below is strictly narrower."""
     return is_inventory_adjustment_request(text) or is_inventory_write_request(text)
+
+
+#: A PURE template: every non-empty line is the header, the Reason line (with an
+#: annotation-shaped value) or a `SKU: n` line. Nothing else may ride along.
+_TEMPLATE_HEADER_LINE_RE = re.compile(
+    r"^\s*\*{0,2}[\w][\w /\-()]*(?:inventory|stock)[\w /\-()]*\*{0,2}\s*:?\s*$", re.I)
+_MAX_TEMPLATE_LEN = 600
+
+
+def is_inventory_write_grant_request(text: str) -> bool:
+    """The G1 GRANT predicate: strictly narrower than recognition (D-051 lens C F3).
+
+    The recognition predicate's template branch has neither the question veto nor
+    the length cap its prose sibling has, so "3-line wrapper + any appended ask"
+    satisfied it -- and with the grant, that appended ask would have run with F3E
+    entity scope for an unlisted user. The grant therefore requires EITHER the prose
+    form (which carries the veto + 240-char cap already) OR a PURE template: bounded,
+    every non-empty line one of header / Reason (annotation value, not a request) /
+    `SKU: n`, and no question shape anywhere. A template with a stapled ask falls
+    back to the ordinary entity gate -- harmless for a rostered user, a refusal for
+    an unrostered one, which is the safe direction.
+    """
+    if not text or not isinstance(text, str):
+        return False
+    if is_inventory_write_request(text):
+        return True
+    if not is_inventory_adjustment_request(text):
+        return False
+    if len(text) > _MAX_TEMPLATE_LEN or _QUESTION_SHAPE_RE.search(text):
+        return False
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        m = _REASON_LINE_RE.match(line)
+        if m:
+            value = m.group(2).strip()
+            if len(value) > _MAX_REASON_LEN or _REASON_IS_REQUEST_RE.search(value):
+                return False
+            continue
+        if _SKU_LINE_RE.match(line) or _TEMPLATE_HEADER_LINE_RE.match(line):
+            continue
+        return False  # a line that is none of the three shapes: not a pure template
+    return True
 
 
 def is_inventory_adjustment_request(text: str) -> bool:

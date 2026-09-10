@@ -641,16 +641,22 @@ def _auto_expire_unrouted_operational(entries: list, cutoff_dt, now_dt) -> int:
 
 
 def _expire_low_risk_mechanical(entries: list, now_dt,
-                                answered_ts: dict | set | None = None) -> tuple[int, int, int]:
+                                answered_ts: dict | set | None = None,
+                                ) -> tuple[int, int, int, int, int]:
     """C2 (Code #12; Q5 = (d) ruled 9/1, classes + 14d ruled 9/8): resolve, in
     place and BY NAME, the PENDING rows that are exactly task_close / asana_task /
     hubspot_note, entity FNDR or F3E, pending >= 14 days (from the later of
     creation and first surfacing) with no reviewer action -> DISMISSED with
     resolved_reason `expired_low_risk` (review_lanes.EXPIRED_LOW_RISK).
 
-    Returns (expired, skipped_entity_unresolved, skipped_other_entity) so the run
-    log states how much of the pool the drain could NOT touch and why -- an
-    unresolvable entity is a refusal (it might be LEX), never a default.
+    Returns (expired, skipped_entity_unresolved, skipped_other_entity,
+    skipped_content_screened, expired_never_carded) so the run log states how much
+    of the pool the drain could NOT touch and why -- an unresolvable entity is a
+    refusal (it might be LEX), never a default; a row the decision lane's content
+    screen excludes is a refusal too (D-051 lens E F3: a description carrying a LEX
+    token under an F3E-resolved entity was 1 of the 53 the first run would have
+    dismissed). Each expired row records `surfaced` (was it ever carded), so the
+    terminal is honest about whether a reviewer was ever asked (lens E F4).
 
     Runs BEFORE _escalate_stale_mechanical in the same lock + rewrite, so an
     expired row is never also escalated; everything this pass declines still
@@ -659,7 +665,7 @@ def _expire_low_risk_mechanical(entries: list, now_dt,
     the Monday digest and on the weekly batch card -- not a timer pretending to
     be a decision.
     """
-    expired = unresolved = other = 0
+    expired = unresolved = other = screened = never_carded = 0
     for e in entries:
         if e.get("state") != "PENDING" or not review_lanes.is_mechanical(e):
             continue
@@ -669,12 +675,18 @@ def _expire_low_risk_mechanical(entries: list, now_dt,
             e["state"] = "DISMISSED"
             e["resolved_at"] = now_dt.isoformat()
             e["resolved_reason"] = review_lanes.EXPIRED_LOW_RISK
+            surfaced = bool(str(e.get("dm_message_ts") or "").strip())
+            e["surfaced"] = surfaced
             expired += 1
+            if not surfaced:
+                never_carded += 1
         elif why == "entity_unresolved":
             unresolved += 1
         elif why == "other_entity":
             other += 1
-    return expired, unresolved, other
+        elif why == "content_screened":
+            screened += 1
+    return expired, unresolved, other, screened, never_carded
 
 
 # ── C2: the weekly mechanical BATCH-REVIEW card (cq-8b51427896b8 folded) ───────
@@ -719,25 +731,33 @@ def _age_days(entry: dict, now_dt) -> int | None:
         return None
 
 
-def _count_expired_low_risk_7d(now_dt) -> int:
-    """Rows resolved `expired_low_risk` in the last 7 days (live ledger + archive)."""
-    n = 0
+def _count_expired_low_risk_7d(now_dt) -> int | None:
+    """Rows resolved `expired_low_risk` in the last 7 days (live ledger + archive),
+    de-duplicated by update_id -- a rotation crash window can leave one row in BOTH
+    files, and flywheel_metrics dedups for exactly that reason; the card and the
+    health digest must agree (D-051 lens E F6). None when the ledgers cannot be
+    read: blind is never rendered as 0."""
     try:
         from cora.knowledge_review import load_proposed_updates, _ARCHIVE_PATH  # type: ignore[attr-defined]
+        import json as _json
         rows = list(load_proposed_updates())
-        try:
-            import json as _json
-            if _ARCHIVE_PATH.exists():
-                for line in _ARCHIVE_PATH.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if line:
-                        try:
-                            rows.append(_json.loads(line))
-                        except Exception:  # noqa: BLE001
-                            continue
-        except Exception:  # noqa: BLE001
-            pass
+        if _ARCHIVE_PATH.exists():
+            for line in _ARCHIVE_PATH.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(_json.loads(line))
+                except Exception:  # noqa: BLE001 -- a torn archive line is not a count
+                    continue
+        seen: set[str] = set()
+        n = 0
         for r in rows:
+            uid = str(r.get("update_id") or "")
+            if uid:
+                if uid in seen:
+                    continue
+                seen.add(uid)
             if r.get("resolved_reason") != review_lanes.EXPIRED_LOW_RISK:
                 continue
             try:
@@ -745,13 +765,27 @@ def _count_expired_low_risk_7d(now_dt) -> int:
                     n += 1
             except Exception:  # noqa: BLE001
                 continue
-    except Exception:  # noqa: BLE001
         return n
-    return n
+    except Exception:  # noqa: BLE001 -- unreadable ledgers: unknown, never zero
+        return None
+
+
+def _row_renderable(u: dict) -> tuple[bool, str]:
+    """(renderable, entity_or_reason) -- the ONE gate both card loops use (D-051 lens
+    A MED #7): a LEX-resolved row is counted, never rendered; a row the decision
+    lane's content screen excludes (lex_token / phi / qa / screen_error, fail-closed)
+    is withheld. Everything else renders with its resolved entity ('' = unresolved)."""
+    ent = review_lanes.resolve_entity(u)
+    if ent.startswith("LEX"):
+        return False, "lex"
+    excluded, _why = review_lanes.content_screen_excludes(u)
+    if excluded:
+        return False, "screened"
+    return True, ent
 
 
 def _build_mechanical_batch_card(pending: list[dict], now_dt, *, expired_this_run: int,
-                                 expired_7d: int) -> str:
+                                 expired_7d: int | None, never_carded_this_run: int = 0) -> str:
     """The card text. Pure; content-screened per row; LEX rows count-only."""
     mech = [u for u in pending if review_lanes.is_mechanical(u)]
     overdue = sum(1 for u in mech if review_lanes.past_review_deadline(u, now_dt))
@@ -768,49 +802,57 @@ def _build_mechanical_batch_card(pending: list[dict], now_dt, *, expired_this_ru
     lines.append("by entity: " + " · ".join(
         f"{e} {n}" + (" (count only)" if e.startswith("LEX") else "")
         for e, n in sorted(by_entity.items(), key=lambda kv: (-kv[1], kv[0]))))
+    seven = ("unavailable (ledger unreadable)" if expired_7d is None
+             else f"{expired_7d} in 7d (incl. this run)")
     lines.append(
         f"Auto-expire (`{review_lanes.EXPIRED_LOW_RISK}`, a NAMED terminal: task_close / asana_task / "
         f"hubspot_note, entity FNDR or F3E only, >= {review_lanes.LOW_RISK_EXPIRE_DAYS}d pending, no "
-        f"reviewer action): {expired_this_run} this run · {expired_7d} in 7d. Every other class and "
-        f"entity rides this card and never auto-expires.")
+        f"reviewer action): {expired_this_run} this run ({never_carded_this_run} of them never carded "
+        f"to a reviewer) · {seven}. Every other class and entity rides this card and never "
+        f"auto-expires.")
     oldest = sorted(mech, key=lambda u: str(u.get("proposed_at") or ""))
     shown = 0
     withheld = 0
     lex_hidden = 0
     lines.append(f"Oldest still pending (up to {_BATCH_CARD_OLDEST_N}, content-screened):")
     for u in oldest:
-        if shown >= _BATCH_CARD_OLDEST_N:
-            break
-        ent = review_lanes.resolve_entity(u)
-        if ent.startswith("LEX"):
-            lex_hidden += 1
+        ok, tag = _row_renderable(u)
+        if not ok:
+            # counted over the WHOLE pool, not just the rows scanned before the cap
+            # (D-051 lens E F13: '4 withheld' read as a total against a LEX
+            # population of 29)
+            if tag == "lex":
+                lex_hidden += 1
+            else:
+                withheld += 1
             continue
-        excluded, _why = review_lanes.content_screen_excludes(u)
-        if excluded:
-            withheld += 1
+        if shown >= _BATCH_CARD_OLDEST_N:
             continue
         age = _age_days(u, now_dt)
         desc = str(u.get("description") or "(no description)")[:140]
         shown += 1
-        lines.append(f"  {shown}. [{u.get('update_type')}] {ent or '?'} "
+        lines.append(f"  {shown}. [{u.get('update_type')}] {tag or '?'} "
                      f"{'' if age is None else str(age) + 'd'} -- {desc}")
     if withheld or lex_hidden:
         lines.append(f"  ({withheld} withheld by the content screen; {lex_hidden} LEX row(s) counted, "
-                     f"never rendered)")
+                     f"never rendered -- across the whole pending pool)")
     # NEEDS HARRISON -- the judgment + decision lanes (never auto-expire): the live
     # refresh cq-8b51427896b8 asked for, re-derived from the ledger every Monday
-    # instead of a stale hand-written section.
+    # instead of a stale hand-written section. Same renderability gate as above;
+    # filter THEN slice, so a screened-out oldest row never eats a slot silently.
     judgment = [u for u in pending if is_knowledge_update(u.get("update_type"), u.get("payload"))]
     decisions = [u for u in pending if u.get("update_type") == _kr_UPDATE_TYPE_DECISION]
     lines.append(f"*Needs Harrison* (judgment lane, never auto-expires): {len(judgment)} knowledge "
                  f"item(s) + {len(decisions)} decision card(s) pending.")
-    for u in sorted(judgment, key=lambda u: str(u.get("proposed_at") or ""))[:5]:
-        excluded, _why = review_lanes.content_screen_excludes(u)
-        if excluded:
-            continue
+    renderable = [u for u in sorted(judgment, key=lambda u: str(u.get("proposed_at") or ""))
+                  if _row_renderable(u)[0]]
+    for u in renderable[:5]:
         age = _age_days(u, now_dt)
         lines.append(f"  - [{u.get('update_type')}] {'' if age is None else str(age) + 'd'} -- "
                      f"{str(u.get('description') or '')[:120]}")
+    if len(judgment) > len(renderable):
+        lines.append(f"  ({len(judgment) - len(renderable)} knowledge item(s) withheld by the "
+                     f"content screen / LEX -- counted, never rendered)")
     lines.append("_React on the individual cards to act (thumbs-up do it, thumbs-down dismiss); "
                  "this summary carries no buttons._")
     text = "\n".join(lines)
@@ -823,22 +865,31 @@ def _build_mechanical_batch_card(pending: list[dict], now_dt, *, expired_this_ru
 
 def _maybe_send_mechanical_batch_card(pending: list[dict], log: logging.Logger, *,
                                       dry_run: bool, expired_this_run: int,
+                                      never_carded_this_run: int = 0,
                                       now_dt=None, _client_factory=None) -> bool:
-    """Send the weekly card on the digest day, once per day. Dry-run logs the text.
+    """Send the weekly card on the digest day, once per day. A DRY RUN renders and
+    logs the text on ANY weekday (D-051 lens E F12: the preview used to be
+    reachable only on the day it also sends for real) and never sends or marks.
     Returns True only when a DM was actually sent."""
-    if not _is_digest_day():
-        return False
     now_dt = now_dt or datetime.now(timezone.utc)
     today_az = datetime.now(timezone(timedelta(hours=-7))).date().isoformat()
-    if not dry_run and _batch_card_sent_today(today_az):
+    if dry_run:
+        text = _build_mechanical_batch_card(
+            pending, now_dt, expired_this_run=expired_this_run,
+            expired_7d=_count_expired_low_risk_7d(now_dt),
+            never_carded_this_run=never_carded_this_run)
+        log.info("[DRY RUN] mechanical batch card would read (digest day today: %s):\n%s",
+                 "yes" if _is_digest_day() else "no -- it sends on Mondays only", text)
+        return False
+    if not _is_digest_day():
+        return False
+    if _batch_card_sent_today(today_az):
         log.info("mechanical batch card: already sent today -- not re-sending")
         return False
     text = _build_mechanical_batch_card(
         pending, now_dt, expired_this_run=expired_this_run,
-        expired_7d=_count_expired_low_risk_7d(now_dt))
-    if dry_run:
-        log.info("[DRY RUN] mechanical batch card would read:\n%s", text)
-        return False
+        expired_7d=_count_expired_low_risk_7d(now_dt),
+        never_carded_this_run=never_carded_this_run)
     token = os.environ.get("SLACK_BOT_TOKEN", "")
     ts = send_dm_to_harrison(text, token, _client_factory=_client_factory)
     if not ts:
@@ -1609,6 +1660,10 @@ def main() -> int:
     # DMs it this run. Otherwise a fact posted right before a >48h gap (e.g. an
     # #info-for-cora note Friday evening, next review Monday 7am) would be
     # silently dropped before Harrison ever saw it.
+    # C2 counters live OUTSIDE the dry-run branch so the batch card reads them by
+    # name (D-051 lens E F14: a locals().get() reached across the branch).
+    low_risk_expired = low_risk_unresolved = low_risk_other = 0
+    low_risk_screened = low_risk_never_carded = 0
     if not args.dry_run:
         import json as _json
         from datetime import datetime as _dt, timezone as _tz, timedelta as _td
@@ -1624,7 +1679,6 @@ def main() -> int:
         answered_ts = _kr_actionable_reaction_actors()
         auto_dismissed = 0
         expired_unrouted = 0
-        low_risk_expired = low_risk_unresolved = low_risk_other = 0
         mech_escalated = 0
         mech_overdue = 0
         mech_retired = 0
@@ -1653,7 +1707,8 @@ def main() -> int:
                 # C2 (Code #12): the three low-risk mechanical classes in FNDR/F3E
                 # expire BY NAME after 14d pending with no reviewer action -- before
                 # the escalation pass, so an expired row is never also escalated.
-                low_risk_expired, low_risk_unresolved, low_risk_other = \
+                (low_risk_expired, low_risk_unresolved, low_risk_other,
+                 low_risk_screened, low_risk_never_carded) = \
                     _expire_low_risk_mechanical(entries, now, answered_ts)
                 # D-206: mechanical rows no longer age out silently -- they
                 # escalate. Same pass, same lock, same rewrite as the expiry it
@@ -1683,15 +1738,18 @@ def main() -> int:
                      "DM'd/routed) as expired_unrouted",
                      expired_unrouted, "y" if expired_unrouted == 1 else "ies",
                      _OPERATIONAL_UNROUTED_EXPIRY_DAYS)
-        if low_risk_expired or low_risk_unresolved or low_risk_other:
-            # Named and counted every run (never silent): what expired, and how
-            # much of the pool the drain could NOT touch and why.
+        if low_risk_expired or low_risk_unresolved or low_risk_other or low_risk_screened:
+            # Named and counted every run (never silent): what expired, how many of
+            # those a reviewer was never even shown (D-051 lens E F4 -- 'no reviewer
+            # action' and 'no reviewer was ever asked' are different sentences), and
+            # how much of the pool the drain could NOT touch and why.
             log.info("expired_low_risk: %d mechanical row(s) resolved by name (task_close/"
-                     "asana_task/hubspot_note, FNDR/F3E, >=%dd pending, no reviewer action); "
-                     "%d left pending (entity unresolvable -- never expired), %d left pending "
-                     "(other entity -- rides the batch card)",
-                     low_risk_expired, review_lanes.LOW_RISK_EXPIRE_DAYS,
-                     low_risk_unresolved, low_risk_other)
+                     "asana_task/hubspot_note, FNDR/F3E, >=%dd pending, no reviewer action) "
+                     "-- %d of them were never carded to a reviewer; %d left pending (entity "
+                     "unresolvable -- never expired), %d left pending (other entity -- rides "
+                     "the batch card), %d left pending (content screen -- never expired)",
+                     low_risk_expired, review_lanes.LOW_RISK_EXPIRE_DAYS, low_risk_never_carded,
+                     low_risk_unresolved, low_risk_other, low_risk_screened)
         if mech_overdue:
             # The standing measure of the thing D-206 forbids hiding. WARNING,
             # not INFO, and it names the reason nobody can act when that is the
@@ -1778,7 +1836,16 @@ def main() -> int:
         slack_token = os.environ.get("SLACK_BOT_TOKEN", "")
         for u in approved_updates:
             log.info("  [%s] %s — %s", u["update_type"], u["update_id"][:8], u["description"][:120])
-            ok = _execute_approved_update(u, slack_token, log)
+            if args.dry_run:
+                # D-051 lens E F1 (2026-09-09): this call had NO dry-run gate. A
+                # `--dry-run` at 17:48 completed one real Asana task, created three,
+                # posted to #hjrg-leadership -- and, because the resolve above IS
+                # dry-run-gated, left all four rows PENDING for the next live run to
+                # execute AGAIN. --dry-run means zero connector writes, full stop.
+                log.info("  [DRY RUN] would execute [%s] %s", u["update_type"], u["update_id"][:8])
+                ok = True
+            else:
+                ok = _execute_approved_update(u, slack_token, log)
             # D2: ack AFTER the apply, gated on its result so "Saved" reflects the
             # durable write and a failed apply is never shown as success (D-051).
             if not args.dry_run:
@@ -1813,7 +1880,8 @@ def main() -> int:
     try:
         _maybe_send_mechanical_batch_card(
             pending, log, dry_run=args.dry_run,
-            expired_this_run=locals().get("low_risk_expired", 0))
+            expired_this_run=low_risk_expired,
+            never_carded_this_run=low_risk_never_carded)
     except Exception as exc:  # noqa: BLE001
         log.warning("mechanical batch card failed (non-fatal): %s", exc)
     unsent = [u for u in pending if not u.get("dm_message_ts")]

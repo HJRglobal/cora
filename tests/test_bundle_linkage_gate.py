@@ -121,8 +121,12 @@ class TestGate:
         cq._append_event({"event": "staged", "ts": cq._now_iso(), "id": cid, "prompt_path": "/p"})
         rec = cq.get_item(cid)
         assert rec["status"] == "STAGED" and not rec.get("bundle_id")
-        outcome, _ = cq.process_queue_action(cq.ACTION_MARK_SHIPPED, cid, HARRISON)
+        outcome, msg = cq.process_queue_action(cq.ACTION_MARK_SHIPPED, cid, HARRISON)
         assert outcome == "refused"
+        # D-051 lens B MED #4: the refusal names the one door such a row has -- there
+        # is no reconcile script for a row staged before bundle linkage existed
+        assert "predates bundle linkage" in msg and f"ship {cid} <bundle-or-branch>" in msg
+        assert cq.get_item(cid)["status"] == "STAGED"
 
     def test_non_founder_still_not_authorized(self, qenv):
         cid = _seed(title="tommy ships")

@@ -119,11 +119,9 @@ class TestF4Synthetic:
         import re
         src = inspect.getsource(cq._fold_items)
         branches = set(re.findall(r'et == "([a-z_]+)"', src))
-        assert branches <= cq._KNOWN_EVENT_TYPES
-        # every known kind is either a reducer branch or a deliberately status-neutral
-        # kind the fold reads by name elsewhere in the same function
-        for kind in cq._KNOWN_EVENT_TYPES:
-            assert f'"{kind}"' in src, kind
+        # strict equality (D-051 lens D LOW #9): a KNOWN kind with no reducer branch
+        # used to pass on a substring a docstring or comment could satisfy
+        assert branches == cq._KNOWN_EVENT_TYPES
 
 
 class TestF4Live:
@@ -141,7 +139,7 @@ class TestF4Live:
         # second method (audit §H): a raw scan independent of ledger_integrity()
         events = [json.loads(l) for l in real.read_text(encoding="utf-8").splitlines() if l.strip()]
         captured = {e.get("id") for e in events if e.get("event") == "captured"}
-        raw_orphans = sorted({e.get("id") for e in events if e.get("id") not in captured})
+        raw_orphans = sorted({i for e in events if (i := e.get("id")) and i not in captured})
         assert raw_orphans == ids
         assert rep["unknown_event_types"] == {"cowork-biweekly-review": 1}, rep["unknown_event_types"]
 
@@ -200,3 +198,77 @@ class TestF5:
         finally:
             cq._EVENT_LEDGER = saved
         assert rep["proposed_total"] >= rep["aged_total"] >= len(rep["aged_priority"])
+        # the NON-EMPTINESS the name promises (D-051 lens D MED #5: the inequality
+        # alone is true by construction and passed at 0/0/0)
+        assert rep["aged_total"] >= 1 and rep["aged_priority"], rep
+
+
+class TestF4Blind:
+    """B MED #3 (D-051): a MISSING or TORN ledger must never read as clean."""
+
+    def test_missing_ledger_raises_and_the_check_warns(self, qenv, monkeypatch):
+        with pytest.raises(FileNotFoundError):
+            cq.ledger_integrity(qenv / "does-not-exist.jsonl")
+        monkeypatch.setattr(cq, "_EVENT_LEDGER", qenv / "does-not-exist.jsonl")
+        r = hc.check_code_queue_ledger_integrity()
+        assert r.status == "warn" and "Could not reconcile" in r.detail
+
+    def test_empty_ledger_reports_nothing_folded_not_ok(self, qenv):
+        cq._EVENT_LEDGER.write_text("", encoding="utf-8")
+        rep = cq.ledger_integrity()
+        assert rep["raw_ids"] == 0 and rep["folded_ids"] == 0 and rep["unparseable"] == 0
+
+    def test_torn_lines_are_counted_and_warned(self, qenv):
+        cq.seed_item(kind="bug", severity="P2", title="healthy", summary="s", entity="F3E",
+                     signal="explicit", status="PROPOSED")
+        with cq._EVENT_LEDGER.open("a", encoding="utf-8") as fh:
+            fh.write('{"event": "approved", "ts": "2026-09-09T00:00:00", "id": "cq-aaaaaaaaaaaa"\n')  # torn
+            fh.write("not json at all\n")
+        rep = cq.ledger_integrity()
+        assert rep["unparseable"] == 2
+        r = hc.check_code_queue_ledger_integrity()
+        assert r.status == "warn" and "2 unparseable line(s)" in r.detail
+
+
+class TestParkedAging:
+    """B HIGH #2 (D-051): a PARKED row whose trigger fired is watched by a gauge."""
+
+    def _park(self, until):
+        import uuid
+        # distinct titles: seed_item fuzzy-dedups titles at 0.85 (a shared prefix collapses them)
+        cid = cq.seed_item(kind="bug", severity="P1", title=f"parked {uuid.uuid4().hex}", summary="s",
+                           entity="F3E", signal="explicit", status="APPROVED")
+        o, _ = cq.park_item(cid, HARRISON, "waiting", until=until)
+        assert o == "parked"
+        return cid
+
+    def test_due_and_reasked_parks_are_due(self, qenv):
+        due = self._park("2026-01-01")                                   # date passed
+        future = (cq._now().date() + timedelta(days=30)).isoformat()
+        waiting = self._park(future)
+        reasked = self._park(future)
+        cq._append_event({"event": "recurrence", "ts": cq._now_iso(), "id": reasked,
+                          "evidence": {"channel_id": "C1", "ts": "1.2"}})
+        rep = cq.parked_aging()
+        ids = {d["id"] for d in rep["due"]}
+        assert ids == {due, reasked} and rep["parked_total"] == 3
+        by = {d["id"]: d for d in rep["due"]}
+        assert by[reasked]["parked_recurrences"] == 1 and by[due]["park_until"] == "2026-01-01"
+        assert waiting not in ids
+
+    def test_health_check_warns_with_ids_and_ok_when_quiet(self, qenv):
+        future = (cq._now().date() + timedelta(days=30)).isoformat()
+        self._park(future)
+        assert hc.check_parked_aging().status == "ok"
+        due = self._park("2026-01-01")
+        r = hc.check_parked_aging()
+        assert r.status == "warn" and due in r.detail and "Re-queue" in r.detail
+
+    def test_scan_failure_warns(self, monkeypatch):
+        monkeypatch.setattr(cq, "parked_aging", lambda: 1 / 0)
+        assert hc.check_parked_aging().status == "warn"
+
+    def test_registered_in_main(self):
+        import inspect
+        body = inspect.getsource(hc)[inspect.getsource(hc).index("def main("):]
+        assert "all_results.append(check_parked_aging())" in body

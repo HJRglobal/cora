@@ -5,6 +5,7 @@ the first run under the gate); the probe proves the gate on a throwaway ledger."
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -12,12 +13,20 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location(
-        "reconcile_code12",
-        _REPO_ROOT / "scripts" / "reconcile_code_queue_code12_2026-09-09.py")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
+    # D-051 lens D MED #7: the script's import-time load_dotenv(override=True) writes
+    # straight into os.environ (monkeypatch cannot see it) and un-pins the live flags
+    # conftest set. Snapshot + restore around the exec so the tests keep their pins.
+    saved = dict(os.environ)
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "reconcile_code12",
+            _REPO_ROOT / "scripts" / "reconcile_code_queue_code12_2026-09-09.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
     return mod
 
 
@@ -96,7 +105,8 @@ def test_apply_passes_the_bundle_reference_and_labels_follow_outcomes(capsys, mo
     assert "SUPERSEDED  cq-0f8abd3c1981  by cq-deca62a00719" in out
     assert "RE-GRADED  cq-a296aa8e0a2e  LOW -> HIGH" in out
     recs = [e for e in events if e.get("event") == "reconciled"]
-    assert {e["id"] for e in recs} == {"cq-0f8abd3c1981", "cq-a296aa8e0a2e"}
+    # supersede + re-grade + the four evidence-attached dismissals (D-051 lens E F11)
+    assert {e["id"] for e in recs} == {"cq-0f8abd3c1981", "cq-a296aa8e0a2e"} | EXPECTED_DISMISSED
     assert all(e["bundle_id"] == "code-12" and e["commit"] == "abc1234" for e in recs)
 
 
@@ -127,11 +137,36 @@ def test_shared_prompt_sharers_are_reported_not_struck(capsys, monkeypatch):
 
 def test_probe_gate_refuses_without_bundle_and_never_touches_the_real_ledger(capsys, monkeypatch):
     mod = _load()
-    real = mod.code_queue._EVENT_LEDGER
+    # the UNREDIRECTED constant (D-051 lens D LOW-MED #8: the conftest autouse fixture
+    # had already pointed _EVENT_LEDGER at tmp, so the old comparison proved nothing)
+    real = mod.code_queue._DEFAULT_EVENT_LEDGER
+    redirected = mod.code_queue._EVENT_LEDGER
     before = real.read_text(encoding="utf-8") if real.exists() else None
     assert mod.main(["--probe-gate"]) == 0
     out = capsys.readouterr().out
     assert "PROBE OK" in out and "refused" in out
     after = real.read_text(encoding="utf-8") if real.exists() else None
     assert before == after
-    assert mod.code_queue._EVENT_LEDGER == real  # restored
+    assert mod.code_queue._EVENT_LEDGER == redirected  # restored
+
+
+def test_env_pins_survive_loading_the_script(monkeypatch):
+    monkeypatch.setenv("CORA_CODE_QUEUE", "off")
+    monkeypatch.setenv("CORA_AUTOWRITE_LIVE", "off")
+    _load()
+    assert os.environ["CORA_CODE_QUEUE"] == "off" and os.environ["CORA_AUTOWRITE_LIVE"] == "off"
+
+
+def test_a_raising_precondition_blocks_instead_of_aborting(capsys, monkeypatch):
+    """D-051 lens E F10: under --apply a raise mid-loop would have left earlier
+    transitions written and later ones not."""
+    mod = _load()
+    monkeypatch.setattr(mod.code_queue, "get_item", _rec("PROPOSED"))
+    monkeypatch.setattr(mod.code_queue, "load_items", lambda: [])
+    monkeypatch.setitem(mod.PRECONDITIONS, "cq-554184feb53b", lambda: 1 / 0)
+    for name in ("process_queue_action", "dismiss_with_evidence", "supersede_item", "set_severity"):
+        monkeypatch.setattr(mod.code_queue, name, _boom)
+    assert mod.main([]) == 1
+    out = capsys.readouterr().out
+    assert "BLOCKED  cq-554184feb53b" in out and "precondition raised ZeroDivisionError" in out
+    assert "would mark SHIPPED  cq-60024f032136" in out  # the loop continued

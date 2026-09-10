@@ -54,6 +54,7 @@ import inspect
 import re
 import subprocess
 import sys
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Callable
@@ -84,7 +85,8 @@ def _s1_present() -> str | None:
     src = inspect.getsource(app.handle_message_event)
     if "code_queue.match_queue_verb(text)" not in src or "code_queue.apply_queue_verb(" not in src:
         return "S1' interceptor not wired in app.handle_message_event"
-    if src.index("code_queue.match_queue_verb(text)") > src.index("gap_autofill.match_pending_ask"):
+    if ("gap_autofill.match_pending_ask" in src
+            and src.index("code_queue.match_queue_verb(text)") > src.index("gap_autofill.match_pending_ask")):
         return "S1' interceptor sits below the gap-ask capture (a pending ask could swallow the verb)"
     return None
 
@@ -94,8 +96,9 @@ def _s2_present() -> str | None:
     if not hasattr(slack_egress, "screen_phantom_write_claims"):
         return "S2' screen missing on this tree"
     src = inspect.getsource(app._dispatch_qa)
-    if src.count("slack_egress.screen_phantom_write_claims(") != 2:
-        return "S2' screen not wired at both final-reply sites in _dispatch_qa"
+    # two final-reply sites + the cached-serve path (D-051 lens A HIGH #2)
+    if src.count("slack_egress.screen_phantom_write_claims(") != 3:
+        return "S2' screen not wired at both final-reply sites + the cached-serve path in _dispatch_qa"
     # behavioural: the 06:53 shape trips in observe mode and returns byte-identical text
     import logging
     text = "Done. Staging all three:\n• cq-e7f2a4c91b2e - x\nAll three are queued."
@@ -120,6 +123,17 @@ def _s3_present() -> str | None:
     from cora import egress_rails, code_queue as cq, mcp_server
     if not hasattr(egress_rails, "observe_week_read") or not hasattr(cq, "format_surface_line"):
         return "S3' observe-week read / surface fields missing"
+    # BEHAVIOUR, not a grep (D-051 lens E F9): the read must count BOTH rails and an
+    # unarmed, empty window must read as NOT clean (silence is not safety).
+    empty = Path(tempfile.mkdtemp(prefix="cq-s3-"))
+    try:
+        read = egress_rails.observe_week_read(log_dir=empty, armed_path=empty / "armed.json")
+    finally:
+        shutil.rmtree(empty, ignore_errors=True)
+    if set(read.get("counts_7d") or {}) != {"sentinel-egress-leak", "phantom-write-claim"}:
+        return "S3' observe_week_read does not count BOTH rails"
+    if read.get("clean_7d") is not False:
+        return "S3' an unarmed, empty window reads as clean"
     hc = (_REPO_ROOT / "scripts" / "nightly_health_check.py").read_text(encoding="utf-8")
     if "all_results.append(check_egress_rails())" not in hc:
         return "S3' check_egress_rails not registered in the nightly check"
@@ -145,6 +159,18 @@ def _c2_present() -> str | None:
     from cora import review_lanes
     if getattr(review_lanes, "EXPIRED_LOW_RISK", "") != "expired_low_risk":
         return "C2 EXPIRED_LOW_RISK missing"
+    # BEHAVIOUR (D-051 lens E F9): the ruled shape expires; a LEX row never does.
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    now = _dt.now(_tz.utc)
+    row = {"state": "PENDING", "update_type": "task_close", "payload": {"entity": "F3E"},
+           "description": "[F3E] Possible task completion: confirm receipts",
+           "proposed_at": (now - _td(days=15)).isoformat(), "dm_message_ts": ""}
+    ok, why = review_lanes.is_low_risk_expirable(row, now)
+    if not ok:
+        return f"C2 is_low_risk_expirable refuses the ruled 15d F3E task_close shape ({why})"
+    lex = dict(row, payload={"entity": "LEX"}, description="[LEX] x")
+    if review_lanes.is_low_risk_expirable(lex, now)[0]:
+        return "C2 is_low_risk_expirable expires a LEX row"
     rk = (_REPO_ROOT / "scripts" / "run_knowledge_review.py").read_text(encoding="utf-8")
     if "_expire_low_risk_mechanical(entries, now, answered_ts)" not in rk:
         return "C2 expiry pass not wired into Step 0"
@@ -175,9 +201,19 @@ def _hotfix_present() -> str | None:
     return None
 
 
+def _gate(fn: Callable[[], str | None]) -> str | None:
+    """Run one precondition; a RAISE is a blocker, never an abort (D-051 lens E F10:
+    an AttributeError from a renamed symbol mid --apply would have left the earlier
+    transitions written and the later ones not)."""
+    try:
+        return fn()
+    except Exception as exc:  # noqa: BLE001
+        return f"precondition raised {type(exc).__name__}: {_ascii(exc)}"
+
+
 def _bundle_present() -> str | None:
     for fn in (_s1_present, _s2_present, _s3_present, _c1_present, _c2_present, _g1_present):
-        b = fn()
+        b = _gate(fn)
         if b:
             return b
     return None
@@ -317,6 +353,7 @@ def probe_gate() -> int:
     finally:
         code_queue._EVENT_LEDGER, code_queue._FINGERPRINT_LEDGER, code_queue._SIGNALS_LEDGER = saved
         code_queue._SYNC = saved_sync
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -339,7 +376,7 @@ def main(argv: list[str] | None = None) -> int:
 
     rc = 0
     for cq_id, label in SHIPPED.items():
-        blocker = PRECONDITIONS.get(cq_id, lambda: None)()
+        blocker = _gate(PRECONDITIONS.get(cq_id, lambda: None))
         if blocker:
             print(f"  BLOCKED  {cq_id}  {label}  -> {blocker}")
             rc = 1
@@ -400,7 +437,12 @@ def main(argv: list[str] | None = None) -> int:
         try:
             outcome, msg = code_queue.dismiss_with_evidence(cq_id, HARRISON_ID, evidence)
             if outcome == "dismissed":
-                print(f"  DISMISSED  {cq_id}  -> {_ascii(msg)[:120]}{share_note}")
+                # D-051 lens E F11: the most contestable disposition names its bundle too.
+                rec_err = _provenance(cq_id, "DISMISSED (evidence-attached)", commit)
+                print(f"  DISMISSED  {cq_id}  -> {_ascii(msg)[:120]}{share_note}"
+                      + (f"  [provenance record FAILED: {rec_err}]" if rec_err else ""))
+                if rec_err:
+                    rc = 1
             else:
                 print(f"  NOT DISMISSED  {cq_id}  -> {outcome}: {_ascii(msg)}")
                 rc = 1
@@ -409,7 +451,7 @@ def main(argv: list[str] | None = None) -> int:
             rc = 1
 
     for loser, (winner, label) in SUPERSEDED.items():
-        blocker = PRECONDITIONS.get(loser, lambda: None)()
+        blocker = _gate(PRECONDITIONS.get(loser, lambda: None))
         if blocker:
             print(f"  BLOCKED  {loser}  supersede by {winner}  -> {blocker}")
             rc = 1

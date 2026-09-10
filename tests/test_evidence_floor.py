@@ -1,7 +1,8 @@
 """C1 -- evidence-attached kickoffs + the EVIDENCE FLOOR (Code #12, cq-b6f2f4825ffb).
 
 Fixture = the four kickoffs the 2026-09-07 Monday menu generated with an EMPTY
-evidence field, replayed from their exact ledger shapes:
+evidence field, replayed in the shapes the floor READS (evidence / summary / signal /
+seeded / reporter -- titles abbreviated, classifier fields omitted; D-051 lens D LOW #12):
   cq-00648c3d162d  deflection, evidence [{channel D0B4CTD3B09, ts "", note <raw ask>}]
   cq-651e6783994f  capability, evidence [{channel "", ts "", note "#fndr"}]  (Harrison's QUESTION)
   cq-17f7595b8c45  LEX deflection, evidence [{channel C0B3RHB3XPU, ts ""}]
@@ -124,12 +125,36 @@ class TestFloorPredicate:
         assert cq._is_seed_shaped(FIXTURE_ROWS[0]) is False
         assert cq._is_seed_shaped(FIXTURE_ROWS[1]) is False
 
-    def test_lex_explicit_redacted_body_needs_a_permalink(self):
-        """A LEX item's body is redacted at rest, so only the pointer can carry it."""
+    def test_lex_explicit_ask_passes_on_a_channel_pointer(self):
+        """A LEX item's body is redacted at rest -- but an EXPLICIT ask is a human
+        typing cora_queue_code_session in a known channel; redaction is Cora's own
+        act, not missing provenance (D-051 lens B MED #7: queue_explicit wrote ts=""
+        and the LEX scrub drops the note, so every LEX explicit ask was floored)."""
         assert cq.has_evidence({"signal": "explicit", "summary": "", "entity": "LEX",
-                                "evidence": [{"channel_id": "C1", "ts": ""}]}) is False
+                                "evidence": [{"channel_id": "C1", "ts": ""}]}) is True
         assert cq.has_evidence({"signal": "explicit", "summary": "", "entity": "LEX",
                                 "evidence": [{"channel_id": "C1", "ts": "1.2"}]}) is True
+        # no channel, no ts, redacted body: still floored
+        assert cq.has_evidence({"signal": "explicit", "summary": "", "entity": "LEX",
+                                "evidence": [{"channel_id": "", "ts": ""}]}) is False
+        # the passive LEX 9/7 rows (deflection / capability) stay floored
+        assert cq.has_evidence(FIXTURE_ROWS[2]) is False and cq.has_evidence(FIXTURE_ROWS[3]) is False
+
+    def test_seeded_flag_without_a_body_is_floored(self):
+        """D-051 lens A LOW #10: the flag says a seed wrote it; the floor still needs
+        something to build from -- a LEX seed (redacted title, blank summary) has none."""
+        assert cq.has_evidence({"seeded": True, "signal": "friction", "summary": "",
+                                "title": cq._LEX_REDACTED_TITLE, "evidence": [{"channel_id": "", "ts": ""}]}) is False
+        assert cq.has_evidence({"seeded": True, "signal": "friction", "summary": "",
+                                "title": "a real title", "evidence": []}) is True
+
+    def test_seed_shape_needs_the_seed_reporter(self):
+        """D-051 lens B LOW: a channel-less passive capture whose note equals its
+        summary must not pass as a seed -- every legacy seed carries seed_item's reporter."""
+        row = {"signal": "deflection", "summary": "Can Cora do X?", "reporter": "U_SOMEONE",
+               "evidence": [{"channel_id": "", "ts": "", "note": "Can Cora do X?"}]}
+        assert cq._is_seed_shaped(row) is False and cq.has_evidence(row) is False
+        assert cq._is_seed_shaped({**row, "reporter": HARRISON}) is True
 
     def test_permalink_needs_both_halves(self):
         assert cq.slack_permalink("C1", "") == ""
@@ -152,6 +177,37 @@ class TestFloorHolds:
         rec = cq.get_item(cid)
         assert rec["status"] == "APPROVED" and not rec.get("prompt_path")
         assert not list((qenv / "founder-os").rglob("*.md"))  # nothing written
+
+    def test_stage_bundle_holds_the_floor(self, qenv):
+        """D-051 lens B HIGH #1: the Monday menu's Stage-bundle button bypassed the
+        floor entirely -- the same surface and button family as the 9/7 incident."""
+        a = _replay(FIXTURE_ROWS[0]); b = _replay(FIXTURE_ROWS[1])
+        o, msg = cq.stage_bundle(f"bundle:{a},{b}", HARRISON)
+        assert o == "no_evidence" and a in msg and b in msg
+        assert cq.get_item(a)["status"] == "APPROVED" and cq.get_item(b)["status"] == "APPROVED"
+        # mixed: the evidenced row stages, the floored row is refused BY ID
+        seeded = cq.seed_item(kind="bug", severity="P2", title="Seeded with body", summary="the body",
+                              entity="FNDR", signal="explicit", status="APPROVED")
+        o, msg = cq.stage_bundle(f"bundle:{seeded},{a}", HARRISON)
+        assert o == "staged" and "1 refused by the evidence floor" in msg and a in msg
+        assert cq.get_item(seeded)["status"] == "STAGED" and cq.get_item(a)["status"] == "APPROVED"
+
+    def test_override_sentence_only_when_the_founder_overrode(self):
+        """D-051 lens B HIGH #1: the kickoff used to CLAIM 'staged by the founder's
+        override' for every floored item, whoever staged it."""
+        plain = "\n".join(cq._evidence_block([FIXTURE_ROWS[1]]))
+        assert "EVIDENCE: none on the item" in plain and "attach the thread before firing" in plain
+        assert "founder's typed override" not in plain
+        overridden = "\n".join(cq._evidence_block([FIXTURE_ROWS[1]], override=True))
+        assert "founder's typed override" in overridden
+        # a passive LEX capture with a channel but no ts renders NO pointer (the
+        # cq-89fdad5f0f86 half-pointer artifact stays out); an EXPLICIT LEX ask
+        # renders its channel pointer, never an invented permalink
+        lex = "\n".join(cq._evidence_block([FIXTURE_ROWS[2]]))
+        assert "C0B3RHB3XPU" not in lex and "permalink:" not in lex
+        typed = dict(FIXTURE_ROWS[2], signal="explicit")
+        lex2 = "\n".join(cq._evidence_block([typed]))
+        assert "channel pointer: <slack://channel?id=C0B3RHB3XPU>" in lex2 and "permalink:" not in lex2
 
     def test_founder_typed_stage_is_the_deliberate_override(self, qenv):
         cid = _replay(FIXTURE_ROWS[0], status="APPROVED")

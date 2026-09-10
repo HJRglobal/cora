@@ -114,6 +114,19 @@ def _mock_slack_auth_test() -> None:
 _mock_slack_auth_test()
 
 
+def pytest_collection_finish(session):
+    """Belt for the import-time env leak class (2026-09-09): a test module that
+    imports scripts/run_kb_evals.py at module level arms CORA_EVAL_MODE=1 for the
+    whole session at COLLECTION time, and tools_for_entity() then returns [] for
+    every test that lacks its own delenv guard. Collection must leave the flag
+    unset; a leak is undone here and named, so it cannot hide behind a sibling
+    module that happens to pop it."""
+    if os.environ.pop("CORA_EVAL_MODE", None) is not None:
+        import warnings
+        warnings.warn("CORA_EVAL_MODE was set after collection -- a test module imports "
+                      "the eval harness at module level; unset for the session")
+
+
 def pytest_configure(config):
     """Called by pytest before any test collection or execution begins.
 
@@ -155,9 +168,17 @@ def pytest_configure(config):
 
 class _EveryoneIsAMember(frozenset):
     """A member set that contains every id -- the suite-wide default for the G1
-    live-membership check (see _inventory_membership_default_member)."""
+    live-membership check (see _inventory_membership_default_member). Truthy and
+    non-empty by construction (D-051 lens D LOW #11): a future `if not members`
+    branch must never read the default as an EMPTY channel while `in` says yes."""
 
     def __contains__(self, item) -> bool:  # noqa: D401
+        return True
+
+    def __len__(self) -> int:
+        return 1
+
+    def __bool__(self) -> bool:
         return True
 
 
@@ -416,6 +437,8 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
         # Code #12 C3: the Monday-menu run artifact (maybe_send_weekly_menu writes
         # one row per fire). A new write path needs its redirect the day it is born.
         ("cora.code_queue", "_MENU_RUNS_LEDGER", "code-queue-menu-runs.jsonl"),
+        # Code #12 S3' coverage: the bot's armed-rails record (egress_rails.record_armed).
+        ("cora.egress_rails", "ARMED_STATE_PATH", "egress-rails-armed.json"),
         ("cora.knowledge_review", "_AUTOWRITE_AUDIT_PATH", "cora-autowrite-audit.jsonl"),
         # cq-eba0861fc043 (session #11 S2): these THREE sat un-redirected right beside
         # _AUTOWRITE_AUDIT_PATH above. propose_update() appends to
@@ -463,6 +486,22 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
                 monkeypatch.setattr(_mod, _attr, tmp_path / _fname, raising=False)
         except Exception:
             pass
+    # SCRIPT-module constants (D-051 lens D HIGH #3 / lens E F7): the loop above
+    # imports by name, which for a `scripts.*` module would run its import-time
+    # load_dotenv(override=True) on EVERY test. So these are redirected only when a
+    # test has ALREADY imported the script -- the only way it could write through
+    # them. Found: 10 pre-existing tests reach the C2 batch-card writer through
+    # rkr.main() with a stubbed DM sender; on a Monday they would stamp the REAL
+    # data/state/mechanical-batch-card.json and suppress the real 07:00 card.
+    import sys as _sys
+    _SCRIPT_CONSTS = [
+        ("scripts.run_knowledge_review", "_MECHANICAL_BATCH_STATE_PATH", "mechanical-batch-card.json"),
+        ("run_knowledge_review", "_MECHANICAL_BATCH_STATE_PATH", "mechanical-batch-card.json"),
+    ]
+    for _mod_name, _attr, _fname in _SCRIPT_CONSTS:
+        _mod = _sys.modules.get(_mod_name)
+        if _mod is not None and hasattr(_mod, _attr):
+            monkeypatch.setattr(_mod, _attr, tmp_path / _fname, raising=False)
     yield
     os.environ["CORA_DISABLE_HUBSPOT_PORTAL_GUARD"] = "1"
     try:
@@ -532,6 +571,10 @@ _GUARDED_LEDGERS = (
     "data/health/instance.json",
     "logs/decision-deliveries.jsonl",
     "logs/fireflies-diarization.jsonl",
+    # Code #12 (D-051 review): the three write paths this bundle added.
+    "data/state/code-queue-menu-runs.jsonl",
+    "data/state/mechanical-batch-card.json",
+    "data/state/egress-rails-armed.json",
 )
 
 

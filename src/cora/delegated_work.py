@@ -293,9 +293,12 @@ def known_job_ids() -> frozenset[str]:
     Raises on an unreadable ledger so the screen skips the family with a WARNING
     instead of redacting real ids."""
     out: set[str] = set()
-    for path in (_BOT_LEDGER, _RUNNER_LEDGER):
-        if not path.exists():
-            continue
+    present = [p for p in (_BOT_LEDGER, _RUNNER_LEDGER) if p.exists()]
+    if not present:
+        # D-051 lens C F6: no ledger at all is "cannot check", never "every dw- id
+        # is fabricated" (None -> the screen skips the family with a WARNING).
+        return None  # type: ignore[return-value]
+    for path in present:
         for ev in _read_jsonl(path):
             jid = str(ev.get("job_id") or "").strip().lower()
             if jid.startswith("dw-"):

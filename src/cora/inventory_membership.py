@@ -102,35 +102,51 @@ def member_ids(channel_id: str, *, client_factory: Callable | None = None,
     return members
 
 
-def allows(user_id: str, *, client_factory: Callable | None = None) -> tuple[bool, str]:
-    """(allowed, reason) for an OUT-OF-CHANNEL inventory write by ``user_id``.
+def allows(user_id: str, *, entity: str = "F3E",
+           client_factory: Callable | None = None) -> tuple[bool, str]:
+    """(allowed, reason) for an OUT-OF-CHANNEL inventory write by ``user_id`` on
+    ``entity``'s inventory.
 
-    reason in {"member", "not_member", "lookup_failed", "no_channel_configured",
-    "no_user"} -- only "member" allows. Fail closed on every other branch.
+    The authority is membership of THAT entity's configured write channel(s) --
+    never of some other entity's inventory channel that happens to be in the same
+    YAML (D-051 lens C F4). reason in {"member", "not_member", "lookup_failed",
+    "no_channel_configured", "no_user"} -- only "member" allows. Fail closed on
+    every other branch.
     """
     uid = str(user_id or "").strip()
     if not uid:
         return False, "no_user"
-    channel_ids = guard_input.inventory_write_channel_ids()
+    try:
+        channel_ids = guard_input.inventory_write_channel_ids(entity)
+    except Exception:  # noqa: BLE001 -- D-051 lens D HIGH #1: a raising config read is a
+        # refusal, never an escape from the fail-closed contract
+        log.warning("inventory_membership: channel config unreadable -- refusing", exc_info=True)
+        return False, "lookup_failed"
     if not channel_ids:
         return False, "no_channel_configured"
     any_lookup_ok = False
+    any_failed = False
     for cid in sorted(channel_ids):
         members = member_ids(cid, client_factory=client_factory)
         if members is None:
+            any_failed = True
             continue
         any_lookup_ok = True
         if uid in members:
             return True, "member"
-    if not any_lookup_ok:
+    if not any_lookup_ok or any_failed:
+        # D-051 lens B LOW: with several channels, "not a member of the ones I could
+        # read" is not "not a member" -- the honest answer is "could not check".
         return False, "lookup_failed"
     return False, "not_member"
 
 
-def refusal_text(reason: str) -> str:
+def refusal_text(reason: str, *, entity: str = "F3E") -> str:
     """User-facing, source-opaque, and honest about WHY -- a failed lookup is not
-    "you are not allowed", it is "I could not check"."""
-    channel = "#f3-hq-inventory-adjustments"
+    "you are not allowed", it is "I could not check". The channel name comes from
+    the YAML (D-051 lens A LOW #9), never a literal that a rename would orphan."""
+    names = sorted(guard_input.inventory_write_channel_names(entity))
+    channel = ", ".join(f"#{n}" for n in names) or "the configured inventory channel"
     if reason == "lookup_failed":
         return (f"I couldn't verify channel membership just now, so I did not change the "
                 f"count. Post the request in {channel} instead -- anyone in that channel can "

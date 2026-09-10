@@ -241,3 +241,8 @@ def test_the_kickoff_evidence_renderer_has_the_same_guard():
     full = dict(half, evidence=[{"channel_id": "C123", "ts": "1787611109.915539", "note": "n"}])
     text2 = "\n".join(cq._evidence_block([full]))
     assert "permalink: https://hjr-global.slack.com/archives/C123/p1787611109915539" in text2
+    # an EXPLICIT (human-typed) ask is the one shape whose channel alone is a real
+    # pointer (Code #12 D-051 lens B MED #7) -- rendered as such, never as a permalink
+    typed = dict(half, signal="explicit", summary="")
+    text3 = "\n".join(cq._evidence_block([typed]))
+    assert "channel pointer: <slack://channel?id=D0B4CTD3B09>" in text3 and "permalink:" not in text3

@@ -42,16 +42,28 @@ class TestSurfaceFields:
         cid = cq.seed_item(kind="bug", severity="P3", title="A", summary="s", entity="F3E",
                            signal="explicit", status="PROPOSED")
         f = cq.item_surface_fields(cq.get_item(cid))
+        # no card -> no 'tap Queue' offer (D-051 lens F MED #2); the verb names WHO
+        # types it (lens A LOW #12: the line is read on the KB-ingested backlog by anyone)
         assert f == {"kickoff": False, "card": False,
-                     "how_to_stage": f"approve first (tap Queue on its card, or reply `approve {cid}` "
-                                     f"in your Cora DM), then reply `stage {cid}`"}
+                     "how_to_stage": f"approve first (Harrison replies `approve {cid}` in a Cora DM "
+                                     f"-- no card, a seeded item), then Harrison replies `stage {cid}`"}
+
+    def test_proposed_with_card_offers_the_queue_tap(self, qenv):
+        cid = cq.seed_item(kind="bug", severity="P3", title="A2", summary="s", entity="F3E",
+                           signal="explicit", status="PROPOSED")
+        cq._append_event({"event": "dm_sent", "ts": cq._now_iso(), "id": cid,
+                          "dm_channel_id": "D1", "dm_message_ts": "1.2"})
+        f = cq.item_surface_fields(cq.get_item(cid))
+        assert f["card"] is True
+        assert f["how_to_stage"].startswith("approve first (tap Queue on its card, or Harrison replies")
+        assert "no card" not in f["how_to_stage"]
 
     def test_approved_seed_without_card_names_the_verb_and_step_75(self, qenv):
         cid = cq.seed_item(kind="bug", severity="P3", title="B", summary="s", entity="F3E",
                            signal="explicit", status="APPROVED")
         f = cq.item_surface_fields(cq.get_item(cid))
         assert f["kickoff"] is False and f["card"] is False
-        assert f"reply `stage {cid}` in your Cora DM" in f["how_to_stage"]
+        assert f"Harrison replies `stage {cid}` in a Cora DM" in f["how_to_stage"]
         assert "no card" in f["how_to_stage"] and "step 7.5" in f["how_to_stage"]
 
     def test_approved_with_card_offers_the_button_too(self, qenv):
@@ -60,7 +72,7 @@ class TestSurfaceFields:
         cq._append_event({"event": "dm_sent", "ts": cq._now_iso(), "id": cid,
                           "dm_channel_id": "D1", "dm_message_ts": "1.2"})
         f = cq.item_surface_fields(cq.get_item(cid))
-        assert f["card"] is True and "tap Stage prompt on its card" in f["how_to_stage"]
+        assert f["card"] is True and "taps Stage prompt on its card" in f["how_to_stage"]
 
     def test_staged_and_terminal(self, qenv):
         cid = cq.seed_item(kind="bug", severity="P2", title="D", summary="s", entity="F3E",
@@ -75,7 +87,7 @@ class TestSurfaceFields:
         cid = cq.seed_item(kind="bug", severity="P3", title="E", summary="s", entity="F3E",
                            signal="explicit", status="APPROVED")
         text = cq.render_backlog_text()
-        assert f"kickoff: no · card: no · how-to-stage: reply `stage {cid}` in your Cora DM" in text
+        assert f"kickoff: no · card: no · how-to-stage: Harrison replies `stage {cid}` in a Cora DM" in text
 
     def test_item_card_carries_the_line_as_this_message(self, qenv):
         cid = cq.seed_item(kind="bug", severity="P3", title="F", summary="s", entity="F3E",

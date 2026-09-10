@@ -23,8 +23,14 @@
 #                      the LIVE membership of this channel, read through this id at
 #                      request time (<= 5 min cache; a failed lookup refuses). No
 #                      hand-maintained name list -- frozen lists are retired.
+#   entity           : the entity whose inventory this channel writes. The G1 grant and
+#                      the membership authority are BOTH conditioned on it (D-051 lens C,
+#                      2026-09-09): a channel of another entity added here earns no F3E
+#                      grant and confers no F3E write authority -- the LEX wall is not a
+#                      thing to widen by editing a YAML.
 channels:
   f3-hq-inventory-adjustments:      # Slack id C0B7X2E4VNG; Shopify location id 81567023424
     slack_channel_id: C0B7X2E4VNG   # verified live 2026-09-09: conversations.info name == this key, is_member true, 11 members
+    entity: F3E
     default_location: "1337 S Gilbert Rd"
     unit: cases

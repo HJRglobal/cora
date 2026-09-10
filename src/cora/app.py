@@ -1468,6 +1468,12 @@ def _dispatch_qa(
                     "semantic_cache served channel=#%s user=%s entity=%s latency_ms=%d",
                     channel_name, user_id, entity, latency_ms,
                 )
+                # Code #12 S2' (D-051 lens A HIGH #2): a cached reply has no tool
+                # ledger, so only the fabricated-id half runs (tool_use_count=None).
+                cached_response = slack_egress.screen_phantom_write_claims(
+                    cached_response, tool_use_count=None,
+                    channel_name=channel_name, user_id=user_id or "",
+                )
                 say(
                     text=_guard_content(cached_response),
                     thread_ts=reply_thread_ts,
@@ -1990,18 +1996,20 @@ def _dispatch_qa(
         response_text = _validate_channel_links(response_text, client)
         # Verbatim tables are time-sensitive (financial figures), so never cache them.
         # Cache the ORIGINAL (entity-keyed, channel-agnostic); guard at serve time.
+        # Code #12 S2' (cq-60024f032136): phantom-write-claim + fabricated-id
+        # screen on the model's FINAL text -- BEFORE the semantic-cache store (D-051
+        # lens A HIGH #2: an unscreened phantom cached here would replay to the next
+        # asker with no tool ledger at all) and BEFORE the confirm-card blocks are
+        # built from it (Slack renders blocks over text). Observe mode logs the
+        # `phantom-write-claim` key and returns the text byte-identical; enforce
+        # prepends the honest line. The count is the turn's measured tool ledger.
+        response_text = slack_egress.screen_phantom_write_claims(
+            response_text, tool_use_count=_turn_tool_use_count(gen_meta),
+            channel_name=channel_name, user_id=user_id or "",
+        )
         if cache_storable and not is_structured_table:
             _try_cache_store(entity, user_message, question_embedding, response_text, hints)
         response_text = _guard_content(response_text)
-        # Code #12 S2' (cq-60024f032136): phantom-write-claim + fabricated-id
-        # screen on the model's FINAL text, BEFORE the confirm-card blocks are
-        # built from it (Slack renders blocks over text). Observe mode logs the
-        # `phantom-write-claim` key and returns the text byte-identical; enforce
-        # rewrites. tool_use_count is the turn's ledger from claude_client.
-        response_text = slack_egress.screen_phantom_write_claims(
-            response_text, tool_use_count=gen_meta.get("tool_use_count", 0),
-            channel_name=channel_name, user_id=user_id or "",
-        )
         log.info(
             "responded (non-streaming) entity=%s channel=#%s user=%s latency_ms=%d response_chars=%d",
             entity, channel_name, user_id, latency_ms, len(response_text),
@@ -2123,18 +2131,20 @@ def _dispatch_qa(
     response_text = _validate_channel_links(response_text, client)
     # Verbatim tables are never cached (time-sensitive financial figures).
     # Cache the ORIGINAL (entity-keyed, channel-agnostic); guard at serve time.
+    # Code #12 S2' (cq-60024f032136): phantom-write-claim + fabricated-id
+    # screen on the model's FINAL text -- BEFORE the semantic-cache store (D-051
+    # lens A HIGH #2: an unscreened phantom cached here would replay to the next
+    # asker with no tool ledger at all) and BEFORE the confirm-card blocks are
+    # built from it (Slack renders blocks over text). Observe mode logs the
+    # `phantom-write-claim` key and returns the text byte-identical; enforce
+    # prepends the honest line. The count is the turn's measured tool ledger.
+    response_text = slack_egress.screen_phantom_write_claims(
+        response_text, tool_use_count=_turn_tool_use_count(gen_meta),
+        channel_name=channel_name, user_id=user_id or "",
+    )
     if cache_storable and not is_structured_table:
         _try_cache_store(entity, user_message, question_embedding, response_text, hints)
     response_text = _guard_content(response_text)
-    # Code #12 S2' (cq-60024f032136): phantom-write-claim + fabricated-id
-    # screen on the model's FINAL text, BEFORE the confirm-card blocks are
-    # built from it (Slack renders blocks over text). Observe mode logs the
-    # `phantom-write-claim` key and returns the text byte-identical; enforce
-    # rewrites. tool_use_count is the turn's ledger from claude_client.
-    response_text = slack_egress.screen_phantom_write_claims(
-        response_text, tool_use_count=gen_meta.get("tool_use_count", 0),
-        channel_name=channel_name, user_id=user_id or "",
-    )
 
     skipped = throttle.release_stream(stream_id).get("skipped_count", 0)
     log.info(
@@ -2164,12 +2174,23 @@ def _dispatch_qa(
         # under a claim that was already consumed, breaking one-stash-one-card
         # and leaving the first copy unregistered and unclosable. The text still
         # reaches the user, and the typed confirm path still works.
-        say(
-            text=response_text,
-            thread_ts=reply_thread_ts,
-            unfurl_links=False,
-            unfurl_media=False,
-        )
+        #
+        # Code #12 D-051 lens A MED #8: the placeholder still shows the LAST
+        # mid-stream frame, which the phantom screen never saw. Retry a text-only
+        # update with the SCREENED text first (a blocks-shaped failure usually is
+        # not a text failure); only if that fails too does a fresh reply go out.
+        try:
+            client.chat_update(channel=placeholder_channel, ts=placeholder_ts, text=response_text)
+            log.info("Final chat_update recovered text-only for ts=%s (no buttons)", placeholder_ts)
+        except Exception as exc2:  # noqa: BLE001
+            log.warning("text-only chat_update also failed for ts=%s: %s -- posting fresh",
+                        placeholder_ts, exc2)
+            say(
+                text=response_text,
+                thread_ts=reply_thread_ts,
+                unfurl_links=False,
+                unfurl_media=False,
+            )
     _post_reply_card_sweep()
 
     # Register AFTER the response is confirmed posted so only successful
@@ -2245,8 +2266,9 @@ def handle_cora_ask(ack, body, client) -> None:
         # configured write channel proves membership (you cannot post in a channel
         # you are not in) -> entity scope granted per Hannah's 8/21 rule; every
         # sensitive-topic block still runs. Channel AND write-intent, never one alone.
-        _inv_grant = guard_input.is_inventory_write_channel(channel_name) and \
-            guard_input.is_inventory_write_intent(text)
+        # G1 in-channel grant -- one predicate for the three channel-path gates
+        # (_inventory_entity_grant); the DM path has none.
+        _inv_grant = _inventory_entity_grant(entity, channel_id, text)
         access_block = user_access.check_access(
             user_id, entity, text, phi_custodian=phi_custodian, tier=tier,
             entity_grant=_inv_grant,
@@ -2409,8 +2431,9 @@ def handle_mention(event: dict, say: callable, client) -> None:
         # configured write channel proves membership (you cannot post in a channel
         # you are not in) -> entity scope granted per Hannah's 8/21 rule; every
         # sensitive-topic block still runs. Channel AND write-intent, never one alone.
-        _inv_grant = guard_input.is_inventory_write_channel(channel_name) and \
-            guard_input.is_inventory_write_intent(user_message)
+        # G1 in-channel grant -- one predicate for the three channel-path gates
+        # (_inventory_entity_grant); the DM path has none.
+        _inv_grant = _inventory_entity_grant(entity, channel_id, user_message)
         access_block = user_access.check_access(
             user_id, entity, user_message, phi_custodian=phi_custodian, tier=tier,
             entity_grant=_inv_grant,
@@ -2467,6 +2490,34 @@ def handle_mention(event: dict, say: callable, client) -> None:
         prior_messages=prior_messages,
         root_thread_ts=root_thread_ts,
     )
+
+
+def _inventory_entity_grant(entity: str, channel_id: str, text: str) -> bool:
+    """The G1 in-channel grant (Code #12; D-051 lens C F1/F3/F5): entity F3E (hard),
+    the post landed IN a configured F3E inventory write channel (keyed on the
+    immutable channel ID, never the 30-min-cached name), and the message is a
+    GRANT-shaped write request (pure template or vetoed prose -- never a wrapper with
+    a stapled ask). One predicate for the three channel-path gates (handle_mention,
+    handle_cora_ask, the thread follow-up); _handle_dm_qa has no grant at all."""
+    return bool(
+        str(entity or "").upper() == "F3E"
+        and guard_input.is_inventory_write_channel_id(channel_id, entity="F3E")
+        and guard_input.is_inventory_write_grant_request(text)
+    )
+
+
+def _turn_tool_use_count(gen_meta: dict | None) -> int:
+    """The turn's tool ledger as the phantom-write screen reads it: client tool_use
+    blocks (claude_client._record_tool_meta) PLUS the server-side web tools the usage
+    block reports (D-051 lens A MED #5 -- a web-search turn ran zero client tools,
+    so 'the page was updated last week' read as a phantom claim). Measured, never
+    inferred from a flag (D-257)."""
+    m = gen_meta or {}
+    try:
+        return (int(m.get("tool_use_count") or 0) + int(m.get("web_search_requests") or 0)
+                + int(m.get("web_fetch_requests") or 0))
+    except (TypeError, ValueError):
+        return int(m.get("tool_use_count") or 0)
 
 
 def _try_cache_store(
@@ -3195,7 +3246,7 @@ def handle_message_event(event: dict, client) -> None:
             if _qverb is not None:
                 try:
                     _outcome, _qmsg = code_queue.apply_queue_verb(
-                        _qverb[0], _qverb[1], user_id)
+                        _qverb[0], _qverb[1], user_id, *_qverb[2:])
                 except Exception:  # noqa: BLE001 -- fail HONESTLY, never fall to the model
                     log.exception("founder-dm queue verb crashed verb=%s id=%s",
                                   _qverb[0], _qverb[1])
@@ -3777,8 +3828,9 @@ def handle_message_event(event: dict, client) -> None:
     # configured write channel proves membership (you cannot post in a channel
     # you are not in) -> entity scope granted per Hannah's 8/21 rule; every
     # sensitive-topic block still runs. Channel AND write-intent, never one alone.
-    _inv_grant = guard_input.is_inventory_write_channel(channel_name) and \
-        guard_input.is_inventory_write_intent(text)
+    # G1 in-channel grant -- one predicate for the three channel-path gates
+    # (_inventory_entity_grant); the DM path has none.
+    _inv_grant = _inventory_entity_grant(entity, channel_id, text)
     access_block = user_access.check_access(
         user_id, entity, text, phi_custodian=phi_custodian, tier=tier,
         entity_grant=_inv_grant,
@@ -5192,15 +5244,23 @@ def handle_revops_edit_submit(ack, body, client, view) -> None:
 # is its OWN message -> chat_update drops its actions block; the Monday menu is ONE
 # message with MANY actions blocks -> a threaded reply keeps the others tappable.
 
-def _cq_ack_in_message(client, body: dict, msg: str) -> None:
+def _cq_ack_in_message(client, body: dict, msg: str, *, keep_card: bool = False) -> None:
+    """Ack a card button. A message with several actions blocks (the Monday menu)
+    is always threaded; a single-item card is consumed (buttons replaced by the
+    outcome) ONLY when the action changed state -- keep_card=True threads instead,
+    because a refusal / evidence-floor hold / error / in-flight race changed
+    nothing and the card must stay tappable (D-051 lens B MED #6: the floor's
+    re-card used to delete the very Dismiss/Edit/Later buttons it pointed at)."""
     channel_id = (body.get("channel") or {}).get("id", "")
     message_ts = (body.get("message") or {}).get("ts", "")
     if not (channel_id and message_ts):
+        log.warning("code-queue ack: no channel/ts pointer on the interaction body -- "
+                    "outcome not surfaced: %s", msg[:120])
         return
     blocks = (body.get("message") or {}).get("blocks") or []
     actions_blocks = [b for b in blocks if b.get("type") == "actions"]
     try:
-        if len(actions_blocks) > 1:
+        if keep_card or len(actions_blocks) > 1:
             client.chat_postMessage(channel=channel_id, thread_ts=message_ts, text=msg,
                                     unfurl_links=False, unfurl_media=False)
         else:
@@ -5212,6 +5272,10 @@ def _cq_ack_in_message(client, body: dict, msg: str) -> None:
             client.chat_update(channel=channel_id, ts=message_ts, text=msg, blocks=new_blocks)
     except Exception as exc:  # noqa: BLE001
         log.warning("code-queue ack update failed: %s", exc)
+
+
+# Outcomes after which the item card must stay tappable (nothing changed).
+_CQ_KEEP_CARD_OUTCOMES = frozenset({"no_evidence", "refused", "error", "inflight"})
 
 
 def _handle_code_queue_button(body: dict, client, action_id: str) -> None:
@@ -5230,7 +5294,9 @@ def _handle_code_queue_button(body: dict, client, action_id: str) -> None:
             except Exception:  # noqa: BLE001
                 pass
             return
-        _cq_ack_in_message(client, body, msg)
+        # Nothing changed on these outcomes -> the card keeps its buttons.
+        _cq_ack_in_message(client, body, msg,
+                           keep_card=outcome in _CQ_KEEP_CARD_OUTCOMES)
     except Exception:  # noqa: BLE001 -- a handler error must never crash the bot
         log.warning("code-queue button handler error (non-fatal)", exc_info=True)
 
@@ -5388,6 +5454,8 @@ def _cq_ack_view_submit(client, meta: dict, msg: str) -> None:
     pointer, not the message body, so the thread is the one safe surface."""
     ch, ts = str(meta.get("dm_channel") or ""), str(meta.get("dm_ts") or "")
     if not (ch and ts):
+        log.warning("code-queue modal ack: no card pointer in private_metadata -- "
+                    "outcome not surfaced: %s", msg[:120])
         return
     try:
         client.chat_postMessage(channel=ch, thread_ts=ts, text=msg,
@@ -5406,19 +5474,40 @@ def handle_cq_park(ack, body, client) -> None:
     _open_cq_modal(body, client, code_queue.park_modal_view, "park")
 
 
+def _ack_view_once(ack, **kw):
+    """Bolt wants exactly one ack per view submit; the validate-then-ack shape below
+    needs a guard so an exception path never double-acks or forgets to ack."""
+    try:
+        ack(**kw) if kw else ack()
+    except Exception:  # noqa: BLE001
+        log.warning("code-queue modal ack failed (non-fatal)", exc_info=True)
+
+
 @app.view(code_queue.VIEW_PARK_SUBMIT)
 def handle_cq_park_submit(ack, body, client, view) -> None:
-    ack()
+    acked = False
     try:
+        state = (view.get("state") or {}).get("values") or {}
+        reason = _view_value(state, "cq_park_reason")
+        until = _view_value(state, "cq_park_until", "selected_date")
+        trigger = _view_value(state, "cq_park_event")
+        # D-051 lens F MED #3: validate BEFORE the ack so Slack renders the errors
+        # IN the modal (response_action="errors") instead of closing it on a silent
+        # refusal. The pure validator is shared with park_item, which re-checks.
+        errors = code_queue.validate_park(reason, until, trigger)
+        if errors:
+            _ack_view_once(ack, response_action="errors", errors=errors)
+            return
+        _ack_view_once(ack)
+        acked = True
         meta = json.loads(view.get("private_metadata") or "{}")
         actor_id = (body.get("user") or {}).get("id", "")
-        state = (view.get("state") or {}).get("values") or {}
         _outcome, msg = code_queue.park_item(
-            str(meta.get("cq_id") or ""), actor_id, _view_value(state, "cq_park_reason"),
-            until=_view_value(state, "cq_park_until", "selected_date"),
-            trigger_event=_view_value(state, "cq_park_event"))
+            str(meta.get("cq_id") or ""), actor_id, reason, until=until, trigger_event=trigger)
         _cq_ack_view_submit(client, meta, msg)
     except Exception:  # noqa: BLE001
+        if not acked:
+            _ack_view_once(ack)
         log.warning("code-queue park-submit handler error (non-fatal)", exc_info=True)
 
 
@@ -5430,15 +5519,24 @@ def handle_cq_dismiss_note(ack, body, client) -> None:
 
 @app.view(code_queue.VIEW_DISMISS_SUBMIT)
 def handle_cq_dismiss_submit(ack, body, client, view) -> None:
-    ack()
+    acked = False
     try:
+        state = (view.get("state") or {}).get("values") or {}
+        note = _view_value(state, "cq_dismiss_note")
+        errors = code_queue.validate_dismiss_note(note)
+        if errors:
+            _ack_view_once(ack, response_action="errors", errors=errors)
+            return
+        _ack_view_once(ack)
+        acked = True
         meta = json.loads(view.get("private_metadata") or "{}")
         actor_id = (body.get("user") or {}).get("id", "")
-        state = (view.get("state") or {}).get("values") or {}
         _outcome, msg = code_queue.dismiss_with_evidence(
-            str(meta.get("cq_id") or ""), actor_id, _view_value(state, "cq_dismiss_note"))
+            str(meta.get("cq_id") or ""), actor_id, note)
         _cq_ack_view_submit(client, meta, msg)
     except Exception:  # noqa: BLE001
+        if not acked:
+            _ack_view_once(ack)
         log.warning("code-queue dismiss-submit handler error (non-fatal)", exc_info=True)
 
 

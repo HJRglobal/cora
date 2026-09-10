@@ -136,8 +136,23 @@ _SENTINEL_LEAD_RE = re.compile(
 _ENFORCE_ENV = "CORA_SENTINEL_ENFORCE"
 
 
+_SENTINEL_MODES = ("observe", "enforce")
+_MODE_WARNED: set[str] = set()
+
+
 def _sentinel_mode() -> str:
-    return (os.environ.get(_ENFORCE_ENV) or "observe").strip().lower()
+    """observe (default) | enforce. Any other value reads as observe and is
+    WARNED once per process (D-051 lens A MED #4): the raw value used to leak
+    into every rail log line (`mode=true`) and both rails compare `== "enforce"`,
+    so a typo silently kept observe while the log claimed a third mode."""
+    raw = (os.environ.get(_ENFORCE_ENV) or "observe").strip().lower()
+    if raw in _SENTINEL_MODES:
+        return raw
+    if raw not in _MODE_WARNED:
+        _MODE_WARNED.add(raw)
+        log.warning("%s=%r is not a mode (observe|enforce) -- treating it as observe",
+                    _ENFORCE_ENV, raw)
+    return "observe"
 
 
 def scrub_write_sentinels(text):
@@ -187,9 +202,15 @@ def scrub_write_sentinels(text):
 # Same observe -> enforce ritual and the SAME flag as the sentinel scrub
 # (CORA_SENTINEL_ENFORCE): observe = a WARNING keyed `phantom-write-claim` naming
 # the matched phrase / the fabricated id, reply delivered byte-identical; enforce =
-# the claim is replaced with the honest template and the fabricated id redacted,
-# at ERROR. The nightly health check counts the WARN key beside the sentinel leaks;
-# the flip is Harrison's, after a clean week counted WITH this screen (S3').
+# the honest template is PREPENDED as the reply's first line (the body is kept
+# byte-identical) and the fabricated id is redacted, at ERROR. The first cut
+# DELETED every claiming sentence; the D-051 review (lens A HIGH #1, 2026-09-09)
+# refused that: 'filed' / 'updated' / 'created' are ordinary English, so a
+# legitimate zero-tool KB answer ("the invoice was filed on Tuesday") would have
+# lost its answer sentence -- the 'a strip can remove the outcome' class. A
+# correction line the reader sees FIRST is honest and reversible; a deletion is
+# neither. The nightly health check counts the WARN key beside the sentinel
+# leaks; the flip is Harrison's, after a clean week counted WITH this screen (S3').
 #
 # CALLED EXPLICITLY by app._dispatch_qa on the model's FINAL reply text, NOT from
 # the class-level WebClient wrapper below: (a) the turn's tool_use count exists
@@ -232,35 +253,22 @@ _ID_LEDGERS: tuple[tuple[str, re.Pattern[str], Callable[[], frozenset[str]]], ..
     ("dw", re.compile(r"\bdw-[0-9a-f]{12}\b", re.IGNORECASE), _known_dw_ids),
 )
 
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+# Slack link / mention tokens (`<https://x|label>`, `<@U..>`, `<#C..|name>`) are
+# masked before the lexicon runs (D-051 lens A MED #5): a label like "Updated
+# pricing page" is not a write claim, and under enforce nothing inside the token
+# is ever touched (the body is kept byte-identical anyway).
+_LINK_TOKEN_RE = re.compile(r"<[^<>\n]{1,400}>")
 
 
-def _rewrite_write_claims(text: str) -> str:
-    """ENFORCE-mode rewrite: every line / sentence carrying a write-claim phrase is
-    replaced by the honest template (deduplicated, so a three-bullet phantom
-    becomes one line, not three). Everything else is kept verbatim. If nothing
-    survives, the template alone is returned -- never an empty body."""
-    out_lines: list[str] = []
-    emitted = False  # the template lands ONCE, at the first claim; later claims are dropped
-    for line in text.splitlines():
-        if not _WRITE_CLAIM_RE.search(line):
-            out_lines.append(line)
-            continue
-        kept: list[str] = []
-        for sent in _SENTENCE_SPLIT_RE.split(line):
-            if not sent.strip():
-                continue
-            if _WRITE_CLAIM_RE.search(sent):
-                if not emitted:
-                    kept.append(PHANTOM_HONEST_TEMPLATE)
-                    emitted = True
-                continue
-            kept.append(sent.strip())
-        rebuilt = " ".join(kept).strip()
-        if rebuilt:
-            out_lines.append(rebuilt)
-    result = re.sub(r"\n{3,}", "\n\n", "\n".join(out_lines)).strip()
-    return result or PHANTOM_HONEST_TEMPLATE
+def _prepend_honest_line(text: str) -> str:
+    """ENFORCE-mode correction: the honest template becomes the reply's FIRST line;
+    the body is kept byte-identical (D-051 lens A HIGH #1 -- never a strip: a
+    heuristic deletion over model prose removes outcomes and mangles quoted
+    text). Idempotent: a body already led by the template is returned as-is."""
+    body = text.lstrip()
+    if body.startswith(PHANTOM_HONEST_TEMPLATE):
+        return text
+    return f"{PHANTOM_HONEST_TEMPLATE}\n\n{body}"
 
 
 def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
@@ -270,8 +278,9 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
 
     Observe mode (default, CORA_SENTINEL_ENFORCE unset): every hit is a WARNING
     keyed ``phantom-write-claim`` and the text is returned BYTE-IDENTICAL.
-    Enforce mode: a fabricated id is redacted to ``[unknown id]`` and each claiming
-    line/sentence becomes the honest template, at ERROR.
+    Enforce mode: a fabricated id is redacted to ``[unknown id]`` and the honest
+    template is PREPENDED as the first line (the body is kept byte-identical), at
+    ERROR. Slack link/mention tokens are masked before the lexicon runs.
 
     ``tool_use_count`` is the turn's tool_use ledger (claude_client meta). None =
     unknown -> the lexicon half is skipped (never assume zero); the id half runs
@@ -299,6 +308,13 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
             log.warning("%s kind=fabricated-id ledger=%s UNAVAILABLE -- %d id(s) not "
                         "checked this turn", PHANTOM_LOG_KEY, label, len(found), exc_info=True)
             continue
+        if known is None:
+            # D-051 lens C F6: a ledger that does not EXIST is "cannot check", not
+            # "nothing is known" -- an empty reference set would redact every real
+            # id under ENFORCE. Skip the family, loudly.
+            log.warning("%s kind=fabricated-id ledger=%s ABSENT -- %d id(s) not checked "
+                        "this turn", PHANTOM_LOG_KEY, label, len(found))
+            continue
         for fid in sorted(found - set(known)):
             emit("%s kind=fabricated-id id=%s ledger=%s mode=%s channel=#%s user=%s -- "
                  "the reply names an id that exists in no ledger",
@@ -306,14 +322,14 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
             if mode == "enforce":
                 out = re.sub(re.escape(fid), "[unknown id]", out, flags=re.IGNORECASE)
     if count == 0:
-        m = _WRITE_CLAIM_RE.search(out)
+        m = _WRITE_CLAIM_RE.search(_LINK_TOKEN_RE.sub(" ", out))
         if m:
             emit("%s kind=lexicon phrase=%r mode=%s channel=#%s user=%s -- a write "
                  "claim with zero tool_use this turn",
                  PHANTOM_LOG_KEY, m.group(0).strip(), mode, channel_name or "?",
                  user_id or "?")
             if mode == "enforce":
-                out = _rewrite_write_claims(out)
+                out = _prepend_honest_line(out)
     return out
 
 

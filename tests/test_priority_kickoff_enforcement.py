@@ -45,7 +45,7 @@ def _seed(severity="P1", status="PROPOSED", title="thing", **kw):
 
 
 def _fake_generator(monkeypatch, path="/notes/prompt.md", meta=None):
-    def _gen(items, slug=None, meta_out=None):
+    def _gen(items, slug=None, meta_out=None, **_kw):
         if meta_out is not None and meta:
             meta_out.update(meta)
         return path
@@ -69,7 +69,7 @@ class TestEnsureKickoffStaged:
         cq.ensure_kickoff_staged(cid)
         calls = {"n": 0}
 
-        def _gen(items, slug=None, meta_out=None):
+        def _gen(items, slug=None, meta_out=None, **_kw):
             calls["n"] += 1
             return "/notes/second.md"
         monkeypatch.setattr(cq, "generate_kickoff_prompt", _gen)
@@ -79,14 +79,14 @@ class TestEnsureKickoffStaged:
 
     def test_generator_returning_nothing_is_an_error_not_silence(self, qenv, monkeypatch):  # noqa: F811
         monkeypatch.setattr(cq, "generate_kickoff_prompt",
-                            lambda items, slug=None, meta_out=None: "")
+                            lambda items, slug=None, meta_out=None, **_kw: "")
         cid = _seed()
         outcome, detail = cq.ensure_kickoff_staged(cid)
         assert outcome == "error" and "no file" in detail
         assert cq.get_item(cid)["status"] == "PROPOSED"  # no phantom staged event
 
     def test_generator_crash_is_an_error_not_a_raise(self, qenv, monkeypatch):  # noqa: F811
-        def _boom(items, slug=None, meta_out=None):
+        def _boom(items, slug=None, meta_out=None, **_kw):
             raise RuntimeError("sonnet down")
         monkeypatch.setattr(cq, "generate_kickoff_prompt", _boom)
         cid = _seed()
@@ -139,7 +139,7 @@ class TestEnsureKickoffStaged:
         prompt file plus a second `staged` event -- orphaning the first."""
         calls: list[int] = []
 
-        def _gen(items, slug=None, meta_out=None):
+        def _gen(items, slug=None, meta_out=None, **_kw):
             calls.append(1)
             return f"/gen/prompt-{len(calls)}.md"
         monkeypatch.setattr(cq, "generate_kickoff_prompt", _gen)
@@ -200,7 +200,7 @@ class TestSeverityVocabulary:
 class TestLoudFailure:
     def test_approve_reports_generation_failure(self, qenv, monkeypatch):  # noqa: F811
         monkeypatch.setattr(cq, "generate_kickoff_prompt",
-                            lambda items, slug=None, meta_out=None: None)
+                            lambda items, slug=None, meta_out=None, **_kw: None)
         cid = _seed(severity="P1")
         outcome, msg = cq.process_queue_action(cq.ACTION_APPROVE, cid, HARRISON)
         # The approve STANDS (its ledger event is already written) but the message
@@ -219,7 +219,7 @@ class TestLoudFailure:
 
     def test_stage_action_reports_failure(self, qenv, monkeypatch):  # noqa: F811
         monkeypatch.setattr(cq, "generate_kickoff_prompt",
-                            lambda items, slug=None, meta_out=None: "")
+                            lambda items, slug=None, meta_out=None, **_kw: "")
         cid = _seed(severity="P3")
         outcome, msg = cq.process_queue_action(cq.ACTION_STAGE, cid, HARRISON)
         assert outcome == "error" and "nothing staged" in msg
@@ -279,7 +279,7 @@ class TestSeedAtApproved:
         """Default must not fire a Sonnet call from a data-migration helper."""
         calls = {"n": 0}
 
-        def _gen(items, slug=None, meta_out=None):
+        def _gen(items, slug=None, meta_out=None, **_kw):
             calls["n"] += 1
             return "/notes/x.md"
         monkeypatch.setattr(cq, "generate_kickoff_prompt", _gen)

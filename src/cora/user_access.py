@@ -324,6 +324,12 @@ def _load_permissions() -> dict[str, Any]:
         return {}
 
 
+# The sensitive-topic set an UNLISTED user carries when a structural grant (Code
+# #12 G1's in-channel inventory grant) stands in for roster authorization. Every
+# topic the roster can block -- `financials` stays tier-aware in check_access.
+_GRANT_DEFAULT_BLOCKED_TOPICS: tuple[str, ...] = ("financials", "hr", "legal", "phi", "cap_table")
+
+
 def is_authorized(user_id: str, entity: str) -> bool:
     """Return True if the user is allowed to receive answers about this entity.
 
@@ -440,6 +446,15 @@ def check_access(
 
     # Sensitive topic check
     blocked = blocked_topics(user_id)
+    if entity_grant and user_id != _HARRISON_ID and not _load_permissions().get(user_id):
+        # D-051 lens C F2 (2026-09-09): an UNLISTED user has an EMPTY block list, so
+        # for the grant's own target population (a channel member who is in no
+        # roster file) "every topic block still runs" was vacuously true -- the
+        # grant made check_access a total no-op. A grant is entity scope earned by
+        # a structural fact; it must never also mean "no topic is sensitive". The
+        # unlisted-user default outside a grant is unchanged here (a pre-existing
+        # posture, seeded for a Harrison ruling rather than widened mid-build).
+        blocked = list(_GRANT_DEFAULT_BLOCKED_TOPICS)
     if not blocked:
         return None
 

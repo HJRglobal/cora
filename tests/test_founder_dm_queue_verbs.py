@@ -97,6 +97,17 @@ class TestMatchQueueVerb:
     def test_non_exact_forms_do_not_match(self, text):
         assert cq.match_queue_verb(text) is None
 
+    def test_ship_verb_needs_exactly_one_reference(self):
+        """D-051 lens B MED #4: the one honest door for a row staged before bundle
+        linkage existed -- the C7 gate refuses a bare tap and no script names it."""
+        assert cq.match_queue_verb("ship cq-621dfad586aa code-12") == ("ship", "cq-621dfad586aa", "code-12")
+        assert cq.match_queue_verb("Ship cq-621DFAD586AA claude/code-12-queue-metabolism") == \
+            ("ship", "cq-621dfad586aa", "claude/code-12-queue-metabolism")
+        assert cq.match_queue_verb("ship cq-621dfad586aa") is None            # no reference
+        assert cq.match_queue_verb("ship cq-621dfad586aa a b") is None         # two words
+        assert cq.match_queue_verb("please ship cq-621dfad586aa code-12") is None
+        assert cq.match_queue_verb("ship cq-621dfad586aa x") is None           # too short to be a reference
+
 
 # ── apply_queue_verb: inherits every guard from the tool it calls ─────────────
 
@@ -154,6 +165,19 @@ class TestApplyQueueVerb:
     def test_unknown_verb_is_an_error(self, qenv):
         outcome, _ = cq.apply_queue_verb("restage", "cq-621dfad586aa", HARRISON)
         assert outcome == "error"
+
+    def test_ship_verb_ships_a_legacy_row_with_the_stated_reference(self, qenv):
+        cid = _seed(status="APPROVED")
+        cq._append_event({"event": "staged", "ts": cq._now_iso(), "id": cid, "prompt_path": "/p"})  # legacy: no bundle
+        assert cq.process_queue_action(cq.ACTION_MARK_SHIPPED, cid, HARRISON)[0] == "refused"
+        outcome, msg = cq.apply_queue_verb("ship", cid, HARRISON, "claude/code-12")
+        assert outcome == "shipped" and "claude/code-12" in msg
+        rec = cq.get_item(cid)
+        assert rec["status"] == "SHIPPED" and rec["bundle_id"] == "claude/code-12" and rec["branch"] == "claude/code-12"
+        assert cq.apply_queue_verb("ship", cid, HARRISON, "")[0] == "error"
+        other = _seed(status="APPROVED", title="tommy ships")
+        assert cq.apply_queue_verb("ship", other, TOMMY, "code-12")[0] == "not_authorized"
+        assert cq.get_item(other)["status"] == "APPROVED"
 
 
 # ── handle_message_event DM branch: the interceptor sits first ────────────────
@@ -257,6 +281,14 @@ class TestDmInterceptor:
         branch_mocks.qa.assert_not_called()
         text = client.chat_postMessage.call_args.kwargs["text"]
         assert "went wrong" in text and "check the backlog" in text
+
+    def test_ship_verb_passes_the_reference_through(self, branch_mocks, qenv):
+        client = MagicMock()
+        with patch.object(app_module.code_queue, "apply_queue_verb",
+                          return_value=("shipped", "\U0001F6A2 Marked shipped (bundle `code-12`).")) as apply:
+            app_module.handle_message_event(_event(text="ship cq-621dfad586aa code-12"), client)
+        apply.assert_called_once_with("ship", "cq-621dfad586aa", HARRISON, "code-12")
+        branch_mocks.qa.assert_not_called()
 
     def test_real_ledger_path_end_to_end(self, branch_mocks, qenv):
         """No mocks on the queue: seed -> typed stage -> STAGED, reply carries the path."""

@@ -104,7 +104,10 @@ class TestProposedCoverage:
         assert len(carried["proposed_listed"]) >= 20
         assert len(blocks) <= 50 and carried["blocks"] == len(blocks)
         assert "PROPOSED coverage" in text and "nothing else surfaces these" in text
-        assert "other" not in text.lower()  # the no-kitchen-sink pin stays honest
+        # the no-kitchen-sink pin: no BUNDLE row is themed "other" (D-051 lens D LOW
+        # #13: a bare substring reddened on 'another'/'others' in ordinary copy)
+        import re as _re
+        assert not _re.search(r"^- \*other\*", text, _re.M | _re.I)
         assert len(_actions(blocks, cq.ACTION_APPROVE)) == len(carried["proposed_actionable"])
         assert len(_actions(blocks, cq.ACTION_PARK)) >= len(carried["proposed_actionable"])
 
@@ -189,8 +192,9 @@ class TestPark:
 
     def test_park_with_date_leaves_the_card_until_due(self, qenv):
         cid = _seed("park me", status="APPROVED")
-        o, msg = cq.park_item(cid, HARRISON, "waiting on the Q4 budget", until="2099-01-01")
-        assert o == "parked" and "until 2099-01-01" in msg
+        fut = (cq._now().date() + timedelta(days=30)).isoformat()
+        o, msg = cq.park_item(cid, HARRISON, "waiting on the Q4 budget", until=fut)
+        assert o == "parked" and f"until {fut}" in msg
         rec = cq.get_item(cid)
         assert rec["status"] == "PARKED" and rec["park_reason"] == "waiting on the Q4 budget"
         carried = {}
@@ -215,17 +219,36 @@ class TestPark:
         text, blocks = cq.build_weekly_menu(carried_out=carried)
         assert cid in carried["parked_waiting"]
         assert "Parked (1), waiting on a trigger" in text
-        assert "Tessa grants project admin" in "\n".join(
-            b["text"]["text"] for b in blocks if b.get("type") == "section")
+        sections = "\n".join(b["text"]["text"] for b in blocks if b.get("type") == "section")
+        assert "Tessa grants project admin" in sections and "review by" in sections
         assert not [e for e in _actions(blocks, cq.ACTION_APPROVE) if e["value"] == cid]
 
     def test_park_is_phi_screened_and_refuses_terminal(self, qenv):
         cid = _seed("park me", status="APPROVED")
+        fut = (cq._now().date() + timedelta(days=30)).isoformat()
         o, msg = cq.park_item(cid, HARRISON, "waiting on Bob Smith's billing authorization",
-                              until="2099-01-01")
+                              until=fut)
         assert o == "error" and "PHI" in msg
         cq._append_event({"event": "shipped", "ts": cq._now_iso(), "id": cid, "bundle_id": "b"})
-        assert cq.park_item(cid, HARRISON, "x", until="2099-01-01")[0] == "noop"
+        assert cq.park_item(cid, HARRISON, "x", until=fut)[0] == "noop"
+
+    def test_park_is_bounded_and_an_event_park_gets_a_review_horizon(self, qenv):
+        """D-051 lens B HIGH #2: a 2099 park was accepted and an event-only park never
+        became due -- one tap could silence a recurring P0 ask indefinitely."""
+        cid = _seed("park me", status="APPROVED")
+        o, msg = cq.park_item(cid, HARRISON, "x", until="2099-01-01")
+        assert o == "error" and f"at most {cq.PARK_MAX_DAYS} days" in msg
+        too_far = (cq._now().date() + timedelta(days=cq.PARK_MAX_DAYS + 1)).isoformat()
+        assert cq.park_item(cid, HARRISON, "x", until=too_far)[0] == "error"
+        o, msg = cq.park_item(cid, HARRISON, "blocked on Tessa", trigger_event="Tessa grants admin")
+        rec = cq.get_item(cid)
+        horizon = (cq._now().date() + timedelta(days=cq.PARK_MAX_DAYS)).isoformat()
+        assert o == "parked" and rec["park_until"] == horizon and rec["park_horizon"] is True
+        assert f"review by {horizon}" in msg and "review horizon" in msg
+        errors = cq.validate_park("", "2099-01-01", "")
+        assert set(errors) == {"cq_park_reason", "cq_park_until"}
+        assert cq.validate_park("why", "", "") == {"cq_park_event": cq.validate_park("why", "", "")["cq_park_event"]}
+        assert cq.validate_park("why", "", "an event") == {}
 
     def test_park_on_a_proposed_row_then_requeue(self, qenv):
         cid = _seed("proposed park", severity="P1")
@@ -271,11 +294,10 @@ class TestArtifact:
         rows = [json.loads(l) for l in (qenv / "menu-runs.jsonl").read_text(encoding="utf-8").splitlines()]
         assert rows[0]["reason"] == "not_live"
 
-    def test_artifact_ledger_is_redirected_by_the_suite(self):
+    def test_artifact_ledger_is_redirected_by_the_suite(self, tmp_path):
         """The conftest autouse redirect covers the new write path (a suite run must
         never write into data/state/code-queue-menu-runs.jsonl)."""
-        assert cq._MENU_RUNS_LEDGER.name == "code-queue-menu-runs.jsonl"
-        assert "pytest" in str(cq._MENU_RUNS_LEDGER).lower() or "tmp" in str(cq._MENU_RUNS_LEDGER).lower()
+        assert cq._MENU_RUNS_LEDGER == tmp_path / "code-queue-menu-runs.jsonl"  # THIS test's tmp
 
 
 class TestModalsAndWiring:
@@ -307,14 +329,43 @@ class TestModalsAndWiring:
         from unittest.mock import MagicMock
         cid = _seed("submit", status="APPROVED")
         client = MagicMock()
+        fut = (cq._now().date() + timedelta(days=30)).isoformat()
         view = {"private_metadata": json.dumps({"cq_id": cid, "dm_channel": "D1", "dm_ts": "9.9"}),
                 "state": {"values": {"cq_park_reason": {"v": {"value": "await budget"}},
-                                     "cq_park_until": {"v": {"selected_date": "2099-01-01"}},
+                                     "cq_park_until": {"v": {"selected_date": fut}},
                                      "cq_park_event": {"v": {"value": ""}}}}}
-        app_module.handle_cq_park_submit(lambda: None, {"user": {"id": HARRISON}}, client, view)
+        ack = MagicMock()
+        app_module.handle_cq_park_submit(ack, {"user": {"id": HARRISON}}, client, view)
+        ack.assert_called_once_with()
         assert cq.get_item(cid)["status"] == "PARKED"
         kw = client.chat_postMessage.call_args.kwargs
         assert kw["channel"] == "D1" and kw["thread_ts"] == "9.9" and "Parked" in kw["text"]
+
+    def test_park_submit_validation_errors_render_in_the_modal(self, qenv):
+        """D-051 lens F MED #3: an invalid submit used to ack, close the modal and
+        thread nothing legible; the errors now come back in the modal."""
+        import cora.app as app_module
+        from unittest.mock import MagicMock
+        cid = _seed("submit", status="APPROVED")
+        client = MagicMock()
+        view = {"private_metadata": json.dumps({"cq_id": cid, "dm_channel": "D1", "dm_ts": "9.9"}),
+                "state": {"values": {"cq_park_reason": {"v": {"value": ""}},
+                                     "cq_park_until": {"v": {"selected_date": "2099-01-01"}},
+                                     "cq_park_event": {"v": {"value": ""}}}}}
+        ack = MagicMock()
+        app_module.handle_cq_park_submit(ack, {"user": {"id": HARRISON}}, client, view)
+        assert ack.call_count == 1
+        kw = ack.call_args.kwargs
+        assert kw["response_action"] == "errors" and set(kw["errors"]) == {"cq_park_reason", "cq_park_until"}
+        assert cq.get_item(cid)["status"] == "APPROVED"
+        client.chat_postMessage.assert_not_called()
+        # dismiss modal: an empty note errors in the modal too
+        dview = {"private_metadata": json.dumps({"cq_id": cid, "dm_channel": "D1", "dm_ts": "9.9"}),
+                 "state": {"values": {"cq_dismiss_note": {"v": {"value": "  "}}}}}
+        ack2 = MagicMock()
+        app_module.handle_cq_dismiss_submit(ack2, {"user": {"id": HARRISON}}, client, dview)
+        assert ack2.call_args.kwargs["response_action"] == "errors"
+        assert cq.get_item(cid)["status"] == "APPROVED"
 
 
 class TestLiveReadOnly:
@@ -339,6 +390,10 @@ class TestLiveReadOnly:
         ids = [b.get("block_id") for b in blocks if b.get("type") == "actions"]
         assert len(ids) == len(set(ids))  # Slack rejects duplicate block_ids
         assert all(len(b["text"]["text"]) <= 3000 for b in blocks if b.get("type") == "section")
+
+
+class TestAllocatorSynthetic:
+    """Synthetic (qenv) allocator / listing pins -- not live reads."""
 
     def test_stale_rows_cannot_crowd_out_proposed_coverage(self, qenv):
         """The live-ledger defect replayed: 24 stale STAGED rows + 13 priority PROPOSED
@@ -375,3 +430,83 @@ class TestLiveReadOnly:
         assert all(cid in listing for cid in carried["proposed_listed"])  # every listed id is whole
         assert not any(cid in listing for cid in ids
                        if cid not in carried["proposed_listed"] + carried["proposed_actionable"])
+
+
+class TestParkedIsNotASilencer:
+    """D-051 lens B HIGH #2 + MED #4/#5: a park cannot swallow a re-ask, a recurrence
+    is its trigger, Later cannot replace it, and a bundle-less row has no dead
+    Mark-shipped button."""
+
+    def test_explicit_reask_on_a_parked_row_mints_a_fresh_row(self, qenv, monkeypatch):
+        monkeypatch.setenv("CORA_CODE_QUEUE", "log")
+        first, _ = cq.queue_explicit(HARRISON, "F3E", "C1", "please add retry to uploads", True)
+        assert cq.park_item(first, HARRISON, "later", until=(cq._now().date() + timedelta(days=10)).isoformat())[0] == "parked"
+        second, outcome = cq.queue_explicit(HARRISON, "F3E", "C1", "please add retry to uploads", True)
+        assert outcome == "ok" and second != first
+        assert cq.get_item(first)["status"] == "PARKED" and cq.get_item(second)["status"] == "APPROVED"
+
+    def test_passive_recurrence_on_a_parked_row_makes_it_due(self, qenv):
+        cid = _seed("parked recurring", status="APPROVED")
+        cq.park_item(cid, HARRISON, "later", until=(cq._now().date() + timedelta(days=30)).isoformat())
+        carried = {}
+        cq.build_weekly_menu(carried_out=carried)
+        assert cid in carried["parked_waiting"]
+        cq._append_event({"event": "recurrence", "ts": cq._now_iso(), "id": cid,
+                          "evidence": {"channel_id": "C1", "ts": "1.2", "note": "again"}})
+        assert cq.get_item(cid)["parked_recurrences"] == 1
+        carried = {}
+        text, blocks = cq.build_weekly_menu(carried_out=carried)
+        assert cid in carried["parked_due"] and "re-asked x1 since parked" in text
+        assert [e for e in _actions(blocks, cq.ACTION_APPROVE) if e["value"] == cid]
+
+    def test_later_refuses_parked_and_terminal_rows(self, qenv):
+        cid = _seed("later on parked", severity="P3")
+        cq.park_item(cid, HARRISON, "vendor replies", trigger_event="vendor replies")
+        o, msg = cq.process_queue_action(cq.ACTION_LATER, cid, HARRISON)
+        assert o == "noop" and "PARKED" in msg
+        rec = cq.get_item(cid)
+        assert rec["status"] == "PARKED" and rec["park_event"] == "vendor replies"
+        shipped = _seed("later on shipped", status="APPROVED")
+        cq._append_event({"event": "shipped", "ts": cq._now_iso(), "id": shipped, "bundle_id": "b"})
+        o, msg = cq.process_queue_action(cq.ACTION_LATER, shipped, HARRISON)
+        assert o == "noop" and cq.get_item(shipped)["status"] == "SHIPPED"
+
+    def test_no_mark_shipped_button_without_a_bundle_and_the_refusal_names_the_verb(self, qenv):
+        # a stale STAGED row with no bundle (legacy shape) and one staged with a bundle
+        legacy = _seed("legacy stale", status="APPROVED")
+        cq._append_event({"event": "staged", "ts": (cq._now() - timedelta(days=20)).isoformat(),
+                          "id": legacy, "prompt_path": "G:/x.md"})
+        bundled = _seed("bundled stale", status="APPROVED", sub="other-sub")
+        cq._append_event({"event": "staged", "ts": (cq._now() - timedelta(days=20)).isoformat(),
+                          "id": bundled, "prompt_path": "G:/y.md", "bundle_id": "bnd-1"})
+        text, blocks = cq.build_weekly_menu()
+        ship_values = {e["value"] for e in _actions(blocks, cq.ACTION_MARK_SHIPPED)}
+        assert bundled in ship_values and legacy not in ship_values
+        assert f"ship {legacy} <bundle-or-branch>" in text
+        o, msg = cq.process_queue_action(cq.ACTION_MARK_SHIPPED, legacy, HARRISON)
+        assert o == "refused" and "predates bundle linkage" in msg and f"ship {legacy}" in msg
+        o2, _ = cq.process_queue_action(cq.ACTION_MARK_SHIPPED, bundled, HARRISON)
+        assert o2 == "shipped"
+
+    def test_titles_are_mrkdwn_escaped_and_the_parked_listing_is_whole_line(self, qenv):
+        cid = _seed("Fix <b>bold</b> & <i>", status="APPROVED")
+        text, blocks = cq.build_weekly_menu()
+        assert "&lt;b&gt;bold&lt;/b&gt; &amp; &lt;i&gt;" in text and "<b>" not in text
+        # fully random 192-char titles: a shared prefix would fuzzy-dedup at 0.85
+        parked = [_seed(uuid.uuid4().hex * 6, status="APPROVED", sub=f"p{i}") for i in range(16)]
+        fut = (cq._now().date() + timedelta(days=30)).isoformat()
+        for p in parked:
+            cq.park_item(p, HARRISON, "later", until=fut)
+        carried = {}
+        text, blocks = cq.build_weekly_menu(carried_out=carried)
+        section = next(b["text"]["text"] for b in blocks if b.get("type") == "section"
+                       and b["text"]["text"].startswith("*Parked (16)"))
+        assert len(section) <= 3000
+        assert "more parked rows in the backlog -- nothing dropped" in section
+        assert all(ln.startswith(("*Parked", "•", "_+")) for ln in section.splitlines())  # whole lines only
+
+    def test_carried_artifact_has_a_stable_schema(self, qenv):
+        _seed("schema", status="APPROVED")
+        carried = {}
+        cq.build_weekly_menu(carried_out=carried)
+        assert carried["stale_overflow"] == 0 and carried["proposed_overflow"] == 0

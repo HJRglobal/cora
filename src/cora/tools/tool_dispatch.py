@@ -5609,7 +5609,8 @@ def _shopify_set_inventory_impl(slack_user_id: str, entity: str, _input: dict) -
     # Harrison is a member like anyone else -- no founder side-door.
     from cora import guard_input, inventory_membership
     if not guard_input.is_inventory_write_channel(channel):
-        allowed, why = inventory_membership.allows(slack_user_id)
+        # F3E's channel(s) only (D-051 lens C F4): this tool writes F3E inventory.
+        allowed, why = inventory_membership.allows(slack_user_id, entity="F3E")
         if not allowed:
             log.info("f3e_shopify_set_inventory out-of-channel REFUSED user=%s channel=%r why=%s",
                      slack_user_id, channel, why)
@@ -12392,7 +12393,8 @@ def _execute_claimed_code_queue(pending: dict, slack_user_id: str, entity: str) 
     req = str(pending.get("request") or "").strip()
     is_founder = slack_user_id == code_queue.HARRISON_ID
     cq_id, outcome = code_queue.queue_explicit(
-        slack_user_id, entity, str(pending.get("channel_id") or ""), req, is_founder)
+        slack_user_id, entity, str(pending.get("channel_id") or ""), req, is_founder,
+        message_ts=str(pending.get("message_ts") or ""))
     # These two are NOT Class-B, but they ride the same shared seam and are
     # posted verbatim on the same two human surfaces, so they carried the same
     # defect (found by the static executor scan, not by the seed). Rewritten to
@@ -12478,6 +12480,10 @@ def _tool_queue_code_session(slack_user_id: str, entity: str, _input: dict) -> s
                 "describing the bug or the feature to build.")
     _store_pending_code_queue(slack_user_id, channel, {
         "request": request, "channel_id": channel_id, "ts": time.time(),
+        # D-051 lens B MED #7: the asking turn's thread/message ts -- the evidence
+        # POINTER queue_explicit records, so a LEX ask (body redacted at rest) still
+        # carries a permalink and the C1 floor has a door.
+        "message_ts": str(input_data.get("_thread_ts") or ""),
         "stash_id": confirm_cards.mint_stash_id("code_queue", slack_user_id, channel),
     })
     return _write_blocked_contract(

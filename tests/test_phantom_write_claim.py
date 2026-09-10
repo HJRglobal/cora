@@ -13,12 +13,16 @@ Contract under test:
   * ten benign write-shaped sentences WITH tool_use -> zero trips;
   * observe mode (the shipped default): text returned BYTE-IDENTICAL, WARN keyed
     `phantom-write-claim` (the key the S3' health count reads);
-  * enforce mode: the honest template replaces each claiming sentence, the
-    fabricated ids are redacted, and the log level is ERROR;
+  * enforce mode: the honest template is PREPENDED as the first line, the body is
+    kept byte-identical, the fabricated ids are redacted, and the log level is ERROR
+    (D-051 lens A HIGH #1: a sentence strip removes outcomes -- never again);
+  * an unknown CORA_SENTINEL_ENFORCE value reads as observe and is WARNED once;
+  * Slack link / mention tokens are masked before the lexicon runs;
   * orphan ledger ids (events with no `captured`) are KNOWN, never fabricated;
   * the class-level WebClient sanitizer does NOT run the screen (code-authored
     posts are not model claims), and app._dispatch_qa calls it on both final-reply
-    paths BEFORE the confirm-card blocks are built.
+    paths BEFORE the semantic-cache store and BEFORE the confirm-card blocks are
+    built, and on the cached-serve path (ids only -- a cached reply has no ledger).
 """
 
 from __future__ import annotations
@@ -187,46 +191,73 @@ class TestBenign:
 # ── enforce mode ─────────────────────────────────────────────────────────────
 
 class TestEnforce:
-    def test_0653_rewritten_with_template_and_redacted_ids(self, ledgers, monkeypatch, caplog):
+    """Enforce = PREPEND the honest line (body byte-identical) + redact fabricated ids,
+    at ERROR. The first cut deleted every claiming sentence; the D-051 review refused
+    that (lens A HIGH #1): 'filed' / 'updated' / 'created' are ordinary English, so a
+    legitimate zero-tool KB answer would have lost its answer sentence."""
+
+    def test_0653_prepends_the_template_and_redacts_only_the_fabricated_ids(self, ledgers, monkeypatch, caplog):
         monkeypatch.setenv("CORA_SENTINEL_ENFORCE", "enforce")
         caplog.set_level(logging.ERROR, logger=se.__name__)
         out = se.screen_phantom_write_claims(REPLY_0653, tool_use_count=0)
-        assert out != REPLY_0653
+        assert out.startswith(se.PHANTOM_HONEST_TEMPLATE + "\n\n")
         for f in FAKE_IDS:
             assert f not in out
-        assert "[unknown id]" in out
+        assert out.count("[unknown id]") == 2
         assert REAL_ID in out  # the real id survives
-        assert se.PHANTOM_HONEST_TEMPLATE in out
         assert out.count(se.PHANTOM_HONEST_TEMPLATE) == 1  # one honest line, not three
-        assert "queued for your review queue" not in out  # the claiming sentence is gone
-        assert "Nothing fires until you explicitly approve." in out  # non-claims survive
+        # the body is otherwise BYTE-IDENTICAL -- nothing deleted, nothing rewritten
+        expected_body = REPLY_0653
+        for f in FAKE_IDS:
+            expected_body = expected_body.replace(f, "[unknown id]")
+        assert out == se.PHANTOM_HONEST_TEMPLATE + "\n\n" + expected_body
+        assert "queued for your review queue" in out
+        assert "Nothing fires until you explicitly approve." in out
         assert all(r.levelno == logging.ERROR for r in caplog.records
                    if se.PHANTOM_LOG_KEY in r.getMessage())
 
-    def test_0654_rewritten(self, ledgers, monkeypatch):
+    def test_0654_prepends_once_and_keeps_the_body(self, ledgers, monkeypatch):
         monkeypatch.setenv("CORA_SENTINEL_ENFORCE", "enforce")
         out = se.screen_phantom_write_claims(REPLY_0654, tool_use_count=0)
-        assert "locked in" not in out.lower()
-        assert "canonicalized" not in out.lower()
-        assert "is live" not in out.lower()
-        assert "code session queued" not in out.lower()
-        assert se.PHANTOM_HONEST_TEMPLATE in out
+        assert out == se.PHANTOM_HONEST_TEMPLATE + "\n\n" + REPLY_0654
         assert out.count(se.PHANTOM_HONEST_TEMPLATE) == 1
-        assert "Roger." in out and "What's next?" in out
 
-    def test_claim_only_body_becomes_the_template_never_empty(self, ledgers, monkeypatch):
+    def test_claim_only_body_is_led_by_the_template_and_idempotent(self, ledgers, monkeypatch):
         monkeypatch.setenv("CORA_SENTINEL_ENFORCE", "enforce")
-        assert se.screen_phantom_write_claims("Done.", tool_use_count=0) == se.PHANTOM_HONEST_TEMPLATE
-        assert se.screen_phantom_write_claims("Deleted.", tool_use_count=0) == se.PHANTOM_HONEST_TEMPLATE
+        once = se.screen_phantom_write_claims("Done.", tool_use_count=0)
+        assert once == se.PHANTOM_HONEST_TEMPLATE + "\n\nDone."
+        assert se.screen_phantom_write_claims(once, tool_use_count=0) == once  # a second pass adds nothing
+        assert se.screen_phantom_write_claims("Deleted.", tool_use_count=0).startswith(se.PHANTOM_HONEST_TEMPLATE)
 
     def test_enforce_leaves_tool_bearing_reply_alone(self, ledgers, monkeypatch):
         monkeypatch.setenv("CORA_SENTINEL_ENFORCE", "enforce")
-        for s in BENIGN_WITH_TOOLS:
-            assert se.screen_phantom_write_claims(s, tool_use_count=1) == s
+        for s_ in BENIGN_WITH_TOOLS:
+            assert se.screen_phantom_write_claims(s_, tool_use_count=1) == s_
 
-    def test_observe_is_the_default_and_unknown_mode_values_observe(self, ledgers, monkeypatch):
+    def test_observe_is_the_default_and_unknown_mode_values_observe(self, ledgers, monkeypatch, caplog):
+        """D-051 lens A MED #4: the raw value used to leak into every rail line as
+        `mode=yes-please`; now it reads as observe and is WARNED once per process."""
         monkeypatch.setenv("CORA_SENTINEL_ENFORCE", "yes-please")
+        se._MODE_WARNED.clear()
+        caplog.set_level(logging.WARNING, logger=se.__name__)
         assert se.screen_phantom_write_claims(REPLY_0654, tool_use_count=0) == REPLY_0654
+        assert se.screen_phantom_write_claims(REPLY_0654, tool_use_count=0) == REPLY_0654
+        assert se._sentinel_mode() == "observe"
+        warns = [r for r in caplog.records if "is not a mode" in r.getMessage()]
+        assert len(warns) == 1
+        assert not any("mode=yes-please" in r.getMessage() for r in caplog.records)
+        assert all("mode=observe" in r.getMessage() for r in caplog.records
+                   if "kind=lexicon" in r.getMessage())
+
+    def test_link_and_mention_tokens_are_masked_from_the_lexicon(self, ledgers, caplog):
+        """D-051 lens A MED #5: a link LABEL is not a write claim."""
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        se.screen_phantom_write_claims(
+            "See <https://x.com/p|Updated pricing page> and <#C1|filed-receipts> for context.",
+            tool_use_count=0)
+        assert _hits(caplog, "lexicon") == []
+        se.screen_phantom_write_claims("Updated the page: <https://x.com/p|pricing>.", tool_use_count=0)
+        assert len(_hits(caplog, "lexicon")) == 1
 
 
 # ── reference sets ────────────────────────────────────────────────────────────
@@ -250,13 +281,27 @@ class TestKnownIds:
         cq._append_event({"event": "captured", "id": "cq-000000000001", "ts": cq._now_iso()})
         assert "cq-000000000001" in cq.known_ids()
 
-    def test_missing_ledger_knows_nothing_so_every_id_is_flagged(self, ledgers, caplog, monkeypatch):
+    def test_missing_ledger_is_cannot_check_never_all_fabricated(self, ledgers, caplog, monkeypatch):
+        """D-051 lens C F6: a mis-pathed / absent ledger under ENFORCE would otherwise
+        redact every legitimate id. Absent -> the family is skipped with a WARNING."""
         monkeypatch.setattr(cq, "_EVENT_LEDGER", ledgers / "never-written.jsonl")
         cq._KNOWN_IDS_CACHE.update({"key": None, "ids": frozenset()})
-        assert cq.known_ids() == frozenset()
+        assert cq.known_ids() is None
+        monkeypatch.setenv("CORA_SENTINEL_ENFORCE", "enforce")
         caplog.set_level(logging.WARNING, logger=se.__name__)
-        se.screen_phantom_write_claims("see cq-621dfad586aa", tool_use_count=1)
-        assert len(_hits(caplog, "fabricated-id")) == 1
+        text = "see cq-621dfad586aa"
+        assert se.screen_phantom_write_claims(text, tool_use_count=1) == text  # NOT redacted
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any("ABSENT" in m for m in msgs)
+        assert not any("kind=fabricated-id id=" in m for m in msgs)
+
+    def test_absent_dw_ledgers_are_cannot_check_too(self, ledgers, caplog, monkeypatch):
+        monkeypatch.setenv("CORA_SENTINEL_ENFORCE", "enforce")
+        assert dw.known_job_ids() is None  # neither dw ledger exists in the fixture
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        text = "job dw-aaaaaaaaaaaa is running"
+        assert se.screen_phantom_write_claims(text, tool_use_count=1) == text
+        assert any("ledger=dw ABSENT" in r.getMessage() for r in caplog.records)
 
     def test_unreadable_ledger_skips_the_family_with_a_warning(self, ledgers, caplog, monkeypatch):
         def _boom():
@@ -299,20 +344,36 @@ class TestSeamPlacement:
         assert "cq-e7f2a4c91b2e" in out
         assert not [r for r in caplog.records if se.PHANTOM_LOG_KEY in r.getMessage()]
 
-    def test_dispatch_qa_screens_both_final_replies_before_the_card_blocks(self):
+    def test_dispatch_qa_screens_before_the_cache_store_and_the_card_blocks(self):
+        """D-051 lens A HIGH #2 + lens D MED #4: three screens -- the cached-serve path
+        (ids only) and both final-reply paths, each strictly BEFORE its cache store,
+        its content guard and its confirm-card build (positions compared pairwise;
+        str.index(sub, c) can never be < c, which is what the old assert tested)."""
+        import re
         import cora.app as app_module
         src = inspect.getsource(app_module._dispatch_qa)
-        calls = [m.start() for m in __import__("re").finditer(
-            r"slack_egress\.screen_phantom_write_claims\(", src)]
-        assert len(calls) == 2, "one screen per final-reply path (non-streaming + streaming)"
-        guards = [m.start() for m in __import__("re").finditer(
-            r"response_text = _guard_content\(response_text\)", src)]
-        assert len(guards) == 2
-        for g, c in zip(guards, calls):
-            assert c > g  # after the content guard ...
-            nxt_card = src.index("_confirm_card_for_reply(response_text)", c)
-            assert nxt_card > c  # ... and before the blocks are built from the text
-        assert 'tool_use_count=gen_meta.get("tool_use_count", 0)' in src
+        screens = [m.start() for m in re.finditer(r"slack_egress\.screen_phantom_write_claims\(", src)]
+        assert len(screens) == 3, "cached-serve + non-streaming + streaming"
+        cached = screens[0]
+        assert "tool_use_count=None" in src[cached:cached + 300]
+        assert src.index("cached_response = sc.get_cache().lookup(") < cached < src.index("say(", cached)
+        finals = screens[1:]
+        stores = [m.start() for m in re.finditer(r"_try_cache_store\(entity, user_message", src)]
+        guards = [m.start() for m in re.finditer(r"response_text = _guard_content\(response_text\)", src)]
+        cards = [m.start() for m in re.finditer(r"_confirm_card_for_reply\(response_text\)", src)]
+        assert len(stores) == len(guards) == len(cards) == 2
+        for scr, store, guard, card in zip(finals, stores, guards, cards):
+            assert scr < store < guard < card, (scr, store, guard, card)
+        assert src.count("tool_use_count=_turn_tool_use_count(gen_meta)") == 2
+
+    def test_turn_tool_use_count_adds_server_web_tools(self):
+        """D-051 lens A MED #5: a web-search turn ran zero client tools."""
+        import cora.app as app_module
+        f = app_module._turn_tool_use_count
+        assert f({"tool_use_count": 0}) == 0
+        assert f({"tool_use_count": 0, "web_search_requests": 2}) == 2
+        assert f({"tool_use_count": 1, "web_fetch_requests": 1}) == 2
+        assert f(None) == 0 and f({}) == 0
 
     def test_claude_client_counts_tool_use_blocks(self):
         from cora import claude_client as cc

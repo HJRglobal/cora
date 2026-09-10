@@ -315,10 +315,13 @@ KNOWN_ENTITY_CODES = frozenset({
     "FNDR", "HJRG", "F3E", "F3C", "OSN", "OSNGW", "OSNGM", "OSNGF", "OSNVV", "UFL", "BDM",
     "HJRP", "HJRP-RR", "HJRPROD", "POD", "LEX", "LEX-LLC", "LEX-LLA", "LEX-LBHS", "LEX-LTS",
 })
-# "[BDM] Drive doc suggests ..." (asana_task) and 'mentioned in slack (UFL) but ...'
-# (hubspot_note). Upper-case code only, so "(assigned to Micah Kessler)" never reads
-# as an entity; an unknown code ("(HIGH)") is dropped by the KNOWN set.
-_DESC_ENTITY_RE = __import__("re").compile(r"^\s*\[([A-Z][A-Z0-9-]{1,11})\]|\(([A-Z][A-Z0-9-]{1,11})\)")
+# "[BDM] Drive doc suggests ..." (asana_task), 'mentioned in slack (UFL) but ...'
+# (hubspot_note) and 'Possible task completion: "[HJRG] Reinstate ..."' (task_close --
+# the code sits INSIDE the quoted task name, so the bracket branch is NOT anchored;
+# D-051 lens E F8: the `^` anchor missed 8 live rows). Upper-case code only, so
+# "(assigned to Micah Kessler)" never reads as an entity; an unknown code ("(HIGH)")
+# is dropped by the KNOWN set; TWO different known codes are ambiguous -> unresolved.
+_DESC_ENTITY_RE = __import__("re").compile(r"\[([A-Z][A-Z0-9-]{1,11})\]|\(([A-Z][A-Z0-9-]{1,11})\)")
 _TASK_URL_PROJECT_RE = __import__("re").compile(r"/project/(\d{10,20})(?:/|$)")
 _ASANA_MAP_PATH = (
     Path(__file__).parent.parent.parent / "data" / "maps" / "asana-project-map.yaml"
@@ -368,19 +371,23 @@ def _asana_gid_entity_map() -> dict[str, str]:
 def resolve_entity(update: dict | None) -> str:
     """Best-effort entity code for a ledger row, '' when it cannot be told.
 
-    Order: payload.entity (the explicit field, 98 of 462 live rows) -> a bracketed
-    or parenthesized KNOWN code in the description -> the Asana project gid in
+    Order: payload.entity (the explicit field, 98 of 462 live rows) -> the ONE
+    bracketed / parenthesized KNOWN code anywhere in the description (two different
+    known codes = ambiguous = unresolved, never a guess) -> the Asana project gid in
     payload.task_url mapped through asana-project-map.yaml. Never a default.
     """
     u = update or {}
     ent = item_entity(u)
     if ent:
         return ent
-    m = _DESC_ENTITY_RE.search(str(u.get("description") or ""))
-    if m:
-        code = (m.group(1) or m.group(2) or "").upper()
-        if code in KNOWN_ENTITY_CODES:
-            return code
+    desc = str(u.get("description") or "")
+    known = {c for c in ((m.group(1) or m.group(2) or "").upper()
+                         for m in _DESC_ENTITY_RE.finditer(desc))
+             if c in KNOWN_ENTITY_CODES}
+    if len(known) == 1:
+        return next(iter(known))
+    if len(known) > 1:
+        return ""
     payload = u.get("payload") if isinstance(u.get("payload"), dict) else {}
     mm = _TASK_URL_PROJECT_RE.search(str(payload.get("task_url") or ""))
     if mm:
@@ -392,7 +399,10 @@ def is_low_risk_expirable(update: dict | None, now_dt, *, answered: bool = False
     """(eligible, why_not). Eligible = PENDING + one of LOW_RISK_EXPIRE_TYPES +
     entity resolves to FNDR/F3E + pending >= LOW_RISK_EXPIRE_DAYS measured from the
     LATER of creation (proposed_at) and first surfacing (dm_message_ts) + no
-    reviewer action (``answered`` is the caller's reaction-log read). The reason
+    reviewer action (``answered`` is the caller's reaction-log read) + NOT excluded
+    by the decision lane's content screen (D-051 lens E F3: a description carrying
+    a LEX token under an F3E-resolved entity is a refusal here exactly as it is for
+    can_approve -- a row on a PHI boundary is never auto-dispositioned). The reason
     string names which gate held, so the run log can count them."""
     from datetime import datetime as _dt, timedelta as _td, timezone as _tz
     u = update or {}
@@ -407,6 +417,9 @@ def is_low_risk_expirable(update: dict | None, now_dt, *, answered: bool = False
         return False, "other_entity"
     if answered:
         return False, "reviewer_acted"
+    excluded, _why = content_screen_excludes(u)
+    if excluded:
+        return False, "content_screened"
     try:
         clock = _dt.fromisoformat(str(u.get("proposed_at")))
         if clock.tzinfo is None:
