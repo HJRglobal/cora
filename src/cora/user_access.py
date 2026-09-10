@@ -387,12 +387,25 @@ def check_access(
     user_message: str,
     phi_custodian: bool = False,
     tier: str | None = None,
+    entity_grant: bool = False,
 ) -> str | None:
     """Full access check. Returns a redirect message string if blocked, None if allowed.
 
     Checks:
       1. Entity authorization — is the user allowed to ask about this entity?
       2. Sensitive topic detection — is the question about a blocked topic?
+
+    `entity_grant` (default False; Code #12 G1, cq-f23d6885dd1c): the caller has
+    ALREADY established entity authorization by a STRUCTURAL fact -- today exactly
+    one: the message is an office-inventory WRITE request posted IN the configured
+    inventory write channel, so the sender is a live member of that channel (you
+    cannot post in a channel you are not in) and Hannah's 8/21 rule ("anyone
+    in-channel using the template executes"; Skylar Eastham cleared 8/28) applies.
+    Skips ONLY check 1. Every sensitive-topic block in check 2 still runs on the
+    raw message -- the grant is entity scope, never topic scope. Verified 2026-09-09:
+    Skylar is a live channel member and in NEITHER roster file, so without this the
+    unknown-user rule (FNDR/HJRG only) refused her F3E writes -- the live incident
+    and the Hannah-vs-Skylar "parity" bug are the same defect.
 
     `phi_custodian` (default False): when True, the `phi` topic block is skipped
     for THIS request only. The caller sets it via lex_phi_access.phi_allowed(),
@@ -419,7 +432,7 @@ def check_access(
     # code (FNDR/HJRG/F3E/...). Leaking the code both confuses operators and exposes
     # internal taxonomy (the 2026-06-01 #f3-events incident: Alex was refused 3x with
     # "I can only assist with FNDR topics", leaking the code on the access-gate default).
-    if not is_authorized(user_id, entity):
+    if not entity_grant and not is_authorized(user_id, entity):
         return (
             "That's outside what I can help with in this channel. Ask me in the "
             "channel for the team that owns it and I'll answer there."

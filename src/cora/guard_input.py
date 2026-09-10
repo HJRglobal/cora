@@ -300,6 +300,45 @@ def is_inventory_write_channel(channel_name: str | None) -> bool:
     return bool(name) and name in inventory_write_channels()
 
 
+#: Code #12 G1: the write channels' Slack IDs (`slack_channel_id` in the same YAML),
+#: for the OUT-OF-CHANNEL membership check (inventory_membership.allows). Same TTL
+#: and the same fail-soft-to-EMPTY posture -- but here empty means "no channel whose
+#: membership could prove anything", and the membership check treats that as a
+#: refusal (fail closed), never as "no rule applies".
+_INV_CHANNEL_ID_CACHE: dict[str, object] = {"at": 0.0, "value": None}
+
+
+def inventory_write_channel_ids() -> set[str]:
+    now = time.monotonic()
+    cached = _INV_CHANNEL_ID_CACHE.get("value")
+    if cached is not None and (now - float(_INV_CHANNEL_ID_CACHE["at"])) < _INV_CHANNEL_TTL:
+        return cached  # type: ignore[return-value]
+    try:
+        import yaml
+        if not _INV_CHANNEL_CFG_PATH.exists():
+            return set()
+        data = yaml.safe_load(_INV_CHANNEL_CFG_PATH.read_text(encoding="utf-8")) or {}
+        value = {
+            str(v.get("slack_channel_id") or "").strip()
+            for k, v in (data.get("channels") or {}).items()
+            if isinstance(v, dict) and str(v.get("slack_channel_id") or "").strip()
+        }
+    except Exception:  # noqa: BLE001 -- a guard input helper never raises
+        return set()
+    if value:  # never cache an empty/failed load
+        _INV_CHANNEL_ID_CACHE.update({"at": now, "value": value})
+    return value
+
+
+def is_inventory_write_intent(text: str) -> bool:
+    """Either form of an office-inventory WRITE request: the rigid template
+    (is_inventory_adjustment_request) or the prose form (is_inventory_write_request).
+    The G1 in-channel grant keys on this together with the channel, so a QUESTION
+    posted in the write channel by a non-roster member is still governed by the
+    ordinary entity gate."""
+    return is_inventory_adjustment_request(text) or is_inventory_write_request(text)
+
+
 def is_inventory_adjustment_request(text: str) -> bool:
     """True only when ALL THREE structural signals of an office-inventory write
     request are present. Any one alone is not enough -- but note that satisfying

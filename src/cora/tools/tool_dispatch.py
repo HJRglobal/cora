@@ -5599,6 +5599,23 @@ def _shopify_set_inventory_impl(slack_user_id: str, entity: str, _input: dict) -
             f"{_NOT_WRITTEN}\nDTC inventory updates are only available from F3E channels."
         )
 
+    # --- G1 (Code #12, cq-f23d6885dd1c + cq-28de84159c3f): HYBRID authorization ---
+    # IN the configured write channel, membership is proven by the post itself
+    # (the pre-LLM gate grants entity scope on that fact; nothing to look up here).
+    # OUT of it -- a DM, any other channel, including the founder's cross-entity
+    # path -- the allowlist is the LIVE membership of that channel, read at
+    # request time (<= 5 min cache), no hand-maintained names. A lookup that fails
+    # REFUSES (fail closed): "could not verify" must never read as "authorized".
+    # Harrison is a member like anyone else -- no founder side-door.
+    from cora import guard_input, inventory_membership
+    if not guard_input.is_inventory_write_channel(channel):
+        allowed, why = inventory_membership.allows(slack_user_id)
+        if not allowed:
+            log.info("f3e_shopify_set_inventory out-of-channel REFUSED user=%s channel=%r why=%s",
+                     slack_user_id, channel, why)
+            return _shopify_write_blocked(
+                f"{_NOT_WRITTEN}\n{inventory_membership.refusal_text(why)}")
+
     confirmed = _confirmed_flag(input_data)
     items = input_data.get("items")
     is_bulk = isinstance(items, list) and len(items) > 0

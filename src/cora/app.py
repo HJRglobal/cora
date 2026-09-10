@@ -44,6 +44,7 @@ from . import delegated_work
 from .knowledge_base import embeddings as kb_embeddings
 from . import review_lanes
 from . import slack_egress
+from . import guard_input
 from . import sibling_guard
 from . import cross_entity_guard
 from . import info_intake
@@ -2240,8 +2241,15 @@ def handle_cora_ask(ack, body, client) -> None:
         tier = channel_classifier.tier_label(
             entity, channel_classifier.classify_function(channel_name)
         )
+        # G1 (Code #12, cq-f23d6885dd1c): an inventory WRITE request posted IN the
+        # configured write channel proves membership (you cannot post in a channel
+        # you are not in) -> entity scope granted per Hannah's 8/21 rule; every
+        # sensitive-topic block still runs. Channel AND write-intent, never one alone.
+        _inv_grant = guard_input.is_inventory_write_channel(channel_name) and \
+            guard_input.is_inventory_write_intent(text)
         access_block = user_access.check_access(
-            user_id, entity, text, phi_custodian=phi_custodian, tier=tier
+            user_id, entity, text, phi_custodian=phi_custodian, tier=tier,
+            entity_grant=_inv_grant,
         )
         if access_block:
             log.info(
@@ -2397,8 +2405,15 @@ def handle_mention(event: dict, say: callable, client) -> None:
         phi_custodian = lex_phi_access.phi_allowed(
             user_id, entity, is_dm=str(channel_id).startswith("D")
         )
+        # G1 (Code #12, cq-f23d6885dd1c): an inventory WRITE request posted IN the
+        # configured write channel proves membership (you cannot post in a channel
+        # you are not in) -> entity scope granted per Hannah's 8/21 rule; every
+        # sensitive-topic block still runs. Channel AND write-intent, never one alone.
+        _inv_grant = guard_input.is_inventory_write_channel(channel_name) and \
+            guard_input.is_inventory_write_intent(user_message)
         access_block = user_access.check_access(
-            user_id, entity, user_message, phi_custodian=phi_custodian, tier=tier
+            user_id, entity, user_message, phi_custodian=phi_custodian, tier=tier,
+            entity_grant=_inv_grant,
         )
         if access_block:
             log.info(
@@ -3758,8 +3773,15 @@ def handle_message_event(event: dict, client) -> None:
     tier = channel_classifier.tier_label(
         entity, channel_classifier.classify_function(channel_name)
     )
+    # G1 (Code #12, cq-f23d6885dd1c): an inventory WRITE request posted IN the
+    # configured write channel proves membership (you cannot post in a channel
+    # you are not in) -> entity scope granted per Hannah's 8/21 rule; every
+    # sensitive-topic block still runs. Channel AND write-intent, never one alone.
+    _inv_grant = guard_input.is_inventory_write_channel(channel_name) and \
+        guard_input.is_inventory_write_intent(text)
     access_block = user_access.check_access(
-        user_id, entity, text, phi_custodian=phi_custodian, tier=tier
+        user_id, entity, text, phi_custodian=phi_custodian, tier=tier,
+        entity_grant=_inv_grant,
     )
     if access_block:
         # By design this also blocks a staged-write CONFIRM reply that echoes a

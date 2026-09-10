@@ -153,6 +153,35 @@ def pytest_configure(config):
 # green — tests now always exercise the real module.)
 
 
+class _EveryoneIsAMember(frozenset):
+    """A member set that contains every id -- the suite-wide default for the G1
+    live-membership check (see _inventory_membership_default_member)."""
+
+    def __contains__(self, item) -> bool:  # noqa: D401
+        return True
+
+
+@pytest.fixture(autouse=True)
+def _inventory_membership_default_member(monkeypatch):
+    """Code #12 G1: an OUT-OF-CHANNEL DTC inventory write requires LIVE membership
+    of #f3-hq-inventory-adjustments, read via the bot token. The suite has no token
+    and must never call Slack, and every inventory-tool suite that predates the
+    rule drives the tool from another channel to exercise resolve / preview /
+    confirm -- not authority. So by default every test runs as a channel MEMBER.
+    tests/test_inventory_membership_auth.py owns the authority contract and
+    restores the real lookup for its own tests."""
+    try:
+        from cora import inventory_membership as im
+    except Exception:  # noqa: BLE001 -- module absent on an old tree
+        yield
+        return
+    im.reset_cache()
+    monkeypatch.setattr(im, "member_ids",
+                        lambda channel_id, *, client_factory=None, now=None: _EveryoneIsAMember())
+    yield
+    im.reset_cache()
+
+
 @pytest.fixture(autouse=True)
 def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     """Isolate module-global state that otherwise leaks between tests.

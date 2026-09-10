@@ -16,7 +16,15 @@
 #
 # FAIL-SOFT: a missing/unparseable file or an unlisted channel simply means "no
 # default" -- the tool falls back to asking for the location (never a write bypass).
+#   slack_channel_id : the channel's Slack ID. Code #12 G1 (2026-09-09, HYBRID
+#                      authorization ruled 9/1 + 9/8): IN this channel anyone who
+#                      posts the request executes (membership is proven by the
+#                      post); OUT of it (a DM, any other channel) the allowlist is
+#                      the LIVE membership of this channel, read through this id at
+#                      request time (<= 5 min cache; a failed lookup refuses). No
+#                      hand-maintained name list -- frozen lists are retired.
 channels:
   f3-hq-inventory-adjustments:      # Slack id C0B7X2E4VNG; Shopify location id 81567023424
+    slack_channel_id: C0B7X2E4VNG   # verified live 2026-09-09: conversations.info name == this key, is_member true, 11 members
     default_location: "1337 S Gilbert Rd"
     unit: cases
