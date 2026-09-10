@@ -76,8 +76,11 @@ class TestFollowupAccessCheck:
         # phi_custodian derived exactly as handle_mention does (channel -> not DM).
         path2_mocks.phi.assert_called_once_with(TOMMY, "F3E", is_dm=False)
         # tier computed via the real channel_classifier: f3e-sales -> TIER_3.
+        # entity_grant mirrors handle_mention too (Code #12 G1): False for a
+        # non-inventory message in a non-inventory channel.
         path2_mocks.access.assert_called_once_with(
             TOMMY, "F3E", "whats the plan", phi_custodian=False, tier="TIER_3",
+            entity_grant=False,
         )
 
     def test_phi_custodian_flag_passes_through(self, path2_mocks):

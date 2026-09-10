@@ -162,10 +162,15 @@ def test_request_shaped_checkpoints_use_the_request_union():
     for needle in (
         'if phi_guard.is_any_phi_request(f"{title} {summary}".strip()):',   # seed_item
         'if phi_guard.is_any_phi_request(f"{title} {summary}"):',            # apply_edit
+        # Code #12 C3: two more refuse-a-human's-typed-text gates -- a park reason
+        # (+ its resume-event text) and a dismissal note, both typed by Harrison
+        # into a modal and refused to his face on a hit. Same lane as apply_edit.
+        'if phi_guard.is_any_phi_request(f"{reason} {trigger_event}"):',      # park_item
+        "if phi_guard.is_any_phi_request(note):",                             # dismiss_with_evidence
     ):
         assert needle in src, needle
-    assert src.count("is_any_phi_request(") == 2, (
-        "the request-shaped union spread beyond the two refuse-a-human gates")
+    assert src.count("is_any_phi_request(") == 4, (
+        "the request-shaped union spread beyond the four refuse-a-human gates")
 
 
 def test_at_rest_screens_stay_strict():

@@ -243,8 +243,16 @@ class TestGatePresenceAndOrdering:
             client = MagicMock()
             _invoke(surface, client, "whats the plan", TOMMY)
             # f3e-sales -> TIER_3 for the channel surfaces; the DM pins TIER_3.
+            expected = {"phi_custodian": False, "tier": "TIER_3"}
+            if not IS_DM[surface]:
+                # Code #12 G1: the three CHANNEL surfaces carry the in-channel
+                # inventory grant (False for a non-inventory message in a
+                # non-inventory channel -- parity of the kwarg itself is the pin);
+                # the DM path never does: out-of-channel authority is the
+                # inventory tool's live-membership check.
+                expected["entity_grant"] = False
             ctx.guards.access.assert_called_once_with(
-                TOMMY, ENTITY, "whats the plan", phi_custodian=False, tier="TIER_3",
+                TOMMY, ENTITY, "whats the plan", **expected,
             )
 
     def test_phi_custodian_flag_flows_to_check_access(self, surface):

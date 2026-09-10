@@ -2932,14 +2932,67 @@ def _proposed_row_line(it: dict[str, Any]) -> str:
             f"{it.get('title', '')} (`{it.get('id', '?')}`) -- {age}d")
 
 
+_LISTING_MAX_CHARS = 2600   # one section block (Slack cap 3000); leaves room for the overflow note
+
+
+def _fit_listing(header: str, lines: list[str], overflow_note: Callable[[int], str]) -> tuple[str, int]:
+    """Pack as many whole lines as fit under _LISTING_MAX_CHARS and report how many
+    did. A `[:2900]` slice on a long listing cut the last lines (and the '+N more'
+    note) mid-word on the live card -- a lossy truncation nothing counted. Whole
+    lines only; the remainder is COUNTED in the note, never silently dropped."""
+    body = header
+    n = 0
+    for ln in lines:
+        candidate = body + "\n" + ln
+        if len(candidate) > _LISTING_MAX_CHARS:
+            break
+        body = candidate
+        n += 1
+    rest = len(lines) - n
+    if rest:
+        body += "\n" + overflow_note(rest)
+    return body, n
+
+
+_MENU_MAX_STALE_ROWS = 8      # actionable stale / due-parked rows; the rest list as text
+
+
+def _allocate_menu_slots(n_prio: int, n_approved_rows: int, n_stale: int, n_aged: int,
+                         fixed_blocks: int) -> dict[str, int]:
+    """Action-row slots (2 blocks each) under the block budget, in PRIORITY order:
+    PROPOSED P0/P1-class rows first (the least-netted tier, audit F8), APPROVED rows
+    (the menu's original purpose), stale STAGED / due-PARKED rows, then PROPOSED aged
+    rows. Every remainder is LISTED as text (one block each) -- never dropped.
+
+    Found on the live ledger 2026-09-09 (not by a fixture): 24 stale STAGED rows
+    rendered first took 48 blocks, the card hit 54, and the trailing PROPOSED
+    coverage -- the section C3 exists for -- was trimmed off entirely. Allocation
+    before rendering is what makes the ceiling a budget instead of a guillotine.
+    """
+    listing_reserve = 3  # proposed-rest + stale-rest + approved-overflow notes, worst case
+    avail = max(0, (_MENU_BLOCK_BUDGET - fixed_blocks - listing_reserve) // 2)
+    out: dict[str, int] = {}
+    take = min(n_prio, _MENU_MAX_PROPOSED_ROWS, avail)
+    out["prio"], avail = take, avail - take
+    take = min(n_approved_rows, _MENU_MAX_ROWS, avail)
+    out["approved"], avail = take, avail - take
+    take = min(n_stale, _MENU_MAX_STALE_ROWS, avail)
+    out["stale"], avail = take, avail - take
+    take = min(n_aged, max(0, _MENU_MAX_PROPOSED_ROWS - out["prio"]), avail)
+    out["aged"], avail = take, avail - take
+    return out
+
+
 def build_weekly_menu(*, carried_out: dict[str, Any] | None = None) -> tuple[str, list[dict[str, Any]]] | None:
     """(text, blocks) for the Monday menu, or None if there is nothing to show.
     APPROVED items are grouped by AFFINITY (subsystem_guess -> entity) into bundles of
     at most _MAX_BUNDLE_ITEMS; a group of one is listed singly. There is NO kitchen-sink
-    "other" bundle (defect #5). Plus config items, a staleness sweep (STAGED >14d and
-    expired SNOOZEs, with Keep counts + the cap), due/waiting PARKED rows, and the
-    PROPOSED coverage (C3). ``carried_out`` (optional dict) is filled with the ids
-    carried per section -- the durable artifact maybe_send_weekly_menu records."""
+    "other" bundle (defect #5). Plus config items, the PROPOSED coverage (C3), a
+    staleness sweep (STAGED >14d and expired SNOOZEs, with Keep counts + the cap) and
+    due/waiting PARKED rows. Action slots are ALLOCATED by priority under the Slack
+    block budget before anything renders (_allocate_menu_slots); every remainder is
+    listed. ``carried_out`` (optional dict) is filled with the ids carried per
+    section -- the durable artifact maybe_send_weekly_menu records."""
     items = load_items()
     approved = [it for it in items if it.get("status") == "APPROVED" and it.get("kind") != "config"]
     config_items = [it for it in items if it.get("status") == "APPROVED" and it.get("kind") == "config"]
@@ -2951,16 +3004,19 @@ def build_weekly_menu(*, carried_out: dict[str, Any] | None = None) -> tuple[str
     expired_snoozed = [it for it in items if it.get("status") == "SNOOZED"
                        and (_parse_ts(it.get("snooze_until")) or now) <= now]
     proposed_cov = _proposed_coverage(items)
+    prio_rows = [it for it in proposed_cov if is_priority_severity(it.get("severity"))]
+    aged_rows = [it for it in proposed_cov if not is_priority_severity(it.get("severity"))]
     parked_due, parked_waiting = _parked_rows(items, now)
 
     carried: dict[str, Any] = {
         "approved": _ids(approved), "config": _ids(config_items),
         "stale_staged": _ids(stale_staged), "expired_snoozed": _ids(expired_snoozed),
         "parked_due": _ids(parked_due), "parked_waiting": _ids(parked_waiting),
+        "stale_actionable": [], "stale_listed": [],
         "proposed_actionable": [], "proposed_listed": [], "proposed_overflow": 0,
         "proposed_aged": sum(1 for it in proposed_cov if _age_days(it.get("ts")) >= STALE_STAGED_DAYS),
-        "proposed_priority": sum(1 for it in proposed_cov if is_priority_severity(it.get("severity"))),
-        "blocks": 0,
+        "proposed_priority": len(prio_rows),
+        "blocks": 0, "trimmed": 0,
     }
 
     if not (approved or config_items or stale_staged or expired_snoozed
@@ -2968,12 +3024,6 @@ def build_weekly_menu(*, carried_out: dict[str, Any] | None = None) -> tuple[str
         if carried_out is not None:
             carried_out.update(carried)
         return None
-
-    blocks: list[dict[str, Any]] = [
-        {"type": "section", "text": {"type": "mrkdwn",
-         "text": "*Cora code-session queue -- Monday menu*"}},
-    ]
-    text_lines = ["*Cora code-session queue -- Monday menu*"]
 
     def _btn(action_id: str, label: str, value: str, *, style: str | None = None) -> dict[str, Any]:
         b: dict[str, Any] = {"type": "button", "action_id": action_id,
@@ -2983,17 +3033,37 @@ def build_weekly_menu(*, carried_out: dict[str, Any] | None = None) -> tuple[str
         return b
 
     # APPROVED -> affinity bundles (<= _MAX_BUNDLE_ITEMS each), singletons listed singly.
+    approved_rows: list[list[dict[str, Any]]] = []
     if approved:
         groups: dict[str, list[dict[str, Any]]] = {}
         for it in approved:
             groups.setdefault(_affinity_key(it), []).append(it)
         # Deterministic order: largest group first, then key. Split each group into
         # chunks of <= _MAX_BUNDLE_ITEMS -- NO cross-affinity merge.
-        rows: list[list[dict[str, Any]]] = []
         for _key, group in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
             for start in range(0, len(group), _MAX_BUNDLE_ITEMS):
-                rows.append(group[start:start + _MAX_BUNDLE_ITEMS])
-        shown, overflow_n = rows[:_MENU_MAX_ROWS], max(0, len(rows) - _MENU_MAX_ROWS)
+                approved_rows.append(group[start:start + _MAX_BUNDLE_ITEMS])
+
+    # Attention rows: due parks first (a trigger fired), then capped Keeps (they
+    # need a decision, not another Keep), then the oldest stale rows, then expired snoozes.
+    capped = [it for it in stale_staged if int(it.get("keep_count") or 0) >= KEEP_CAP]
+    uncapped = sorted([it for it in stale_staged if it not in capped],
+                      key=lambda it: str(it.get("staged_at") or it.get("ts") or ""))
+    attention_rows = parked_due + capped + uncapped + expired_snoozed
+
+    fixed_blocks = 1 + (1 if config_items else 0) + (1 if parked_waiting else 0) \
+        + (1 if proposed_cov else 0)
+    slots = _allocate_menu_slots(len(prio_rows), len(approved_rows), len(attention_rows),
+                                 len(aged_rows), fixed_blocks)
+
+    blocks: list[dict[str, Any]] = [
+        {"type": "section", "text": {"type": "mrkdwn",
+         "text": "*Cora code-session queue -- Monday menu*"}},
+    ]
+    text_lines = ["*Cora code-session queue -- Monday menu*"]
+
+    if approved_rows:
+        shown, overflow_n = approved_rows[:slots["approved"]], max(0, len(approved_rows) - slots["approved"])
         for chunk in shown:
             ids_csv = ",".join(str(g.get("id", "")) for g in chunk)
             if len(chunk) == 1:
@@ -3035,60 +3105,14 @@ def build_weekly_menu(*, carried_out: dict[str, Any] | None = None) -> tuple[str
         text_lines.append(cline)
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": cline[:2900]}})
 
-    # Staleness sweep -- with the Keep count and the cap (C3).
-    for it in (stale_staged + expired_snoozed):
-        why = "STAGED >14d" if it.get("status") == "STAGED" else "snooze expired"
-        cid = str(it.get("id", ""))
-        kc = int(it.get("keep_count") or 0)
-        capped = kc >= KEEP_CAP
-        if capped:
-            sline = (f"⛔ KEPT x{kc} (capped) -- {why}: {it.get('title', '')} (`{cid}`) -- "
-                     f"park it with a trigger, ship it, or dismiss it")
-        else:
-            sline = f"⏳ {why}: {it.get('title', '')} (`{cid}`)" + (f" -- kept x{kc}" if kc else "")
-        sline += f"\n_{format_surface_line(it)}_"
-        text_lines.append("- " + sline.splitlines()[0])
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": sline[:2900]}})
-        elements = [_btn(ACTION_MARK_SHIPPED, "🚢 Mark shipped", cid)]
-        if not capped:
-            elements.append(_btn(ACTION_KEEP, "Keep", cid))
-        elements += [_btn(ACTION_PARK, "⏸ Park", cid), _btn(ACTION_DISMISS_NOTE, "🗑️ Dismiss w/ note", cid)]
-        blocks.append({"type": "actions", "block_id": f"cq_stale_{cid}"[:255], "elements": elements})
-
-    # PARKED: due rows resurface with actions; waiting rows are listed count-only.
-    for it in parked_due:
-        cid = str(it.get("id", ""))
-        sline = (f"⏰ park trigger reached ({str(it.get('park_until') or '')[:10]}): "
-                 f"{it.get('park_reason', '')} -- {it.get('title', '')} (`{cid}`)")
-        text_lines.append("- " + sline)
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": sline[:2900]}})
-        blocks.append({"type": "actions", "block_id": f"cq_parked_{cid}"[:255], "elements": [
-            _btn(ACTION_APPROVE, "✅ Re-queue", cid, style="primary"),
-            _btn(ACTION_MARK_SHIPPED, "🚢 Mark shipped", cid),
-            _btn(ACTION_PARK, "⏸ Park again", cid),
-            _btn(ACTION_DISMISS_NOTE, "🗑️ Dismiss w/ note", cid),
-        ]})
-    if parked_waiting:
-        wl = [f"• {it.get('title', '')} (`{it.get('id', '?')}`) -- "
-              + (f"until {str(it.get('park_until') or '')[:10]}" if it.get("park_until")
-                 else f"on: {it.get('park_event', '')}")
-              for it in parked_waiting[:10]]
-        pline = f"*Parked ({len(parked_waiting)}), waiting on a trigger:*\n" + "\n".join(wl)
-        if len(parked_waiting) > 10:
-            pline += f"\n_+{len(parked_waiting) - 10} more parked rows in the backlog_"
-        text_lines.append(pline.splitlines()[0])
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": pline[:2900]}})
-
-    # PROPOSED coverage (C3) -- last, so it takes whatever block budget remains.
+    # PROPOSED coverage (C3) -- P0/P1-class rows first, then aged rows; the remainder listed.
     if proposed_cov:
-        n_aged = carried["proposed_aged"]
-        n_hi = carried["proposed_priority"]
-        hline = (f"*PROPOSED coverage* -- {len(proposed_cov)} row(s): {n_aged} aged >= "
-                 f"{STALE_STAGED_DAYS}d, {n_hi} P0/P1-class (nothing else surfaces these)")
+        hline = (f"*PROPOSED coverage* -- {len(proposed_cov)} row(s): {carried['proposed_aged']} aged >= "
+                 f"{STALE_STAGED_DAYS}d, {len(prio_rows)} P0/P1-class (nothing else surfaces these)")
         text_lines.append(hline)
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": hline[:2900]}})
-        budget_rows = max(0, min(_MENU_MAX_PROPOSED_ROWS, (_MENU_BLOCK_BUDGET - len(blocks) - 1) // 2))
-        actionable, rest = proposed_cov[:budget_rows], proposed_cov[budget_rows:]
+        actionable = prio_rows[:slots["prio"]] + aged_rows[:slots["aged"]]
+        rest = prio_rows[slots["prio"]:] + aged_rows[slots["aged"]:]
         for it in actionable:
             cid = str(it.get("id", ""))
             sline = _proposed_row_line(it) + f"\n_{format_surface_line(it)}_"
@@ -3101,21 +3125,83 @@ def build_weekly_menu(*, carried_out: dict[str, Any] | None = None) -> tuple[str
             ]})
         carried["proposed_actionable"] = _ids(actionable)
         if rest:
-            listed, overflow = rest[:20], rest[20:]
-            rline = ("*Also PROPOSED and aged / priority (approve with `approve <id>` in your "
-                     "Cora DM):*\n" + "\n".join(_proposed_row_line(it) for it in listed))
-            if overflow:
-                rline += f"\n_+{len(overflow)} more in the generated backlog -- nothing dropped_"
+            rline, n_listed = _fit_listing(
+                "*Also PROPOSED and aged / priority (approve with `approve <id>` in your Cora DM):*",
+                [_proposed_row_line(it) for it in rest],
+                lambda k: f"_+{k} more in the generated backlog -- nothing dropped_",
+            )
             text_lines.append(rline.splitlines()[0])
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": rline[:2900]}})
-            carried["proposed_listed"] = _ids(listed)
-            carried["proposed_overflow"] = len(overflow)
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": rline}})
+            carried["proposed_listed"] = _ids(rest[:n_listed])
+            carried["proposed_overflow"] = len(rest) - n_listed
 
-    # Hard ceiling (Slack rejects > 50 blocks): by construction we stay under it, so a
-    # breach is a bug -- fail LOUD in the log and trim the trailing actions rather than
-    # let chat.postMessage reject the whole card and silence every row on it.
+    # Attention sweep -- due parks, stale STAGED (with the Keep count and the cap),
+    # expired snoozes; the allocated rows carry buttons, the rest are listed.
+    act_rows, list_rows = attention_rows[:slots["stale"]], attention_rows[slots["stale"]:]
+    for it in act_rows:
+        cid = str(it.get("id", ""))
+        kc = int(it.get("keep_count") or 0)
+        if it.get("status") == "PARKED":
+            sline = (f"⏰ park trigger reached ({str(it.get('park_until') or '')[:10]}): "
+                     f"{it.get('park_reason', '')} -- {it.get('title', '')} (`{cid}`)")
+            elements = [_btn(ACTION_APPROVE, "✅ Re-queue", cid, style="primary"),
+                        _btn(ACTION_MARK_SHIPPED, "🚢 Mark shipped", cid),
+                        _btn(ACTION_PARK, "⏸ Park again", cid),
+                        _btn(ACTION_DISMISS_NOTE, "🗑️ Dismiss w/ note", cid)]
+            block_id = f"cq_parked_{cid}"
+        else:
+            why = "STAGED >14d" if it.get("status") == "STAGED" else "snooze expired"
+            capped_row = kc >= KEEP_CAP
+            if capped_row:
+                sline = (f"⛔ KEPT x{kc} (capped) -- {why}: {it.get('title', '')} (`{cid}`) -- "
+                         f"park it with a trigger, ship it, or dismiss it")
+            else:
+                sline = f"⏳ {why}: {it.get('title', '')} (`{cid}`)" + (f" -- kept x{kc}" if kc else "")
+            sline += f"\n_{format_surface_line(it)}_"
+            elements = [_btn(ACTION_MARK_SHIPPED, "🚢 Mark shipped", cid)]
+            if not capped_row:
+                elements.append(_btn(ACTION_KEEP, "Keep", cid))
+            elements += [_btn(ACTION_PARK, "⏸ Park", cid), _btn(ACTION_DISMISS_NOTE, "🗑️ Dismiss w/ note", cid)]
+            block_id = f"cq_stale_{cid}"
+        text_lines.append("- " + sline.splitlines()[0])
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": sline[:2900]}})
+        blocks.append({"type": "actions", "block_id": block_id[:255], "elements": elements})
+    carried["stale_actionable"] = _ids(act_rows)
+    if list_rows:
+        ll = []
+        for it in list_rows:
+            kc = int(it.get("keep_count") or 0)
+            tag = ("park trigger reached" if it.get("status") == "PARKED"
+                   else ("KEPT x%d (capped)" % kc if kc >= KEEP_CAP
+                         else ("STAGED >14d" if it.get("status") == "STAGED" else "snooze expired")))
+            ll.append(f"• {tag}: {it.get('title', '')} (`{it.get('id', '?')}`)")
+        lline, n_listed = _fit_listing(
+            f"*Also waiting on a decision ({len(list_rows)}) -- `dismiss <id>` in your Cora DM, "
+            f"or ship via the bundle's step-7.5 script:*",
+            ll, lambda k: f"_+{k} more in the generated backlog -- nothing dropped_")
+        text_lines.append(lline.splitlines()[0])
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": lline}})
+        carried["stale_listed"] = _ids(list_rows[:n_listed])
+        carried["stale_overflow"] = len(list_rows) - n_listed
+
+    if parked_waiting:
+        wl = [f"• {it.get('title', '')} (`{it.get('id', '?')}`) -- "
+              + (f"until {str(it.get('park_until') or '')[:10]}" if it.get("park_until")
+                 else f"on: {it.get('park_event', '')}")
+              for it in parked_waiting[:10]]
+        pline = f"*Parked ({len(parked_waiting)}), waiting on a trigger:*\n" + "\n".join(wl)
+        if len(parked_waiting) > 10:
+            pline += f"\n_+{len(parked_waiting) - 10} more parked rows in the backlog_"
+        text_lines.append(pline.splitlines()[0])
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": pline[:2900]}})
+
+    # Hard ceiling (Slack rejects > 50 blocks). By construction the allocator keeps us
+    # under it, so a breach is a BUG: fail loud in the log, trim the tail rather than let
+    # chat.postMessage reject the whole card, and RECORD the trim in the artifact.
     if len(blocks) > 50:
-        log.error("code_queue: Monday menu built %d blocks (> 50) -- trimming; fix the budget", len(blocks))
+        log.error("code_queue: Monday menu built %d blocks (> 50) -- trimming; fix the allocator",
+                  len(blocks))
+        carried["trimmed"] = len(blocks) - 50
         blocks = blocks[:50]
     carried["blocks"] = len(blocks)
     if carried_out is not None:

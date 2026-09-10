@@ -96,9 +96,12 @@ class TestProposedCoverage:
         assert fresh_low not in covered
         assert carried["proposed_aged"] == 34 and carried["proposed_priority"] == 8
         # priority rows come first and are actionable
-        # the 8 P0/P1-class rows fill the 8 actionable slots; the aged rows are listed/overflowed
+        # the 8 P0/P1-class rows fill the 8 actionable slots; the aged rows are listed
+        # (as many whole lines as one block holds) and the rest counted as overflow
         assert set(carried["proposed_actionable"]) == set(high)
-        assert len(carried["proposed_listed"]) == 20 and carried["proposed_overflow"] == 14
+        assert set(carried["proposed_listed"]) <= set(aged)
+        assert len(carried["proposed_listed"]) + carried["proposed_overflow"] == 34
+        assert len(carried["proposed_listed"]) >= 20
         assert len(blocks) <= 50 and carried["blocks"] == len(blocks)
         assert "PROPOSED coverage" in text and "nothing else surfaces these" in text
         assert "other" not in text.lower()  # the no-kitchen-sink pin stays honest
@@ -329,4 +332,46 @@ class TestLiveReadOnly:
         assert built is not None
         _text, blocks = built
         assert len(blocks) <= 50
+        assert carried["trimmed"] == 0  # the allocator, not the guillotine, kept it under 50
         assert carried["proposed_aged"] + carried["proposed_priority"] > 0
+        # the section C3 exists for is VISIBLE on the live card, buttons included
+        assert len(carried["proposed_actionable"]) >= 1
+        ids = [b.get("block_id") for b in blocks if b.get("type") == "actions"]
+        assert len(ids) == len(set(ids))  # Slack rejects duplicate block_ids
+        assert all(len(b["text"]["text"]) <= 3000 for b in blocks if b.get("type") == "section")
+
+    def test_stale_rows_cannot_crowd_out_proposed_coverage(self, qenv):
+        """The live-ledger defect replayed: 24 stale STAGED rows + 13 priority PROPOSED
+        rows. Before the allocator the card built 54 blocks and the PROPOSED section
+        was trimmed off; now every section gets its slots first and nothing is trimmed."""
+        for i in range(24):
+            cid = _seed(f"stale {i}", status="APPROVED", sub=f"s{i}")
+            cq._append_event({"event": "staged", "ts": (cq._now() - timedelta(days=20)).isoformat(),
+                              "id": cid, "prompt_path": "/p", "bundle_id": f"solo-{cid}"})
+        for i in range(13):
+            _seed(f"hi {i}", severity="HIGH")
+        carried = {}
+        _text, blocks = cq.build_weekly_menu(carried_out=carried)
+        assert len(blocks) <= 50 and carried["trimmed"] == 0
+        assert len(carried["proposed_actionable"]) == 8
+        assert len(carried["stale_actionable"]) == 8 and len(carried["stale_listed"]) == 16
+        assert len(carried["proposed_listed"]) == 5 and carried["proposed_overflow"] == 0
+
+    def test_listing_never_truncates_mid_line(self, qenv):
+        # long, fully random titles (a shared prefix would fuzzy-dedup at 0.85)
+        ids = [cq.seed_item(kind="bug", severity="HIGH", title=uuid.uuid4().hex * 3, summary="s",
+                            entity="F3E", signal="explicit", status="PROPOSED") for _ in range(60)]
+        assert len(set(ids)) == 60
+        carried = {}
+        _text, blocks = cq.build_weekly_menu(carried_out=carried)
+        listing = [b for b in blocks if b.get("type") == "section"
+                   and b["text"]["text"].startswith("*Also PROPOSED")][0]["text"]["text"]
+        assert len(listing) <= 3000
+        assert carried["proposed_overflow"] > 0  # 52 long lines cannot fit one block
+        assert listing.rstrip().endswith("nothing dropped_")
+        assert f"+{carried['proposed_overflow']} more" in listing
+        assert len(carried["proposed_listed"]) + carried["proposed_overflow"] + \
+            len(carried["proposed_actionable"]) == 60
+        assert all(cid in listing for cid in carried["proposed_listed"])  # every listed id is whole
+        assert not any(cid in listing for cid in ids
+                       if cid not in carried["proposed_listed"] + carried["proposed_actionable"])
