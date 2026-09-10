@@ -424,6 +424,15 @@ class TestCoraWorkspaceFolderPin:
             # "Harrison Laptop", owner harrison@, children Desktop/Documents/Downloads.
             "1cdDb9jvDhoOz1vliE-tmVaks01ey1AJj",  # Computers / HJR Always-On Desktop
             "1xmXreU4eKvcpAsj7Ic3fiwJO_ySidZ0F",  # Computers / Harrison Laptop
+            # 2026-09-09 (Code #12 pre-step, cq-a1aaee9f46e0): the personal
+            # "Desktop to Desktop" machine-to-machine transfer tree, top-level under
+            # My Drive (door #3 after Computers). Verified live 2026-09-09 by
+            # Harrison's dry-run chains: `To cleanup <- H-Laptop Downloads <-
+            # Desktop to Desktop <- My Drive` and `Remote Desktop Download <-
+            # Desktop to Desktop <- My Drive`; 10 child folders, 515 descendants,
+            # 86 files with KB chunks (1,342 chunks). Ordinary folder WITH a
+            # parent -> pinned in the expansion set only, NOT walk-only.
+            "1gZVdKz3BIdePV6eeG08kkf7G65yDohaM",  # My Drive / Desktop to Desktop
         )
         for prior in priors:
             assert prior in KB_EXCLUDED_FOLDER_IDS, prior

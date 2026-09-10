@@ -155,6 +155,19 @@ KB_EXCLUDED_FOLDER_IDS: frozenset[str] = frozenset(
         # owner harrison@hjrglobal.com, children exactly Desktop/Documents/Downloads.
         "1cdDb9jvDhoOz1vliE-tmVaks01ey1AJj",  # Computers / HJR Always-On Desktop
         "1xmXreU4eKvcpAsj7Ic3fiwJO_ySidZ0F",  # Computers / Harrison Laptop
+        # Personal My Drive machine-to-machine transfer tree reached by the flat
+        # per-user sweep (door #3 after Computers, cq-a1aaee9f46e0, pinned 2026-09-09).
+        # Top-level under My Drive; children: H-Laptop Downloads (holds "To cleanup"),
+        # Remote Desktop Download, Amazon Order, H-Phone downloads, Inbox, Desktop
+        # Images, Videos, Files, Kling, Nutrition Labels. Measured 2026-09-08/09 in
+        # two of the children alone: 65 files / 988 chunks incl. a personal financial
+        # statement, EIN/IRS letters, entity P&Ls, NSF formulation sheets, a
+        # manufacturing agreement, agreement templates, payments bundles, 12 HubSpot
+        # CRM exports. Ordinary folder WITH a parent -> subfolder expansion covers
+        # every child; NOT walk-only. The purge script refuses the parent by its
+        # depth floor, so purges run per child via purge_cora_internal_kb.py
+        # --folder-id (Harrison's hand, inside the restart's stop window).
+        "1gZVdKz3BIdePV6eeG08kkf7G65yDohaM",  # My Drive / Desktop to Desktop
     }
 )
 
@@ -197,6 +210,7 @@ KB_EXCLUDED_FOLDER_LABELS: dict[str, str] = {
     "1YNObhKwo8RITgrRbw3MFpf-0hIiLWTx9": "_shared/projects/cora (Cora build workspace, D-057; ZONE-X mirror + capture quarantine live under it)",
     "1cdDb9jvDhoOz1vliE-tmVaks01ey1AJj": "Drive Computers backup: HJR Always-On Desktop (Desktop, Documents, Downloads)",
     "1xmXreU4eKvcpAsj7Ic3fiwJO_ySidZ0F": "Drive Computers backup: Harrison Laptop (Desktop, Documents, Downloads)",
+    "1gZVdKz3BIdePV6eeG08kkf7G65yDohaM": "My Drive/Desktop to Desktop (PERSONAL machine-to-machine transfer tree: H-Laptop Downloads/To cleanup, Remote Desktop Download, phone downloads, inbox, media; purged per child folder)",
 }
 
 
