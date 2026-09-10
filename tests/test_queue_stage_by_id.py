@@ -111,9 +111,11 @@ def test_stage_by_id_delegates_to_the_shared_kickoff_generator(qenv, monkeypatch
                        entity="F3E", signal="tool_error", status="PROPOSED")
     calls = []
     monkeypatch.setattr(cq, "ensure_kickoff_staged",
-                        lambda c: (calls.append(c), ("staged", "/tmp/p.md"))[1])
+                        lambda c, **kw: (calls.append((c, kw)), ("staged", "/tmp/p.md"))[1])
     assert cq.stage_by_id(cid, HARRISON) == ("staged", "/tmp/p.md")
-    assert calls == [cid]
+    # Code #12 C1: the typed founder verb is THE deliberate override of the
+    # evidence floor -- and the only caller that passes it.
+    assert calls == [(cid, {"override_evidence_floor": True})]
 
 
 # ── (c1) the WRITE_CONFIRMED leak ───────────────────────────────────────────
@@ -225,8 +227,17 @@ def test_a_complete_row_still_renders_it():
 
 
 def test_the_kickoff_evidence_renderer_has_the_same_guard():
-    """Leaving :1443 half-fixed reproduces the identical artifact in every
-    generated prompt instead of only on the card."""
-    import inspect
-    src = inspect.getsource(cq)
-    assert "if str(e.get('channel_id') or '').strip()" in src
+    """Leaving the prompt renderer half-fixed reproduces the identical artifact in
+    every generated prompt instead of only on the card. Code #12 C1 replaced the
+    renderer with _evidence_block (permalinks via slack_permalink, which needs
+    BOTH halves), so the pin is now behavioural: a channel-only row renders no
+    pointer at all, a complete row renders the permalink."""
+    half = {"id": "cq-abc", "status": "PROPOSED", "kind": "bug", "severity": "P2",
+            "entity": "FNDR", "title": "t", "summary": "s", "signal": "deflection",
+            "evidence": [{"channel_id": "D0B4CTD3B09", "ts": "", "note": "n"}]}
+    text = "\n".join(cq._evidence_block([half]))
+    assert "ch D0B4CTD3B09/ts" not in text and "ts ``" not in text
+    assert "permalink:" not in text and "D0B4CTD3B09" not in text
+    full = dict(half, evidence=[{"channel_id": "C123", "ts": "1787611109.915539", "note": "n"}])
+    text2 = "\n".join(cq._evidence_block([full]))
+    assert "permalink: https://hjr-global.slack.com/archives/C123/p1787611109915539" in text2

@@ -13989,7 +13989,8 @@ def dispatch(
             try:
                 from cora import code_queue
                 code_queue.capture_tool_failure(
-                    tool_name, entity, "TimeoutError", channel_id, slack_user_id, True)
+                    tool_name, entity, "TimeoutError", channel_id, slack_user_id, True,
+                    thread_ts=str(thread_ts or ""))
             except Exception:  # noqa: BLE001 -- capture may never affect the reply
                 pass
             return result
@@ -14001,7 +14002,8 @@ def dispatch(
         try:
             from cora import code_queue
             code_queue.capture_tool_failure(
-                tool_name, entity, type(exc).__name__, channel_id, slack_user_id, False)
+                tool_name, entity, type(exc).__name__, channel_id, slack_user_id, False,
+                thread_ts=str(thread_ts or ""))
         except Exception:  # noqa: BLE001 -- capture may never affect the reply
             pass
         return result

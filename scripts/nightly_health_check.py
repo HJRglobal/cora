@@ -1997,6 +1997,38 @@ def check_priority_kickoffs() -> CheckResult:
         f"(a SHIPPED item is refused, so a stale button is safe): {detail}{more}")
 
 
+def check_egress_rails(now: datetime | None = None) -> CheckResult:
+    """Code #12 S3'(a) (cq-deca62a00719): the observe-week read for the two seam
+    rails, SIDE BY SIDE -- `sentinel-egress-leak` (session #11 S1, a contract token
+    echoed) and `phantom-write-claim` (Code #12 S2', a write asserted with zero
+    tool_use, or an id that exists in no ledger) -- 24h and 7d, from the bot's own
+    logs (cora.egress_rails, single-sourced with the Monday digest).
+
+    THIS is the enforce-flip reminder, and it reads BOTH keys. The 8/30 -> 9/6
+    observe week was called clean on the first key alone while a three-fold
+    phantom-write incident happened in plain prose on day 3 (decisions.md
+    2026-09-03): a criterion that counts one rail certifies the other's silence.
+    WARN while the 7d window carries any hit in observe mode (the week is not
+    clean; the flip stays gated); ok, with the explicit "criterion MET" sentence,
+    when both read zero for a week. Never critical -- a phantom claim in observe
+    mode is delivered text, not an outage; once ENFORCE is on the ERROR-volume
+    triage above owns escalation. A counting failure WARNs, so blind can never
+    render as clean (the lens-5 rule the priority-kickoff monitor already follows).
+    """
+    try:
+        from cora import egress_rails
+        read = egress_rails.observe_week_read(now)
+    except Exception as exc:  # noqa: BLE001 -- a broken gauge never fails the run
+        return CheckResult("Egress rails (observe week)", "warn",
+                           f"Could not count the rail lines: {exc}")
+    detail = egress_rails.format_line(read) + " -- " + str(read.get("flip_criterion", ""))
+    if read.get("mode") == "enforce":
+        hits = sum((read.get("counts_7d") or {}).values())
+        return CheckResult("Egress rails (ENFORCE)", "warn" if hits else "ok", detail)
+    return CheckResult("Egress rails (observe week)",
+                       "ok" if read.get("clean_7d") else "warn", detail)
+
+
 # ── Report builder ────────────────────────────────────────────────────────────
 
 
@@ -2157,6 +2189,9 @@ def main() -> int:
 
     log.info("Checking for APPROVED P0/P1 items missing a kickoff prompt...")
     all_results.append(check_priority_kickoffs())
+
+    log.info("Reading the egress-rail observe week (sentinel + phantom-write-claim)...")
+    all_results.append(check_egress_rails())
 
     run_time = time.time() - t0
 

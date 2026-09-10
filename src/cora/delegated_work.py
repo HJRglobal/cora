@@ -286,6 +286,23 @@ _SPEC_FIELDS = (
 )
 
 
+def known_job_ids() -> frozenset[str]:
+    """Every dw- job id that appears in either RAW ledger, fold-independent -- the
+    reference set for the S2' fabricated-id screen (slack_egress, Code #12): a
+    model reply naming a dw- id that neither ledger has ever seen is flagged.
+    Raises on an unreadable ledger so the screen skips the family with a WARNING
+    instead of redacting real ids."""
+    out: set[str] = set()
+    for path in (_BOT_LEDGER, _RUNNER_LEDGER):
+        if not path.exists():
+            continue
+        for ev in _read_jsonl(path):
+            jid = str(ev.get("job_id") or "").strip().lower()
+            if jid.startswith("dw-"):
+                out.add(jid)
+    return frozenset(out)
+
+
 def _fold_jobs() -> dict[str, dict[str, Any]]:
     """Fold both ledgers into {job_id: record}. Events are merged by ``ts``
     (ISO strings sort chronologically; the sort is stable so same-ts events

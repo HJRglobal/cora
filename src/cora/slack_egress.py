@@ -64,6 +64,7 @@ import functools
 import logging
 import os
 import re
+from typing import Callable
 
 from .reply_formatter import normalize_slack_bold, redact_links_and_ids
 
@@ -171,6 +172,149 @@ def scrub_write_sentinels(text):
         _sentinel_mode(), len(text) - len(scrubbed),
     )
     return scrubbed
+
+
+# -- Phantom-write-claim + fabricated-id screen (Code #12 S2', cq-60024f032136) --
+# The 2026-09-03 06:53 / 06:54 founder-DM replies asserted "Done. Staging all
+# three", "All three locked in", "canonicalized as resolved", "Knowledge entry is
+# live" -- with ZERO tool_use in the turn -- and named two well-formed cq- ids that
+# exist in no ledger. The S1 sentinel scrub above saw nothing: it guards the model
+# ECHOING a contract token, not the model ASSERTING a write in prose. Doctrine
+# (decisions.md 2026-09-03, Harrison-ratified): a write confirmation emitted with
+# zero tool_use is a phantom by definition, and a seam detector measures OUTPUT
+# claims against the turn's tool ledger (D-257 -- measured, never argv).
+#
+# Same observe -> enforce ritual and the SAME flag as the sentinel scrub
+# (CORA_SENTINEL_ENFORCE): observe = a WARNING keyed `phantom-write-claim` naming
+# the matched phrase / the fabricated id, reply delivered byte-identical; enforce =
+# the claim is replaced with the honest template and the fabricated id redacted,
+# at ERROR. The nightly health check counts the WARN key beside the sentinel leaks;
+# the flip is Harrison's, after a clean week counted WITH this screen (S3').
+#
+# CALLED EXPLICITLY by app._dispatch_qa on the model's FINAL reply text, NOT from
+# the class-level WebClient wrapper below: (a) the turn's tool_use count exists
+# only there; (b) Slack renders `blocks` and ignores `text` when both are present,
+# so a rewrite must land BEFORE the confirm-card blocks are built from the same
+# string; (c) code-authored posts (cards, digests, interceptor replies, scripts)
+# are not model claims and must not inflate the count the enforce flip reads.
+#
+# The lexicon is the ruled list, verbatim (kickoff S2'): staged | queued | locked
+# in | canonicalized | filed | created | updated | deleted | is live | ^done.
+# "Referring to a Cora action" is not decidable by regex; the observe week
+# measures the false-positive rate (a KB answer about "the invoice filed on
+# Tuesday" with no tool call will count) and the phrase is logged so the noise can
+# be characterized before any tightening is ruled.
+_WRITE_CLAIM_RE = re.compile(
+    r"\b(?:staged|queued|locked\s+in|canonicali[sz]ed|filed|created|updated|deleted|is\s+live)\b"
+    r"|^\s*done\.",
+    re.IGNORECASE | re.MULTILINE,
+)
+PHANTOM_HONEST_TEMPLATE = "I did not perform any action this turn."
+PHANTOM_LOG_KEY = "phantom-write-claim"
+
+
+def _known_cq_ids() -> frozenset[str]:
+    from .code_queue import known_ids  # lazy: code_queue imports drive_io / phi_guard
+    return known_ids()
+
+
+def _known_dw_ids() -> frozenset[str]:
+    from .delegated_work import known_job_ids  # lazy: same reason
+    return known_job_ids()
+
+
+# (label, id pattern, ledger reader). Generalized to every id family that HAS a
+# ledger: cq- (the code-session queue) and dw- (delegated work). No `r-` entry:
+# nothing in this repo mints an "r-" id (verified 2026-09-09), and a check with no
+# ledger to read would redact every legitimate use of the pattern.
+_ID_LEDGERS: tuple[tuple[str, re.Pattern[str], Callable[[], frozenset[str]]], ...] = (
+    ("cq", re.compile(r"\bcq-[0-9a-f]{12}\b", re.IGNORECASE), _known_cq_ids),
+    ("dw", re.compile(r"\bdw-[0-9a-f]{12}\b", re.IGNORECASE), _known_dw_ids),
+)
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _rewrite_write_claims(text: str) -> str:
+    """ENFORCE-mode rewrite: every line / sentence carrying a write-claim phrase is
+    replaced by the honest template (deduplicated, so a three-bullet phantom
+    becomes one line, not three). Everything else is kept verbatim. If nothing
+    survives, the template alone is returned -- never an empty body."""
+    out_lines: list[str] = []
+    emitted = False  # the template lands ONCE, at the first claim; later claims are dropped
+    for line in text.splitlines():
+        if not _WRITE_CLAIM_RE.search(line):
+            out_lines.append(line)
+            continue
+        kept: list[str] = []
+        for sent in _SENTENCE_SPLIT_RE.split(line):
+            if not sent.strip():
+                continue
+            if _WRITE_CLAIM_RE.search(sent):
+                if not emitted:
+                    kept.append(PHANTOM_HONEST_TEMPLATE)
+                    emitted = True
+                continue
+            kept.append(sent.strip())
+        rebuilt = " ".join(kept).strip()
+        if rebuilt:
+            out_lines.append(rebuilt)
+    result = re.sub(r"\n{3,}", "\n\n", "\n".join(out_lines)).strip()
+    return result or PHANTOM_HONEST_TEMPLATE
+
+
+def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
+                                user_id: str = ""):
+    """Screen ONE model reply for (1) ids that exist in no ledger and (2) a write
+    claim made in a turn with zero tool_use.
+
+    Observe mode (default, CORA_SENTINEL_ENFORCE unset): every hit is a WARNING
+    keyed ``phantom-write-claim`` and the text is returned BYTE-IDENTICAL.
+    Enforce mode: a fabricated id is redacted to ``[unknown id]`` and each claiming
+    line/sentence becomes the honest template, at ERROR.
+
+    ``tool_use_count`` is the turn's tool_use ledger (claude_client meta). None =
+    unknown -> the lexicon half is skipped (never assume zero); the id half runs
+    regardless of the count, because an invented id is invented even in a turn
+    that called a read tool. Non-string / empty input passes through untouched;
+    a ledger that cannot be read skips ITS id family with a WARNING rather than
+    redacting real ids (fail-open on the reference set, never on the claim).
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    try:
+        count = None if tool_use_count is None else int(tool_use_count)
+    except (TypeError, ValueError):
+        count = None
+    mode = _sentinel_mode()
+    emit = log.error if mode == "enforce" else log.warning
+    out = text
+    for label, rx, reader in _ID_LEDGERS:
+        found = {m.group(0).lower() for m in rx.finditer(out)}
+        if not found:
+            continue
+        try:
+            known = reader()
+        except Exception:  # noqa: BLE001 -- an unreadable ledger must not redact real ids
+            log.warning("%s kind=fabricated-id ledger=%s UNAVAILABLE -- %d id(s) not "
+                        "checked this turn", PHANTOM_LOG_KEY, label, len(found), exc_info=True)
+            continue
+        for fid in sorted(found - set(known)):
+            emit("%s kind=fabricated-id id=%s ledger=%s mode=%s channel=#%s user=%s -- "
+                 "the reply names an id that exists in no ledger",
+                 PHANTOM_LOG_KEY, fid, label, mode, channel_name or "?", user_id or "?")
+            if mode == "enforce":
+                out = re.sub(re.escape(fid), "[unknown id]", out, flags=re.IGNORECASE)
+    if count == 0:
+        m = _WRITE_CLAIM_RE.search(out)
+        if m:
+            emit("%s kind=lexicon phrase=%r mode=%s channel=#%s user=%s -- a write "
+                 "claim with zero tool_use this turn",
+                 PHANTOM_LOG_KEY, m.group(0).strip(), mode, channel_name or "?",
+                 user_id or "?")
+            if mode == "enforce":
+                out = _rewrite_write_claims(out)
+    return out
 
 
 # ── The single sanitizer ──────────────────────────────────────────────────────

@@ -860,6 +860,13 @@ def _record_tool_meta(meta: dict | None, tool_use_blocks: list) -> None:
     if meta is None:
         return
     names = [n for n in (getattr(b, "name", "") for b in tool_use_blocks) if n]
+    # Code #12 S2' (cq-60024f032136): the turn's tool_use LEDGER as a number. The
+    # phantom-write-claim screen (slack_egress.screen_phantom_write_claims) keys on
+    # `tool_use_count == 0` -- a reply asserting staged/queued/locked-in/filed/
+    # created/is-live with ZERO tool_use in the turn is a phantom by definition
+    # (decisions.md 2026-09-03). Counted per tool_use BLOCK, never derived from the
+    # bool below (D-257: measured, not assumed).
+    meta["tool_use_count"] = int(meta.get("tool_use_count") or 0) + len(list(tool_use_blocks))
     if names:
         meta.setdefault("tool_names", []).extend(names)
         if any(n in VERBATIM_TABLE_TOOLS for n in names):
@@ -1187,6 +1194,7 @@ def generate_response(
         meta["used_tools"] = False
         meta["used_verbatim_tool"] = False
         meta["tool_names"] = []
+        meta["tool_use_count"] = 0
 
     _last_shopify_result: str = ""  # HIGH-2: the write tool owns its outcome text
     _paused_text: str = ""  # text emitted before a pause_turn continuation — each
@@ -1395,6 +1403,7 @@ def generate_response_streaming(
         meta["used_tools"] = False
         meta["used_verbatim_tool"] = False
         meta["tool_names"] = []
+        meta["tool_use_count"] = 0
 
     def _maybe_push(text: str) -> None:
         if update_callback is not None:

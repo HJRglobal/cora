@@ -43,6 +43,7 @@ from . import code_queue
 from . import delegated_work
 from .knowledge_base import embeddings as kb_embeddings
 from . import review_lanes
+from . import slack_egress
 from . import sibling_guard
 from . import cross_entity_guard
 from . import info_intake
@@ -1962,6 +1963,7 @@ def _dispatch_qa(
         code_queue.capture_message_signal(
             user_message, entity, channel_id, channel_name, user_id or "",
             response_text=response_text,
+            message_ts=reply_thread_ts or "",  # C1: the permalink half of the evidence pointer
         )
         if web_on:
             # Daily-cap accounting + deterministic provenance: the Sources line is
@@ -1990,6 +1992,15 @@ def _dispatch_qa(
         if cache_storable and not is_structured_table:
             _try_cache_store(entity, user_message, question_embedding, response_text, hints)
         response_text = _guard_content(response_text)
+        # Code #12 S2' (cq-60024f032136): phantom-write-claim + fabricated-id
+        # screen on the model's FINAL text, BEFORE the confirm-card blocks are
+        # built from it (Slack renders blocks over text). Observe mode logs the
+        # `phantom-write-claim` key and returns the text byte-identical; enforce
+        # rewrites. tool_use_count is the turn's ledger from claude_client.
+        response_text = slack_egress.screen_phantom_write_claims(
+            response_text, tool_use_count=gen_meta.get("tool_use_count", 0),
+            channel_name=channel_name, user_id=user_id or "",
+        )
         log.info(
             "responded (non-streaming) entity=%s channel=#%s user=%s latency_ms=%d response_chars=%d",
             entity, channel_name, user_id, latency_ms, len(response_text),
@@ -2089,6 +2100,7 @@ def _dispatch_qa(
     code_queue.capture_message_signal(
         user_message, entity, channel_id, channel_name, user_id or "",
         response_text=response_text,
+        message_ts=reply_thread_ts or "",  # C1: the permalink half of the evidence pointer
     )
     if web_on:
         # Daily-cap accounting + deterministic provenance (see non-streaming path).
@@ -2113,6 +2125,15 @@ def _dispatch_qa(
     if cache_storable and not is_structured_table:
         _try_cache_store(entity, user_message, question_embedding, response_text, hints)
     response_text = _guard_content(response_text)
+    # Code #12 S2' (cq-60024f032136): phantom-write-claim + fabricated-id
+    # screen on the model's FINAL text, BEFORE the confirm-card blocks are
+    # built from it (Slack renders blocks over text). Observe mode logs the
+    # `phantom-write-claim` key and returns the text byte-identical; enforce
+    # rewrites. tool_use_count is the turn's ledger from claude_client.
+    response_text = slack_egress.screen_phantom_write_claims(
+        response_text, tool_use_count=gen_meta.get("tool_use_count", 0),
+        channel_name=channel_name, user_id=user_id or "",
+    )
 
     skipped = throttle.release_stream(stream_id).get("skipped_count", 0)
     log.info(
@@ -3143,6 +3164,39 @@ def handle_message_event(event: dict, client) -> None:
             # message was the mention), so the guard's own truthiness test is
             # unaffected by running after it.
             text = _strip_dm_bot_mention(text, client)
+            # ── Founder-DM queue verbs (Code #12 S1', cq-554184feb53b) ───────
+            # FIRST, ahead of every capture predicate below: an exact
+            # "stage|approve|dismiss cq-<id>" is a deterministic queue action --
+            # never a gap-ask answer, a knowledge-check answer, a decision reply
+            # or a Q&A question -- so it must not be eligible for any greedy
+            # top-level capture that follows, and it must never reach the model
+            # (2026-09-03 06:49: the model answered "Stage cq-621dfad586aa" with
+            # the morning briefing, then narrated phantom stages with invented
+            # ids). The reply is the queue's OWN outcome string: a non-founder
+            # gets its not_authorized text, an unknown id its not-found text.
+            # Exact match only; a sentence that merely cites an id still routes
+            # to the model like any other DM.
+            _qverb = code_queue.match_queue_verb(text)
+            if _qverb is not None:
+                try:
+                    _outcome, _qmsg = code_queue.apply_queue_verb(
+                        _qverb[0], _qverb[1], user_id)
+                except Exception:  # noqa: BLE001 -- fail HONESTLY, never fall to the model
+                    log.exception("founder-dm queue verb crashed verb=%s id=%s",
+                                  _qverb[0], _qverb[1])
+                    _outcome, _qmsg = ("error", "Something went wrong applying that "
+                                       "queue verb -- check the backlog before retrying.")
+                log.info("founder-dm queue verb=%s id=%s user=%s outcome=%s",
+                         _qverb[0], _qverb[1], user_id, _outcome)
+                try:
+                    client.chat_postMessage(
+                        channel=event.get("channel", user_id), text=_qmsg,
+                        thread_ts=event.get("thread_ts"),
+                        unfurl_links=False, unfurl_media=False,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("founder-dm queue verb ack post failed: %s", exc)
+                return
             # Gap autofill Stage 2: if this user has a pending knowledge-gap
             # ask, treat the reply as the answer. Threaded replies to the ask
             # message always match. A top-level DM matches only when it is NOT

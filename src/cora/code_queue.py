@@ -568,6 +568,35 @@ def _fold_items() -> dict[str, dict[str, Any]]:
     return items
 
 
+_KNOWN_IDS_CACHE: dict[str, Any] = {"key": None, "ids": frozenset()}
+
+
+def known_ids() -> frozenset[str]:
+    """Every cq- id that appears in ANY event of the RAW ledger -- orphans (events
+    with no ``captured``) included, because an id the ledger has ever seen is not
+    FABRICATED whatever the fold makes of it. The reference set for the S2'
+    fabricated-id screen (slack_egress.screen_phantom_write_claims, Code #12).
+    Cached on (path, mtime, size) so a hot reply path never re-parses an unchanged
+    file; an unreadable ledger returns the empty set and the caller treats that as
+    "cannot check", never as "everything is fabricated"."""
+    path = _EVENT_LEDGER
+    try:
+        st = Path(path).stat()
+        key = (str(path), st.st_mtime_ns, st.st_size)
+    except FileNotFoundError:
+        return frozenset()  # a ledger that has never been written knows NO id
+    except OSError:
+        raise  # unreadable (not missing): the screen skips the family with a WARNING
+    with _LEDGER_LOCK:
+        if _KNOWN_IDS_CACHE.get("key") == key:
+            return _KNOWN_IDS_CACHE["ids"]
+    ids = frozenset(
+        str(ev.get("id") or "").lower() for ev in _read_jsonl(Path(path)) if ev.get("id"))
+    with _LEDGER_LOCK:
+        _KNOWN_IDS_CACHE.update({"key": key, "ids": ids})
+    return ids
+
+
 def load_items() -> list[dict[str, Any]]:
     """All queue records (folded), newest-captured first.
 
@@ -821,22 +850,27 @@ def _submit(fn: Callable, *args: Any) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 def capture_tool_failure(tool_name: str, entity: str, error_class: str,
                          channel_id: str, slack_user_id: str, is_timeout: bool,
-                         *, client_factory: Callable | None = None) -> None:
+                         *, client_factory: Callable | None = None,
+                         thread_ts: str = "") -> None:
     """Hot-path entry (called from dispatch's timeout + crash arms). Fail-soft:
     NEVER raises, NEVER blocks the dispatch return. No message text is captured
-    (evidence is a channel pointer only), so S1 is inherently PHI-safe."""
+    (evidence is a channel pointer only), so S1 is inherently PHI-safe.
+
+    thread_ts (C1): the thread root of the turn that crashed, so the pointer is a
+    PERMALINK (channel_id + ts) and the item passes the evidence floor."""
     try:
         if code_queue_level() == "off":
             return
         _submit(_process_tool_failure, tool_name, entity, error_class,
-                channel_id, slack_user_id, is_timeout, client_factory)
+                channel_id, slack_user_id, is_timeout, client_factory,
+                str(thread_ts or ""))
     except Exception:  # noqa: BLE001 -- belt-and-braces; capture may never affect the reply
         log.debug("code_queue.capture_tool_failure swallowed", exc_info=True)
 
 
 def _process_tool_failure(tool_name: str, entity: str, error_class: str,
                           channel_id: str, slack_user_id: str, is_timeout: bool,
-                          client_factory: Callable | None) -> None:
+                          client_factory: Callable | None, thread_ts: str = "") -> None:
     tool_name = str(tool_name or "").strip() or "unknown_tool"
     _record_signal("tool_failure", tool_name, {"timeout": bool(is_timeout)})
     user_present = bool((slack_user_id or "").strip())
@@ -858,7 +892,10 @@ def _process_tool_failure(tool_name: str, entity: str, error_class: str,
         "kind": "bug", "severity": severity, "title": title, "summary": summary,
         "subsystem_guess": tool_name, "entity": entity, "signal": "tool_error",
         "representative": tool_name,  # invariant: same tool failing = same item
-        "evidence": [{"channel_id": channel_id, "ts": "", "note": "tool failure (no message text)"}],
+        # C1: the thread root is the PERMALINK half of the pointer; the note still
+        # carries no message text (PHI-safe by construction).
+        "evidence": [{"channel_id": channel_id, "ts": str(thread_ts or ""),
+                      "note": "tool failure (no message text)"}],
         "reporter": slack_user_id,
     }
     _capture(rec, client_factory=client_factory)
@@ -891,10 +928,16 @@ def _strip_quoted(text: str) -> str:
 
 def capture_message_signal(text: str, entity: str, channel_id: str, channel_name: str,
                            slack_user_id: str, response_text: str = "",
-                           *, client_factory: Callable | None = None) -> None:
+                           *, client_factory: Callable | None = None,
+                           message_ts: str = "") -> None:
     """Hot-path entry (called post-reply from _extract_and_log_gap). Detects an
     S2 phrase in the user's message OR an S4 capability deflection in Cora's reply;
-    a hit becomes a classifier candidate. Fail-soft, off-thread, dedup-before-model."""
+    a hit becomes a classifier candidate. Fail-soft, off-thread, dedup-before-model.
+
+    message_ts (C1): the triggering message's / thread root's Slack ts, so the
+    evidence row can become a PERMALINK (channel_id + ts) instead of the bare
+    channel pointer every passive capture wrote before 2026-09-09 -- which is why
+    the 9/7 auto-generated kickoffs all read "no Slack permalink"."""
     try:
         if code_queue_level() == "off":
             return
@@ -912,14 +955,14 @@ def capture_message_signal(text: str, entity: str, channel_id: str, channel_name
             return
         signal = "phrase" if phrase_hit else "deflection"
         _submit(_process_message_signal, clean, entity, channel_id, channel_name,
-                slack_user_id, signal, client_factory)
+                slack_user_id, signal, client_factory, str(message_ts or ""))
     except Exception:  # noqa: BLE001
         log.debug("code_queue.capture_message_signal swallowed", exc_info=True)
 
 
 def _process_message_signal(text: str, entity: str, channel_id: str, channel_name: str,
                             slack_user_id: str, signal: str,
-                            client_factory: Callable | None) -> None:
+                            client_factory: Callable | None, message_ts: str = "") -> None:
     question = (text or "").strip()
     if len(question) < 8:
         return
@@ -980,7 +1023,8 @@ def _process_message_signal(text: str, entity: str, channel_id: str, channel_nam
         from . import knowledge_gaps
         if knowledge_gaps.is_capability_ask(question):
             capture_capability_ask(question, entity, channel_name, slack_user_id,
-                                   client_factory=client_factory)
+                                   client_factory=client_factory,
+                                   channel_id=channel_id, message_ts=message_ts)
         else:
             _route_to_flywheel(question, entity, channel_name, slack_user_id)
         return
@@ -993,7 +1037,8 @@ def _process_message_signal(text: str, entity: str, channel_id: str, channel_nam
         "subsystem_guess": verdict.get("subsystem_guess", ""),
         "entity": entity, "signal": signal,
         "representative": question,
-        "evidence": [{"channel_id": channel_id, "ts": "", "note": question[:400]}],
+        # C1: ts is the PERMALINK half of the pointer (was always "" before 2026-09-09).
+        "evidence": [{"channel_id": channel_id, "ts": str(message_ts or ""), "note": question[:400]}],
         "reporter": slack_user_id,
         "fix_sketch": verdict.get("fix_sketch", ""),
     }
@@ -1037,7 +1082,8 @@ def _route_to_flywheel(question: str, entity: str, channel_name: str, user: str)
 # Fork 3a (Wave-1 flywheel-conversion calibration) -- capability-ask routing
 # ─────────────────────────────────────────────────────────────────────────────
 def capture_capability_ask(question: str, entity: str, channel: str, user: str | None,
-                           *, client_factory: Callable | None = None) -> None:
+                           *, client_factory: Callable | None = None,
+                           channel_id: str = "", message_ts: str = "") -> None:
     """Route a deterministically-classified capability ask (knowledge_gaps.
     is_capability_ask) straight to the code-queue as a feature candidate -- never
     through Haiku (the deterministic verdict already decided kind) and never through
@@ -1052,19 +1098,29 @@ def capture_capability_ask(question: str, entity: str, channel: str, user: str |
         question = (question or "").strip()
         if not question:
             return
-        _submit(_process_capability_ask, question, entity, channel, user, client_factory)
+        _submit(_process_capability_ask, question, entity, channel, user, client_factory,
+                str(channel_id or ""), str(message_ts or ""))
     except Exception:  # noqa: BLE001
         log.debug("code_queue.capture_capability_ask swallowed", exc_info=True)
 
 
 def _process_capability_ask(question: str, entity: str, channel: str, user: str | None,
-                            client_factory: Callable | None) -> None:
+                            client_factory: Callable | None,
+                            channel_id: str = "", message_ts: str = "") -> None:
+    # C1: a capability ask minted from a message now carries the message's
+    # PERMALINK halves when the caller has them (channel_id + ts); the
+    # knowledge_gaps.log_gap callers know only the channel NAME, so their rows
+    # keep the name-only note and fall under the evidence floor until a human
+    # attaches the thread -- honest, never a fabricated pointer. Passive captures
+    # mint PROPOSED, never APPROVED: the founder fast-path exists ONLY in
+    # queue_explicit (the deliberate tool call), so a founder's QUESTION can never
+    # arrive at APPROVED through this route (cq-b6f2f4825ffb, pinned in tests).
     rec = {
         "kind": "feature", "severity": "P3",
         "title": question[:120], "summary": question[:200],
         "subsystem_guess": "", "entity": entity, "signal": "capability",
         "representative": question,
-        "evidence": [{"channel_id": "", "ts": "",
+        "evidence": [{"channel_id": str(channel_id or ""), "ts": str(message_ts or ""),
                       "note": f"#{channel}" if channel else ""}],
         "reporter": user or "",
     }
@@ -1245,6 +1301,43 @@ _STATUS_ORDER = ["PROPOSED", "APPROVED", "STAGED", "BLOCKED", "SNOOZED",
                  "SHIPPED", "DISMISSED", "SUPERSEDED"]
 
 
+# ── S3'(b) (cq-deca62a00719): per-item surface fields ────────────────────────
+# The 9/2 audit's traceability finding in miniature: a reader of the backlog or a
+# card could not tell whether an item HAD a kickoff, whether a card had ever been
+# posted for it, or how to get it staged -- so a seeded item with no card was
+# "tap Stage on the item" (unactionable) and a PROPOSED item's next step was
+# unstated. Three fields, rendered identically on the backlog view (KB-ingested),
+# the item card and the Monday menu rows.
+def item_surface_fields(rec: dict[str, Any]) -> dict[str, Any]:
+    """{kickoff: bool, card: bool, how_to_stage: str} for one folded record."""
+    status = str(rec.get("status") or "PROPOSED").upper()
+    kickoff = bool(rec.get("prompt_path"))
+    card = bool(rec.get("dm_message_ts"))
+    cid = str(rec.get("id") or "?")
+    if status in _TERMINAL_STATUSES:
+        how = f"closed ({status})"
+    elif kickoff:
+        how = "already staged -- the kickoff is on disk"
+    elif status == "PROPOSED":
+        how = (f"approve first (tap Queue on its card, or reply `approve {cid}` in your Cora "
+               f"DM), then reply `stage {cid}`")
+    else:
+        how = f"reply `stage {cid}` in your Cora DM"
+        how += (" or tap Stage prompt on its card" if card else
+                " (no card -- a seeded item; it also closes at step 7.5 when a session ships it)")
+    return {"kickoff": kickoff, "card": card, "how_to_stage": how}
+
+
+def format_surface_line(rec: dict[str, Any], *, on_card: bool = False) -> str:
+    """`kickoff: yes/no · card: yes/no · how-to-stage: ...` -- one line, ASCII-safe
+    apart from the middots. on_card=True renders the card field as "this message"
+    (the line is on the card itself, whose dm_message_ts is not yet known)."""
+    f = item_surface_fields(rec)
+    kickoff = "yes" if f["kickoff"] else "no"
+    card = "this message" if on_card else ("yes" if f["card"] else "no")
+    return f"kickoff: {kickoff} · card: {card} · how-to-stage: {f['how_to_stage']}"
+
+
 def render_backlog_text(items: list[dict[str, Any]] | None = None) -> str:
     items = items if items is not None else load_items()
     lines = [
@@ -1278,6 +1371,7 @@ def render_backlog_text(items: list[dict[str, Any]] | None = None) -> str:
                 f"[{entity}] {it.get('title', '(untitled)')}{cnt_s} "
                 f"-- {age}d old (`{it.get('id', '?')}`)"
             )
+            lines.append(f"    - {format_surface_line(it)}")
             if it.get("prompt_path"):
                 lines.append(f"    - prompt: `{it['prompt_path']}`")
         lines.append("")
@@ -1361,6 +1455,138 @@ def _write_prompt_file(body: str, fname: str) -> tuple[str | None, bool]:
         return None, False
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# C1 (Code #12, cq-b6f2f4825ffb): evidence provenance + the EVIDENCE FLOOR
+# ─────────────────────────────────────────────────────────────────────────────
+# 2026-09-07: the Monday menu's Stage buttons generated FOUR kickoffs whose
+# "## 0. Evidence" read `evidence= field empty -- no Slack permalink, no repro`,
+# one of them for Harrison's own QUESTION ("do you have access to all the Cowork
+# Cascade knowledge now as well?", cq-651e6783994f). Root causes, measured on the
+# ledger: (1) every passive capture path wrote evidence with ts="" -- a channel
+# pointer that can never become a permalink -- and the capability route wrote no
+# channel id at all; (2) nothing stood between "APPROVED" and "generate a kickoff"
+# that asked whether the item carried any evidence.
+#
+# The floor: an item whose evidence is EMPTY does not auto-stage. Evidence is a
+# Slack PERMALINK (channel_id AND ts) OR an EXPLICIT body (signal == "explicit":
+# the cora_queue_code_session tool or a seed_item caller -- a human or a session
+# wrote the request deliberately, and that text IS the evidence). A passive
+# capture's raw note (deflection / capability / phrase / thumbs-down / tool
+# failure) is NOT evidence on its own: it is the trigger text, and the 9/7
+# fixture rows all carry one. The founder's typed `stage cq-<id>` (S1') is the
+# deliberate override; every other path -- approve auto-stage, the Stage button,
+# seed stage_now, a script -- re-cards for evidence instead.
+_SLACK_WORKSPACE_URL = "https://hjr-global.slack.com"
+
+
+def slack_permalink(channel_id: str, ts: str) -> str:
+    """The canonical archive permalink, or "" when either half is missing."""
+    ch = str(channel_id or "").strip()
+    t = str(ts or "").strip()
+    if not ch or not t:
+        return ""
+    return f"{_SLACK_WORKSPACE_URL}/archives/{ch}/p{t.replace('.', '')}"
+
+
+def evidence_permalinks(rec: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+    for e in (rec.get("evidence") or []):
+        if not isinstance(e, dict):
+            continue
+        link = slack_permalink(e.get("channel_id", ""), e.get("ts", ""))
+        if link and link not in out:
+            out.append(link)
+    return out
+
+
+def _is_seed_shaped(rec: dict[str, Any]) -> bool:
+    """A seed_item row, by SHAPE rather than by label: no channel, no ts, and the
+    evidence note is the summary's first 200 chars -- the exact row seed_item has
+    always written. Live census 2026-09-09: 223 captured rows have this shape
+    under NINE different signal labels (explicit, friction, tool_error, v2b_s5_*,
+    kb_eval_*), so keying the seed body on the label alone would have floored
+    every non-"explicit" seed. Rows seeded after this change also carry
+    ``seeded: True``; the shape rule is what covers the legacy rows."""
+    if rec.get("seeded") is True:
+        return True
+    summary = str(rec.get("summary") or "").strip()
+    if not summary:
+        return False
+    for e in (rec.get("evidence") or []):
+        if not isinstance(e, dict):
+            continue
+        if str(e.get("channel_id") or "").strip() or str(e.get("ts") or "").strip():
+            continue
+        note = str(e.get("note") or "").strip()
+        if note and note == summary[:200].strip():
+            return True
+    return False
+
+
+def has_evidence(rec: dict[str, Any]) -> bool:
+    """The evidence FLOOR predicate. True when the item carries a Slack permalink
+    (an evidence row with BOTH channel_id and ts), OR an explicit body -- the
+    cora_queue_code_session tool (signal == "explicit", the request text is the
+    note) or a seed_item row (see _is_seed_shaped): a human or a session wrote the
+    request deliberately, and that text IS the evidence. A passive capture's raw
+    trigger text is NOT evidence on its own -- every 9/7 fixture row carries one.
+    A LEX item's body is redacted at rest, so for LEX the permalink is the only
+    door -- a LEX build ask with no pointer re-cards like any other."""
+    if evidence_permalinks(rec):
+        return True
+    if _is_seed_shaped(rec):
+        return True
+    if str(rec.get("signal") or "").strip().lower() == "explicit":
+        if str(rec.get("summary") or "").strip():
+            return True
+        for e in (rec.get("evidence") or []):
+            if isinstance(e, dict) and str(e.get("note") or "").strip():
+                return True
+    return False
+
+
+def no_evidence_message(rec: dict[str, Any]) -> str:
+    """The re-card text: what is missing, and the two honest ways forward."""
+    cid = str(rec.get("id") or "?")
+    return (f"NOT staged -- `{cid}` carries no evidence (no Slack permalink, no seed body). "
+            f"Attach the thread it came from, or reply `stage {cid}` in your Cora DM to "
+            f"stage it anyway (the deliberate override).")
+
+
+def _evidence_block(items: list[dict[str, Any]]) -> list[str]:
+    """`## 0. Evidence` lines populated from seed provenance: every permalink, the
+    seed text (representative / summary / explicit notes), and the classifier
+    fields (kind, severity, signal, subsystem, reporter, count, captured date).
+    An item with nothing says so -- never a fabricated pointer."""
+    lines: list[str] = []
+    for it in items:
+        cid = it.get("id", "?")
+        lines.append(f"- `{it.get('severity', '?')}` **{it.get('kind', '?')}** "
+                     f"[{it.get('entity', '?')}] {it.get('title', '')} (`{cid}`)")
+        cls = (f"signal={it.get('signal', '?')} · subsystem={it.get('subsystem_guess') or '-'} · "
+               f"reporter={it.get('reporter') or '-'} · seen x{int(it.get('count') or 1)} · "
+               f"captured {str(it.get('ts') or '')[:10] or '-'}")
+        lines.append(f"    - classifier: {cls}")
+        if it.get("summary"):
+            lines.append(f"    - summary: {it['summary']}")
+        rep = str(it.get("representative") or "").strip()
+        if rep and rep != str(it.get("summary") or "").strip():
+            lines.append(f"    - seed text: {rep[:400]}")
+        links = evidence_permalinks(it)
+        for link in links:
+            lines.append(f"    - permalink: {link}")
+        for e in (it.get("evidence") or [])[:5]:
+            if not isinstance(e, dict):
+                continue
+            note = str(e.get("note") or "").strip()
+            if note and note != rep:
+                lines.append(f"    - note: {note[:400]}")
+        if not has_evidence(it):
+            lines.append("    - EVIDENCE: none on the item (no Slack permalink, no seed body) "
+                         "-- staged by the founder's override; attach the thread before firing.")
+    return lines
+
+
 _PROMPT_SYS = """\
 You write a paste-ready Code-session kickoff prompt for "Cora" (an internal
 Slack AI-assistant codebase). Match this house skeleton EXACTLY:
@@ -1368,7 +1594,9 @@ Slack AI-assistant codebase). Match this house skeleton EXACTLY:
 - A one-line byline pinning Opus-tier + the STANDING OPERATING LOOP, and the
   literal banner "AUTO-GENERATED DRAFT -- VERIFY-FIRST everything", plus a
   suggested branch name `claude/<slug>`.
-- Section 0: evidence (the signals below, with any Slack pointers).
+- Section 0: evidence -- copy the EVIDENCE block you are given VERBATIM (every
+  permalink, the seed text, the classifier fields); if it says none exists,
+  say so. Never invent a pointer.
 - Section 1: deliverable slices (ONE per queued item when bundled).
 - Section 2: guardrails to respect (reference Cora doctrine IDs where relevant:
   D-011 no-canon-write, staged-write gate, D-051 adversarial review, PHI D-082).
@@ -1392,14 +1620,7 @@ def _deterministic_prompt(items: list[dict[str, Any]], slug: str) -> str:
         "## 0. Evidence",
         "",
     ]
-    for it in items:
-        lines.append(f"- `{it.get('severity', '?')}` **{it.get('kind', '?')}** "
-                     f"[{it.get('entity', '?')}] {it.get('title', '')} (`{it.get('id', '?')}`)")
-        if it.get("summary"):
-            lines.append(f"    - {it['summary']}")
-        for ev in (it.get("evidence") or [])[:3]:
-            if ev.get("channel_id") or ev.get("ts"):
-                lines.append(f"    - evidence: channel `{ev.get('channel_id', '')}` ts `{ev.get('ts', '')}`")
+    lines += _evidence_block(items)
     lines += [
         "",
         "## 1. Deliverables",
@@ -1443,20 +1664,17 @@ def generate_kickoff_prompt(items: list[dict[str, Any]], *, slug: str | None = N
     body: str | None = None
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if api_key:
+        # C1: the model is handed the SAME evidence block the deterministic
+        # skeleton renders (permalinks, seed text, classifier fields) and told to
+        # copy it verbatim -- so a generated kickoff can never again read
+        # "evidence= field empty" for an item whose provenance the ledger holds,
+        # and never invents a pointer for one whose provenance it does not.
         evidence = "\n".join(
-            f"- [{it.get('severity')}] {it.get('kind')} [{it.get('entity')}] "
-            f"{it.get('title')} :: {it.get('summary', '')} :: fix: {it.get('fix_sketch', '')} "
-            f":: id={it.get('id')} :: evidence="
-            # Same half-empty artifact as the card renderer above -- leaving it
-            # here would reproduce "ch D0B4CTD3B09/ts " in every generated
-            # kickoff prompt instead of only on the card.
-            + "; ".join(
-                f"ch {str(e.get('channel_id') or '').strip()}"
-                f"/ts {str(e.get('ts') or '').strip()}"
-                for e in (it.get('evidence') or [])[:3]
-                if str(e.get('channel_id') or '').strip()
-                and str(e.get('ts') or '').strip())
-            for it in items
+            [f"- [{it.get('severity')}] {it.get('kind')} [{it.get('entity')}] "
+             f"{it.get('title')} :: fix: {it.get('fix_sketch', '')} :: id={it.get('id')}"
+             for it in items]
+            + ["", "EVIDENCE block (copy verbatim into Section 0):"]
+            + _evidence_block(items)
         )
         try:
             import anthropic
@@ -1524,6 +1742,8 @@ def build_item_card(rec: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     if rec.get("fix_sketch"):
         text += f"\n_Fix sketch:_ {rec['fix_sketch']}"
     text += ev_txt
+    # S3'(b): the same three surface fields the backlog view carries.
+    text += f"\n_{format_surface_line(rec, on_card=True)}_"
     if status == "APPROVED":
         elements = [
             {"type": "button", "action_id": ACTION_STAGE, "style": "primary",
@@ -1688,6 +1908,10 @@ def process_queue_action(action_id: str, cq_id: str, actor_id: str) -> tuple[str
                 # reservation) is NOT a failure -- reporting one would send Harrison
                 # chasing a retry the in-flight winner is about to make unnecessary.
                 msg = "✅ Queued (APPROVED) -- a prompt is already being generated."
+            elif outcome == "no_evidence":
+                # C1: the approve stands; the kickoff does NOT -- the ack IS the
+                # re-card, naming what is missing and both honest ways forward.
+                msg = f"✅ Queued (APPROVED). {detail}"
             elif outcome == "error":
                 # LOUD, never silent: the approve still stands (the ledger event is
                 # already written) but Harrison is told the kickoff did NOT generate,
@@ -1724,6 +1948,9 @@ def process_queue_action(action_id: str, cq_id: str, actor_id: str) -> tuple[str
                             else detail)
         if outcome == "inflight":
             return "noop", "Already staging -- I'll post the prompt path when it's ready."
+        if outcome == "no_evidence":
+            # C1: a Stage BUTTON is not the override -- the founder's typed verb is.
+            return "no_evidence", detail
         return "error", f"Prompt generation failed -- nothing staged ({detail})."
 
     if action_id == ACTION_MARK_SHIPPED:
@@ -1781,7 +2008,7 @@ def process_queue_action(action_id: str, cq_id: str, actor_id: str) -> tuple[str
 _TERMINAL_STATUSES = frozenset({"SHIPPED", "DISMISSED", "SUPERSEDED"})
 
 
-def ensure_kickoff_staged(cq_id: str) -> tuple[str, str]:
+def ensure_kickoff_staged(cq_id: str, *, override_evidence_floor: bool = False) -> tuple[str, str]:
     """Generate + ledger-record a kickoff prompt for one item. The single
     implementation every approval path shares.
 
@@ -1790,6 +2017,11 @@ def ensure_kickoff_staged(cq_id: str) -> tuple[str, str]:
       "noop"     -> nothing to do (detail is the existing path, or why)
       "inflight" -> a concurrent attempt holds the reservation; it will finish
       "error"    -> detail is a short human reason; the CALLER must surface it
+
+    override_evidence_floor: the C1 evidence floor's deliberate override -- set
+    ONLY by stage_by_id (the founder's typed `stage cq-<id>` verb, Code #12 S1').
+    Every other caller (approve auto-stage, the Stage button, seed stage_now,
+    scripts) is subject to the floor once C1 lands.
 
     Reservation-guarded (defect #3 TOCTOU class) so a concurrent approve/stage can
     never double-generate. The race is its OWN outcome rather than an error string
@@ -1812,6 +2044,14 @@ def ensure_kickoff_staged(cq_id: str) -> tuple[str, str]:
     # priority_items_missing_kickoff already used.
     if rec.get("prompt_path"):
         return "noop", str(rec["prompt_path"])
+    # C1 EVIDENCE FLOOR (cq-b6f2f4825ffb): no permalink and no explicit body ->
+    # nothing to build from, so nothing is generated. The caller re-cards with
+    # the two honest ways forward (no_evidence_message). Only the founder's typed
+    # `stage cq-<id>` (stage_by_id, S1') passes override_evidence_floor=True.
+    if not override_evidence_floor and not has_evidence(rec):
+        log.info("code_queue: evidence floor held %s (signal=%s) -- not auto-staging",
+                 cq_id, rec.get("signal"))
+        return "no_evidence", no_evidence_message(rec)
     if not _begin_staging([cq_id]):
         return "inflight", "another staging attempt is already in flight for this item"
     try:
@@ -2177,7 +2417,59 @@ def stage_by_id(cq_id: str, actor_id: str) -> tuple[str, str]:
                 f"I can't find `{cid or '(no id)'}` in the queue. If you have the "
                 f"card, tap its \u201cStage prompt\u201d button -- that is the same "
                 f"path and it always resolves the right item.")
-    return ensure_kickoff_staged(cid)
+    return ensure_kickoff_staged(cid, override_evidence_floor=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Founder-DM queue verbs (Code #12 S1', cq-554184feb53b) -- pre-model, deterministic
+# ─────────────────────────────────────────────────────────────────────────────
+# 2026-09-03 06:49 AZ: Harrison's DM "@Cora Stage cq-621dfad586aa" was answered
+# with the morning-briefing digest -- zero tool_use. The typed verb was honored
+# ONLY inside queue_explicit (the cora_queue_code_session backend), i.e. only when
+# the MODEL elected to call that tool; a queue verb in a founder DM had no
+# deterministic route the way the F-23 confirm interceptor gives one to "yes" /
+# "cancel" (the 1ff pattern). Four minutes later the model narrated "Done.
+# Staging all three" with two invented ids (S2' in slack_egress guards that half).
+#
+# EXACT MATCH ONLY. A sentence that merely cites an id ("retry uploads the way
+# cq-abc123def456 describes") is a build request, not a verb, and still goes to
+# the model. The verb is case-insensitive ("Stage" is what was typed); the id is
+# lowercased. Trailing punctuation is NOT tolerated -- the locked spec's regex is
+# reproduced verbatim so the match surface stays exactly what was ruled.
+_QUEUE_VERB_RE = re.compile(
+    r"^\s*(stage|approve|dismiss)\s+(cq-[0-9a-f]{12})\s*$", re.IGNORECASE)
+
+
+def match_queue_verb(text: str) -> tuple[str, str] | None:
+    """(verb, cq_id) when *text* is EXACTLY a queue verb + id, else None."""
+    m = _QUEUE_VERB_RE.match(str(text or ""))
+    if not m:
+        return None
+    return m.group(1).lower(), m.group(2).lower()
+
+
+def apply_queue_verb(verb: str, cq_id: str, actor_id: str) -> tuple[str, str]:
+    """Run one typed queue verb DIRECTLY against the queue. The reply is the
+    queue's OWN outcome string, verbatim; the model is never consulted.
+
+    Every guard is INHERITED, not re-derived: `stage` -> stage_by_id (Harrison-
+    only, the not-found string, the _TERMINAL_STATUSES guard, prompt_path
+    idempotence, the staging reservation -- and, deliberately, the C1
+    evidence-floor OVERRIDE: a typed `stage` is the founder saying "stage it
+    anyway"); `approve` / `dismiss` -> process_queue_action (Harrison-only,
+    idempotent, terminal-row guards). A non-founder gets the tool's own
+    not_authorized text; an unknown id gets its not-found text -- never a model
+    reply in either case.
+    """
+    v = str(verb or "").strip().lower()
+    cid = str(cq_id or "").strip().lower()
+    if v == "stage":
+        return stage_by_id(cid, actor_id)
+    if v == "approve":
+        return process_queue_action(ACTION_APPROVE, cid, actor_id)
+    if v == "dismiss":
+        return process_queue_action(ACTION_DISMISS, cid, actor_id)
+    return "error", f"Unknown queue verb: {verb!r}"
 
 
 def queue_explicit(user: str, entity: str, channel_id: str, request: str,
@@ -2569,6 +2861,7 @@ def seed_item(*, kind: str, severity: str, title: str, summary: str, entity: str
         "representative": title,
         "evidence": [{"channel_id": "", "ts": "", "note": summary[:200]}],
         "reporter": HARRISON_ID,
+        "seeded": True,  # C1: a seed's body IS its evidence (has_evidence / _is_seed_shaped)
     }
     # Summary PHI gate -- FAIL-CLOSED, mirroring _capture (D-051): the seed persists
     # title/summary RAW (title is the dedup basis; it also renders into the KB-ingested

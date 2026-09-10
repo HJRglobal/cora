@@ -600,6 +600,21 @@ def claude_mirror_section() -> dict:
 # rendering
 # --------------------------------------------------------------------------- #
 
+def egress_rails_section() -> dict:
+    """Code #12 S3'(a) (cq-deca62a00719): the observe-week read for BOTH seam rails
+    -- sentinel-egress-leak (session #11 S1) and phantom-write-claim (Code #12 S2')
+    -- single-sourced from cora.egress_rails so this digest and the nightly health
+    check can never disagree about the numbers the enforce flip is gated on."""
+    try:
+        from cora import egress_rails
+        read = egress_rails.observe_week_read()
+        read["available"] = True
+        read["line"] = egress_rails.format_line(read)
+        return read
+    except Exception as exc:  # noqa: BLE001 -- fail-soft convention (see kb_corpus)
+        return {"available": False, "reason": str(exc)}
+
+
 def _fmt_bytes(n: int) -> str:
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024 or unit == "GB":
@@ -680,6 +695,19 @@ def threshold_alarms(report: dict) -> list[str]:
         if probs:
             alarms.append("claude mirror: " + "; ".join(probs) + ".")
 
+    # Egress rails (Code #12 S3'(a)): the observe week is NOT clean while either
+    # seam rail fired in the last 7 days -- the CORA_SENTINEL_ENFORCE flip stays
+    # gated until BOTH read zero (decisions.md 2026-09-03: one rail's silence never
+    # certifies the other's).
+    er = report.get("egress_rails", {})
+    if er.get("available") and er.get("mode") != "enforce" and not er.get("clean_7d"):
+        c7 = er.get("counts_7d") or {}
+        alarms.append(
+            f"EGRESS RAILS: observe week NOT clean -- sentinel-egress-leak "
+            f"{c7.get('sentinel-egress-leak', '?')} | phantom-write-claim "
+            f"{c7.get('phantom-write-claim', '?')} in 7d; the CORA_SENTINEL_ENFORCE flip "
+            f"stays gated until both read 0 for a week."
+        )
     # Flywheel alarms come pre-evaluated by cora.flywheel_metrics (WS-2) so the
     # thresholds are single-sourced with the nightly health check.
     fw = report.get("flywheel", {})
@@ -776,8 +804,20 @@ def format_slack(report: dict) -> str:
         if isinstance(mech_pending, int):
             lines.append(
                 f"*Mechanical lane:* {mech_pending:,} pending | "
-                f"{fw.get('mechanical_overdue', '?')} past review deadline"
+                f"{fw.get('mechanical_overdue', '?')} past review deadline | "
+                f"expired_low_risk 7d {fw.get('expired_low_risk_7d', '?')}"
             )
+    er = report.get("egress_rails", {})
+    if er.get("available"):
+        c7 = er.get("counts_7d") or {}
+        lines.append(
+            f"*Egress rails* (mode={er.get('mode', '?')}): sentinel-egress-leak 7d "
+            f"{c7.get('sentinel-egress-leak', '?')} | phantom-write-claim 7d "
+            f"{c7.get('phantom-write-claim', '?')} -- "
+            + ("flip criterion MET (both rails clean 7d)" if er.get("clean_7d")
+               else ("ENFORCE on" if er.get("mode") == "enforce"
+                     else "observe week NOT clean; flip stays gated"))
+        )
     cm = report.get("claude_mirror", {})
     if cm.get("available"):
         age = cm.get("age_hours")
@@ -934,6 +974,15 @@ def render(report: dict) -> None:
         for line in fw.get("display_lines", []):
             print(f"    {line}")
 
+    # 8. egress rails (Code #12 S3'(a))
+    er = report.get("egress_rails", {})
+    print("\n[8] EGRESS RAILS (observe week: sentinel-egress-leak + phantom-write-claim)")
+    if not er.get("available"):
+        print(f"    unavailable: {er.get('reason')}")
+    else:
+        print(f"    {er.get('line')}")
+        print(f"    {er.get('flip_criterion')}")
+
     print("\n" + "=" * 72)
 
 
@@ -951,6 +1000,7 @@ def build_report(log_days: int, use_api: bool) -> dict:
         "flywheel": flywheel_metrics_section(),
         "dashboard_drift": dashboard_drift_section(),
         "claude_mirror": claude_mirror_section(),
+        "egress_rails": egress_rails_section(),
     }
     report["alarms"] = threshold_alarms(report)
     return report

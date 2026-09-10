@@ -436,6 +436,7 @@ def code_queue_seed(
     entity: str,
     status: str | None = None,
     subsystem_guess: str = "",
+    stage_now: bool = False,
 ) -> dict[str, Any]:
     """The ONE write tool on this surface: seed a single item into the code-session
     backlog via ``code_queue.seed_item`` — same PHI-fail-closed, fingerprint-
@@ -443,7 +444,16 @@ def code_queue_seed(
     The backlog is NOT canon (D-011 untouched, decisions.md/CLAUDE.md are
     unreachable from this surface). ``status`` is restricted to PROPOSED
     (default) / APPROVED — any other value is refused before ``seed_item`` is
-    ever called."""
+    ever called.
+
+    ``stage_now`` (Code #12 S3'(c), cq-deca62a00719 / cq-0f8abd3c1981): pass
+    through to ``seed_item`` so an APPROVED P0/P1-class seed gets its kickoff
+    generated inline. A seed posts NO DM card ("no DM, no classifier"), so the
+    old success text -- "Tap Stage on the item" -- pointed at a button that did
+    not exist and sent operators down the model-routed typed-verb path that
+    failed on 2026-09-03. The message now says what IS true: no card; stage with
+    the founder-DM verb ``stage <id>`` (Code #12 S1') or re-seed with stage_now;
+    otherwise an APPROVED seed closes at step 7.5 on merge."""
     from cora import code_queue
 
     kind = (kind or "").strip()
@@ -466,7 +476,7 @@ def code_queue_seed(
         cq_id = code_queue.seed_item(
             kind=kind, severity=severity, title=title, summary=summary,
             entity=entity, signal="explicit", status=status,
-            subsystem_guess=subsystem_guess or "",
+            subsystem_guess=subsystem_guess or "", stage_now=bool(stage_now),
         )
     except Exception as exc:  # noqa: BLE001 — a write tool still never crashes the server
         log.warning("MCP code_queue_seed failed: %s", exc)
@@ -482,21 +492,42 @@ def code_queue_seed(
     # P0/P1-class severity bypasses the only paths that generate a kickoff prompt, and
     # seed_item's warning is a log line no MCP caller reads. The whole point of the
     # P1-at-approval slice is that a priority item must never LOOK fully handled when
-    # it is not, so surface it here too.
-    kickoff_note = ""
-    if status == "APPROVED" and code_queue.is_priority_severity(severity):
+    # it is not, so surface it here too -- and say HOW to stage it truthfully
+    # (S3'(c)): a seed has no card, so "tap Stage" was never actionable.
+    try:
+        rec = code_queue.get_item(cq_id) or {}
+    except Exception:  # noqa: BLE001 -- the message is advisory; never fail the seed
+        rec = {}
+    prompt_path = str(rec.get("prompt_path") or "")
+    priority = code_queue.is_priority_severity(severity)
+    kickoff_missing = status == "APPROVED" and priority and not prompt_path
+    if prompt_path:
+        kickoff_note = f" Kickoff generated inline: `{prompt_path}`."
+    elif kickoff_missing and stage_now:
+        kickoff_note = (" stage_now was requested but no kickoff was generated (see the bot "
+                        f"log); reply `stage {cq_id}` in your Cora DM to retry.")
+    elif kickoff_missing:
         kickoff_note = (
-            f" NOTE: {severity} is P0/P1-class and this was seeded straight to "
-            "APPROVED, so NO kickoff prompt was generated. Tap Stage on the item, or "
-            "the nightly health check will flag it within "
+            f" NOTE: {severity} is P0/P1-class and this was seeded straight to APPROVED "
+            f"with NO kickoff prompt. To stage it, reply `stage {cq_id}` in your Cora DM "
+            "(or re-seed with stage_now=true); otherwise it closes at step 7.5 on merge "
+            "when a session ships it. The nightly health check flags it after "
             f"{code_queue.PRIORITY_KICKOFF_GRACE_HOURS}h.")
+    elif status == "APPROVED":
+        kickoff_note = (f" To stage a kickoff, reply `stage {cq_id}` in your Cora DM "
+                        "(stage_now applies only to P0/P1-class seeds); otherwise it closes "
+                        "at step 7.5 on merge.")
+    else:
+        kickoff_note = (f" It rides the Monday menu's PROPOSED coverage; to move it, reply "
+                        f"`approve {cq_id}` then `stage {cq_id}` in your Cora DM.")
     return {
         "id": cq_id, "seeded": True, "status": status,
-        "kickoff_missing": bool(kickoff_note),
+        "kickoff_missing": bool(kickoff_missing),
+        "card": False,
         "message": (f"Seeded {cq_id} (status={status}). This is the code-session "
                     "backlog, not canon — Harrison reviews it in the normal flow. "
-                    "Re-seeding the same title is idempotent (returns this id)."
-                    + kickoff_note),
+                    "Re-seeding the same title is idempotent (returns this id). "
+                    "No DM card is posted for a seed." + kickoff_note),
     }
 
 
@@ -784,6 +815,12 @@ _TOOL_SPECS: list[dict[str, Any]] = [
                     "description": "Default PROPOSED. APPROVED only if Harrison explicitly approved this in-session.",
                 },
                 "subsystem_guess": {"type": "string", "description": "Optional: module/area this touches."},
+                "stage_now": {
+                    "type": "boolean",
+                    "description": ("Default false. For an APPROVED P0/P1-class seed, generate the "
+                                    "kickoff prompt inline (a seed posts no DM card; the "
+                                    "alternative is the founder-DM verb `stage <id>`)."),
+                },
             },
             "required": ["kind", "severity", "title", "summary", "entity"],
             "additionalProperties": False,
@@ -791,7 +828,7 @@ _TOOL_SPECS: list[dict[str, Any]] = [
         "fn": lambda a: code_queue_seed(
             a.get("kind", ""), a.get("severity", ""), a.get("title", ""),
             a.get("summary", ""), a.get("entity", ""), a.get("status"),
-            a.get("subsystem_guess", ""),
+            a.get("subsystem_guess", ""), stage_now=bool(a.get("stage_now", False)),
         ),
     },
     {
