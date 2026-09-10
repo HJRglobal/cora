@@ -5333,6 +5333,93 @@ def handle_cq_edit_submit(ack, body, client, view) -> None:
         log.warning("code-queue edit-submit handler error (non-fatal)", exc_info=True)
 
 
+# ── Code #12 C3: park-with-trigger + dismiss-with-evidence modals ────────────
+def _open_cq_modal(body: dict, client, builder, label: str) -> None:
+    """Shared opener for the code-queue modals (Park / Dismiss w/ note): the
+    Harrison gate (ephemeral refusal for anyone else), then views_open with the
+    item id + the card's channel/ts in private_metadata so the submit can ack on
+    the original card. Mirrors handle_cq_edit; Slack I/O only -- every rule lives
+    in code_queue.park_item / dismiss_with_evidence."""
+    try:
+        actions = body.get("actions") or []
+        cq_id = (actions[0].get("value") if actions else "") or ""
+        actor_id = (body.get("user") or {}).get("id", "")
+        channel_id = (body.get("channel") or {}).get("id", "")
+        message_ts = (body.get("message") or {}).get("ts", "")
+        trigger_id = body.get("trigger_id", "")
+        if actor_id != code_queue.HARRISON_ID:
+            try:
+                client.chat_postEphemeral(channel=channel_id, user=actor_id,
+                                          text="Only Harrison can action the code-session queue.")
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        client.views_open(trigger_id=trigger_id, view=builder(cq_id, channel_id, message_ts))
+    except Exception:  # noqa: BLE001
+        log.warning("code-queue %s-modal open failed (non-fatal)", label, exc_info=True)
+
+
+def _cq_ack_view_submit(client, meta: dict, msg: str) -> None:
+    """Ack a modal submit as a THREADED reply under the original card: the Monday
+    menu is one message with many actions blocks, so the Rider-D chat_update idiom
+    would drop every other row's buttons; a view submit carries only the metadata
+    pointer, not the message body, so the thread is the one safe surface."""
+    ch, ts = str(meta.get("dm_channel") or ""), str(meta.get("dm_ts") or "")
+    if not (ch and ts):
+        return
+    try:
+        client.chat_postMessage(channel=ch, thread_ts=ts, text=msg,
+                                unfurl_links=False, unfurl_media=False)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("code-queue modal ack failed: %s", exc)
+
+
+def _view_value(state: dict, block_id: str, key: str = "value") -> str:
+    return str(((state.get(block_id) or {}).get("v", {}) or {}).get(key, "") or "")
+
+
+@app.action(code_queue.ACTION_PARK)
+def handle_cq_park(ack, body, client) -> None:
+    ack()
+    _open_cq_modal(body, client, code_queue.park_modal_view, "park")
+
+
+@app.view(code_queue.VIEW_PARK_SUBMIT)
+def handle_cq_park_submit(ack, body, client, view) -> None:
+    ack()
+    try:
+        meta = json.loads(view.get("private_metadata") or "{}")
+        actor_id = (body.get("user") or {}).get("id", "")
+        state = (view.get("state") or {}).get("values") or {}
+        _outcome, msg = code_queue.park_item(
+            str(meta.get("cq_id") or ""), actor_id, _view_value(state, "cq_park_reason"),
+            until=_view_value(state, "cq_park_until", "selected_date"),
+            trigger_event=_view_value(state, "cq_park_event"))
+        _cq_ack_view_submit(client, meta, msg)
+    except Exception:  # noqa: BLE001
+        log.warning("code-queue park-submit handler error (non-fatal)", exc_info=True)
+
+
+@app.action(code_queue.ACTION_DISMISS_NOTE)
+def handle_cq_dismiss_note(ack, body, client) -> None:
+    ack()
+    _open_cq_modal(body, client, code_queue.dismiss_modal_view, "dismiss-note")
+
+
+@app.view(code_queue.VIEW_DISMISS_SUBMIT)
+def handle_cq_dismiss_submit(ack, body, client, view) -> None:
+    ack()
+    try:
+        meta = json.loads(view.get("private_metadata") or "{}")
+        actor_id = (body.get("user") or {}).get("id", "")
+        state = (view.get("state") or {}).get("values") or {}
+        _outcome, msg = code_queue.dismiss_with_evidence(
+            str(meta.get("cq_id") or ""), actor_id, _view_value(state, "cq_dismiss_note"))
+        _cq_ack_view_submit(client, meta, msg)
+    except Exception:  # noqa: BLE001
+        log.warning("code-queue dismiss-submit handler error (non-fatal)", exc_info=True)
+
+
 def _card_preview_text(orig_blocks: list[dict]) -> str:
     """The card's original preview text, recovered from its rendered blocks --
     used to re-register a card whose terminal edit failed, so a later sweep can

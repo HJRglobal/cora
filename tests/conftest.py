@@ -384,6 +384,9 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
         ("cora.code_queue", "_EVENT_LEDGER", "code-session-queue.jsonl"),
         ("cora.code_queue", "_FINGERPRINT_LEDGER", "code-queue-fingerprints.jsonl"),
         ("cora.code_queue", "_SIGNALS_LEDGER", "code-queue-signals.jsonl"),
+        # Code #12 C3: the Monday-menu run artifact (maybe_send_weekly_menu writes
+        # one row per fire). A new write path needs its redirect the day it is born.
+        ("cora.code_queue", "_MENU_RUNS_LEDGER", "code-queue-menu-runs.jsonl"),
         ("cora.knowledge_review", "_AUTOWRITE_AUDIT_PATH", "cora-autowrite-audit.jsonl"),
         # cq-eba0861fc043 (session #11 S2): these THREE sat un-redirected right beside
         # _AUTOWRITE_AUDIT_PATH above. propose_update() appends to

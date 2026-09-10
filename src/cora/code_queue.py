@@ -110,7 +110,7 @@ def is_priority_severity(severity: str | None) -> bool:
 # Statuses at which an item is still "live" -- a new similar signal should dedup INTO
 # it (used by the embedding paraphrase layer). Terminal statuses are excluded so a
 # dismissed/shipped item never absorbs a genuinely fresh ask.
-_OPEN_STATUSES = frozenset({"PROPOSED", "APPROVED", "STAGED", "SNOOZED", "BLOCKED"})
+_OPEN_STATUSES = frozenset({"PROPOSED", "APPROVED", "STAGED", "SNOOZED", "BLOCKED", "PARKED"})
 
 # Block Kit action ids (own namespace; handled by app.py wrappers)
 ACTION_APPROVE = "code_queue_approve"
@@ -121,6 +121,14 @@ ACTION_STAGE = "code_queue_stage"           # stage a prompt (single item or bun
 ACTION_MARK_SHIPPED = "code_queue_shipped"
 ACTION_KEEP = "code_queue_keep"
 VIEW_EDIT_SUBMIT = "code_queue_edit_submit"
+# C3 (Code #12): park-with-trigger + dismiss-with-evidence (both open a modal).
+ACTION_PARK = "code_queue_park"
+VIEW_PARK_SUBMIT = "code_queue_park_submit"
+ACTION_DISMISS_NOTE = "code_queue_dismiss_note"
+VIEW_DISMISS_SUBMIT = "code_queue_dismiss_submit"
+# A Keep tap buys STALE_STAGED_DAYS of silence; after this many the row must be
+# parked with a trigger, shipped or dismissed (lock packet: "Keep-count cap").
+KEEP_CAP = 2
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Paths
@@ -1437,7 +1445,7 @@ def classify_candidate(message: str, entity: str) -> dict[str, Any] | None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Backlog renderer (generated view; drive_io fail-soft; NEVER raises)
 # ─────────────────────────────────────────────────────────────────────────────
-_STATUS_ORDER = ["PROPOSED", "APPROVED", "STAGED", "BLOCKED", "SNOOZED",
+_STATUS_ORDER = ["PROPOSED", "APPROVED", "STAGED", "BLOCKED", "SNOOZED", "PARKED",
                  "SHIPPED", "DISMISSED", "SUPERSEDED"]
 
 
@@ -2131,8 +2139,20 @@ def process_queue_action(action_id: str, cq_id: str, actor_id: str, *,
         return "shipped", f"🚢 Marked shipped ({ref})."
 
     if action_id == ACTION_KEEP:
+        # C3: Keeps are counted and CAPPED. One tap used to buy 14 silent days with
+        # no reason, no trigger and no ceiling (audit F6: 16 of 23 aged STAGED rows
+        # suppressed by one tap each). At the cap the row must be parked WITH a
+        # trigger, shipped, or dismissed -- a stale Keep button is a no-op.
+        kc = int(rec.get("keep_count") or 0)
+        if kc >= KEEP_CAP:
+            return "noop", (f"Keep is capped at {KEEP_CAP} for this item (kept x{kc}) -- park it "
+                            "with a trigger, ship it, or dismiss it.")
         _append_event({"event": "kept", "ts": _now_iso(), "id": cq_id})
-        return "kept", "Kept -- staleness clock reset."
+        left = KEEP_CAP - (kc + 1)
+        return "kept", (f"Kept (x{kc + 1}) -- staleness clock reset"
+                        + (f"; {left} Keep left before the cap." if left else
+                           "; that was the last Keep -- next time park it with a trigger, "
+                           "ship it, or dismiss it."))
 
     return "error", f"Unknown action: {action_id}"
 
@@ -2449,6 +2469,127 @@ def record_staged(cq_id: str, prompt_path: str, actor_id: str) -> tuple[str, str
     return "staged", f"📝 Prompt staged: `{path}`"
 
 
+# ── C3 (Code #12): park-with-trigger + dismiss-with-evidence ──────────────────
+_PARK_REASON_MAX = 200
+_PARK_EVENT_MAX = 120
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def park_item(cq_id: str, actor_id: str, reason: str, *, until: str = "",
+              trigger_event: str = "") -> tuple[str, str]:
+    """Park an open item WITH a trigger: a reason plus a resume DATE (YYYY-MM-DD,
+    resurfaces on the Monday menu once it passes) and/or a resume EVENT (free
+    text; listed count-only on every menu until a human acts). Replaces the
+    reason-less, trigger-less Keep as the way to defer (audit F6). Harrison-only;
+    terminal rows refused; the reason is PHI-screened like every other typed
+    field that egresses to the backlog view."""
+    if actor_id != HARRISON_ID:
+        return "not_authorized", "Only Harrison can action the code-session queue."
+    rec = get_item(cq_id)
+    if not rec:
+        return "error", "That queue item no longer exists."
+    if str(rec.get("status", "")).upper() in _TERMINAL_STATUSES:
+        return "noop", f"Item is {rec['status']} -- not parking a terminal row."
+    reason = " ".join(str(reason or "").split())[:_PARK_REASON_MAX]
+    if not reason:
+        return "error", "A park needs a reason -- say why it waits."
+    until = str(until or "").strip()
+    if until and not _DATE_RE.match(until):
+        return "error", "The resume date must be YYYY-MM-DD."
+    trigger_event = " ".join(str(trigger_event or "").split())[:_PARK_EVENT_MAX]
+    if not until and not trigger_event:
+        return "error", "A park needs a trigger -- a resume date or the event that resumes it."
+    try:
+        if phi_guard.is_any_phi_request(f"{reason} {trigger_event}"):
+            return "error", "Park rejected -- the text tripped the PHI guard."
+    except Exception:  # noqa: BLE001 -- fail closed
+        return "error", "Park rejected -- PHI check failed (fail-closed)."
+    _append_event({"event": "parked", "ts": _now_iso(), "id": cq_id, "reason": reason,
+                   "until": until, "trigger_event": trigger_event})
+    _render_backlog_safe()
+    trig = " / ".join(x for x in (f"until {until}" if until else "", f"on: {trigger_event}" if trigger_event else "") if x)
+    return "parked", f"⏸ Parked ({trig}) -- {reason}"
+
+
+def dismiss_with_evidence(cq_id: str, actor_id: str, note: str, *,
+                          channel_id: str = "", ts: str = "") -> tuple[str, str]:
+    """Dismiss WITH a stated reason (the evidence-attached disposition class the 9/8
+    lock named for the Appendix-A rows). The reason rides the `dismissed` event and
+    folds to dismiss_reason. Harrison-only; PHI-screened; idempotent."""
+    if actor_id != HARRISON_ID:
+        return "not_authorized", "Only Harrison can action the code-session queue."
+    rec = get_item(cq_id)
+    if not rec:
+        return "error", "That queue item no longer exists."
+    if str(rec.get("status", "")).upper() == "DISMISSED":
+        return "noop", "Already dismissed."
+    note = " ".join(str(note or "").split())[:_EVIDENCE_NOTE_MAX_CHARS]
+    if not note:
+        return "error", "A dismiss-with-evidence needs the evidence -- say why."
+    try:
+        if phi_guard.is_any_phi_request(note):
+            return "error", "Dismissal note rejected -- the text tripped the PHI guard."
+    except Exception:  # noqa: BLE001 -- fail closed
+        return "error", "Dismissal note rejected -- PHI check failed (fail-closed)."
+    ev: dict[str, Any] = {"event": "dismissed", "ts": _now_iso(), "id": cq_id, "reason": note}
+    if channel_id or ts:
+        ev["evidence"] = {"channel_id": str(channel_id or ""), "ts": str(ts or "")}
+    _append_event(ev)
+    _render_backlog_safe()
+    return "dismissed", f"🗑️ Dismissed with evidence -- {note}"
+
+
+def _modal_meta(cq_id: str, dm_channel: str, dm_ts: str) -> str:
+    return json.dumps({"cq_id": cq_id, "dm_channel": dm_channel, "dm_ts": dm_ts})
+
+
+def park_modal_view(cq_id: str, dm_channel: str, dm_ts: str) -> dict[str, Any]:
+    rec = get_item(cq_id) or {}
+    return {
+        "type": "modal",
+        "callback_id": VIEW_PARK_SUBMIT,
+        "private_metadata": _modal_meta(cq_id, dm_channel, dm_ts),
+        "title": {"type": "plain_text", "text": "Park with a trigger"},
+        "submit": {"type": "plain_text", "text": "Park"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {"type": "section", "text": {"type": "mrkdwn",
+             "text": f"*{str(rec.get('title', ''))[:150]}* (`{cq_id}`)"}},
+            {"type": "input", "block_id": "cq_park_reason",
+             "label": {"type": "plain_text", "text": "Why does it wait?"},
+             "element": {"type": "plain_text_input", "action_id": "v", "multiline": True,
+                         "max_length": _PARK_REASON_MAX}},
+            {"type": "input", "block_id": "cq_park_until", "optional": True,
+             "label": {"type": "plain_text", "text": "Resume date (resurfaces on that Monday's menu)"},
+             "element": {"type": "datepicker", "action_id": "v"}},
+            {"type": "input", "block_id": "cq_park_event", "optional": True,
+             "label": {"type": "plain_text", "text": "...or the event that resumes it"},
+             "element": {"type": "plain_text_input", "action_id": "v",
+                         "max_length": _PARK_EVENT_MAX}},
+        ],
+    }
+
+
+def dismiss_modal_view(cq_id: str, dm_channel: str, dm_ts: str) -> dict[str, Any]:
+    rec = get_item(cq_id) or {}
+    return {
+        "type": "modal",
+        "callback_id": VIEW_DISMISS_SUBMIT,
+        "private_metadata": _modal_meta(cq_id, dm_channel, dm_ts),
+        "title": {"type": "plain_text", "text": "Dismiss with evidence"},
+        "submit": {"type": "plain_text", "text": "Dismiss"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {"type": "section", "text": {"type": "mrkdwn",
+             "text": f"*{str(rec.get('title', ''))[:150]}* (`{cq_id}`)"}},
+            {"type": "input", "block_id": "cq_dismiss_note",
+             "label": {"type": "plain_text", "text": "Why is this closed? (the evidence)"},
+             "element": {"type": "plain_text_input", "action_id": "v", "multiline": True,
+                         "max_length": _EVIDENCE_NOTE_MAX_CHARS}},
+        ],
+    }
+
+
 def append_evidence(cq_id: str, actor_id: str, note: str,
                     *, channel_id: str = "", ts: str = "") -> tuple[str, str]:
     """Attach one dated real-world example to an EXISTING item (Slice 0).
@@ -2735,12 +2876,70 @@ _MENU_MAX_ROWS = 12  # cap stage-able rows shown (bundles + singletons) -- Slack
 #                      50-block ceiling; overflow is NOTED, never silently dropped.
 
 
-def build_weekly_menu() -> tuple[str, list[dict[str, Any]]] | None:
+# C3 (Code #12; audit F2/F6/F8): the menu's four groups were APPROVED, APPROVED-
+# config, STAGED >14d and expired SNOOZEs -- and NO PROPOSED branch, so the queue's
+# largest tier (80 rows on 9/9, 44 aged >= 14d, 13 HIGH-class) had no recurring
+# surface and no backstop (the Friday sweep keys on prompt FILES, which PROPOSED
+# rows lack). Keep was a reason-less, trigger-less 14-day snooze (16 of 23 aged
+# STAGED rows suppressed by one tap). And the card wrote no durable artifact of
+# what it carried. All four are closed here:
+#   * PROPOSED coverage: rows aged >= STALE_STAGED_DAYS and/or P0/P1-class,
+#     priority first; the first rows are actionable (Queue / Park / Dismiss w/
+#     note) under a hard block budget, the rest are LISTED -- never dropped;
+#   * park-with-trigger (reason + resume date and/or event); a due park resurfaces,
+#     an event-park stays listed count-only;
+#   * Keep count rendered; at KEEP_CAP the row renders in a distinct state and
+#     loses its Keep button;
+#   * every send writes one row to _MENU_RUNS_LEDGER (what was carried, or why
+#     nothing was) -- a task that fires and writes nothing == one that never fired.
+_MENU_MAX_PROPOSED_ROWS = 8   # actionable PROPOSED rows (2 blocks each); the rest list as text
+_MENU_BLOCK_BUDGET = 48       # Slack's ceiling is 50 blocks; 2 kept in reserve for the notes
+_MENU_RUNS_LEDGER = _STATE_DIR / "code-queue-menu-runs.jsonl"
+
+
+def _proposed_coverage(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """PROPOSED rows aged >= STALE_STAGED_DAYS OR P0/P1-class (either vocabulary),
+    priority first, then oldest first."""
+    rows = [it for it in items if it.get("status") == "PROPOSED"
+            and (_age_days(it.get("ts")) >= STALE_STAGED_DAYS
+                 or is_priority_severity(it.get("severity")))]
+    rows.sort(key=lambda it: (0 if is_priority_severity(it.get("severity")) else 1,
+                              -_age_days(it.get("ts"))))
+    return rows
+
+
+def _parked_rows(items: list[dict[str, Any]], now: datetime) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """(due, waiting): a PARKED row whose resume date has passed is DUE; the rest
+    (future date, or an event trigger) are WAITING and list count-only."""
+    today = now.date().isoformat()
+    due: list[dict[str, Any]] = []
+    waiting: list[dict[str, Any]] = []
+    for it in items:
+        if it.get("status") != "PARKED":
+            continue
+        until = str(it.get("park_until") or "")[:10]
+        (due if (until and until <= today) else waiting).append(it)
+    return due, waiting
+
+
+def _ids(rows: list[dict[str, Any]]) -> list[str]:
+    return [str(r.get("id", "")) for r in rows]
+
+
+def _proposed_row_line(it: dict[str, Any]) -> str:
+    age = _age_days(it.get("ts"))
+    return (f"• `{it.get('severity', '?')}` {it.get('kind', '?')} [{it.get('entity', '?')}] "
+            f"{it.get('title', '')} (`{it.get('id', '?')}`) -- {age}d")
+
+
+def build_weekly_menu(*, carried_out: dict[str, Any] | None = None) -> tuple[str, list[dict[str, Any]]] | None:
     """(text, blocks) for the Monday menu, or None if there is nothing to show.
     APPROVED items are grouped by AFFINITY (subsystem_guess -> entity) into bundles of
     at most _MAX_BUNDLE_ITEMS; a group of one is listed singly. There is NO kitchen-sink
-    "other" bundle (defect #5). Plus config items + a staleness sweep (STAGED >14d and
-    expired SNOOZEs)."""
+    "other" bundle (defect #5). Plus config items, a staleness sweep (STAGED >14d and
+    expired SNOOZEs, with Keep counts + the cap), due/waiting PARKED rows, and the
+    PROPOSED coverage (C3). ``carried_out`` (optional dict) is filled with the ids
+    carried per section -- the durable artifact maybe_send_weekly_menu records."""
     items = load_items()
     approved = [it for it in items if it.get("status") == "APPROVED" and it.get("kind") != "config"]
     config_items = [it for it in items if it.get("status") == "APPROVED" and it.get("kind") == "config"]
@@ -2751,8 +2950,23 @@ def build_weekly_menu() -> tuple[str, list[dict[str, Any]]] | None:
                     and _age_days(it.get("last_touch") or it.get("staged_at") or it.get("ts")) >= STALE_STAGED_DAYS]
     expired_snoozed = [it for it in items if it.get("status") == "SNOOZED"
                        and (_parse_ts(it.get("snooze_until")) or now) <= now]
+    proposed_cov = _proposed_coverage(items)
+    parked_due, parked_waiting = _parked_rows(items, now)
 
-    if not (approved or config_items or stale_staged or expired_snoozed):
+    carried: dict[str, Any] = {
+        "approved": _ids(approved), "config": _ids(config_items),
+        "stale_staged": _ids(stale_staged), "expired_snoozed": _ids(expired_snoozed),
+        "parked_due": _ids(parked_due), "parked_waiting": _ids(parked_waiting),
+        "proposed_actionable": [], "proposed_listed": [], "proposed_overflow": 0,
+        "proposed_aged": sum(1 for it in proposed_cov if _age_days(it.get("ts")) >= STALE_STAGED_DAYS),
+        "proposed_priority": sum(1 for it in proposed_cov if is_priority_severity(it.get("severity"))),
+        "blocks": 0,
+    }
+
+    if not (approved or config_items or stale_staged or expired_snoozed
+            or proposed_cov or parked_due or parked_waiting):
+        if carried_out is not None:
+            carried_out.update(carried)
         return None
 
     blocks: list[dict[str, Any]] = [
@@ -2760,6 +2974,13 @@ def build_weekly_menu() -> tuple[str, list[dict[str, Any]]] | None:
          "text": "*Cora code-session queue -- Monday menu*"}},
     ]
     text_lines = ["*Cora code-session queue -- Monday menu*"]
+
+    def _btn(action_id: str, label: str, value: str, *, style: str | None = None) -> dict[str, Any]:
+        b: dict[str, Any] = {"type": "button", "action_id": action_id,
+                             "text": {"type": "plain_text", "text": label}, "value": value}
+        if style:
+            b["style"] = style
+        return b
 
     # APPROVED -> affinity bundles (<= _MAX_BUNDLE_ITEMS each), singletons listed singly.
     if approved:
@@ -2777,15 +2998,16 @@ def build_weekly_menu() -> tuple[str, list[dict[str, Any]]] | None:
             ids_csv = ",".join(str(g.get("id", "")) for g in chunk)
             if len(chunk) == 1:
                 it = chunk[0]
-                sline = f"• [{it.get('entity', '?')}] {it.get('title', '')} (`{it.get('id', '?')}`)"
-                text_lines.append("- " + sline)
+                sline = (f"• [{it.get('entity', '?')}] {it.get('title', '')} (`{it.get('id', '?')}`)"
+                         f"\n_{format_surface_line(it)}_")
+                text_lines.append("- " + sline.splitlines()[0])
                 blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": sline[:2900]}})
                 blocks.append({
                     "type": "actions", "block_id": f"cq_single_{it.get('id', '')}"[:255],
                     "elements": [
-                        {"type": "button", "action_id": ACTION_STAGE, "style": "primary",
-                         "text": {"type": "plain_text", "text": "📝 Stage prompt"},
-                         "value": str(it.get("id", ""))},
+                        _btn(ACTION_STAGE, "📝 Stage prompt", str(it.get("id", "")), style="primary"),
+                        _btn(ACTION_PARK, "⏸ Park", str(it.get("id", ""))),
+                        _btn(ACTION_DISMISS_NOTE, "🗑️ Dismiss w/ note", str(it.get("id", ""))),
                     ],
                 })
             else:
@@ -2798,9 +3020,7 @@ def build_weekly_menu() -> tuple[str, list[dict[str, Any]]] | None:
                 blocks.append({
                     "type": "actions", "block_id": f"cq_bundle_{_slug(theme)}_{_id_suffix(chunk)}"[:255],
                     "elements": [
-                        {"type": "button", "action_id": ACTION_STAGE, "style": "primary",
-                         "text": {"type": "plain_text", "text": "📝 Stage bundle"},
-                         "value": "bundle:" + ids_csv},
+                        _btn(ACTION_STAGE, "📝 Stage bundle", "bundle:" + ids_csv, style="primary"),
                     ],
                 })
         if overflow_n:
@@ -2815,47 +3035,132 @@ def build_weekly_menu() -> tuple[str, list[dict[str, Any]]] | None:
         text_lines.append(cline)
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": cline[:2900]}})
 
+    # Staleness sweep -- with the Keep count and the cap (C3).
     for it in (stale_staged + expired_snoozed):
         why = "STAGED >14d" if it.get("status") == "STAGED" else "snooze expired"
-        sline = f"⏳ {why}: {it.get('title', '')} (`{it.get('id')}`)"
+        cid = str(it.get("id", ""))
+        kc = int(it.get("keep_count") or 0)
+        capped = kc >= KEEP_CAP
+        if capped:
+            sline = (f"⛔ KEPT x{kc} (capped) -- {why}: {it.get('title', '')} (`{cid}`) -- "
+                     f"park it with a trigger, ship it, or dismiss it")
+        else:
+            sline = f"⏳ {why}: {it.get('title', '')} (`{cid}`)" + (f" -- kept x{kc}" if kc else "")
+        sline += f"\n_{format_surface_line(it)}_"
+        text_lines.append("- " + sline.splitlines()[0])
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": sline[:2900]}})
+        elements = [_btn(ACTION_MARK_SHIPPED, "🚢 Mark shipped", cid)]
+        if not capped:
+            elements.append(_btn(ACTION_KEEP, "Keep", cid))
+        elements += [_btn(ACTION_PARK, "⏸ Park", cid), _btn(ACTION_DISMISS_NOTE, "🗑️ Dismiss w/ note", cid)]
+        blocks.append({"type": "actions", "block_id": f"cq_stale_{cid}"[:255], "elements": elements})
+
+    # PARKED: due rows resurface with actions; waiting rows are listed count-only.
+    for it in parked_due:
+        cid = str(it.get("id", ""))
+        sline = (f"⏰ park trigger reached ({str(it.get('park_until') or '')[:10]}): "
+                 f"{it.get('park_reason', '')} -- {it.get('title', '')} (`{cid}`)")
         text_lines.append("- " + sline)
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": sline[:2900]}})
-        blocks.append({
-            "type": "actions", "block_id": f"cq_stale_{it.get('id')}"[:255],
-            "elements": [
-                {"type": "button", "action_id": ACTION_MARK_SHIPPED,
-                 "text": {"type": "plain_text", "text": "🚢 Mark shipped"}, "value": str(it.get("id", ""))},
-                {"type": "button", "action_id": ACTION_KEEP,
-                 "text": {"type": "plain_text", "text": "Keep"}, "value": str(it.get("id", ""))},
-                {"type": "button", "action_id": ACTION_DISMISS,
-                 "text": {"type": "plain_text", "text": "🗑️ Dismiss"}, "value": str(it.get("id", ""))},
-            ],
-        })
+        blocks.append({"type": "actions", "block_id": f"cq_parked_{cid}"[:255], "elements": [
+            _btn(ACTION_APPROVE, "✅ Re-queue", cid, style="primary"),
+            _btn(ACTION_MARK_SHIPPED, "🚢 Mark shipped", cid),
+            _btn(ACTION_PARK, "⏸ Park again", cid),
+            _btn(ACTION_DISMISS_NOTE, "🗑️ Dismiss w/ note", cid),
+        ]})
+    if parked_waiting:
+        wl = [f"• {it.get('title', '')} (`{it.get('id', '?')}`) -- "
+              + (f"until {str(it.get('park_until') or '')[:10]}" if it.get("park_until")
+                 else f"on: {it.get('park_event', '')}")
+              for it in parked_waiting[:10]]
+        pline = f"*Parked ({len(parked_waiting)}), waiting on a trigger:*\n" + "\n".join(wl)
+        if len(parked_waiting) > 10:
+            pline += f"\n_+{len(parked_waiting) - 10} more parked rows in the backlog_"
+        text_lines.append(pline.splitlines()[0])
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": pline[:2900]}})
 
+    # PROPOSED coverage (C3) -- last, so it takes whatever block budget remains.
+    if proposed_cov:
+        n_aged = carried["proposed_aged"]
+        n_hi = carried["proposed_priority"]
+        hline = (f"*PROPOSED coverage* -- {len(proposed_cov)} row(s): {n_aged} aged >= "
+                 f"{STALE_STAGED_DAYS}d, {n_hi} P0/P1-class (nothing else surfaces these)")
+        text_lines.append(hline)
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": hline[:2900]}})
+        budget_rows = max(0, min(_MENU_MAX_PROPOSED_ROWS, (_MENU_BLOCK_BUDGET - len(blocks) - 1) // 2))
+        actionable, rest = proposed_cov[:budget_rows], proposed_cov[budget_rows:]
+        for it in actionable:
+            cid = str(it.get("id", ""))
+            sline = _proposed_row_line(it) + f"\n_{format_surface_line(it)}_"
+            text_lines.append("- " + sline.splitlines()[0])
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": sline[:2900]}})
+            blocks.append({"type": "actions", "block_id": f"cq_proposed_{cid}"[:255], "elements": [
+                _btn(ACTION_APPROVE, "✅ Queue", cid, style="primary"),
+                _btn(ACTION_PARK, "⏸ Park", cid),
+                _btn(ACTION_DISMISS_NOTE, "🗑️ Dismiss w/ note", cid),
+            ]})
+        carried["proposed_actionable"] = _ids(actionable)
+        if rest:
+            listed, overflow = rest[:20], rest[20:]
+            rline = ("*Also PROPOSED and aged / priority (approve with `approve <id>` in your "
+                     "Cora DM):*\n" + "\n".join(_proposed_row_line(it) for it in listed))
+            if overflow:
+                rline += f"\n_+{len(overflow)} more in the generated backlog -- nothing dropped_"
+            text_lines.append(rline.splitlines()[0])
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": rline[:2900]}})
+            carried["proposed_listed"] = _ids(listed)
+            carried["proposed_overflow"] = len(overflow)
+
+    # Hard ceiling (Slack rejects > 50 blocks): by construction we stay under it, so a
+    # breach is a bug -- fail LOUD in the log and trim the trailing actions rather than
+    # let chat.postMessage reject the whole card and silence every row on it.
+    if len(blocks) > 50:
+        log.error("code_queue: Monday menu built %d blocks (> 50) -- trimming; fix the budget", len(blocks))
+        blocks = blocks[:50]
+    carried["blocks"] = len(blocks)
+    if carried_out is not None:
+        carried_out.update(carried)
     return "\n".join(text_lines), blocks
+
+
+def record_menu_run(row: dict[str, Any]) -> None:
+    """One durable row per Monday-menu fire (C3): what the card carried, or why
+    nothing was sent. Fail-soft -- an artifact write must never break the send."""
+    try:
+        _append_jsonl(_MENU_RUNS_LEDGER, {"ts": _now_iso(), **row})
+    except Exception:  # noqa: BLE001
+        log.warning("code_queue: menu-run artifact write failed (non-fatal)", exc_info=True)
 
 
 def maybe_send_weekly_menu(*, client_factory: Callable | None = None) -> bool:
     """Send the Monday menu DM. No-op unless live. Returns True if a DM was sent.
-    Gating on the weekday is the CALLER's job (run_knowledge_review._is_digest_day)."""
+    Gating on the weekday is the CALLER's job (run_knowledge_review._is_digest_day).
+    Every call writes ONE artifact row (C3): sent + what was carried, or the reason
+    nothing went out -- a fire that writes nothing == a fire that never happened."""
     if code_queue_level() != "live":
+        record_menu_run({"sent": False, "reason": "not_live"})
         return False
+    carried: dict[str, Any] = {}
     try:
-        built = build_weekly_menu()
+        built = build_weekly_menu(carried_out=carried)
         if built is None:
+            record_menu_run({"sent": False, "reason": "nothing_to_show", **carried})
             return False
         text, blocks = built
         client = (client_factory or _default_client_factory)()
         if client is None:
+            record_menu_run({"sent": False, "reason": "no_slack_client", **carried})
             return False
         open_resp = client.conversations_open(users=[HARRISON_ID])
-        client.chat_postMessage(
+        resp = client.chat_postMessage(
             channel=open_resp["channel"]["id"], text=text[:2900], blocks=blocks,
             unfurl_links=False, unfurl_media=False,
         )
+        record_menu_run({"sent": True, "message_ts": str((resp or {}).get("ts", "")), **carried})
         return True
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         log.warning("code_queue: weekly menu send failed (non-fatal)", exc_info=True)
+        record_menu_run({"sent": False, "reason": f"error: {type(exc).__name__}", **carried})
         return False
 
 
