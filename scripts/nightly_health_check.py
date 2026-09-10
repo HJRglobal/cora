@@ -1997,6 +1997,65 @@ def check_priority_kickoffs() -> CheckResult:
         f"(a SHIPPED item is refused, so a stale button is safe): {detail}{more}")
 
 
+def check_code_queue_ledger_integrity() -> CheckResult:
+    """F4 (Code #12, audit F1/F4): folded-vs-raw id reconciliation of the code-queue
+    ledger. WARN on any id with events but no `captured` event (the reducer drops
+    it -- a real, approved ask was invisible on every surface for 16 days this way)
+    and on any event kind the reducer does not model. Names ids and kinds, never
+    titles. A scan failure WARNs (blind is never clean)."""
+    try:
+        from cora import code_queue
+        rep = code_queue.ledger_integrity()
+    except Exception as exc:  # noqa: BLE001 -- a broken gauge never fails the run
+        return CheckResult("Code-queue ledger integrity", "warn",
+                           f"Could not reconcile the ledger: {exc}")
+    orphans = rep.get("orphans") or []
+    unknown = rep.get("unknown_event_types") or {}
+    if not orphans and not unknown:
+        return CheckResult("Code-queue ledger integrity", "ok",
+                           f"{rep.get('raw_ids', '?')} ids in the raw ledger, all fold "
+                           f"({rep.get('folded_ids', '?')} captured); no unknown event kinds.")
+    parts = []
+    if orphans:
+        parts.append(f"{len(orphans)} orphan id(s) with events but no `captured` (fold "
+                     f"drops them): " + "; ".join(
+                         f"{o['id']} ({o['events']} ev: {', '.join(o['kinds'])})" for o in orphans[:5]))
+    if unknown:
+        parts.append("unknown event kind(s): " + ", ".join(
+            f"{k!r} x{n}" for k, n in sorted(unknown.items())))
+    return CheckResult("Code-queue ledger integrity", "warn",
+                       " | ".join(parts) + " -- repair through code_queue.seed_item / the "
+                       "module's own writers, never a jsonl hand-edit.")
+
+
+def check_proposed_priority_aging() -> CheckResult:
+    """F5 (Code #12, audit F5): WARN on PROPOSED P0/P1-class items older than
+    PROPOSED_PRIORITY_AGING_DAYS -- the tier the 9/2 audit found rotting (8
+    HIGH-class rows, three ~a month old) while check_priority_kickoffs above read
+    "ok" on a population every approval path empties synchronously. Sibling, not a
+    replacement: the older check still guards its (rare) class. Ids, never titles."""
+    try:
+        from cora import code_queue
+        rep = code_queue.proposed_priority_aging()
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult("PROPOSED priority aging", "warn",
+                           f"Could not scan the code queue: {exc}")
+    aged = rep.get("aged_priority") or []
+    ctx = (f"{rep.get('aged_total', '?')} PROPOSED item(s) aged >= "
+           f"{code_queue.PROPOSED_PRIORITY_AGING_DAYS}d of {rep.get('proposed_total', '?')}")
+    if not aged:
+        return CheckResult("PROPOSED priority aging", "ok",
+                           f"No PROPOSED P0/P1-class item is older than "
+                           f"{code_queue.PROPOSED_PRIORITY_AGING_DAYS}d ({ctx}).")
+    detail = "; ".join(f"{a['id']} [{a['severity']}/{a['entity']}] {a['age_days']}d"
+                       for a in aged[:5])
+    more = f" (+{len(aged) - 5} more)" if len(aged) > 5 else ""
+    return CheckResult("PROPOSED priority aging", "warn",
+                       f"{len(aged)} PROPOSED P0/P1-class item(s) undecided for >= "
+                       f"{code_queue.PROPOSED_PRIORITY_AGING_DAYS}d -- they ride the Monday "
+                       f"menu's PROPOSED coverage (approve / park / dismiss): {detail}{more}. {ctx}.")
+
+
 def check_egress_rails(now: datetime | None = None) -> CheckResult:
     """Code #12 S3'(a) (cq-deca62a00719): the observe-week read for the two seam
     rails, SIDE BY SIDE -- `sentinel-egress-leak` (session #11 S1, a contract token
@@ -2189,6 +2248,12 @@ def main() -> int:
 
     log.info("Checking for APPROVED P0/P1 items missing a kickoff prompt...")
     all_results.append(check_priority_kickoffs())
+
+    log.info("Reconciling the code-queue ledger (orphans / unknown event kinds)...")
+    all_results.append(check_code_queue_ledger_integrity())
+
+    log.info("Checking PROPOSED P0/P1-class aging...")
+    all_results.append(check_proposed_priority_aging())
 
     log.info("Reading the egress-rail observe week (sentinel + phantom-write-claim)...")
     all_results.append(check_egress_rails())

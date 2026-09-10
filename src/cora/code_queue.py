@@ -485,12 +485,45 @@ def _append_event(event: dict[str, Any]) -> None:
     _append_jsonl(_EVENT_LEDGER, event)
 
 
+# Every event kind the reducer models. F4 (Code #12, audit F1/F4): an event of any
+# OTHER kind used to fall through `items.get(...)` -> None and vanish without a
+# trace -- a hand-written `"event": "cowork-biweekly-review"` row made a real,
+# Harrison-approved ask invisible on every surface for 16 days. Unknown kinds and
+# orphaned events (no `captured` for the id) are now LOUD here and COUNTED by
+# ledger_integrity() for the nightly health check.
+_KNOWN_EVENT_TYPES = frozenset({
+    "captured", "recurrence", "approved", "dismissed", "snoozed", "staged", "shipped",
+    "reconciled", "superseded", "blocked", "edited", "evidence", "kept", "parked",
+    "dm_sent", "dm_held", "dm_flushed",
+})
+# Warn ONCE per (kind|id) per process: get_item folds on every read, and a WARNING
+# per fold would be thousands of lines a day for one bad row.
+_LEDGER_ANOMALY_WARNED: set[str] = set()
+
+
+def _warn_ledger_anomaly(key: str, msg: str, *args: Any) -> None:
+    with _LEDGER_LOCK:
+        if key in _LEDGER_ANOMALY_WARNED:
+            return
+        _LEDGER_ANOMALY_WARNED.add(key)
+    log.warning(msg, *args)
+
+
 def _fold_items() -> dict[str, dict[str, Any]]:
     """Fold the append-only event ledger into {id: record}. Last-write-wins per
-    field; process_queue_action enforces which transitions are legal to write."""
+    field; process_queue_action enforces which transitions are legal to write.
+    An unknown event kind or an orphaned event is skipped LOUDLY (F4), never
+    silently -- see ledger_integrity() for the counted view."""
     items: dict[str, dict[str, Any]] = {}
     for ev in _read_jsonl(_EVENT_LEDGER):
         et = ev.get("event")
+        if et not in _KNOWN_EVENT_TYPES:
+            _warn_ledger_anomaly(
+                f"unknown|{et}|{ev.get('id')}",
+                "code_queue: UNKNOWN ledger event kind %r for %s -- the reducer cannot apply "
+                "it and the row may be invisible on every surface (ledger integrity; the "
+                "nightly health check counts these)", et, ev.get("id"))
+            continue
         if et == "captured":
             rec = {k: v for k, v in ev.items() if k != "event"}
             rec.setdefault("count", 1)
@@ -499,6 +532,11 @@ def _fold_items() -> dict[str, dict[str, Any]]:
             continue
         rec = items.get(ev.get("id", ""))
         if not rec:
+            _warn_ledger_anomaly(
+                f"orphan|{ev.get('id')}",
+                "code_queue: ORPHAN ledger event %r for %s -- no `captured` event precedes "
+                "it, so the item folds to nothing (ledger integrity; the nightly health "
+                "check counts these)", et, ev.get("id"))
             continue
         if et == "recurrence":
             rec["count"] = int(rec.get("count", 1)) + 1
@@ -518,6 +556,8 @@ def _fold_items() -> dict[str, dict[str, Any]]:
             rec["approved_at"] = ev.get("ts")
         elif et == "dismissed":
             rec["status"] = "DISMISSED"
+            if ev.get("reason"):
+                rec["dismiss_reason"] = str(ev.get("reason"))  # C3: dismiss-with-evidence
         elif et == "snoozed":
             rec["status"] = "SNOOZED"
             rec["snooze_until"] = ev.get("snooze_until")
@@ -528,6 +568,27 @@ def _fold_items() -> dict[str, dict[str, Any]]:
             rec["staged_at"] = ev.get("ts")
         elif et == "shipped":
             rec["status"] = "SHIPPED"
+            # C7: the shipping bundle / branch / commit ride the event itself
+            # (schema was exactly {event, ts, id} until 2026-09-09). Legacy rows
+            # keep whatever staging bundle_id they carried; nothing is invented.
+            for k in ("bundle_id", "branch", "commit"):
+                if ev.get(k):
+                    rec[k] = ev[k]
+            rec["shipped_at"] = ev.get("ts")
+        elif et == "reconciled":
+            # A step-7.5 provenance record (bundle_id + branch + commit for one
+            # transition), written by the 9/3 and 9/8 reconcile scripts before the
+            # C7 gate put the fields on the `shipped` event itself. Status-neutral;
+            # kept on the row so "which bundle shipped this" is answerable for those
+            # rows too (ledger-replay doctrine: copy the reducer's DEFAULTS, never
+            # drop what it merely did not model yet).
+            recs = list(rec.get("reconciled") or [])
+            if len(recs) < 10:
+                recs.append({k: ev.get(k) for k in ("transition", "bundle_id", "branch", "commit", "ts")})
+            rec["reconciled"] = recs
+            for k in ("bundle_id", "branch", "commit"):
+                if ev.get(k) and not rec.get(k):
+                    rec[k] = ev[k]
         elif et == "superseded":
             rec["status"] = "SUPERSEDED"
             if ev.get("superseded_by"):
@@ -556,6 +617,21 @@ def _fold_items() -> dict[str, dict[str, Any]]:
                     rec["evidence"] = ev_list + [note]
         elif et == "kept":
             rec["last_touch"] = ev.get("ts")
+            # C3 (Code #12): a Keep is COUNTED. One tap used to buy 14 silent days
+            # with no reason, no trigger and no cap (audit F6: 16 of 23 aged rows
+            # suppressed by a single tap); the Monday menu renders the count and
+            # caps Keeps at KEEP_CAP -- after that the row must be parked with a
+            # trigger, shipped or dismissed.
+            rec["keep_count"] = int(rec.get("keep_count") or 0) + 1
+        elif et == "parked":
+            # C3: park-with-trigger. A PARKED row leaves every menu section until
+            # its date trigger passes (park_until) -- an event-parked row (no date)
+            # stays listed count-only so it can never silently vanish.
+            rec["status"] = "PARKED"
+            rec["park_reason"] = str(ev.get("reason") or "")
+            rec["park_until"] = str(ev.get("until") or "")
+            rec["park_event"] = str(ev.get("trigger_event") or "")
+            rec["parked_at"] = ev.get("ts")
         elif et == "dm_sent":
             rec["dm_channel_id"] = ev.get("dm_channel_id", "")
             rec["dm_message_ts"] = ev.get("dm_message_ts", "")
@@ -566,6 +642,70 @@ def _fold_items() -> dict[str, dict[str, Any]]:
             rec["dm_held"] = False
             rec["dm_flushed"] = True
     return items
+
+
+def ledger_integrity(path: Path | None = None) -> dict[str, Any]:
+    """F4 (Code #12): the folded-vs-raw reconciliation of the event ledger.
+
+    {raw_ids, folded_ids, orphans: [{id, events, kinds}], unknown_event_types:
+     {kind: n}, unknown_event_ids: [id]} -- an ORPHAN is an id that has events but
+    no `captured` event (the 7/30 cleanup removed a captured row and left 7
+    descendants; a hand-written row used an invented kind); an UNKNOWN kind is one
+    the reducer does not model. Both are the population the fold drops. Reads the
+    RAW file (never the fold) so the two can be compared. Raises on an unreadable
+    ledger -- blind must never read as clean (the priority-kickoff monitor's rule).
+    """
+    p = Path(path) if path is not None else Path(_EVENT_LEDGER)
+    events = _read_jsonl(p)
+    captured: set[str] = set()
+    per_id: dict[str, dict[str, Any]] = {}
+    unknown: dict[str, int] = {}
+    unknown_ids: list[str] = []
+    for ev in events:
+        et = str(ev.get("event") or "")
+        cid = str(ev.get("id") or "")
+        if et not in _KNOWN_EVENT_TYPES:
+            unknown[et] = unknown.get(et, 0) + 1
+            if cid and cid not in unknown_ids:
+                unknown_ids.append(cid)
+        if et == "captured":
+            captured.add(cid)
+        if cid:
+            slot = per_id.setdefault(cid, {"events": 0, "kinds": []})
+            slot["events"] += 1
+            if et not in slot["kinds"]:
+                slot["kinds"].append(et)
+    orphans = [{"id": cid, "events": slot["events"], "kinds": slot["kinds"]}
+               for cid, slot in sorted(per_id.items()) if cid not in captured]
+    return {
+        "raw_ids": len(per_id),
+        "folded_ids": len(captured),
+        "orphans": orphans,
+        "unknown_event_types": unknown,
+        "unknown_event_ids": unknown_ids,
+    }
+
+
+# F5 (Code #12, audit F5): the queue's one monitor watched APPROVED + P0/P1 + no
+# kickoff -- a population every approval path empties synchronously, so it read
+# "ok" permanently while 8 HIGH-class items rotted in PROPOSED, three of them a
+# month old. This is the sibling gauge, aimed at the tier that actually regresses.
+PROPOSED_PRIORITY_AGING_DAYS = 14
+
+
+def proposed_priority_aging(days: int = PROPOSED_PRIORITY_AGING_DAYS) -> dict[str, Any]:
+    """{aged_priority: [{id, severity, entity, age_days}], aged_total: n,
+     proposed_total: n} -- PROPOSED rows that are P0/P1-class (either vocabulary)
+    and older than `days`, oldest first, plus the size of the whole aged PROPOSED
+    tier for context. Raises on a ledger read failure (blind != clean)."""
+    items = load_items()
+    proposed = [it for it in items if it.get("status") == "PROPOSED"]
+    aged = [it for it in proposed if _age_days(it.get("ts")) >= max(0, int(days))]
+    out = [{"id": it.get("id", ""), "severity": it.get("severity", ""),
+            "entity": it.get("entity", ""), "age_days": _age_days(it.get("ts"))}
+           for it in aged if is_priority_severity(it.get("severity"))]
+    out.sort(key=lambda r: -r["age_days"])
+    return {"aged_priority": out, "aged_total": len(aged), "proposed_total": len(proposed)}
 
 
 _KNOWN_IDS_CACHE: dict[str, Any] = {"key": None, "ids": frozenset()}
@@ -1875,10 +2015,19 @@ def maybe_flush_overflow(*, client_factory: Callable | None = None) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 # Button-action correctness (Harrison-gated; idempotent; apply-then-record)
 # ─────────────────────────────────────────────────────────────────────────────
-def process_queue_action(action_id: str, cq_id: str, actor_id: str) -> tuple[str, str]:
+def process_queue_action(action_id: str, cq_id: str, actor_id: str, *,
+                         bundle_id: str = "", branch: str = "",
+                         commit: str = "") -> tuple[str, str]:
     """Apply a card button action. Returns (outcome, message). Harrison-only
     (org-wide intake, founder-only approval per the locked decision). Idempotent.
-    All correctness lives here; the app.py wrapper is only Slack I/O."""
+    All correctness lives here; the app.py wrapper is only Slack I/O.
+
+    bundle_id / branch / commit (Code #12 C7, the bundle-linkage HARD GATE ruled
+    2026-09-02): the provenance a `shipped` event must carry. A step-7.5 reconcile
+    script passes them; a Slack tap passes none and may ship only an item whose
+    row already carries a bundle_id from staging. Without one, MARK_SHIPPED is
+    REFUSED -- the 9/2 audit found 1 of 115 SHIPPED rows traceable to a bundle
+    and the event schema exactly {event, ts, id}."""
     if actor_id != HARRISON_ID:
         return "not_authorized", "Only Harrison can action the code-session queue."
     rec = get_item(cq_id)
@@ -1954,9 +2103,32 @@ def process_queue_action(action_id: str, cq_id: str, actor_id: str) -> tuple[str
         return "error", f"Prompt generation failed -- nothing staged ({detail})."
 
     if action_id == ACTION_MARK_SHIPPED:
-        _append_event({"event": "shipped", "ts": _now_iso(), "id": cq_id})
+        # C7 HARD GATE (ruled 2026-09-02, audit F3): no bundle/branch reference, no
+        # SHIPPED. Covers the seed-then-ship path (102 of 115 historical SHIPPED
+        # rows never passed STAGED and carry nothing): those ship ONLY through a
+        # reconcile script that names its bundle. A row staged inside a bundle
+        # (stage_bundle) or alone (ensure_kickoff_staged -> "solo-<id>") carries
+        # its staging bundle_id, so a Monday-menu tap on such a row still ships.
+        # No back-fill of historical rows (ruled out of scope): the gate is forward.
+        if status == "SHIPPED":
+            return "noop", "Already shipped."
+        bid = str(bundle_id or "").strip() or str(rec.get("bundle_id") or "").strip()
+        if not bid:
+            return "refused", (
+                f"Not marked shipped -- `{cq_id}` carries no bundle/branch reference. "
+                "Run this bundle's step-7.5 reconcile script (it supplies bundle_id + "
+                "branch); a Slack tap can only ship an item that was staged inside a "
+                "bundle.")
+        ev: dict[str, Any] = {"event": "shipped", "ts": _now_iso(), "id": cq_id, "bundle_id": bid}
+        if str(branch or "").strip():
+            ev["branch"] = str(branch).strip()
+        if str(commit or "").strip():
+            ev["commit"] = str(commit).strip()
+        _append_event(ev)
         _render_backlog_safe()
-        return "shipped", "🚢 Marked shipped."
+        ref = f"bundle `{bid}`" + (f", branch `{ev['branch']}`" if ev.get("branch") else "") \
+            + (f", commit `{ev['commit']}`" if ev.get("commit") else "")
+        return "shipped", f"🚢 Marked shipped ({ref})."
 
     if action_id == ACTION_KEEP:
         _append_event({"event": "kept", "ts": _now_iso(), "id": cq_id})
@@ -2069,7 +2241,10 @@ def ensure_kickoff_staged(cq_id: str, *, override_evidence_floor: bool = False) 
                       "(severity=%s) -- APPROVED but UNSTAGED",
                       cq_id, rec.get("severity"))
             return "error", "prompt generation produced no file"
-        ev = {"event": "staged", "ts": _now_iso(), "id": cq_id, "prompt_path": path}
+        # C7: the single-item path names its bundle too ("solo-<id>"), so a later
+        # Mark-shipped tap on this row has a reference and the gate can pass it.
+        ev = {"event": "staged", "ts": _now_iso(), "id": cq_id, "prompt_path": path,
+              "bundle_id": solo_bundle_id(cq_id)}
         if meta.get("mis_homed"):
             ev["mis_homed"] = True
         _append_event(ev)
@@ -2078,6 +2253,12 @@ def ensure_kickoff_staged(cq_id: str, *, override_evidence_floor: bool = False) 
         return "staged", path
     finally:
         _end_staging([cq_id])
+
+
+def solo_bundle_id(cq_id: str) -> str:
+    """The staging bundle_id of an item staged ALONE (C7): deterministic, so a
+    re-stage or a rehome never mints a second identity for the same solo prompt."""
+    return f"solo-{str(cq_id or '').strip().lower()}"
 
 
 # How long an APPROVED priority item may sit without a kickoff before the nightly
@@ -2262,7 +2443,8 @@ def record_staged(cq_id: str, prompt_path: str, actor_id: str) -> tuple[str, str
     if rec.get("prompt_path"):
         return "noop", f"Already staged: `{rec['prompt_path']}`"
     _append_event({"event": "staged", "ts": _now_iso(), "id": cq_id,
-                   "prompt_path": path, "authored": "external"})
+                   "prompt_path": path, "authored": "external",
+                   "bundle_id": solo_bundle_id(cq_id)})  # C7: single-item path names its bundle
     _render_backlog_safe()
     return "staged", f"📝 Prompt staged: `{path}`"
 

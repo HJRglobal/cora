@@ -86,8 +86,12 @@ def main() -> int:
             continue
         line = f"{cid} [{rec.get('status')}] '{rec.get('title', '')[:60]}'"
         if args.apply:
+            # Code #12 C7: every SHIPPED transition names its origin (the bundle-
+            # linkage hard gate refuses one that does not). This one-shot's origin
+            # is itself -- the 7/28 dupe cleanup.
             code_queue.process_queue_action(
-                code_queue.ACTION_MARK_SHIPPED, cid, code_queue.HARRISON_ID)
+                code_queue.ACTION_MARK_SHIPPED, cid, code_queue.HARRISON_ID,
+                bundle_id="cleanup-2026-07-28", branch="claude/code-queue-hardening")
             print(f"SHIPPED: {line}")
             shipped += 1
         else:
