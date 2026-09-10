@@ -190,6 +190,7 @@ def collect(now: datetime | None = None, repo_root: Path | None = None,
     proposed_7d = 0
     resolved_7d = 0
     expired_unrouted_7d = 0
+    expired_low_risk_7d = 0  # C2 (Code #12): the NAMED low-risk mechanical expiry
     routed_7d = 0
     try:
         # A rotation crash window can leave the same row in BOTH files (archive
@@ -226,6 +227,8 @@ def collect(now: datetime | None = None, repo_root: Path | None = None,
                     reason = rec.get("resolved_reason") or ""
                     if reason == "expired_unrouted":
                         expired_unrouted_7d += 1
+                    elif reason == "expired_low_risk":
+                        expired_low_risk_7d += 1
                     elif reason.startswith("routed_to_owner:"):
                         routed_7d += 1
                 if is_knowledge_item(rec):
@@ -241,6 +244,7 @@ def collect(now: datetime | None = None, repo_root: Path | None = None,
             resolved_7d=resolved_7d,
             routed_to_owner_7d=routed_7d,
             expired_unrouted_7d=expired_unrouted_7d,
+            expired_low_risk_7d=expired_low_risk_7d,
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("flywheel_metrics: ledger scan failed: %s", exc)
@@ -645,7 +649,8 @@ def format_lines(metrics: dict) -> list[str]:
         f"producer vs drain, 7d: proposed={metrics.get('proposed_7d', '?')} vs "
         f"resolved={metrics.get('resolved_7d', '?')} "
         f"(routed={metrics.get('routed_to_owner_7d', '?')}, "
-        f"expired_unrouted={metrics.get('expired_unrouted_7d', '?')})",
+        f"expired_unrouted={metrics.get('expired_unrouted_7d', '?')}, "
+        f"expired_low_risk={metrics.get('expired_low_risk_7d', '?')})",
     ]
     # Fork 5a (Wave-1 flywheel-conversion calibration): conversion-of-eligible,
     # per lane -- surfaced alongside the leading inflow indicator so a low

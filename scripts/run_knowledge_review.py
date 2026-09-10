@@ -640,6 +640,215 @@ def _auto_expire_unrouted_operational(entries: list, cutoff_dt, now_dt) -> int:
     return n
 
 
+def _expire_low_risk_mechanical(entries: list, now_dt,
+                                answered_ts: dict | set | None = None) -> tuple[int, int, int]:
+    """C2 (Code #12; Q5 = (d) ruled 9/1, classes + 14d ruled 9/8): resolve, in
+    place and BY NAME, the PENDING rows that are exactly task_close / asana_task /
+    hubspot_note, entity FNDR or F3E, pending >= 14 days (from the later of
+    creation and first surfacing) with no reviewer action -> DISMISSED with
+    resolved_reason `expired_low_risk` (review_lanes.EXPIRED_LOW_RISK).
+
+    Returns (expired, skipped_entity_unresolved, skipped_other_entity) so the run
+    log states how much of the pool the drain could NOT touch and why -- an
+    unresolvable entity is a refusal (it might be LEX), never a default.
+
+    Runs BEFORE _escalate_stale_mechanical in the same lock + rewrite, so an
+    expired row is never also escalated; everything this pass declines still
+    escalates and, after _MECHANICAL_MAX_ESCALATIONS, ends by name there.
+    D-206 stands: this is a NAMED terminal for a ruled low-risk class, counted in
+    the Monday digest and on the weekly batch card -- not a timer pretending to
+    be a decision.
+    """
+    expired = unresolved = other = 0
+    for e in entries:
+        if e.get("state") != "PENDING" or not review_lanes.is_mechanical(e):
+            continue
+        answered = _answered_by_an_approver(e, answered_ts)
+        ok, why = review_lanes.is_low_risk_expirable(e, now_dt, answered=answered)
+        if ok:
+            e["state"] = "DISMISSED"
+            e["resolved_at"] = now_dt.isoformat()
+            e["resolved_reason"] = review_lanes.EXPIRED_LOW_RISK
+            expired += 1
+        elif why == "entity_unresolved":
+            unresolved += 1
+        elif why == "other_entity":
+            other += 1
+    return expired, unresolved, other
+
+
+# ── C2: the weekly mechanical BATCH-REVIEW card (cq-8b51427896b8 folded) ───────
+# The mechanical lane's individual cards are capped at 5 per run and the surface
+# is OFF (CORA_MECHANICAL_REVIEW), so the pool had no legible weekly view at all.
+# One card, Monday (the digest day), to Harrison (D-011: the only approver the
+# lane has today), counts by type x entity, the oldest rows (content-screened; LEX
+# rows counted, never rendered -- the Code #5 H5 lesson), the named auto-expire
+# tally, and a NEEDS HARRISON block (the judgment + decision lanes, which never
+# auto-expire) -- the live refresh cq-8b51427896b8 asked for. No buttons: the
+# individual cards carry the affordances; this is the map.
+_MECHANICAL_BATCH_STATE_PATH = (
+    Path(__file__).resolve().parents[1] / "data" / "state" / "mechanical-batch-card.json"
+)
+_BATCH_CARD_OLDEST_N = 8
+
+
+def _batch_card_sent_today(now_az_date: str) -> bool:
+    try:
+        import json as _json
+        if _MECHANICAL_BATCH_STATE_PATH.exists():
+            data = _json.loads(_MECHANICAL_BATCH_STATE_PATH.read_text(encoding="utf-8")) or {}
+            return str(data.get("last_sent_date") or "") == now_az_date
+    except Exception:  # noqa: BLE001 -- unreadable state: send (a duplicate beats silence)
+        return False
+    return False
+
+
+def _mark_batch_card_sent(now_az_date: str, message_ts: str) -> None:
+    import json as _json
+    _MECHANICAL_BATCH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _MECHANICAL_BATCH_STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(_json.dumps({"last_sent_date": now_az_date, "message_ts": message_ts}),
+                   encoding="utf-8")
+    tmp.replace(_MECHANICAL_BATCH_STATE_PATH)
+
+
+def _age_days(entry: dict, now_dt) -> int | None:
+    try:
+        return max(0, (now_dt - datetime.fromisoformat(str(entry.get("proposed_at")))).days)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _count_expired_low_risk_7d(now_dt) -> int:
+    """Rows resolved `expired_low_risk` in the last 7 days (live ledger + archive)."""
+    n = 0
+    try:
+        from cora.knowledge_review import load_proposed_updates, _ARCHIVE_PATH  # type: ignore[attr-defined]
+        rows = list(load_proposed_updates())
+        try:
+            import json as _json
+            if _ARCHIVE_PATH.exists():
+                for line in _ARCHIVE_PATH.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line:
+                        try:
+                            rows.append(_json.loads(line))
+                        except Exception:  # noqa: BLE001
+                            continue
+        except Exception:  # noqa: BLE001
+            pass
+        for r in rows:
+            if r.get("resolved_reason") != review_lanes.EXPIRED_LOW_RISK:
+                continue
+            try:
+                if now_dt - datetime.fromisoformat(str(r.get("resolved_at"))) <= timedelta(days=7):
+                    n += 1
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        return n
+    return n
+
+
+def _build_mechanical_batch_card(pending: list[dict], now_dt, *, expired_this_run: int,
+                                 expired_7d: int) -> str:
+    """The card text. Pure; content-screened per row; LEX rows count-only."""
+    mech = [u for u in pending if review_lanes.is_mechanical(u)]
+    overdue = sum(1 for u in mech if review_lanes.past_review_deadline(u, now_dt))
+    by_type: dict[str, int] = {}
+    by_entity: dict[str, int] = {}
+    for u in mech:
+        by_type[str(u.get("update_type"))] = by_type.get(str(u.get("update_type")), 0) + 1
+        ent = review_lanes.resolve_entity(u) or "unresolved"
+        by_entity[ent] = by_entity.get(ent, 0) + 1
+    lines = ["*Mechanical backlog -- weekly batch review*"]
+    lines.append(
+        f"{len(mech)} bookkeeping item(s) PENDING, {overdue} past their review deadline -- "
+        + " · ".join(f"{t} {n}" for t, n in sorted(by_type.items())))
+    lines.append("by entity: " + " · ".join(
+        f"{e} {n}" + (" (count only)" if e.startswith("LEX") else "")
+        for e, n in sorted(by_entity.items(), key=lambda kv: (-kv[1], kv[0]))))
+    lines.append(
+        f"Auto-expire (`{review_lanes.EXPIRED_LOW_RISK}`, a NAMED terminal: task_close / asana_task / "
+        f"hubspot_note, entity FNDR or F3E only, >= {review_lanes.LOW_RISK_EXPIRE_DAYS}d pending, no "
+        f"reviewer action): {expired_this_run} this run · {expired_7d} in 7d. Every other class and "
+        f"entity rides this card and never auto-expires.")
+    oldest = sorted(mech, key=lambda u: str(u.get("proposed_at") or ""))
+    shown = 0
+    withheld = 0
+    lex_hidden = 0
+    lines.append(f"Oldest still pending (up to {_BATCH_CARD_OLDEST_N}, content-screened):")
+    for u in oldest:
+        if shown >= _BATCH_CARD_OLDEST_N:
+            break
+        ent = review_lanes.resolve_entity(u)
+        if ent.startswith("LEX"):
+            lex_hidden += 1
+            continue
+        excluded, _why = review_lanes.content_screen_excludes(u)
+        if excluded:
+            withheld += 1
+            continue
+        age = _age_days(u, now_dt)
+        desc = str(u.get("description") or "(no description)")[:140]
+        shown += 1
+        lines.append(f"  {shown}. [{u.get('update_type')}] {ent or '?'} "
+                     f"{'' if age is None else str(age) + 'd'} -- {desc}")
+    if withheld or lex_hidden:
+        lines.append(f"  ({withheld} withheld by the content screen; {lex_hidden} LEX row(s) counted, "
+                     f"never rendered)")
+    # NEEDS HARRISON -- the judgment + decision lanes (never auto-expire): the live
+    # refresh cq-8b51427896b8 asked for, re-derived from the ledger every Monday
+    # instead of a stale hand-written section.
+    judgment = [u for u in pending if is_knowledge_update(u.get("update_type"), u.get("payload"))]
+    decisions = [u for u in pending if u.get("update_type") == _kr_UPDATE_TYPE_DECISION]
+    lines.append(f"*Needs Harrison* (judgment lane, never auto-expires): {len(judgment)} knowledge "
+                 f"item(s) + {len(decisions)} decision card(s) pending.")
+    for u in sorted(judgment, key=lambda u: str(u.get("proposed_at") or ""))[:5]:
+        excluded, _why = review_lanes.content_screen_excludes(u)
+        if excluded:
+            continue
+        age = _age_days(u, now_dt)
+        lines.append(f"  - [{u.get('update_type')}] {'' if age is None else str(age) + 'd'} -- "
+                     f"{str(u.get('description') or '')[:120]}")
+    lines.append("_React on the individual cards to act (thumbs-up do it, thumbs-down dismiss); "
+                 "this summary carries no buttons._")
+    text = "\n".join(lines)
+    try:
+        from cora.slack_egress import sanitize_text
+        return sanitize_text(text)
+    except Exception:  # noqa: BLE001
+        return text
+
+
+def _maybe_send_mechanical_batch_card(pending: list[dict], log: logging.Logger, *,
+                                      dry_run: bool, expired_this_run: int,
+                                      now_dt=None, _client_factory=None) -> bool:
+    """Send the weekly card on the digest day, once per day. Dry-run logs the text.
+    Returns True only when a DM was actually sent."""
+    if not _is_digest_day():
+        return False
+    now_dt = now_dt or datetime.now(timezone.utc)
+    today_az = datetime.now(timezone(timedelta(hours=-7))).date().isoformat()
+    if not dry_run and _batch_card_sent_today(today_az):
+        log.info("mechanical batch card: already sent today -- not re-sending")
+        return False
+    text = _build_mechanical_batch_card(
+        pending, now_dt, expired_this_run=expired_this_run,
+        expired_7d=_count_expired_low_risk_7d(now_dt))
+    if dry_run:
+        log.info("[DRY RUN] mechanical batch card would read:\n%s", text)
+        return False
+    token = os.environ.get("SLACK_BOT_TOKEN", "")
+    ts = send_dm_to_harrison(text, token, _client_factory=_client_factory)
+    if not ts:
+        log.warning("mechanical batch card: DM send failed -- will retry next run")
+        return False
+    _mark_batch_card_sent(today_az, ts)
+    log.info("mechanical batch card sent ts=%s", ts)
+    return True
+
+
 def _mechanical_past_deadline(entry: dict, now_dt) -> bool:
     """Thin delegate to review_lanes.past_review_deadline.
 
@@ -1415,6 +1624,7 @@ def main() -> int:
         answered_ts = _kr_actionable_reaction_actors()
         auto_dismissed = 0
         expired_unrouted = 0
+        low_risk_expired = low_risk_unresolved = low_risk_other = 0
         mech_escalated = 0
         mech_overdue = 0
         mech_retired = 0
@@ -1440,6 +1650,11 @@ def main() -> int:
                 unrouted_cutoff = now - _td(days=_OPERATIONAL_UNROUTED_EXPIRY_DAYS)
                 expired_unrouted = _auto_expire_unrouted_operational(
                     entries, unrouted_cutoff, now)
+                # C2 (Code #12): the three low-risk mechanical classes in FNDR/F3E
+                # expire BY NAME after 14d pending with no reviewer action -- before
+                # the escalation pass, so an expired row is never also escalated.
+                low_risk_expired, low_risk_unresolved, low_risk_other = \
+                    _expire_low_risk_mechanical(entries, now, answered_ts)
                 # D-206: mechanical rows no longer age out silently -- they
                 # escalate. Same pass, same lock, same rewrite as the expiry it
                 # replaces for those three types.
@@ -1468,6 +1683,15 @@ def main() -> int:
                      "DM'd/routed) as expired_unrouted",
                      expired_unrouted, "y" if expired_unrouted == 1 else "ies",
                      _OPERATIONAL_UNROUTED_EXPIRY_DAYS)
+        if low_risk_expired or low_risk_unresolved or low_risk_other:
+            # Named and counted every run (never silent): what expired, and how
+            # much of the pool the drain could NOT touch and why.
+            log.info("expired_low_risk: %d mechanical row(s) resolved by name (task_close/"
+                     "asana_task/hubspot_note, FNDR/F3E, >=%dd pending, no reviewer action); "
+                     "%d left pending (entity unresolvable -- never expired), %d left pending "
+                     "(other entity -- rides the batch card)",
+                     low_risk_expired, review_lanes.LOW_RISK_EXPIRE_DAYS,
+                     low_risk_unresolved, low_risk_other)
         if mech_overdue:
             # The standing measure of the thing D-206 forbids hiding. WARNING,
             # not INFO, and it names the reason nobody can act when that is the
@@ -1583,6 +1807,15 @@ def main() -> int:
     # Monday-gated, so the learning loop isn't stalled 5/week. Reaction-processing
     # and auto-expire (Steps 0/1) already ran above.
     pending = get_pending_updates()
+    # ── C2 (Code #12, cq-8b51427896b8 folded): the weekly mechanical BATCH card ──
+    # Digest day only, once per day; dry-run logs the text. A card failure must
+    # never change the drain's exit code.
+    try:
+        _maybe_send_mechanical_batch_card(
+            pending, log, dry_run=args.dry_run,
+            expired_this_run=locals().get("low_risk_expired", 0))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("mechanical batch card failed (non-fatal): %s", exc)
     unsent = [u for u in pending if not u.get("dm_message_ts")]
     # Three-way split (Fork 4): knowledge -> Harrison's queue; decisions ->
     # Harrison's never-expiring one-tap cards; everything else -> owner routing.

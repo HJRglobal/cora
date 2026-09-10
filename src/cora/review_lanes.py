@@ -291,6 +291,139 @@ def past_review_deadline(update: dict | None, now_dt) -> bool:
         return False
 
 
+# ── C2 (Code #12, Q5 = (d) ruled 2026-09-01; classes + 14d ruled 2026-09-08) ──
+# The knowledge-backlog drain. Measured at the lock: MECHANICAL BACKLOG 282 of 418
+# past deadline on 9/7 (233 on 9/4, ~+16/day); every one of the live ledger's 89
+# historical expired_unrouted rows was one of exactly these three types. So:
+#   * EXACTLY these three classes may auto-expire -- task_close / asana_task /
+#     hubspot_note -- and only for entity FNDR or F3E, after LOW_RISK_EXPIRE_DAYS
+#     pending with no reviewer action, into the NAMED, COUNTED terminal reason
+#     EXPIRED_LOW_RISK (a Monday digest line; never silent, never "a decision");
+#   * everything else (known-answer proposals, lexicon mappings, decision captures,
+#     any row whose entity is not FNDR/F3E -- or cannot be resolved at all) rides
+#     the weekly batch card and NEVER auto-expires. An unresolvable entity is a
+#     refusal, not a default: 364 of the 462 live PENDING rows carry no
+#     payload.entity, so the resolver below reads the row's other provenance
+#     (a bracketed/parenthesized code in the description, the Asana project gid in
+#     task_url) and returns "" when none of it answers.
+LOW_RISK_EXPIRE_TYPES = MECHANICAL_TYPES
+LOW_RISK_ENTITIES = frozenset({"FNDR", "F3E"})
+LOW_RISK_EXPIRE_DAYS = 14
+EXPIRED_LOW_RISK = "expired_low_risk"
+
+KNOWN_ENTITY_CODES = frozenset({
+    "FNDR", "HJRG", "F3E", "F3C", "OSN", "OSNGW", "OSNGM", "OSNGF", "OSNVV", "UFL", "BDM",
+    "HJRP", "HJRP-RR", "HJRPROD", "POD", "LEX", "LEX-LLC", "LEX-LLA", "LEX-LBHS", "LEX-LTS",
+})
+# "[BDM] Drive doc suggests ..." (asana_task) and 'mentioned in slack (UFL) but ...'
+# (hubspot_note). Upper-case code only, so "(assigned to Micah Kessler)" never reads
+# as an entity; an unknown code ("(HIGH)") is dropped by the KNOWN set.
+_DESC_ENTITY_RE = __import__("re").compile(r"^\s*\[([A-Z][A-Z0-9-]{1,11})\]|\(([A-Z][A-Z0-9-]{1,11})\)")
+_TASK_URL_PROJECT_RE = __import__("re").compile(r"/project/(\d{10,20})(?:/|$)")
+_ASANA_MAP_PATH = (
+    Path(__file__).parent.parent.parent / "data" / "maps" / "asana-project-map.yaml"
+)
+_GID_RE = __import__("re").compile(r"^\d{10,20}$")
+_asana_gid_cache: tuple[float, dict[str, str]] | None = None
+
+
+def _asana_gid_entity_map() -> dict[str, str]:
+    """{project gid: entity} from asana-project-map.yaml's `entities:` subtree --
+    every gid-looking string under an entity key maps to that entity. A gid that
+    appears under TWO entities (the shared HJRG/FNDR catch-all) maps to "" --
+    ambiguous is unresolved, never a guess. Cached on the file's mtime."""
+    global _asana_gid_cache
+    try:
+        mtime = _ASANA_MAP_PATH.stat().st_mtime
+    except OSError:
+        return {}
+    if _asana_gid_cache is not None and _asana_gid_cache[0] == mtime:
+        return _asana_gid_cache[1]
+    out: dict[str, str] = {}
+    try:
+        data = yaml.safe_load(_ASANA_MAP_PATH.read_text(encoding="utf-8")) or {}
+        entities = data.get("entities") or {}
+
+        def _walk(node, entity: str) -> None:
+            if isinstance(node, dict):
+                for v in node.values():
+                    _walk(v, entity)
+            elif isinstance(node, list):
+                for v in node:
+                    _walk(v, entity)
+            elif isinstance(node, (str, int)) and _GID_RE.match(str(node)):
+                gid = str(node)
+                prior = out.get(gid)
+                out[gid] = entity if prior in (None, entity) else ""
+
+        for ent, sub in entities.items():
+            _walk(sub, str(ent).strip().upper())
+    except Exception as exc:  # noqa: BLE001 -- unreadable map = nothing resolves via gids
+        log.warning("review_lanes: asana-project-map unreadable (%s)", exc)
+        out = {}
+    _asana_gid_cache = (mtime, out)
+    return out
+
+
+def resolve_entity(update: dict | None) -> str:
+    """Best-effort entity code for a ledger row, '' when it cannot be told.
+
+    Order: payload.entity (the explicit field, 98 of 462 live rows) -> a bracketed
+    or parenthesized KNOWN code in the description -> the Asana project gid in
+    payload.task_url mapped through asana-project-map.yaml. Never a default.
+    """
+    u = update or {}
+    ent = item_entity(u)
+    if ent:
+        return ent
+    m = _DESC_ENTITY_RE.search(str(u.get("description") or ""))
+    if m:
+        code = (m.group(1) or m.group(2) or "").upper()
+        if code in KNOWN_ENTITY_CODES:
+            return code
+    payload = u.get("payload") if isinstance(u.get("payload"), dict) else {}
+    mm = _TASK_URL_PROJECT_RE.search(str(payload.get("task_url") or ""))
+    if mm:
+        return _asana_gid_entity_map().get(mm.group(1), "")
+    return ""
+
+
+def is_low_risk_expirable(update: dict | None, now_dt, *, answered: bool = False) -> tuple[bool, str]:
+    """(eligible, why_not). Eligible = PENDING + one of LOW_RISK_EXPIRE_TYPES +
+    entity resolves to FNDR/F3E + pending >= LOW_RISK_EXPIRE_DAYS measured from the
+    LATER of creation (proposed_at) and first surfacing (dm_message_ts) + no
+    reviewer action (``answered`` is the caller's reaction-log read). The reason
+    string names which gate held, so the run log can count them."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    u = update or {}
+    if u.get("state") != "PENDING":
+        return False, "not_pending"
+    if str(u.get("update_type") or "") not in LOW_RISK_EXPIRE_TYPES:
+        return False, "not_low_risk_type"
+    ent = resolve_entity(u)
+    if not ent:
+        return False, "entity_unresolved"
+    if ent not in LOW_RISK_ENTITIES:
+        return False, "other_entity"
+    if answered:
+        return False, "reviewer_acted"
+    try:
+        clock = _dt.fromisoformat(str(u.get("proposed_at")))
+        if clock.tzinfo is None:
+            clock = clock.replace(tzinfo=_tz.utc)
+        dm_ts = str(u.get("dm_message_ts") or "").strip()
+        if dm_ts:
+            surfaced = _dt.fromtimestamp(float(dm_ts), tz=_tz.utc)
+            clock = max(clock, surfaced)
+    except Exception:  # noqa: BLE001 -- a malformed stamp is never expired (fail-safe)
+        return False, "bad_timestamp"
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=_tz.utc)
+    if now_dt - clock < _td(days=LOW_RISK_EXPIRE_DAYS):
+        return False, "too_young"
+    return True, ""
+
+
 def is_review_approver(actor_id: str) -> bool:
     """True for anyone who might legitimately act on SOME review card.
 
