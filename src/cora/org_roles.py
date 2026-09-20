@@ -20,6 +20,7 @@ Public API:
   format_role_context(slack_id) -> str  ("" when unknown)
   all_roles()                   -> list[RoleRecord]
   roles_for_entity(entity)      -> list[RoleRecord]
+  find_by_handle(handle)        -> RoleRecord | None  (name / first name / id)
   invalidate_cache()            -> force reload on next call
 """
 
@@ -216,6 +217,44 @@ def roles_for_entity(entity: str) -> list[RoleRecord]:
         for r in list(_by_slack.values()) + list(_registry_only)
         if ent in (e.upper() for e in r.all_entities)
     ]
+
+
+def find_by_handle(handle: str) -> Optional[RoleRecord]:
+    """Resolve a roster HANDLE -- "tessa", "Tessa Miller", "tessa.miller",
+    "@tessa" or a Slack id -- to exactly one RoleRecord, or None.
+
+    Code #13 slice 9 (D-302): human-maintained maps name owners by handle
+    (finance-expected-invoices.yaml `owner: tessa`; decisions-pending.md "Owner
+    of next nudge: Harrison"). The Slack id must come from THIS registry, never a
+    hardcode next to the map. Case-insensitive; matches the full name, the first
+    name, or the slack_id. FAIL-CLOSED on ambiguity: two people sharing a first
+    name resolve to None rather than to whichever parsed first -- the caller
+    falls back to Harrison and says so. Advisory-only like the rest of this
+    module: resolving a person grants nothing.
+    """
+    raw = str(handle or "").strip().lstrip("@")
+    if not raw:
+        return None
+    _refresh_if_stale()
+    needle = " ".join(raw.replace(".", " ").replace("_", " ").replace("-", " ").split()).lower()
+    if not needle:
+        return None
+    people = list(_by_slack.values()) + list(_registry_only)
+    exact = [r for r in people if r.slack_id and r.slack_id.lower() == needle]
+    if len(exact) == 1:
+        return exact[0]
+    full = [r for r in people if " ".join(r.name.split()).lower() == needle]
+    if len(full) == 1:
+        return full[0]
+    if len(full) > 1:
+        return None
+    first = [r for r in people if r.name.split() and r.name.split()[0].lower() == needle]
+    if len(first) == 1:
+        return first[0]
+    if len(first) > 1:
+        log.warning("org_roles: handle %r is ambiguous (%d matches) -- not resolved",
+                    raw, len(first))
+    return None
 
 
 # The disclaimer ships INSIDE the injected block so prompt-layer behavior can

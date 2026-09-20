@@ -591,6 +591,10 @@ def claude_mirror_section() -> dict:
             "added": st.get("added", []),
             "removed": st.get("removed", []),
             "model_changed": st.get("model_changed", []),
+            # Code #13 slice 9c: the Cowork-estate run-marker summary (per-status id
+            # lists + coverage) the mirror computes from _runs/<folder-id>/<date>.json
+            # against data/maps/cowork-run-cadence.yaml.
+            "run_markers": st.get("run_markers") if isinstance(st.get("run_markers"), dict) else {},
         }
     except Exception as exc:  # noqa: BLE001 -- fail-soft convention (see kb_corpus)
         return {"available": False, "reason": str(exc)}
@@ -675,6 +679,24 @@ def _fmt_bytes(n: int) -> str:
     return f"{n:.1f}GB"
 
 
+def _run_marker_digest_fragment(rm: dict) -> str:
+    """The Monday-digest tail for the Cowork run-marker read (Code #13 slice 9c):
+    coverage always, alarm counts only when non-zero. Empty string when the mirror
+    has not produced a summary yet (pre-adoption status files)."""
+    if not isinstance(rm, dict) or not rm.get("coverage"):
+        return ""
+    frag = f" | run markers {rm['coverage']}"
+    alarms = []
+    for key, label in (("did_not_run", "did not run"), ("wrote_nothing", "wrote nothing"),
+                       ("unreadable", "unreadable"), ("reported_error", "error")):
+        n = len(rm.get(key) or [])
+        if n:
+            alarms.append(f"{n} {label}")
+    if alarms:
+        frag += " (" + ", ".join(alarms) + ")"
+    return frag
+
+
 def threshold_alarms(report: dict) -> list[str]:
     """Return human-readable alarms for any section-5 threshold crossed.
 
@@ -744,6 +766,17 @@ def threshold_alarms(report: dict) -> list[str]:
         for k in ("added", "removed", "model_changed"):
             if cm.get(k):
                 probs.append(f"task-estate {k}: " + ", ".join(str(x) for x in cm[k][:10]))
+        # Code #13 slice 9c: a Cowork task with a declared cadence and no run marker
+        # inside its window is 'did not run' -- an alarm, never an ok line.
+        rm = cm.get("run_markers")
+        rm = rm if isinstance(rm, dict) else {}
+        for key, label in (("did_not_run", "did not run"),
+                           ("wrote_nothing", "fired but wrote nothing"),
+                           ("unreadable", "unreadable marker"),
+                           ("reported_error", "reported an error")):
+            ids = rm.get(key) or []
+            if ids:
+                probs.append(f"Cowork run markers {label}: " + ", ".join(str(x) for x in ids[:10]))
         if probs:
             alarms.append("claude mirror: " + "; ".join(probs) + ".")
 
@@ -907,6 +940,7 @@ def format_slack(report: dict) -> str:
             + f" | quarantined {cm.get('quarantined', 0)} | unpinned {cm.get('unpinned', 0)}"
             + (f" | +{len(cm['added'])}/-{len(cm['removed'])} tasks"
                if (cm.get('added') or cm.get('removed')) else "")
+            + _run_marker_digest_fragment(cm.get("run_markers") or {})
         )
     lad = report.get("ladder_registry", {})
     if lad.get("available"):

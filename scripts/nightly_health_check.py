@@ -204,6 +204,11 @@ _CRITICAL_LOG_PATTERNS = [
     # heartbeat token above: observability that can fail quietly is worse than
     # none, so its failure is itself a CRITICAL.
     r"RUN_MARKER_WRITE_FAILING",
+    # Code #13 slice 9b: the repeat-signal escalation ledger (logs/repeat-signals.jsonl)
+    # failing to write would convert "this signal has fired three times unacked"
+    # into "first fire, normal surface" every night -- the escalation would never
+    # climb and the suppression never lift. Same precedent as the two tokens above.
+    r"REPEAT_SIGNAL_WRITE_FAILING",
 ]
 _CRITICAL_RE = re.compile("|".join(_CRITICAL_LOG_PATTERNS), re.IGNORECASE)
 
@@ -859,9 +864,16 @@ def check_decision_gates(today: date | None = None) -> CheckResult:
 
     gated = [e for e in entries if e.get("gate")]
     if not entries:
+        # An unreadable file is an OUTAGE, not a clear: no repeat-signal
+        # reconciliation runs on this branch, so a G: hiccup cannot reset a
+        # live escalation.
         return CheckResult("Decision gates", "warn",
                            "decisions-pending.md could not be read or holds no "
                            "entries -- the decision lane cannot be verified.")
+    # The file WAS read: any gate signal whose row is no longer overdue-undelivered
+    # (CLOSED heading, "Recently resolved" tail, gate re-dated, real delivery)
+    # has cleared. Runs before the no-gates return so a removed gate clears too.
+    _gate_reconcile_clears(overdue)
     if not gated:
         # Truthful, and the actionable half: with no gate dates recorded, this
         # control has nothing to enforce. Do NOT report "ok".
@@ -870,27 +882,144 @@ def check_decision_gates(today: date | None = None) -> CheckResult:
             f"{len(entries)} open decision(s), NONE carrying a gate date -- so a "
             "blown deadline cannot be detected. Add **Gate**: YYYY-MM-DD to the "
             "entries that have one (see decisions-pending.md field rules).")
+    # THE HEALTH DIGEST IS AN ESCALATION PING, NOT A DELIVERY (D-310, 2026-09-19
+    # audit section 3; reverses the 8/19 premise that stood here). The old code
+    # recorded this surface as "health_check", delivery_index counted it, and a
+    # blown gate went CRITICAL on day N, silent for 8 days, CRITICAL again on
+    # N+9 -- an 8-9 day cadence that self-cleared with no human in the loop. Now
+    # the alarm is recorded under the "ping:" surface class (auditable in the
+    # ledger; ignored by the control) and routed through repeat_signal, so it
+    # alarms DAILY until a HUMAN ack: a threaded reply on the decision alert
+    # (decision_alerts ANSWERED), the CLOSED/RESOLVED heading or the "Recently
+    # resolved" tail (fact clears), or Harrison's tap on the tier-3 card.
     if overdue:
-        detail = decision_lane.format_alarm(overdue)
-        # THE HEALTH DIGEST IS ITSELF A DELIVERY (D-051 lenses 2, 3 and 4 all
-        # landed here). The two instrumented surfaces gather P0/P1 only, so a
-        # gated P2 -- the entire population this control was built for -- could
-        # never be marked delivered, and the alarm would have repeated "never
-        # delivered" nightly forever about rows it was itself raising. Recording
-        # this surface's own delivery is what lets the second run say "last
-        # carried <date>" instead. The row keeps alarming while the gate is blown:
-        # that is escalation, and it is the point.
+        alarmed, suppressed, acked = _gate_escalate(overdue, today=today)
         try:
             decision_lane.record_delivery(
-                [r.get("raw_topic") or r.get("topic", "") for r in overdue],
-                "health_check")
+                [r.get("raw_topic") or r.get("topic", "") for r in alarmed],
+                decision_lane.PING_SURFACE_PREFIX + "health_check")
         except Exception:  # noqa: BLE001 -- evidence never breaks the check
-            log.warning("check_decision_gates: delivery record failed", exc_info=True)
-        return CheckResult("Decision gates", "critical", detail)
+            log.warning("check_decision_gates: ping record failed", exc_info=True)
+        notes: list[str] = []
+        for row in suppressed:
+            notes.append(
+                f"gate alarm suppressed pending ack (card {row.get('_card_update_id')}) -- "
+                f"[{row.get('severity') or 'P?'}] {row.get('topic')} ({row.get('entity')}), "
+                f"{row.get('gate_overdue_days')}d overdue")
+        for row in acked:
+            notes.append(
+                f"acknowledged by a human reply -- [{row.get('severity') or 'P?'}] "
+                f"{row.get('topic')} ({row.get('entity')}); not re-alarmed")
+        if alarmed:
+            detail = decision_lane.format_alarm(alarmed)
+            if notes:
+                detail += "\n" + "\n".join("  - " + n for n in notes)
+            return CheckResult("Decision gates", "critical", detail)
+        return CheckResult("Decision gates", "warn", "\n".join(notes))
     return CheckResult(
         "Decision gates", "ok",
         f"{len(gated)} of {len(entries)} open decision(s) carry a gate date; "
         "none are past it undelivered.")
+
+
+_GATE_SIGNAL_TASK = "decision-gate"
+
+
+def _gate_signal_key(row: dict) -> str:
+    """decision-gate|<topic_key>|<entity> -- topic_key is decision_lane's
+    normalized heading (the file has no ids), entity the parsed field."""
+    from cora import repeat_signal
+    return repeat_signal.make_key(
+        _GATE_SIGNAL_TASK,
+        row.get("topic_key") or str(row.get("topic") or ""),
+        str(row.get("entity") or ""))
+
+
+def _gate_owner(row: dict) -> tuple[str, str]:
+    """(slack_id, name) for 'Owner of next nudge', via org_roles.find_by_handle;
+    fail-closed to Harrison with a WARN when the text does not resolve."""
+    from cora import org_roles, repeat_signal
+    owner_text = str(row.get("owner") or "")
+    try:
+        rec = org_roles.find_by_handle(owner_text)
+    except Exception:  # noqa: BLE001
+        rec = None
+    if rec is not None and rec.slack_id:
+        return rec.slack_id, rec.name
+    log.warning("check_decision_gates: owner %r not on the roster -- routing the "
+                "repeat signal to Harrison", owner_text)
+    return repeat_signal.HARRISON_SLACK_ID, "Harrison"
+
+
+def _gate_reconcile_clears(overdue: list[dict]) -> None:
+    """A gate signal whose fact has gone away -- the heading now carries CLOSED /
+    RESOLVED, the entry moved under '## Recently resolved', the gate date moved,
+    or a real surface delivered it -- is no longer in `overdue`. CLEAR it so the
+    ledger records the reset and the next blown gate starts at tier 1."""
+    try:
+        from cora import repeat_signal
+        live = {_gate_signal_key(r) for r in overdue}
+        for key in repeat_signal.active_keys(prefix=_GATE_SIGNAL_TASK + "|"):
+            if key not in live:
+                repeat_signal.clear(key, why="gate no longer overdue-undelivered "
+                                             "(closed/resolved/delivered/re-dated)")
+    except Exception:  # noqa: BLE001 -- bookkeeping never breaks the check
+        log.warning("check_decision_gates: clear reconciliation failed", exc_info=True)
+
+
+def _gate_escalate(overdue: list[dict], *, today: date | None
+                   ) -> tuple[list[dict], list[dict], list[dict]]:
+    """Route each overdue row through repeat_signal.fire (fire_id = today).
+
+    Returns (alarmed, suppressed, acked): `alarmed` renders as the CRITICAL,
+    `suppressed` (tier-3 card pending Harrison's tap) renders as ONE warn line
+    each, `acked` (a human answered the decision alert in-thread) is excluded --
+    a blown gate alarms daily until a HUMAN ack, and this IS the ack. If
+    repeat_signal is unavailable the check falls back to pass-through: every row
+    alarms (the ladder row's demotion posture)."""
+    try:
+        from cora import decision_alerts, repeat_signal
+    except Exception:  # noqa: BLE001
+        log.warning("check_decision_gates: repeat_signal unavailable -- pass-through",
+                    exc_info=True)
+        return list(overdue), [], []
+    try:
+        answered = decision_alerts.answered_topic_keys()
+    except Exception:  # noqa: BLE001
+        answered = set()
+    fire_id = (today or date.today()).isoformat()
+    alarmed: list[dict] = []
+    suppressed: list[dict] = []
+    acked: list[dict] = []
+    for row in overdue:
+        key = _gate_signal_key(row)
+        try:
+            raw_topic = str(row.get("raw_topic") or row.get("topic") or "")
+            if decision_alerts.topic_key(raw_topic) in answered:
+                repeat_signal.ack(key, via="decision-alert-reply")
+                acked.append(row)
+                continue
+            owner_id, owner_name = _gate_owner(row)
+            outcome = repeat_signal.fire(
+                key, fire_id=fire_id,
+                # the REDACTED topic (LEX counted-not-itemized / PHI withheld)
+                # is what lands in the ledger and on any card
+                subject=f"decision gate blown: {row.get('topic')}",
+                entity=str(row.get("entity") or ""),
+                owner_slack_id=owner_id, owner_name=owner_name,
+                normal_surface="#cora-health")
+        except Exception:  # noqa: BLE001 -- escalation never silences the alarm
+            log.warning("check_decision_gates: repeat_signal.fire failed for %s -- alarming",
+                        key, exc_info=True)
+            alarmed.append(row)
+            continue
+        if outcome.suppressed:
+            item = dict(row)
+            item["_card_update_id"] = outcome.card_update_id
+            suppressed.append(item)
+        else:
+            alarmed.append(row)
+    return alarmed, suppressed, acked
 
 
 _WATCHDOG_TASK = "cora-watchdog"
@@ -1465,14 +1594,42 @@ def check_claude_mirror(now_epoch: float | None = None) -> CheckResult:
     for k in ("added", "removed", "model_changed"):
         if st.get(k):
             problems.append(f"task-estate {k}: " + ", ".join(str(x) for x in st[k][:10]))
+    # Code #13 slice 9c (cq-06045f418bd2): the Cowork-estate run-marker read. The
+    # mirror diffs each task's newest _runs/<folder-id>/<date>.json against its
+    # DECLARED cadence (data/maps/cowork-run-cadence.yaml) and summarizes here. A
+    # task with a cadence row and no marker inside 2x its cadence is 'did not run'
+    # -- never 'ok' -- and that MUST reach the nightly report, or the estate looks
+    # healthy for exactly the reason the contract exists (a task that fires and
+    # writes nothing is indistinguishable from one that never fired).
+    rm = st.get("run_markers") or {}
+    if isinstance(rm, dict):
+        for key, label in _RUN_MARKER_ALARM_KEYS:
+            ids = rm.get(key) or []
+            if ids:
+                problems.append(f"Cowork run markers {label}: "
+                                + ", ".join(str(x) for x in ids[:10]))
+    coverage = rm.get("coverage") if isinstance(rm, dict) else None
     if problems:
         return CheckResult("Claude mirror", "warn",
                            "claude-workspace mirror: " + "; ".join(problems)
-                           + f" (quarantined={st.get('quarantined_count', '?')}).")
+                           + f" (quarantined={st.get('quarantined_count', '?')}"
+                           + (f", run-markers={coverage}" if coverage else "") + ").")
     return CheckResult("Claude mirror", "ok",
                        f"mirror fresh ({age_s}), "
                        f"quarantined={st.get('quarantined_count', 0)}, "
-                       f"unpinned={len(st.get('unpinned', []))}.")
+                       f"unpinned={len(st.get('unpinned', []))}"
+                       + (f", run-markers={coverage}" if coverage else "") + ".")
+
+
+# (status-payload key, human label) -- the mirror's run-marker statuses the nightly
+# report WARNs on. The wording mirrors run_marker.evaluate's two alarms (MISSED FIRE /
+# FIRED BUT WROTE NOTHING) plus the two file-drop-specific ones.
+_RUN_MARKER_ALARM_KEYS: tuple[tuple[str, str], ...] = (
+    ("did_not_run", "did not run"),
+    ("wrote_nothing", "fired but wrote nothing"),
+    ("unreadable", "unreadable marker"),
+    ("reported_error", "reported an error"),
+)
 
 
 def check_session_capture_quarantine(

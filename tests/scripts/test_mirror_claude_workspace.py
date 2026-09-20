@@ -766,3 +766,235 @@ def test_sibling_checkout_wins_over_the_subdirectory_heuristic(monkeypatch, tmp_
     sibling = base.parent / "cora-scripts"
     sibling.mkdir()
     assert m._worktree_status(slug) == ("unregistered", sibling)   # sibling exists -> it is the checkout
+
+
+# ── Code #13 slice 9c: Cowork run markers (cq-06045f418bd2) ──────────────────
+from datetime import date as _date, timedelta as _td  # noqa: E402
+
+RM_TODAY = _date(2026, 9, 19)   # pinned clock -- never key a test on the live date
+
+
+def _marker(zk: Path, tid: str, day: _date | str, payload: dict | None = None, raw: str | None = None) -> Path:
+    """Drop a run marker the way a Cowork task would: _runs/<folder-id>/<date>.json."""
+    d = zk / "_runs" / tid
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{day if isinstance(day, str) else day.isoformat()}.json"
+    p.write_text(raw if raw is not None else json.dumps(payload or {}), encoding="utf-8")
+    return p
+
+
+@pytest.fixture()
+def cadence(tmp_path, monkeypatch):
+    """Point the mirror at a tmp DECLARED cadence map (never the live yaml)."""
+    def _set(mapping: dict) -> Path:
+        p = tmp_path / "cowork-run-cadence.yaml"
+        lines = []
+        for tid, ent in mapping.items():
+            lines.append(f"{tid}:")
+            for k, v in ent.items():
+                lines.append(f"  {k}: {json.dumps(v)}")
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        monkeypatch.setattr(m, "CADENCE_PATH", p)
+        return p
+    monkeypatch.setattr(m, "_today_az", lambda: RM_TODAY)
+    return _set
+
+
+def _rm_plan(cfg=None):
+    return m.build_plan(cfg or m.load_config(), "cowork_tasks", today=RM_TODAY)
+
+
+def _rm_row(parity: str, tid: str) -> str:
+    rows = [ln for ln in parity.splitlines() if ln.startswith(f"| {tid} |")]
+    assert len(rows) == 1, f"expected one run-marker row for {tid}, got {rows}"
+    return rows[0]
+
+
+def test_run_marker_ok_row_in_parity_and_status(roots, cadence):
+    """A fresh marker with outputs on a task with a cadence row reads ok in BOTH the
+    ZONE-K parity section and mirror-status.json -- the positive path the health
+    lane's coverage line is built on."""
+    cadence({"quartz-ledger-brief": {"cadence_hours": 24, "expects_output": True}})
+    _task(roots["tasks"], "quartz-ledger-brief")
+    _marker(roots["zk"], "quartz-ledger-brief", RM_TODAY,
+            {"ok": True, "outputs": ["G:/x/report.md"], "duration_s": 12, "notes": "fine"})
+    assert _run(["--apply", "--only", "cowork_tasks"]) == 0
+    parity = (roots["zk"] / "PARITY-REPORT.md").read_text(encoding="utf-8")
+    assert "## Run markers" in parity
+    assert "| **ok** |" in _rm_row(parity, "quartz-ledger-brief")
+    st = json.loads((roots["zk"] / "mirror-status.json").read_text(encoding="utf-8"))
+    rm = st["run_markers"]
+    assert rm["ok"] == 1 and rm["coverage"] == "1 of 1" and rm["did_not_run"] == []
+
+
+def test_markerless_task_with_cadence_row_reads_did_not_run_never_ok(roots, cadence):
+    """THE row this slice exists for: a task with a declared cadence and no marker
+    must read 'did not run' -- an ok would make a never-firing task look healthy."""
+    cadence({"pebble-harbor-digest": {"cadence_hours": 24, "expects_output": True}})
+    _task(roots["tasks"], "pebble-harbor-digest")
+    _run(["--apply", "--only", "cowork_tasks"])
+    parity = (roots["zk"] / "PARITY-REPORT.md").read_text(encoding="utf-8")
+    row = _rm_row(parity, "pebble-harbor-digest")
+    assert "| **did not run** |" in row and "MISSED FIRE" in row
+    assert "| **ok** |" not in row
+    st = json.loads((roots["zk"] / "mirror-status.json").read_text(encoding="utf-8"))
+    assert st["run_markers"]["did_not_run"] == ["pebble-harbor-digest"]
+    assert st["run_markers"]["coverage"] == "0 of 1"
+
+
+def test_task_without_cadence_row_reads_unknown_cadence_not_did_not_run(roots, cadence):
+    """No cadence row -> the gap is not computable: 'unknown cadence', never
+    'did not run' (which would alarm on every unregistered task) and never 'ok'."""
+    cadence({})
+    _task(roots["tasks"], "velvet-orbit-sync")
+    plan = _rm_plan()
+    row = plan.run_markers["velvet-orbit-sync"]
+    assert row["status"] == "unknown cadence"
+    summary = m.run_marker_summary(plan)
+    assert summary["did_not_run"] == [] and summary["unknown_cadence"] == 1 and summary["ok"] == 0
+
+
+def test_empty_outputs_on_expects_output_reads_fired_but_wrote_nothing(roots, cadence):
+    """outputs == [] on an expects_output task is the cq-a251dee3f5cf shape: the task
+    fired (marker is fresh) but produced nothing -- a distinct alarm from 'did not run'."""
+    cadence({"amber-kettle-report": {"cadence_hours": 24, "expects_output": True}})
+    _task(roots["tasks"], "amber-kettle-report")
+    _marker(roots["zk"], "amber-kettle-report", RM_TODAY,
+            {"ok": True, "outputs": [], "duration_s": 3, "notes": "nothing to do"})
+    plan = _rm_plan()
+    row = plan.run_markers["amber-kettle-report"]
+    assert row["status"] == "fired but wrote nothing" and "FIRED BUT WROTE NOTHING" in row["detail"]
+    assert m.run_marker_summary(plan)["wrote_nothing"] == ["amber-kettle-report"]
+
+
+def test_empty_outputs_is_ok_when_expects_output_false(roots, cadence):
+    """A task whose legitimate steady state is doing nothing is declared
+    expects_output: false and must NOT alarm on outputs == []."""
+    cadence({"cobalt-fern-watch": {"cadence_hours": 24, "expects_output": False}})
+    _task(roots["tasks"], "cobalt-fern-watch")
+    _marker(roots["zk"], "cobalt-fern-watch", RM_TODAY, {"ok": True, "outputs": [], "duration_s": 1, "notes": ""})
+    assert _rm_plan().run_markers["cobalt-fern-watch"]["status"] == "ok"
+
+
+def test_malformed_marker_reads_unreadable_marker(roots, cadence):
+    """A file that is not valid JSON must be REPORTED as unreadable -- not skipped
+    (which would read as 'did not run') and not crash the mirror."""
+    cadence({"lantern-moss-audit": {"cadence_hours": 24, "expects_output": True}})
+    _task(roots["tasks"], "lantern-moss-audit")
+    _marker(roots["zk"], "lantern-moss-audit", RM_TODAY, raw="{not json")
+    plan = _rm_plan()
+    assert plan.run_markers["lantern-moss-audit"]["status"] == "unreadable marker"
+    assert m.run_marker_summary(plan)["unreadable"] == ["lantern-moss-audit"]
+
+
+def test_outputs_not_a_list_is_a_contract_violation_reported_as_unreadable(roots, cadence):
+    """The contract says outputs is a LIST; an int (the in-repo ledger's shape) is a
+    violation the reader names, rather than silently trusting a count it cannot len()."""
+    cadence({"granite-swift-brief": {"cadence_hours": 24, "expects_output": True}})
+    _task(roots["tasks"], "granite-swift-brief")
+    _marker(roots["zk"], "granite-swift-brief", RM_TODAY, {"ok": True, "outputs": 3, "duration_s": 1, "notes": ""})
+    row = _rm_plan().run_markers["granite-swift-brief"]
+    assert row["status"] == "unreadable marker" and "outputs is not a list" in row["detail"]
+
+
+def test_stale_marker_beyond_two_cadences_reads_did_not_run_boundary_inclusive(roots, cadence):
+    """A marker older than 2x the cadence is a MISSED FIRE; exactly 2x (day granularity)
+    is still inside the window, so one skipped daily fire is not a false alarm."""
+    cadence({"maple-quill-sweep": {"cadence_hours": 24, "expects_output": True},
+             "onyx-river-sweep": {"cadence_hours": 24, "expects_output": True}})
+    _task(roots["tasks"], "maple-quill-sweep")
+    _task(roots["tasks"], "onyx-river-sweep")
+    _marker(roots["zk"], "maple-quill-sweep", RM_TODAY - _td(days=3), {"ok": True, "outputs": ["a"]})
+    _marker(roots["zk"], "onyx-river-sweep", RM_TODAY - _td(days=2), {"ok": True, "outputs": ["a"]})
+    plan = _rm_plan()
+    assert plan.run_markers["maple-quill-sweep"]["status"] == "did not run"
+    assert "MISSED FIRE" in plan.run_markers["maple-quill-sweep"]["detail"]
+    assert plan.run_markers["onyx-river-sweep"]["status"] == "ok"
+
+
+def test_newest_marker_by_filename_wins(roots, cadence):
+    """Two dated files: the reader takes the newest by FILENAME (not mtime -- Drive File
+    Stream rewrites mtimes), so yesterday's empty run does not mask today's real one."""
+    cadence({"saffron-gale-run": {"cadence_hours": 24, "expects_output": True}})
+    _task(roots["tasks"], "saffron-gale-run")
+    _marker(roots["zk"], "saffron-gale-run", RM_TODAY - _td(days=1), {"ok": True, "outputs": []})
+    _marker(roots["zk"], "saffron-gale-run", RM_TODAY, {"ok": True, "outputs": ["x", "y"]})
+    row = _rm_plan().run_markers["saffron-gale-run"]
+    assert row["status"] == "ok" and row["last_marker"] == RM_TODAY.isoformat() and row["outputs"] == 2
+
+
+def test_marker_reporting_ok_false_is_an_alarm(roots, cadence):
+    """ok: false inside the window is its own alarm -- the health lane must not print
+    ok for a task that told us it failed."""
+    cadence({"ivory-comet-check": {"cadence_hours": 24, "expects_output": True}})
+    _task(roots["tasks"], "ivory-comet-check")
+    _marker(roots["zk"], "ivory-comet-check", RM_TODAY, {"ok": False, "outputs": ["partial"], "notes": ""})
+    plan = _rm_plan()
+    assert plan.run_markers["ivory-comet-check"]["status"] == "reported error"
+    assert m.run_marker_summary(plan)["reported_error"] == ["ivory-comet-check"]
+
+
+def test_mirror_never_touches_the_runs_dir(roots, cadence):
+    """The mirror only READS _runs/: two --apply runs (the second one a removal-diff
+    run with a previous manifest) leave a foreign marker byte-identical, never list it
+    in the manifest, and never move it to _removed/. A stubbed or moved marker would
+    destroy the very evidence the contract collects."""
+    cadence({"willow-drum-brief": {"cadence_hours": 24, "expects_output": True}})
+    _task(roots["tasks"], "willow-drum-brief")
+    p = _marker(roots["zk"], "willow-drum-brief", RM_TODAY, {"ok": True, "outputs": ["g:/one.md"], "notes": "n"})
+    before = p.read_bytes()
+    _run(["--apply"])
+    _run(["--apply"])
+    assert p.read_bytes() == before
+    man = json.loads((roots["zx"] / "cora-mirror-manifest-latest.json").read_text(encoding="utf-8"))
+    assert not any("_runs" in w["dest"] for w in man["writes"])
+    assert not any("_runs" in ev.get("dest", "") for ev in man.get("removals", []))
+    assert not list((roots["zx"] / "_removed").rglob("*.json")) if (roots["zx"] / "_removed").exists() else True
+    # and nothing else appeared under _runs/ (no stubs, no sidecars)
+    assert sorted(x.name for x in (roots["zk"] / "_runs" / "willow-drum-brief").iterdir()) == [p.name]
+
+
+def test_withheld_folder_id_never_reaches_the_run_marker_section(roots, cadence):
+    """A folder id that trips the ZONE-K screen must not ride into the parity table or
+    mirror-status.json via the run-marker read (same posture as the INDEX row)."""
+    cadence({"cowork-cora-lex-lbhs-digest": {"cadence_hours": 24, "expects_output": True}})
+    _task(roots["tasks"], "cowork-cora-lex-lbhs-digest", desc="weekly digest")
+    _task(roots["tasks"], "daily-brief", desc="morning brief")
+    cfg = m.load_config()
+    cfg.allow_files = set()
+    plan = m.build_plan(cfg, "cowork_tasks", today=RM_TODAY)
+    keys = list(plan.run_markers)
+    assert "daily-brief" in keys
+    assert not any("lex" in k.lower() for k in keys)
+    assert any(k.startswith("[withheld-") for k in keys)
+    parity = m.render_parity(plan, None, [], cfg)
+    assert "lex-lbhs" not in parity.lower()
+    assert "[withheld-" in parity
+    st = m.status_payload(plan, None, [], cfg)
+    assert not any("lex" in k.lower() for k in st["run_markers"]["did_not_run"])
+
+
+def test_cadence_map_unreadable_is_a_warn_and_every_task_reads_unknown_cadence(roots, tmp_path, monkeypatch):
+    """A broken cadence yaml must not crash the mirror or make tasks read 'did not run';
+    it WARNs and every task falls to 'unknown cadence' until the map parses."""
+    bad = tmp_path / "broken.yaml"
+    bad.write_text("this: [is: not: valid\n", encoding="utf-8")
+    monkeypatch.setattr(m, "CADENCE_PATH", bad)
+    _task(roots["tasks"], "hazel-tide-sync")
+    plan = _rm_plan()
+    assert plan.cadence_error
+    assert plan.run_markers["hazel-tide-sync"]["status"] == "unknown cadence"
+    assert any("run-cadence map" in w and "unreadable" in w for w in plan.warns)
+    parity = m.render_parity(plan, None, [], m.load_config())
+    assert "cadence map UNREADABLE" in parity
+
+
+def test_run_marker_section_lists_alarms_before_ok_rows(roots, cadence):
+    """Rendering order: alarmed rows first so a 109-row table is readable at the top."""
+    cadence({"alpha-ok-task": {"cadence_hours": 24, "expects_output": True},
+             "zulu-missing-task": {"cadence_hours": 24, "expects_output": True}})
+    _task(roots["tasks"], "alpha-ok-task")
+    _task(roots["tasks"], "zulu-missing-task")
+    _marker(roots["zk"], "alpha-ok-task", RM_TODAY, {"ok": True, "outputs": ["a"]})
+    parity = m.render_parity(_rm_plan(), None, [], m.load_config())
+    assert parity.index("| zulu-missing-task |") < parity.index("| alpha-ok-task |")

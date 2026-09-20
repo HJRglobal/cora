@@ -56,6 +56,17 @@ GATE_GRACE_DAYS = 1
 #: cadence" from "stopped being delivered".
 DELIVERY_WINDOW_DAYS = 8
 
+#: A surface whose name starts with this is an ESCALATION PING, not a delivery
+#: (D-310, 2026-09-19 audit section 3). The nightly health check used to record
+#: its own #cora-health alarm as surface "health_check", which delivery_index
+#: then counted -- so a blown gate was CRITICAL on day N, silent for 8 days,
+#: CRITICAL again on N+9, self-clearing with no human involved. A ping row is
+#: still WRITTEN (auditable: the ledger shows every night the alarm fired) but
+#: delivery_index / undelivered_overdue ignore it, so the alarm stands DAILY
+#: until a human ack or the fact clears. Only a real human-facing delivery
+#: (strategy_memo, channel_synthesis) may silence the control.
+PING_SURFACE_PREFIX = "ping:"
+
 _TEMPLATE_TOPIC = "[Topic]"
 
 # Field patterns. All tolerate the file's real formatting (bolded label, em
@@ -256,6 +267,10 @@ def delivery_index(*, ledger: Path | None = None,
     Reads the whole file -- these are a handful of rows per week, and a windowed
     tail read would make "never delivered" indistinguishable from "delivered
     before the window", which is the distinction the alarm turns on.
+
+    Rows whose surface starts with PING_SURFACE_PREFIX are SKIPPED: an
+    escalation ping is not a delivery and must never suppress the control
+    (D-310). They stay in the file for the audit trail.
     """
     now = now or datetime.now(timezone.utc)
     try:
@@ -273,6 +288,8 @@ def delivery_index(*, ledger: Path | None = None,
         except (ValueError, TypeError):
             continue
         if not isinstance(row, dict):
+            continue
+        if str(row.get("surface") or "").startswith(PING_SURFACE_PREFIX):
             continue
         key = str(row.get("key") or _topic_key(row.get("topic", "")))
         if not key:

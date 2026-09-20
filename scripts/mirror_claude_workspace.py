@@ -44,7 +44,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -413,6 +413,10 @@ class Plan:
     counts: dict[str, dict[str, int]] = field(default_factory=dict)
     unpinned_tasks: list[str] = field(default_factory=list)  # task names with no model pin
     task_models: dict[str, str] = field(default_factory=dict)  # task name -> model pin
+    # Code #13 slice 9c: per-task run-marker evaluation, keyed by FOLDER id (or a
+    # withheld key when the id trips the ZONE-K screen). See evaluate_run_marker.
+    run_markers: dict[str, dict] = field(default_factory=dict)
+    cadence_error: str | None = None  # the cadence map could not be read (every task -> unknown cadence)
 
 
 _AZ_OFFSET = "-07:00"  # America/Phoenix (no DST)
@@ -500,6 +504,189 @@ def _entity_prefix(name: str) -> str:
     if first == "cowork":
         return "cowork-cora"
     return first
+
+
+# ── Cowork run markers (Code #13 slice 9c, cq-06045f418bd2) ──────────────────
+# THE CLASS (same as src/cora/run_marker.py): a task that fires and writes nothing is
+# indistinguishable from one that never fired. The Cowork estate cannot import cora
+# and usually has no G: in bash, so its contract is a FILE DROP, written with the
+# file tools by a footer every SKILL.md body ends with
+# (deployment/cowork-run-marker-footer.md):
+#
+#     <ZONE-K>/_runs/<folder-id>/<YYYY-MM-DD>.json
+#     {"ok": bool, "outputs": [paths / permalinks], "duration_s": number, "notes": str}
+#
+# The KEY is the task's FOLDER id (d.name) -- the same id the ZONE-X body dest uses --
+# never the frontmatter `name:`. `outputs` is a LIST in this contract (the in-repo
+# ledger's is an int); the reader len()s it. Cadence is DECLARED in
+# data/maps/cowork-run-cadence.yaml because the SKILL.md carries no cron; the reader
+# normalizes to run_marker.evaluate's two alarms (MISSED FIRE / FIRED BUT WROTE
+# NOTHING). The mirror only READS _runs/: it never writes, removes or stubs anything
+# there (removal detection covers only its own manifest dests -- test-pinned).
+RUN_MARKERS_DIRNAME = "_runs"
+CADENCE_PATH = CORA_REPO_ROOT / "data" / "maps" / "cowork-run-cadence.yaml"
+RUN_MARKER_FIELDS = ("ok", "outputs", "duration_s", "notes")
+RUN_MARKER_FOOTER_MARKER = "<!-- run-marker-footer v1 -->"
+_MARKER_DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
+
+# Status vocabulary. The first four are the health lane's WARN triggers; a task with
+# a declared cadence and no marker inside 2x that cadence is RM_DID_NOT_RUN -- never
+# RM_OK. RM_UNKNOWN_CADENCE is neither ok nor an alarm: a gap cannot be computed.
+RM_OK = "ok"
+RM_DID_NOT_RUN = "did not run"
+RM_WROTE_NOTHING = "fired but wrote nothing"
+RM_UNREADABLE = "unreadable marker"
+RM_REPORTED_ERROR = "reported error"
+RM_UNKNOWN_CADENCE = "unknown cadence"
+RUN_MARKER_ALARM_STATUSES = (RM_DID_NOT_RUN, RM_WROTE_NOTHING, RM_UNREADABLE, RM_REPORTED_ERROR)
+_RM_RENDER_ORDER = (RM_DID_NOT_RUN, RM_WROTE_NOTHING, RM_UNREADABLE, RM_REPORTED_ERROR,
+                    RM_UNKNOWN_CADENCE, RM_OK)
+
+
+def _today_az() -> date:
+    """Today in America/Phoenix (the date the footer tells a task to stamp)."""
+    return datetime.now(timezone(_td_hours(-7))).date()
+
+
+def load_cadence(path: Path | None = None) -> tuple[dict[str, dict], str | None]:
+    """``({folder-id: {cadence_hours, expects_output, note}}, error)`` from the DECLARED
+    cadence map. Fail-soft: a missing/unparseable file yields ``({}, "<reason>")`` so
+    every task reads 'unknown cadence' and the parity report says why -- never a crash,
+    never a silent 'ok'."""
+    p = Path(path) if path else CADENCE_PATH
+    try:
+        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        return {}, f"{type(exc).__name__}: {exc}"
+    if not isinstance(data, dict):
+        return {}, "cadence map is not a mapping"
+    out: dict[str, dict] = {}
+    for k, v in data.items():
+        if isinstance(v, dict):
+            out[str(k)] = v
+    return out, None
+
+
+def _runs_dir(task_id: str) -> Path:
+    return _zk(RUN_MARKERS_DIRNAME, task_id)
+
+
+def read_run_marker(task_id: str) -> dict | None:
+    """The NEWEST ``_runs/<task_id>/<YYYY-MM-DD>.json`` by FILENAME (never mtime --
+    Drive File Stream rewrites mtimes on sync). ``None`` when the folder or any dated
+    file is absent. A file that exists but is not a JSON object carrying ``ok`` and a
+    LIST ``outputs`` -> ``{"unreadable": True, ...}`` (reported, never excused). Every
+    G: touch is bounded via drive_io; a mount failure reads as unreadable (the honest
+    answer), never as 'no marker' (which would read as 'did not run')."""
+    d = _runs_dir(task_id)
+    try:
+        files = drive_io.glob(d, "*.json", timeout=5.0, retry_seconds=0.0)
+    except Exception as exc:  # noqa: BLE001 -- a gone mount must not crash the mirror
+        return {"date": "", "unreadable": True, "error": type(exc).__name__}
+    dated = sorted(f for f in files if _MARKER_DATE_RE.match(f.stem))
+    if not dated:
+        return None
+    newest = dated[-1]
+    try:
+        data = json.loads(drive_io.read_text(newest, timeout=5.0, retry_seconds=0.0))
+    except Exception as exc:  # noqa: BLE001 -- malformed JSON / read failure
+        return {"date": newest.stem, "unreadable": True, "error": type(exc).__name__}
+    if not isinstance(data, dict):
+        return {"date": newest.stem, "unreadable": True, "error": "not a JSON object"}
+    for req in ("ok", "outputs"):
+        if req not in data:
+            return {"date": newest.stem, "unreadable": True, "error": f"missing field {req}"}
+    if not isinstance(data.get("outputs"), (list, tuple)):
+        return {"date": newest.stem, "unreadable": True, "error": "outputs is not a list"}
+    return {"date": newest.stem, "unreadable": False, "ok": bool(data.get("ok")),
+            "outputs": len(data["outputs"]), "duration_s": data.get("duration_s")}
+
+
+def evaluate_run_marker(task_id: str, marker: dict | None, cadence_entry: dict | None,
+                        *, today: date) -> dict:
+    """One task's row: ``{task, status, detail, last_marker, ok, outputs, cadence_hours,
+    expects_output, note}``. The wording of the two cadence alarms mirrors
+    run_marker.evaluate (MISSED FIRE / FIRED BUT WROTE NOTHING).
+
+    Order matters: an unreadable marker is reported as such even when the cadence is
+    unknown; a task with no cadence row is 'unknown cadence' (a gap is not
+    computable), NOT 'did not run'; a task with a row and no marker inside 2x its
+    cadence is 'did not run' -- the row this whole slice exists to render honestly."""
+    row: dict = {"task": task_id, "status": RM_OK, "detail": "", "last_marker": "",
+                 "ok": None, "outputs": None, "cadence_hours": None,
+                 "expects_output": None, "note": ""}
+    if isinstance(cadence_entry, dict):
+        try:
+            row["cadence_hours"] = float(cadence_entry.get("cadence_hours") or 0) or None
+        except (TypeError, ValueError):
+            row["cadence_hours"] = None
+        row["expects_output"] = bool(cadence_entry.get("expects_output"))
+        row["note"] = str(cadence_entry.get("note") or "")
+    if marker is not None:
+        row["last_marker"] = str(marker.get("date") or "")
+        if marker.get("unreadable"):
+            row["status"] = RM_UNREADABLE
+            row["detail"] = (f"marker {row['last_marker'] or '(listing failed)'} unreadable "
+                             f"({marker.get('error') or 'unknown'}) -- contract: a JSON object "
+                             f"with ok + outputs[] + duration_s + notes")
+            return row
+        row["ok"] = marker.get("ok")
+        row["outputs"] = int(marker.get("outputs") or 0)
+    cadence_h = row["cadence_hours"]
+    if cadence_h is None:
+        row["status"] = RM_UNKNOWN_CADENCE
+        row["detail"] = ("no row in data/maps/cowork-run-cadence.yaml -- gap not computable; "
+                         + (f"last marker {row['last_marker']}" if marker else "no marker"))
+        return row
+    window_h = cadence_h * 2
+    if marker is None:
+        row["status"] = RM_DID_NOT_RUN
+        row["detail"] = (f"no run marker ever recorded (cadence {cadence_h:.0f}h) -- MISSED FIRE, "
+                         f"or the footer is not yet injected")
+        return row
+    try:
+        marker_day = date.fromisoformat(row["last_marker"])
+    except ValueError:
+        row["status"] = RM_UNREADABLE
+        row["detail"] = f"marker filename {row['last_marker']!r} is not a YYYY-MM-DD date"
+        return row
+    age_h = (today - marker_day).days * 24.0
+    if age_h > window_h:
+        row["status"] = RM_DID_NOT_RUN
+        row["detail"] = (f"last marker {row['last_marker']} is {age_h:.0f}h old "
+                         f"(cadence {cadence_h:.0f}h) -- MISSED FIRE")
+        return row
+    if row["expects_output"] and row["outputs"] == 0:
+        row["status"] = RM_WROTE_NOTHING
+        row["detail"] = (f"FIRED BUT WROTE NOTHING ({row['last_marker']}, ok={row['ok']}) -- "
+                         f"exit code alone cannot see this")
+        return row
+    if row["ok"] is False:
+        row["status"] = RM_REPORTED_ERROR
+        row["detail"] = f"last marker {row['last_marker']} reports ok=false ({row['outputs']} output(s))"
+        return row
+    row["detail"] = f"marker {row['last_marker']}, {row['outputs']} output(s), within {window_h:.0f}h"
+    return row
+
+
+def run_marker_summary(plan: "Plan") -> dict:
+    """The machine-readable roll-up for mirror-status.json (read by the 08:45 health
+    check + the Monday digest): per-alarm id lists, counts, and coverage as
+    'N of M tasks have a marker'."""
+    rows = plan.run_markers
+    out: dict = {
+        "total": len(rows),
+        "with_marker": sum(1 for r in rows.values() if r.get("last_marker") or r.get("status") == RM_UNREADABLE),
+        "ok": sum(1 for r in rows.values() if r.get("status") == RM_OK),
+        "unknown_cadence": sum(1 for r in rows.values() if r.get("status") == RM_UNKNOWN_CADENCE),
+        "did_not_run": sorted(k for k, r in rows.items() if r.get("status") == RM_DID_NOT_RUN),
+        "wrote_nothing": sorted(k for k, r in rows.items() if r.get("status") == RM_WROTE_NOTHING),
+        "unreadable": sorted(k for k, r in rows.items() if r.get("status") == RM_UNREADABLE),
+        "reported_error": sorted(k for k, r in rows.items() if r.get("status") == RM_REPORTED_ERROR),
+        "cadence_map_error": plan.cadence_error,
+    }
+    out["coverage"] = f"{out['with_marker']} of {out['total']}"
+    return out
 
 
 # ── Plan builders ─────────────────────────────────────────────────────────────
@@ -628,13 +815,21 @@ def plan_skills(plan: Plan, cfg: Config) -> None:
                                    cls="skills"))
 
 
-def plan_cowork_tasks(plan: Plan, cfg: Config) -> None:
+def plan_cowork_tasks(plan: Plan, cfg: Config, *, today: date | None = None) -> None:
     dirs = _task_dirs(cfg)
     root = _tasks_root(cfg)
     plan.roots_found["cowork_tasks"] = root.exists()
     if not root.exists():
         plan.warns.append(f"cowork_tasks: NOT FOUND -- task store {root} missing")
         return
+    # Code #13 slice 9c: the DECLARED cadence map + the AZ date the markers are
+    # stamped in. `today` is injectable so tests pin the clock.
+    today = today or _today_az()
+    cadence, cadence_err = load_cadence()
+    plan.cadence_error = cadence_err
+    if cadence_err:
+        plan.warns.append(f"cowork_tasks: run-cadence map {CADENCE_PATH.name} unreadable "
+                          f"({cadence_err}) -- every task reads 'unknown cadence'")
     index_rows: list[tuple[str, str, str, str, str, str]] = []
     for d in dirs:
         f = d / "SKILL.md"
@@ -672,6 +867,16 @@ def plan_cowork_tasks(plan: Plan, cfg: Config) -> None:
             _record(plan, "cowork_tasks", "desc_redacted")
         else:
             row_name, row_ent, row_desc = name, _entity_prefix(d.name), desc
+        # Code #13 slice 9c: the run-marker read, keyed by FOLDER id. Both the parity
+        # report and mirror-status.json are ZONE-K, so a folder id that trips the
+        # screen is withheld behind a hash key (same posture as the INDEX row above;
+        # the hash lets two withheld tasks stay distinguishable without naming either).
+        rm_row = evaluate_run_marker(d.name, read_run_marker(d.name), cadence.get(d.name),
+                                     today=today)
+        id_reason = screen_reason(d.name, cfg)
+        rm_key = d.name if (not id_reason or opted) else f"[withheld-{_sha_text(d.name)[:8]}]"
+        rm_row["task"] = rm_key
+        plan.run_markers[rm_key] = rm_row
         sched = _schedule_hint(name, desc)
         index_rows.append((
             row_name, sched or "unspecified", model, row_ent,
@@ -1053,6 +1258,7 @@ def render_parity(plan: Plan, prev: dict | None, removals: list[dict], cfg: Conf
     up = delta.get("unpinned", [])
     lines.append(f"- **unpinned** ({len(up)}): " + (", ".join(up[:20]) if up else "none"))
     lines.append("")
+    lines.extend(_render_run_markers(plan, cfg))
     # D-051 PHI finding 4: this report is ZONE-K (KB-ingested). A quarantined
     # FILENAME can itself carry a client/LEX token, so the ZONE-K report shows only
     # COUNTS by reason -- the full names live in ZONE-X _quarantine/cora-mirror-INDEX.md
@@ -1091,6 +1297,51 @@ def render_parity(plan: Plan, prev: dict | None, removals: list[dict], cfg: Conf
     return "\n".join(lines) + "\n"
 
 
+def _render_run_markers(plan: Plan, cfg: Config) -> list[str]:
+    """The '## Run markers' section of the ZONE-K parity report (Code #13 slice 9c).
+    Alarmed rows first. Task ids that trip the screen were already replaced by a
+    withheld key in plan_cowork_tasks; the free-text cadence `note` is screened here
+    because this report is KB-ingested."""
+    lines = ["## Run markers (Cowork estate file-drop contract, cq-06045f418bd2)"]
+    if not plan.roots_found.get("cowork_tasks"):
+        lines.append("- task store NOT FOUND -- no markers evaluated")
+        lines.append("")
+        return lines
+    rm = run_marker_summary(plan)
+    lines.append(
+        f"- coverage: **{rm['coverage']}** tasks have a marker "
+        f"(`_runs/<folder-id>/<YYYY-MM-DD>.json` with ok / outputs[] / duration_s / notes; "
+        f"contract + injector: deployment/cowork-run-marker-footer.md)")
+    lines.append(
+        f"- alarms: {len(rm['did_not_run'])} did not run, {len(rm['wrote_nothing'])} fired but "
+        f"wrote nothing, {len(rm['unreadable'])} unreadable marker, {len(rm['reported_error'])} "
+        f"reported error; {rm['unknown_cadence']} unknown cadence (no row in "
+        f"data/maps/cowork-run-cadence.yaml -- not computable, so neither alarmed nor ok)")
+    if plan.cadence_error:
+        lines.append(f"- cadence map UNREADABLE ({_md_cell(plan.cadence_error)}) -- every task "
+                     f"reads 'unknown cadence' until it parses")
+    lines.append("- rule: a task with a declared cadence and no marker inside 2x that cadence "
+                 "reads **did not run** -- never ok. A marker with `outputs: []` on an "
+                 "`expects_output` task reads **fired but wrote nothing**.")
+    lines.append("")
+    lines.append("| task | status | last marker | ok | outputs | cadence (h) | detail |")
+    lines.append("|---|---|---|---|---|---|---|")
+    order = {s: i for i, s in enumerate(_RM_RENDER_ORDER)}
+    for key in sorted(plan.run_markers, key=lambda k: (order.get(plan.run_markers[k]["status"], 99), k)):
+        r = plan.run_markers[key]
+        ok = "" if r.get("ok") is None else ("true" if r["ok"] else "false")
+        outs = "" if r.get("outputs") is None else str(r["outputs"])
+        cad = "" if r.get("cadence_hours") is None else f"{r['cadence_hours']:.0f}"
+        detail = r.get("detail", "")
+        note = r.get("note") or ""
+        if note:
+            detail += " | " + (note if not screen_reason(note, cfg) else "[note withheld -- screened]")
+        lines.append(f"| {_md_cell(key)} | **{r['status']}** | {r.get('last_marker') or '--'} | {ok} | "
+                     f"{outs} | {cad} | {_md_cell(detail)} |")
+    lines.append("")
+    return lines
+
+
 _ALL_COUNT_KEYS = ("mirrored", "quarantined", "denied_stock", "unknown_not_allowlisted",
                    "skipped_oversize", "allowlisted_override", "indexed",
                    # every key _record() writes must be a column, or the table silently
@@ -1118,6 +1369,9 @@ def status_payload(plan: "Plan", prev: dict | None, removals: list, cfg: Config)
         "removed": delta.get("removed", []),
         "model_changed": delta.get("model_changed", []),
         "counts": plan.counts,
+        # Code #13 slice 9c: the Cowork run-marker roll-up (ids already withheld
+        # where the folder id trips the screen -- this file is ZONE-K too).
+        "run_markers": run_marker_summary(plan),
     }
 
 
@@ -1243,12 +1497,12 @@ def _uniquify_dest_collisions(plan: Plan) -> None:
     plan.writes = kept
 
 
-def build_plan(cfg: Config, only: str | None) -> Plan:
+def build_plan(cfg: Config, only: str | None, *, today: date | None = None) -> Plan:
     plan = Plan()
     if only in (None, "skills"):
         plan_skills(plan, cfg)
     if only in (None, "cowork_tasks"):
-        plan_cowork_tasks(plan, cfg)
+        plan_cowork_tasks(plan, cfg, today=today)
     if only in (None, "code_memory"):
         plan_code_memory(plan, cfg)
     if only in (None, "cowork_memory"):

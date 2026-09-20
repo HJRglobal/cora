@@ -30,6 +30,20 @@
 #                     it the moment delivery is fixed, so a real miss alarms.
 #   note              (optional) shown ONLY for a known_undelivered entry, to say
 #                     what would fix it.
+#   owner             (optional; Code #13 slice 9a, D-302) the ROSTER HANDLE of
+#                     the human who retrieves this document by hand when it does
+#                     not arrive -- a first name / full name / Slack id resolved
+#                     through data/maps/org-roles.yaml (org_roles.find_by_handle),
+#                     never a Slack id typed here. A MISSING month for a
+#                     known_undelivered (portal-only) vendor sends this person ONE
+#                     nudge DM: the portal link + where to drop the download.
+#                     Unresolvable handle -> the nudge goes to Harrison with a
+#                     WARN in the check's log.
+#   portal_url        (optional) where the owner downloads the document when the
+#                     vendor does not deliver it. Carried into the nudge DM.
+#
+# known_undelivered CLEARS ONLY BY A HUMAN EDIT of this file, after the first
+# download lands in Drive -- the check never edits it, and the nudge says so.
 
 expected:
   - name: Google Ads invoice
@@ -39,6 +53,8 @@ expected:
       - google_ads
       - googleads
     known_undelivered: true
+    owner: tessa
+    portal_url: https://ads.google.com/aw/billing/documents
     note: >-
       Verified 2026-08-25: never filed, and no Google Ads billing email has
       reached a monitored mailbox in 120 days (only ads-noreply@ performance

@@ -98,6 +98,13 @@ def is_static_excluded(path: Path) -> bool:
         return True
     if "_archive" in str(path).lower():
         return True
+    # Code #13 slice 9c: the Cowork run-marker drop zone
+    # (_shared/claude-workspace-mirror/_runs/<task>/<date>.json). Markers are .json,
+    # which the walk never yields -- but ZONE-K is the KB-ingested zone, so a .md a
+    # task drops there by mistake WOULD ingest. Belt: exclude the segment outright.
+    # Segment match, not substring ("test_runs.md" stays ingestible).
+    if any(part.lower() == "_runs" for part in path.parts):
+        return True
     return False
 
 # F-09: the mtime watermark alone MISSES a content change that does not advance

@@ -1,0 +1,58 @@
+# cowork-run-cadence.yaml -- DECLARED cadence for the Cowork scheduled-task estate
+# (Code #13 slice 9c, cq-06045f418bd2; read by scripts/mirror_claude_workspace.py).
+#
+# WHY THIS FILE EXISTS. A Cowork task's SKILL.md carries NO cron -- the schedule
+# lives in the Claude app DB, off disk -- so the mirror cannot compute "did this
+# task run when it should have?" from anything it can read. The cadence is
+# therefore DECLARED here, per task, and the run-marker reader diffs it against
+# the file-drop markers the tasks write to
+# _shared/claude-workspace-mirror/_runs/<folder-id>/<YYYY-MM-DD>.json
+# (contract: deployment/cowork-run-marker-footer.md).
+#
+# KEY = the task's FOLDER id under %USERPROFILE%\OneDrive\Documents\Claude\Scheduled
+# (the same string the marker path uses). Not the frontmatter `name:` -- today they
+# are identical for all 109 tasks, but the folder is what the reader keys on.
+#
+# WHO MAINTAINS IT. Harrison edits this file (or a Cowork session PROPOSES a row)
+# whenever a Cowork task is created, retired, or has its schedule changed in the app.
+# There is no automatic sync from the app DB. Runtime-effective at the next mirror
+# run (03:45 / 12:15 AZ); no restart. Two consequences of a stale row:
+#   * a task listed here with no marker inside 2x its cadence reads 'did not run'
+#     (WARN in the 08:45 health check + the Monday digest) -- never 'ok';
+#   * a task NOT listed here reads 'unknown cadence' -- visible in the parity
+#     report but never alarmed, because a gap cannot be computed.
+#
+# FIELDS per row:
+#   cadence_hours   how often the task is scheduled to fire (24 daily, 168 weekly,
+#                   720 monthly). The alarm window is 2x this, so one skipped fire
+#                   of a weekly job is not a nightly false alarm.
+#   expects_output  true = "a run that writes/sends zero things is a defect"
+#                   (FIRED BUT WROTE NOTHING alarm on outputs == []). Set false for
+#                   a task whose legitimate steady state is doing nothing.
+#   note            free text shown in the parity report (ASCII, no client names).
+#
+# SEEDS (2026-09-19): the four tasks that already self-log runs to ad-hoc jsonl
+# files at three different Drive paths. They are 'transitional' -- their own logs
+# stay in place until the footer lands via the pin script's -InjectRunMarkerFooter
+# -Apply; until then each reads 'did not run' here by design (0 of 109 tasks write
+# this contract today). Cadences are taken from each SKILL.md's description prose.
+
+connector-health-heartbeat:
+  cadence_hours: 24          # "Daily 6:40am connector reachability probe"
+  expects_output: true       # appends one status line every run
+  note: "transitional: self-logs elsewhere (00-Founder/_ops/connector-heartbeat-log.jsonl)"
+
+cora-knowledge-review:
+  cadence_hours: 24          # "Daily 7:07am AZ -- flywheel-health monitor"
+  expects_output: true       # writes its own audit line every run (Step 0 run-gap self-check)
+  note: "transitional: self-logs elsewhere (_shared/projects/cora/cora-flywheel-health-runs.jsonl)"
+
+cowork-cora-redundancy-audit:
+  cadence_hours: 720         # "Monthly audit (1st, 10am)"
+  expects_output: true       # Step 5 audit log line every run, even when nothing is found
+  note: "transitional: self-logs elsewhere (_shared/projects/cora/cowork-redundancy-audit-runs.jsonl)"
+
+hygiene-asana:
+  cadence_hours: 168         # weekly closure sweep (companion to the daily hygiene-nudge-daily)
+  expects_output: true       # Step 4.6a mandatory audit line every run, even at 0 counts
+  note: "transitional: self-logs elsewhere (_shared/projects/cora/hygiene-deferred.jsonl + reply-capture audit)"

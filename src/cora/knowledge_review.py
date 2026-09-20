@@ -1432,6 +1432,7 @@ def process_decision_tap(
         if not approve:
             resolve_update(update_id, "DISMISSED", reason="one_tap_button")
             log.info("knowledge_review: decision one-tap DISMISS %s", update_id[:8])
+            _ack_repeat_signal(update, via="card-dismiss")
             return "dismissed", "👎 Dismissed — not filed."
 
         from .decision_inbox import apply_decision_accept
@@ -1445,6 +1446,9 @@ def process_decision_tap(
                 resolve_update(update_id, "DISMISSED", reason="lex_phi_excluded")
                 log.warning("knowledge_review: decision %s excluded at apply (%s)",
                             update_id[:8], summary)
+                # The card is terminal, so the signal behind it must not stay
+                # suppressed with nothing left to tap.
+                _ack_repeat_signal(update, via="card-excluded")
                 return ("excluded",
                         "🚫 Withheld — this looks LEX/PHI-scoped, so it can't be "
                         "filed (fail-closed). Dismissed.")
@@ -1455,9 +1459,29 @@ def process_decision_tap(
             return "apply_failed", f"⚠️ Couldn't file: {summary}. Left pending."
         resolve_update(update_id, "APPROVED", reason="one_tap_button")
         log.info("knowledge_review: decision one-tap ACCEPT %s (%s)", update_id[:8], summary)
+        _ack_repeat_signal(update, via="card-accept")
         return ("accepted",
                 f"📥 Filed to your decisions inbox — non-canon; promotion to "
                 f"decisions.md stays with the cascade. ({summary})")
+
+
+def _ack_repeat_signal(update: dict[str, Any], *, via: str) -> None:
+    """Code #13 slice 9b: a decision_capture card minted by repeat_signal (tier
+    3) carries payload.signal_key; Harrison's Accept OR Dismiss on it IS the
+    acknowledgement that lifts suppression at the signal's original surface.
+    Called only from process_decision_tap, which is Harrison-gated above, and
+    only after the row reached a TERMINAL state (apply_failed leaves the card
+    PENDING and does not ack). Fail-soft: an ack bookkeeping error never turns a
+    successful tap into a failed one."""
+    try:
+        signal_key = str(((update or {}).get("payload") or {}).get("signal_key") or "")
+        if not signal_key:
+            return
+        from . import repeat_signal
+        if repeat_signal.ack(signal_key, via=via):
+            log.info("knowledge_review: repeat signal %s acknowledged via %s", signal_key, via)
+    except Exception:  # noqa: BLE001
+        log.warning("knowledge_review: repeat-signal ack failed (non-fatal)", exc_info=True)
 
 
 # ── Graduated-trust AUTO-WRITE (§7B, 2026-07-21; D-011 relaxed -> reversible) ────

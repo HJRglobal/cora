@@ -614,6 +614,30 @@ def build_user_briefing(rec: RoleRecord, *, api_key: str, today_str: str) -> str
     )
 
 
+def _repeat_signal_lines(today=None) -> list[str]:
+    """Code #13 slice 9b (D-302 tier 2): the deterministic 'Repeat signal (2nd
+    consecutive fire): <subject> -- owner <name>' lines read from the
+    repeat-signal ledger. Read-only; fail-soft to [] (a ledger problem must never
+    cost Harrison his briefing)."""
+    try:
+        from cora import repeat_signal
+        return repeat_signal.format_briefing_lines(repeat_signal.tier2_signals(today))
+    except Exception:  # noqa: BLE001
+        log.warning("briefing: repeat-signal read failed (non-fatal)", exc_info=True)
+        return []
+
+
+def _append_repeat_signal_lines(text: str, today=None) -> str:
+    """Append the tier-2 lines AFTER build_user_briefing returns -- never inside
+    the LLM-synthesized sections, which the model has dropped labeled headers
+    from before (the role-header incident). The caller applies this to
+    HARRISON's briefing only (sid == _HARRISON_SLACK_ID)."""
+    lines = _repeat_signal_lines(today)
+    if not lines:
+        return text
+    return text.rstrip() + "\n\n" + "\n".join(lines)
+
+
 # ---- Review messages to Harrison (one DM per user) -----------------------------
 
 def _compose_review_header(
@@ -926,6 +950,8 @@ def _run(args: argparse.Namespace, mode: str) -> int:
         log.info("Briefing %s (role=%s, entity=%s)...", rec.name, rec.role, rec.entity)
         try:
             text = build_user_briefing(rec, api_key=anthropic_key, today_str=today_str)
+            if rec.slack_id == _HARRISON_SLACK_ID:
+                text = _append_repeat_signal_lines(text)
             built.append((rec, text))
         except Exception as exc:
             log.warning("Briefing build failed for %s: %s", rec.name, exc)

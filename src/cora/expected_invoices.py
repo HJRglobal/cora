@@ -24,6 +24,20 @@ THIS MODULE IS THE (b) HALF. It reads a human-maintained expectation list, check
 the filer's own content ledger for a matching filing in the period, and returns
 PRESENT / MISSING per vendor. Read-only: it reads two files and writes nothing.
 
+CODE #13 SLICE 9a (D-302, ruled 2026-09-10; cq-21207e34a954). A MISSING month for
+a PORTAL-ONLY vendor (`known_undelivered: true`) is not a surprise -- it is the
+known state -- so the channel line stays a grey config note. What was missing is
+that the human who retrieves that document by hand was never told it was time.
+This module now ALSO decides who to nudge (`nudge_candidates`), resolves the
+yaml's `owner:` handle through the org roster (`resolve_owner`, fail-closed to
+Harrison) and renders the nudge text (`format_owner_nudge`). It still writes
+nothing: the runner script sends the DM and records the repeat signal.
+
+NUDGE vs FLAG are SEPARATE semantics, deliberately. `flag_count` (does a row need
+a human at the CHANNEL?) still excludes known_undelivered -- a tracked config gap
+must not cry wolf twelve times a year -- while `nudge_candidates` (does the
+OWNER need a DM?) includes exactly those rows. One fact, two audiences.
+
 WHY THE FILER LEDGER IS THE RIGHT SOURCE. It is the record of what was actually
 FILED to Drive, which is what accounting needs to have in hand -- as opposed to
 what arrived in a mailbox (a mailbox hit that failed to file is a miss for this
@@ -62,6 +76,22 @@ _DOC_KIND_RE = re.compile(r"invoice|receipt|statement|remittance|bill(?:ing)?")
 STATUS_PRESENT = "PRESENT"
 STATUS_MISSING = "MISSING"
 STATUS_UNKNOWN = "UNKNOWN"
+
+#: Where a hand-downloaded invoice goes so the receipts flow files it: the
+#: "Receipts & Invoices Inbox" Drive folder (D-043 finance tier) and the
+#: receipts mailbox the yaml note names as the Ads billing-contact fix.
+RECEIPTS_INBOX_FOLDER_ID = "1I7zWcCIAOx7zdzIXcxx6WTLk1K40eizj"
+RECEIPTS_INBOX_URL = f"https://drive.google.com/drive/folders/{RECEIPTS_INBOX_FOLDER_ID}"
+RECEIPTS_MAILBOX = "receipts@hjrglobal.com"
+
+#: Fail-closed nudge recipient when the yaml owner handle does not resolve on
+#: the roster. Harrison's id is the one constant this repo hardcodes everywhere
+#: (knowledge_review.HARRISON_SLACK_USER_ID, tool_dispatch._HARRISON_SLACK_ID);
+#: every OTHER person is resolved through org-roles, never typed into src/.
+_HARRISON_SLACK_ID = "U0B2RM2JYJ1"
+
+#: The repeat-signal task name for this check (signal_key = task|vendor|entity).
+SIGNAL_TASK = "expected-invoice"
 
 
 def load_expectations(path: Path | None = None) -> list[dict[str, Any]] | None:
@@ -218,6 +248,7 @@ def assess(period: str | None = None, *,
                 "detail": "filer ledger is empty or unreadable",
                 "known_undelivered": bool(item.get("known_undelivered")),
                 "note": str(item.get("note") or ""),
+                **_owner_fields(item),
             })
         return out
 
@@ -231,6 +262,7 @@ def assess(period: str | None = None, *,
                 "detail": "entry has no `match` patterns, so it cannot be checked",
                 "known_undelivered": bool(item.get("known_undelivered")),
                 "note": str(item.get("note") or ""),
+                **_owner_fields(item),
             })
             continue
         hits = [
@@ -248,8 +280,91 @@ def assess(period: str | None = None, *,
             "filed_count": len(hits),
             "known_undelivered": bool(item.get("known_undelivered")),
             "note": str(item.get("note") or ""),
+            **_owner_fields(item),
         })
     return out
+
+
+def _owner_fields(item: dict[str, Any]) -> dict[str, str]:
+    """The two D-302 keys, carried verbatim from the yaml entry into a result row."""
+    return {
+        "owner": str(item.get("owner") or "").strip(),
+        "portal_url": str(item.get("portal_url") or "").strip(),
+    }
+
+
+# ── the owner nudge (Code #13 slice 9a) ──────────────────────────────────────
+
+def nudge_candidates(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Rows that owe the OWNER a nudge: status MISSING for a portal-only vendor
+    (known_undelivered). Independent of flag_count -- see the module docstring.
+    An UNAVAILABLE check nudges nobody (there is no fact to act on)."""
+    if not result.get("available"):
+        return []
+    return [r for r in (result.get("results") or [])
+            if r.get("status") == STATUS_MISSING and r.get("known_undelivered")]
+
+
+def signal_key_for(row: dict[str, Any]) -> str:
+    """expected-invoice|<vendor>|<entity> -- the repeat-signal identity. The
+    PERIOD is the fire_id, not part of the key: consecutive months are
+    consecutive fires of one signal."""
+    from .repeat_signal import make_key
+    return make_key(SIGNAL_TASK, str(row.get("name") or ""), str(row.get("entity") or ""))
+
+
+def resolve_owner(handle: str) -> tuple[str, str, bool]:
+    """(slack_id, display_name, resolved) for a yaml `owner:` handle via
+    org_roles.find_by_handle. Fail-closed: unresolved (blank, unknown or
+    ambiguous) -> Harrison, with a WARN naming the handle so the yaml gets fixed.
+    Never hardcodes anyone but Harrison."""
+    text = str(handle or "").strip()
+    rec = None
+    if text:
+        try:
+            from . import org_roles
+            rec = org_roles.find_by_handle(text)
+        except Exception:  # noqa: BLE001 -- roster trouble fails closed to Harrison
+            log.warning("expected_invoices: roster lookup failed for owner %r", text,
+                        exc_info=True)
+            rec = None
+    if rec is not None and rec.slack_id:
+        return rec.slack_id, rec.name, True
+    log.warning("expected_invoices: owner %r not resolvable on org-roles -- nudging "
+                "Harrison instead (fix the yaml `owner:` handle)", text or "<blank>")
+    return _HARRISON_SLACK_ID, "Harrison", False
+
+
+def format_owner_nudge(row: dict[str, Any], period: str, *, owner_name: str = "") -> str:
+    """The one nudge DM. Names the vendor, the period, the portal link, exactly
+    where to drop the download so the receipts flow files it, and the fact that
+    known_undelivered clears only by a human edit. No LLM, no PHI surface: every
+    field comes from the yaml the finance team maintains."""
+    name = str(row.get("name") or "the expected invoice")
+    entity = str(row.get("entity") or "")
+    tag = f" [{entity}]" if entity else ""
+    portal = str(row.get("portal_url") or "").strip()
+    greeting = f"Hi {owner_name.split()[0]} -- " if owner_name else ""
+    lines = [
+        f":page_facing_up: {greeting}*{name}*{tag} for *{period}* is not filed in Drive, "
+        f"and this vendor does not deliver it to any monitored mailbox, so it is "
+        f"yours to download.",
+    ]
+    if portal:
+        lines.append(f"• Portal: <{portal}|open the billing documents page> ({portal})")
+    else:
+        lines.append("• Portal: (no `portal_url` in finance-expected-invoices.yaml -- "
+                     "add one so this nudge can link it)")
+    lines.append(
+        f"• Drop the PDF in the Receipts & Invoices Inbox folder "
+        f"(<{RECEIPTS_INBOX_URL}|Drive folder {RECEIPTS_INBOX_FOLDER_ID}>) or email it "
+        f"to {RECEIPTS_MAILBOX} -- either lands in the receipts flow and the filer "
+        f"files it under invoices/.")
+    lines.append(
+        "• known_undelivered clears only when a human edits the yaml after the first "
+        "download lands -- until then this check reads the vendor as a tracked config "
+        "gap and nudges you once per missing month.")
+    return "\n".join(lines)
 
 
 #: How much of a known-undelivered note the Slack line carries. The rest stays in
@@ -280,9 +395,16 @@ def _first_sentence(note: Any) -> str:
     return (head[:cut] if cut > 40 else head).rstrip(" ,;:-") + " ..."
 
 
-def format_report(result: dict[str, Any]) -> str:
+def format_report(result: dict[str, Any], *,
+                  suppressed: dict[str, str] | None = None) -> str:
     """The Slack line(s). Leads with what is missing, because that is the only
-    part that needs a human."""
+    part that needs a human.
+
+    `suppressed` maps vendor name -> decision-card update_id for MISSING rows
+    whose repeat signal reached tier 3 (Code #13 slice 9b): the channel alarm is
+    the ORIGINAL surface for an un-flagged MISSING, so it is replaced by one
+    quiet line naming the card until Harrison acks it. Omitted -> byte-identical
+    to the pre-slice output."""
     per = result.get("period") or "?"
     if not result.get("available"):
         return (f":page_facing_up: *Expected invoices — {per}*\n"
@@ -292,10 +414,15 @@ def format_report(result: dict[str, Any]) -> str:
     missing = [r for r in rows if r.get("status") == STATUS_MISSING]
     unknown = [r for r in rows if r.get("status") == STATUS_UNKNOWN]
     present = [r for r in rows if r.get("status") == STATUS_PRESENT]
+    suppressed = suppressed or {}
 
     lines = [f":page_facing_up: *Expected invoices — {per}*"]
     for r in missing:
         tag = f" [{r['entity']}]" if r.get("entity") else ""
+        if r.get("name") in suppressed:
+            lines.append(f"• :no_bell: *{r['name']}*{tag} — still not filed; alarm "
+                         f"suppressed pending your ack on card {suppressed[r['name']]}")
+            continue
         # A vendor we ALREADY KNOW does not deliver to a monitored mailbox is a
         # standing configuration gap, not a new surprise. Saying so keeps the
         # monthly line honest instead of crying wolf twelve times a year.

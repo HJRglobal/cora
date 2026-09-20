@@ -423,6 +423,10 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     monkeypatch.setenv("FLYWHEEL_MIRROR_DIR", str(tmp_path / "flywheel-mirror"))
     monkeypatch.setenv("LEXICON_ROSTER_PATH", str(tmp_path / "lexicon-roster.yaml"))
     monkeypatch.setenv("STRATEGY_HEARTBEAT_PATH", str(tmp_path / "strategy-heartbeat.json"))
+    # Code #13 slice 9b: the repeat-signal escalation ledger (cora.repeat_signal;
+    # writers: the expected-invoice check, the nightly decision-gate check, the
+    # decision-card tap). Redirected in the SAME commit that introduced it.
+    monkeypatch.setenv("REPEAT_SIGNAL_LEDGER_PATH", str(tmp_path / "repeat-signals.jsonl"))
     # session #11 S4: the run-marker ledger. A new write path needs its conftest
     # redirect in the SAME commit that introduces it, or the next suite run is
     # what discovers the omission -- by writing to it.
@@ -451,6 +455,12 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
         ("cora.code_queue", "_MENU_RUNS_LEDGER", "code-queue-menu-runs.jsonl"),
         # Code #12 S3' coverage: the bot's armed-rails record (egress_rails.record_armed).
         ("cora.egress_rails", "ARMED_STATE_PATH", "egress-rails-armed.json"),
+        # Code #13 slice 9 integration: decision_lane's delivery ledger is a BARE
+        # module constant (no env override) read at call time by delivery_index /
+        # record_delivery -- the nightly decision-gate check now records a ping row
+        # through it every run, and the file sat in _GUARDED_LEDGERS (detect-only)
+        # with no redirect. Surfaced as a session-guard error in a fresh worktree.
+        ("cora.decision_lane", "DELIVERY_LEDGER", "decision-deliveries.jsonl"),
         ("cora.knowledge_review", "_AUTOWRITE_AUDIT_PATH", "cora-autowrite-audit.jsonl"),
         # cq-eba0861fc043 (session #11 S2): these THREE sat un-redirected right beside
         # _AUTOWRITE_AUDIT_PATH above. propose_update() appends to
@@ -585,6 +595,8 @@ _GUARDED_LEDGERS = (
     "logs/cora-instances.jsonl",
     "data/health/instance.json",
     "logs/decision-deliveries.jsonl",
+    # Code #13 slice 9b: the repeat-signal escalation ledger (cora.repeat_signal).
+    "logs/repeat-signals.jsonl",
     "logs/fireflies-diarization.jsonl",
     # Code #12 (D-051 review): the three write paths this bundle added.
     "data/state/code-queue-menu-runs.jsonl",
