@@ -491,9 +491,30 @@ def live_tool_families(entity: str | None) -> list[str]:
     except Exception as exc:  # noqa: BLE001
         log.warning("self_inventory: tool list unavailable: %s", exc)
         return []
-    fams = [label for label, pred in _TOOL_FAMILIES if any(pred(n) for n in names)]
+    fams = [_with_asana_identity(label) for label, pred in _TOOL_FAMILIES if any(pred(n) for n in names)]
     fams.append(_WEB_CONNECTOR_NOTE)
     return fams
+
+
+_ASANA_FAMILY_LABEL = "Asana (live tasks)"
+
+
+def _with_asana_identity(label: str) -> str:
+    """Append the ACTIVE Asana identity to the Asana family line (S-B adjacency).
+
+    Reads the resolver (cora.asana_identity), never a token: the suffix is the
+    identity NAME ("harrison" / "cora") so an attribution question ("did Cora or
+    Harrison create that task?") can cite it. Fail-soft: an unrecognised flag
+    renders as "unknown" rather than hiding the family.
+    """
+    if label != _ASANA_FAMILY_LABEL:
+        return label
+    try:
+        from cora import asana_identity
+        identity = asana_identity.active_identity()
+    except Exception:  # noqa: BLE001
+        identity = "unknown"
+    return f"{label}; acting as: {identity}"
 
 
 # ── inventory build ──────────────────────────────────────────────────────────

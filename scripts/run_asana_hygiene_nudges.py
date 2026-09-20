@@ -9,7 +9,8 @@ Usage (Windows Task Scheduler):
     python scripts/run_asana_hygiene_nudges.py [--dry-run]
 
 Environment variables required:
-    ASANA_PAT            Asana personal access token
+    ASANA_PAT            Asana personal access token (identity "harrison", default)
+    ASANA_PAT_CORA       used instead when CORA_ASANA_IDENTITY=cora (S-B)
     SLACK_BOT_TOKEN      (for sending DMs if needed -- not used in this script)
 """
 

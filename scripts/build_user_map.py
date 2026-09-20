@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Auto-build slack-to-asana mapping by matching users on email.
 
-Pulls Asana workspace users (via ASANA_PAT) AND Slack workspace members
+Pulls Asana workspace users (via the active identity's PAT -- ASANA_PAT or
+ASANA_PAT_CORA per CORA_ASANA_IDENTITY) AND Slack workspace members
 (via SLACK_BOT_TOKEN), joins on email, and emits paste-ready YAML rows
 for every user present in both systems.
 
@@ -25,6 +26,7 @@ the workspace — but Slack will email you a re-auth link).
 
 import os
 import sys
+from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
@@ -32,6 +34,11 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 load_dotenv()
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+from cora.asana_identity import AsanaIdentityError, resolve_pat  # noqa: E402
 
 _ASANA_WORKSPACE_GID = "682743441507584"  # HJR Global
 
@@ -75,11 +82,15 @@ def _dump_slack_users(token: str) -> list[dict]:
 
 
 def main() -> int:
-    pat = os.environ.get("ASANA_PAT", "")
-    slack_token = os.environ.get("SLACK_BOT_TOKEN", "")
-    if not pat:
-        print("ERROR: ASANA_PAT not set in .env", file=sys.stderr)
+    # Active Asana identity's token (S-B): ASANA_PAT by default, ASANA_PAT_CORA
+    # under CORA_ASANA_IDENTITY=cora; hard-fail naming the KEY, never a fallback.
+    try:
+        pat, identity = resolve_pat()
+    except AsanaIdentityError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+    print(f"Asana identity: {identity}", file=sys.stderr)
+    slack_token = os.environ.get("SLACK_BOT_TOKEN", "")
     if not slack_token:
         print("ERROR: SLACK_BOT_TOKEN not set in .env", file=sys.stderr)
         return 1

@@ -36,7 +36,11 @@ def _load() -> "Config":
     app_token = get("SLACK_APP_TOKEN")
     signing_secret = get("SLACK_SIGNING_SECRET")
     anthropic_key = get("ANTHROPIC_API_KEY")
-    # Asana PAT is optional -- bot boots without it, Asana tool-use becomes a no-op
+    # Asana PAT is optional -- bot boots without it, Asana tool-use becomes a no-op.
+    # NOTE (S-B, 2026-09-19): nothing reads config.asana_pat -- every Asana caller
+    # resolves its token per call through cora.asana_identity.resolve_pat(), which
+    # honours CORA_ASANA_IDENTITY (harrison -> ASANA_PAT, cora -> ASANA_PAT_CORA).
+    # This load is retained only for the REPLACE_ME/prefix validation of the key.
     asana_pat = get("ASANA_PAT", required=False, default="")
     # HubSpot Private App token -- optional, HubSpot tool-use disabled if missing
     hubspot_token = get("HUBSPOT_PRIVATE_APP_TOKEN", required=False, default="")

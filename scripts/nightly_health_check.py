@@ -168,14 +168,29 @@ _TASK_LABELS: dict[str, str] = {
     "cowork-cora-proactive-gaps":    "Proactive gaps",
 }
 
-# Required env vars — subset that would break Cora if missing
+# Required env vars — subset that would break Cora if missing. The Asana PAT key
+# is NOT listed here: which key is required depends on CORA_ASANA_IDENTITY
+# (S-B, 2026-09-19) -- see _required_env_vars(), which appends the ACTIVE
+# identity's key (ASANA_PAT for "harrison", ASANA_PAT_CORA for "cora").
 _REQUIRED_ENV_VARS = [
     "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "ANTHROPIC_API_KEY",
-    "ASANA_PAT", "NOTION_API_KEY", "OPENAI_API_KEY",
+    "NOTION_API_KEY", "OPENAI_API_KEY",
     "FIREFLIES_API_KEY", "GOOGLE_SERVICE_ACCOUNT_JSON",
     "GSHEETS_CASHFLOW_FILE_ID", "HUBSPOT_PRIVATE_APP_TOKEN",
     "SHOPIFY_F3E_ACCESS_TOKEN",
 ]
+
+
+def _required_env_vars() -> list[str]:
+    """The static list plus the ACTIVE Asana identity's PAT key name.
+
+    Identity-aware by construction: after Harrison flips CORA_ASANA_IDENTITY=cora
+    the check demands ASANA_PAT_CORA (and stops demanding ASANA_PAT, which he
+    removes on day 14). An unrecognised flag value raises AsanaIdentityError;
+    check_env_vars() turns that into a CRITICAL naming the flag, key names only.
+    """
+    from cora import asana_identity  # noqa: PLC0415
+    return [*_REQUIRED_ENV_VARS, asana_identity.active_pat_key()]
 
 # Critical log patterns — any match flags the log
 _CRITICAL_LOG_PATTERNS = [
@@ -2052,20 +2067,29 @@ def check_api_connectivity() -> list[CheckResult]:
     except Exception as exc:
         results.append(CheckResult("Slack API", "critical", f"Connection error: {exc}"))
 
-    # Asana
+    # Asana -- the ACTIVE identity's token via the single resolver (S-B). The
+    # detail names the identity so a users/me answer that says "Harrison" under
+    # CORA_ASANA_IDENTITY=cora reads as the misconfiguration it is.
     try:
-        asana_pat = os.environ.get("ASANA_PAT", "")
-        r = httpx.get(
-            "https://app.asana.com/api/1.0/users/me",
-            headers={"Authorization": f"Bearer {asana_pat}"},
-            timeout=10
-        )
-        if r.status_code == 200:
-            name = r.json().get("data", {}).get("name", "")
-            results.append(CheckResult("Asana API", "ok", f"Connected — {name}"))
-        else:
-            results.append(CheckResult("Asana API", "warn",
-                                       f"Returned {r.status_code}"))
+        from cora import asana_identity  # noqa: PLC0415
+        try:
+            asana_pat, asana_ident = asana_identity.resolve_pat()
+        except asana_identity.AsanaIdentityError as exc:
+            asana_pat, asana_ident = "", ""
+            results.append(CheckResult("Asana API", "warn", str(exc)))
+        if asana_pat:
+            r = httpx.get(
+                "https://app.asana.com/api/1.0/users/me",
+                headers={"Authorization": f"Bearer {asana_pat}"},
+                timeout=10
+            )
+            if r.status_code == 200:
+                name = r.json().get("data", {}).get("name", "")
+                results.append(CheckResult(
+                    "Asana API", "ok", f"Connected — {name} (identity: {asana_ident})"))
+            else:
+                results.append(CheckResult("Asana API", "warn",
+                                           f"Returned {r.status_code} (identity: {asana_ident})"))
     except Exception as exc:
         results.append(CheckResult("Asana API", "warn", f"Connection error: {exc}"))
 
@@ -2138,15 +2162,25 @@ def check_api_connectivity() -> list[CheckResult]:
 
 
 def check_env_vars() -> CheckResult:
-    """Verify all required environment variables are set."""
-    missing = [v for v in _REQUIRED_ENV_VARS if not os.environ.get(v, "").strip()]
+    """Verify all required environment variables are set (identity-aware for Asana)."""
+    from cora import asana_identity  # noqa: PLC0415
+    try:
+        required = _required_env_vars()
+        identity = asana_identity.active_identity()
+    except asana_identity.AsanaIdentityError as exc:
+        # Key/flag NAMES only in the detail (the resolver never echoes a value).
+        return CheckResult("Environment variables", "critical", str(exc))
+    missing = [v for v in required if not os.environ.get(v, "").strip()]
     if missing:
         return CheckResult(
             "Environment variables", "critical",
-            f"{len(missing)} required var(s) missing: {', '.join(missing)}"
+            f"{len(missing)} required var(s) missing: {', '.join(missing)} "
+            f"(Asana identity: {identity} via {asana_identity.pat_key_for(identity)})"
         )
-    return CheckResult("Environment variables", "ok",
-                       f"All {len(_REQUIRED_ENV_VARS)} required vars present.")
+    return CheckResult(
+        "Environment variables", "ok",
+        f"All {len(required)} required vars present "
+        f"(Asana identity: {identity} via {asana_identity.pat_key_for(identity)}).")
 
 
 def check_disk_space() -> CheckResult:

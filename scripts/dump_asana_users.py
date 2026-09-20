@@ -4,7 +4,8 @@
 Usage:
     python scripts/dump_asana_users.py [> dump.yaml]
 
-Reads ASANA_PAT from .env. Lists every user in the HJR Global workspace
+Reads the active identity's PAT from .env (ASANA_PAT, or ASANA_PAT_CORA under
+CORA_ASANA_IDENTITY=cora). Lists every user in the HJR Global workspace
 (gid 682743441507584) sorted alphabetically. For each user, emits a YAML
 row pre-populated with asana_user_gid, asana_email, display_name — leaving
 slack_user_id as a placeholder for Harrison to fill in.
@@ -18,22 +19,31 @@ People who aren't in Asana can't be mapped (Cora returns a graceful "not
 mapped" error for them — fall back to the static-context answer path).
 """
 
-import os
 import sys
+from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+from cora.asana_identity import AsanaIdentityError, resolve_pat  # noqa: E402
+
 _WORKSPACE_GID = "682743441507584"  # HJR Global
 
 
 def main() -> int:
-    pat = os.environ.get("ASANA_PAT", "")
-    if not pat:
-        print("ERROR: ASANA_PAT not set in .env", file=sys.stderr)
+    # Active Asana identity's token (S-B): ASANA_PAT by default, ASANA_PAT_CORA
+    # under CORA_ASANA_IDENTITY=cora; hard-fail naming the KEY, never a fallback.
+    try:
+        pat, identity = resolve_pat()
+    except AsanaIdentityError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+    print(f"# Asana identity: {identity}", file=sys.stderr)
 
     try:
         r = httpx.get(

@@ -14,7 +14,8 @@ Options:
 Environment variables required (already in .env if Cora is running):
     FIREFLIES_API_KEY      Fireflies GraphQL API key
     ANTHROPIC_API_KEY      For Claude Haiku action item parsing
-    ASANA_PAT              For creating Asana tasks
+    ASANA_PAT              For creating Asana tasks (identity "harrison", default)
+    ASANA_PAT_CORA         used instead when CORA_ASANA_IDENTITY=cora (S-B)
     SLACK_BOT_TOKEN        For posting digests to Slack
 
 See deployment/setup-meeting-action-capture-task.ps1 to register the scheduled task.

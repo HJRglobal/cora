@@ -5,9 +5,12 @@ Two responsibilities:
   1. log_pm_action() -- append ONE line to logs/pm-actions.jsonl for every task action
      Cora performs via her tools (create / complete / delete / update / comment /
      subtask / meeting-capture). This is the authoritative, per-person Cora-attributed
-     record: the single-PAT Asana model attributes every Cora write to Harrison, so
-     `created_by` can't distinguish Cora-vs-UI -- the log is the ground truth for the
-     Cora side. NO task TITLE is ever persisted (gid + entity + action only): these
+     record. Attribution depends on the active Asana identity
+     (cora.asana_identity, flag CORA_ASANA_IDENTITY): under "harrison" (the
+     default) every Cora write is attributed to Harrison, so `created_by` can't
+     distinguish Cora-vs-UI; under "cora" writes land as the cora@ seat, but this
+     log stays the ground truth for the Cora side across the flip (history before
+     the flip carries Harrison's `created_by`). NO task TITLE is ever persisted (gid + entity + action only): these
      edit tools act CROSS-ENTITY (a founder / FNDR / HJRG asker can act on their own
      LEX task, so the channel entity can't reliably gate a LEX title), so titles are
      omitted UNCONDITIONALLY -- that closes invariant #2 (LEX aggregate-only) with no

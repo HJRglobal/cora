@@ -6,7 +6,8 @@ Phase 2 #7 MVP scope:
   read-only doctrine deliberately reversed per Harrison decision after
   5/21 Lex Progress meeting verbal commitments)
 - One workspace hard-coded (HJR Global, gid 682743441507584)
-- PAT inherited from .env (ASANA_PAT)
+- PAT resolved per call by cora.asana_identity: ASANA_PAT (identity "harrison",
+  the default) or ASANA_PAT_CORA (identity "cora", CORA_ASANA_IDENTITY=cora)
 
 Write doctrine (LOCKED 2026-05-21):
 - All writes go through the staged-write pattern: Claude MUST show the
@@ -58,10 +59,20 @@ class AsanaClientError(Exception):
 
 
 def _pat() -> str:
-    val = os.environ.get("ASANA_PAT", "")
-    if not val:
-        raise AsanaClientError("ASANA_PAT not set in environment — Asana tool-use disabled")
-    return val
+    """The active identity's PAT via the single resolver (asana_identity).
+
+    CORA_ASANA_IDENTITY unset/"harrison" -> ASANA_PAT (byte-identical to the
+    pre-S-B read); "cora" -> ASANA_PAT_CORA, hard-raise when missing (never a
+    silent fallback to Harrison's token). Wrapped in AsanaClientError so every
+    existing caller's error contract is unchanged; the message names KEY NAMES
+    only.
+    """
+    from ..asana_identity import AsanaIdentityError, resolve_pat  # noqa: PLC0415
+    try:
+        token, _identity = resolve_pat()
+    except AsanaIdentityError as exc:
+        raise AsanaClientError(str(exc)) from exc
+    return token
 
 
 # Default opt_fields for a per-user task fetch. The plate/digest paths need the

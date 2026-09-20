@@ -250,13 +250,19 @@ def main() -> int:
     log.info("=== Project Channel Sync starting (dry_run=%s) ===", args.dry_run)
 
     bot_token = os.environ.get("SLACK_BOT_TOKEN", "")
-    asana_token = os.environ.get("ASANA_PAT", "")
     if not bot_token:
         log.error("SLACK_BOT_TOKEN not set")
         return 1
-    if not asana_token:
-        log.error("ASANA_PAT not set")
+    # Active Asana identity's token via the single resolver (S-B): ASANA_PAT by
+    # default, ASANA_PAT_CORA under CORA_ASANA_IDENTITY=cora; hard-fail, never a
+    # fallback. Scripts are a fresh process per fire, so the flip needs no restart here.
+    from cora.asana_identity import AsanaIdentityError, resolve_pat  # noqa: PLC0415
+    try:
+        asana_token, asana_identity_name = resolve_pat()
+    except AsanaIdentityError as exc:
+        log.error("%s", exc)  # key NAMES only
         return 1
+    log.info("Asana identity: %s", asana_identity_name)
 
     from slack_sdk import WebClient
     client = WebClient(token=bot_token)

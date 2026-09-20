@@ -60,10 +60,14 @@ class AsanaConnectorError(Exception):
 
 
 def _pat() -> str:
-    val = os.environ.get("ASANA_PAT", "")
-    if not val:
-        raise AsanaConnectorError("ASANA_PAT not set — Asana connector disabled")
-    return val
+    """Active identity's PAT via cora.asana_identity (S-B): ASANA_PAT by default,
+    ASANA_PAT_CORA under CORA_ASANA_IDENTITY=cora; hard-raise, never a fallback."""
+    from ..asana_identity import AsanaIdentityError, resolve_pat  # noqa: PLC0415
+    try:
+        token, _identity = resolve_pat()
+    except AsanaIdentityError as exc:
+        raise AsanaConnectorError(str(exc)) from exc
+    return token
 
 
 def _headers() -> dict[str, str]:

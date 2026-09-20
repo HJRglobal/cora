@@ -14,7 +14,8 @@ Usage (Windows Task Scheduler):
     python scripts/run_due_date_escalation.py [--dry-run]
 
 Environment variables required:
-    ASANA_PAT           Asana personal access token
+    ASANA_PAT           Asana personal access token (identity "harrison", default)
+    ASANA_PAT_CORA      used instead when CORA_ASANA_IDENTITY=cora (S-B)
     SLACK_BOT_TOKEN     For sending DMs
 """
 
