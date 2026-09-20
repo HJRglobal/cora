@@ -8,6 +8,11 @@
 # must be true for any tier above T1 (no failing-capable monitor = no promotion
 # past T1). Every tier change is an `events[]` entry with evidence; no lane skips
 # a tier; demotion is automatic on an unapproved action / failed audit / class WARN.
+# ENFORCED by ladder_registry.validate (D-051 EF-8): a seeded/promoted/demoted
+# event carries `tier:` = the tier the lane holds AFTER it; the LAST such event
+# must equal the row's `tier` (edit `tier` without appending an event -> schema
+# violation), a `promoted` event is exactly one rank up, a `demoted` event is
+# strictly lower.
 #
 # WRITTEN ONLY BY A CODE/COWORK COMMIT. The bot never writes this file. Every row
 # is `confirmed_by: pending-Harrison` until his ONE batch confirm (Code #13 report
@@ -37,6 +42,7 @@ lanes:
     events:
       - ts: 2026-09-19
         event: seeded
+        tier: T0
         by: code-13
         evidence: "_shared/projects/cora/2026-09-09_fndr_cora-code-12-queue-metabolism-CASCADE-REPORT.md section 4 (T0 OBSERVE, verbatim)"
 
@@ -55,6 +61,7 @@ lanes:
     events:
       - ts: 2026-09-19
         event: seeded
+        tier: T1
         by: code-13
         evidence: "Code #12 report section 4 ('T1-class named terminal, bounded to 3 types x 2 entities x 14d, content-screened; the card is propose-only'). NOTE: the expiry ACTS without a tap, bounded by ruled constants -- within-tier by ruling, not drift."
 
@@ -73,6 +80,7 @@ lanes:
     events:
       - ts: 2026-09-19
         event: seeded
+        tier: T0
         by: code-13
         evidence: "_shared/projects/cora/_mirror/cora-mirror-LADDER-ROW.md (verbatim; superseded by this registry's rendered file)"
 
@@ -91,6 +99,7 @@ lanes:
     events:
       - ts: 2026-09-19
         event: seeded
+        tier: T0
         by: code-13
         evidence: "_shared/projects/cora/2026-09-08_fndr_cora-ingest-integrity-bundle-CASCADE-REPORT.md section 4 (verbatim)"
 
@@ -109,6 +118,7 @@ lanes:
     events:
       - ts: 2026-09-19
         event: seeded
+        tier: T0
         by: code-13
         evidence: "_shared/projects/cora/_notes/2026-09-08_fndr_cora-code-prompt-dr-manifest-vm-step1-KICKOFF.md line 39 (row fields); lane absent on main"
 
@@ -127,6 +137,7 @@ lanes:
     events:
       - ts: 2026-09-19
         event: seeded
+        tier: CAP-T1
         by: code-13
         evidence: "charter v1 section 1 line 23 ('the blog one-tap lane = permanent T1'); code: publish_cards.process_tap Harrison-only gate"
 
@@ -145,6 +156,7 @@ lanes:
     events:
       - ts: 2026-09-19
         event: seeded
+        tier: T1
         by: code-13
         evidence: "HONEST tier by code: tool_dispatch runs the F-23 two-call preview->confirm even in-channel (the G1 grant is an ENTITY grant, commit 5e5822c) = requester-approve-then-act. The kickoff wrote T2; seeded T1 pending Harrison's ruling."
 
@@ -164,6 +176,7 @@ lanes:
     events:
       - ts: 2026-09-19
         event: seeded
+        tier: T1
         by: code-13
         evidence: "code: two-call staged write (requester confirm) behind delegated_work.delegated_level(); memory project_cora_delegated_work_phase1"
 
@@ -182,6 +195,7 @@ lanes:
     events:
       - ts: 2026-09-19
         event: seeded
+        tier: T0
         by: code-13
         evidence: "_shared/projects/cora/_mirror/cowork-scheduled-tasks/cora-mirror-fndr-email-triage-twice-daily.md; cq-8324caf8fa08 = the evidence_monitor gap"
 
@@ -200,6 +214,7 @@ lanes:
     events:
       - ts: 2026-09-19
         event: seeded
+        tier: T0
         by: code-13
         evidence: "the ZONE-X mirror body line 8 ('NEVER sends, D-137')"
 
@@ -219,6 +234,7 @@ lanes:
     events:
       - ts: 2026-09-19
         event: seeded
+        tier: T0
         by: code-13
         evidence: ".env carries no CORA_SEND_LIVE key (name check) -> Tier 0 forced for every playbook (send_trust.send_live_mode)"
 
@@ -238,6 +254,7 @@ lanes:
     events:
       - ts: 2026-09-19
         event: seeded
+        tier: T2
         by: code-13
         evidence: "decisions.md 2026-09-08 'One Cora Notetaker' (live flip); .env carries CORA_ONECORA_ENSURE (name check); history before this registry is not reconstructed"
 
@@ -257,6 +274,7 @@ lanes:
     events:
       - ts: 2026-09-19
         event: seeded
+        tier: T0
         by: code-13
         evidence: "Code #13 kickoff section 1 slice 1 (cq-2a88e32a75ea); born T0 OBSERVE"
 
@@ -275,6 +293,7 @@ lanes:
     events:
       - ts: 2026-09-19
         event: seeded
+        tier: T1
         by: code-13
         evidence: "Code #12 S1' (cq-554184feb53b) + Code #13 RIDER 2 (cq-70d7b203f7ad)"
 
@@ -293,6 +312,7 @@ lanes:
     events:
       - ts: 2026-09-19
         event: seeded
+        tier: T2
         by: code-13
         evidence: "Code #13 kickoff section 1 slice 2 (cq-fb50c9e6c911); the 9/9 host outage lost 13 nightly fires and nothing noticed"
 
@@ -312,6 +332,7 @@ lanes:
     events:
       - ts: 2026-09-19
         event: seeded
+        tier: T2
         by: code-13
         evidence: "decisions.md 2026-09-08 R1 ruling (RSVP-accept as cora@ = THE fix); cq-19b0298cf5be; Code #13 slice 3"
 
@@ -332,6 +353,7 @@ lanes:
     events:
       - ts: 2026-09-19
         event: seeded
+        tier: T0
         by: code-13
         evidence: "decisions.md 2026-09-08 R2 ruling; cq-7a724ee43964; Code #13 slice 5"
 
@@ -350,6 +372,7 @@ lanes:
     events:
       - ts: 2026-09-19
         event: seeded
+        tier: T2
         by: code-13
         evidence: "D-303 ruled 2026-09-10 (allowlist-by-folder, v1 = HJR-Founder-OS root); cq-c5ed06e1f0bf; Code #13 slice 8"
 
@@ -368,6 +391,7 @@ lanes:
     events:
       - ts: 2026-09-19
         event: seeded
+        tier: T0
         by: code-13
         evidence: "D-302 ruled 2026-09-10; audit 2026-09-19 section 3 (decision gates re-alarm every 8-9 d and self-clear); Code #13 slice 9"
 
@@ -386,6 +410,7 @@ lanes:
     events:
       - ts: 2026-09-19
         event: seeded
+        tier: T0
         by: code-13
         evidence: "D-302 ruled 2026-09-10 (day ~9 + owner-DM nudge); cq-21207e34a954"
 
@@ -404,5 +429,6 @@ lanes:
     events:
       - ts: 2026-09-19
         event: seeded
+        tier: T0
         by: code-13
         evidence: "cq-06045f418bd2; coverage re-measured 2026-09-19: 0 of 109 Cowork tasks write the contract (the 4 self-loggers write ad-hoc jsonl to three other Drive paths -- the 9/8 '4 of 74' read counted those); a task that fires and writes nothing == one that never fired"

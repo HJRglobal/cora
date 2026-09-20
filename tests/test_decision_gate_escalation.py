@@ -132,6 +132,29 @@ def test_a_real_human_facing_delivery_still_silences_the_control(monkeypatch, tm
     assert hc.check_decision_gates(today=TODAY).status == "ok"
 
 
+def test_a_legacy_health_check_row_is_a_ping_not_a_delivery(monkeypatch, tmp_path, ledger):
+    """D-051 EF-3 regression. The live ledger holds 16 rows written BEFORE the
+    'ping:' prefix existed, surface 'health_check' (latest 2026-09-18). Skipping
+    only the prefix left them counting as deliveries, so the four blown gates
+    stayed silent for up to 8 more days after the merge -- the exact self-
+    clearing silence D-310 exists to end. The legacy spelling is a ping too."""
+    stamp = (NOW - timedelta(hours=20)).isoformat()
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text(json.dumps({"ts": stamp, "surface": "health_check",
+                                  "topic": TOPIC, "key": dl._topic_key(TOPIC)}) + "\n",
+                      encoding="utf-8")
+    assert "health_check" in dl.LEGACY_PING_SURFACES
+    assert dl.delivery_index(now=NOW) == {}
+    entries = dl.parse_entries(_file(_entry(TOPIC)), today=TODAY)
+    overdue = dl.undelivered_overdue(entries, today=TODAY, now=NOW)
+    assert len(overdue) == 1 and overdue[0]["never_delivered"] is True
+    hc = _hc(monkeypatch, tmp_path, _file(_entry(TOPIC)))
+    assert hc.check_decision_gates(today=TODAY).status == "critical"
+    # a real human-facing surface written the same day still counts
+    dl.record_delivery(TOPIC, "strategy_memo")
+    assert dl._topic_key(TOPIC) in dl.delivery_index(now=datetime.now(timezone.utc))
+
+
 def test_the_old_delivery_surface_name_is_gone_from_the_check():
     src = (_REPO_ROOT / "scripts" / "nightly_health_check.py").read_text(encoding="utf-8")
     assert 'PING_SURFACE_PREFIX + "health_check"' in src

@@ -527,32 +527,77 @@ def rail2_legacy_hit(sentence: str) -> tuple[str, str] | None:
     return sorted(hit)[0], "/".join(sorted(lines & {"ENERGY", "MOOD"}))
 
 
+#: Words a clause segment may hold and still be a BARE brand mention ("or F3 Pure",
+#: "and F3 Energy"): the brand tokens themselves plus these fillers. Anything else
+#: makes it a clause of its own.
+_BARE_BRAND_FILLER = frozenset({"f3", "f3's", "and", "the", "a", "an", "also", "too", "even"})
+
+
+def _bare_brand_segment(seg: str) -> bool:
+    """True when a clause segment names an F3 line and NOTHING else -- "F3 Pure or
+    F3 Energy" splits on "or" into a real clause and a bare coordinated brand, and
+    the bare half belongs to the clause before it, not to a clause of its own."""
+    named = False
+    for w in _words(seg):
+        wl = w.lower().strip("'&/-")
+        if wl in _BARE_BRAND_FILLER:
+            continue
+        if wl in ("energy", "pure", "mood") and _is_brandish(w):
+            named = True
+            continue
+        return False
+    return named
+
+
 def rail2_attribution_hit(sentence: str) -> tuple[str, str] | None:
     """The ATTRIBUTION-scoped rail-2 test (see the block comment above): trips when
     a clean token is predicated of Energy/Mood -- i.e. it is neither Pure-attached
     within its own clause segment nor an environmental object. NOT the shipping
-    rail; measured by rail2_harness."""
+    rail; measured by rail2_harness.
+
+    INHERITANCE IS FAIL-CLOSED (D-051 EF-7). The first cut let a brand-less clause
+    inherit only the NEAREST preceding brand clause, so "F3 Energy, like F3 Pure,
+    is clean." cleared: the parenthetical named Pure alone and the predicate
+    "is clean" inherited it, though the sentence's subject is Energy. Now a
+    brand-less segment carrying a clean token inherits the UNION of every line
+    named earlier in the sentence; Energy/Mood anywhere in that union trips (the
+    ruled "ambiguous = trips" posture). Consequence, accepted by ruling: the 9/1
+    shape "..., with F3 Pure using organic cane sugar, monk fruit and stevia as
+    its clean-sweetened base" (Pure AND Energy named earlier) trips again and
+    sits in rail2_harness.UNDECIDED -- write it as two sentences rather than open
+    the holes above with an attachment heuristic. A bare coordinated brand after
+    a split word ("... from F3 Pure or F3 Energy") is merged back into the clause
+    it coordinates with, so "Clean energy from F3 Pure or F3 Energy" reads as one
+    clause naming both. A clause that names a brand ITSELF keeps its own
+    attribution: "... or the clean-sweetened version in F3 Pure" (the 8/26 live
+    rejection) still clears.
+    """
     sent = sentence or ""
     lines = brand_lines_in(sent)
     if not (lines & {"ENERGY", "MOOD"}):
         return None
     scan_sent = _redact(_redact(sent, _NATURAL_OCCURRENCE_RES), _CLEAN_ENVIRONMENT_RES)
-    # A clause with no brand of its own inherits the nearest PRECEDING clause's
-    # line(s): "..., with F3 Pure using organic cane sugar, monk fruit and stevia as
-    # its clean-sweetened base" attaches to Pure (the 9/1 shape), while "F3 Energy
-    # delivers exactly what our customers are seeking, clean energy" attaches to
-    # Energy (the Earthbar quote). A clean clause BEFORE any brand clause inherits
-    # nothing and therefore trips (fail closed).
-    carry: set[str] = set()
+    # Segment, folding a bare coordinated brand into the clause before it. Parts
+    # are kept as lists and joined once per segment so a long run of ", F3 Pure"
+    # coordinations stays linear (no repeated string growth).
+    segs: list[list[str]] = []
     for seg in _CLAUSE_SPLIT_RE.split(scan_sent):
+        if segs and _bare_brand_segment(seg):
+            segs[-1].append(seg)
+        else:
+            segs.append([seg])
+    carry: set[str] = set()
+    for parts in segs:
+        seg = " ".join(parts)
         own = brand_lines_in(seg)
-        if own:
-            carry = own
+        # own attribution wins; a brand-less clause inherits EVERY line named so
+        # far (the union), never just the nearest one
+        seg_lines = own or set(carry)
+        carry |= own
         toks = {w.lower().strip("'&/-") for w in _words(seg)}
         hit = toks & _CLEAN_TOKENS
         if not hit:
             continue
-        seg_lines = own or carry
         if "PURE" in seg_lines and not (seg_lines & {"ENERGY", "MOOD"}):
             continue  # the ONE cleared attachment: the clean word sits with Pure alone
         return sorted(hit)[0], "/".join(sorted(lines & {"ENERGY", "MOOD"}))

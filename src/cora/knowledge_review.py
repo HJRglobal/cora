@@ -1469,10 +1469,15 @@ def _ack_repeat_signal(update: dict[str, Any], *, via: str) -> None:
     """Code #13 slice 9b: a decision_capture card minted by repeat_signal (tier
     3) carries payload.signal_key; Harrison's Accept OR Dismiss on it IS the
     acknowledgement that lifts suppression at the signal's original surface.
-    Called only from process_decision_tap, which is Harrison-gated above, and
-    only after the row reached a TERMINAL state (apply_failed leaves the card
-    PENDING and does not ack). Fail-soft: an ack bookkeeping error never turns a
-    successful tap into a failed one."""
+    Called from process_decision_tap (Harrison-gated above) and from every
+    OTHER terminal resolution of a decision card in run_knowledge_review (the
+    emoji-reaction executor, the render-time LEX/PHI dismiss, the Step-0
+    self-heal) -- D-051 EF-2: a card resolved by any path leaves nothing to tap,
+    so the signal behind it must not stay suppressed. Only after the row reached
+    a TERMINAL state (apply_failed leaves the card PENDING and does not ack).
+    repeat_signal.fire re-verifies the card on every suppressed fire as the
+    belt. Fail-soft: an ack bookkeeping error never turns a successful tap into
+    a failed one."""
     try:
         signal_key = str(((update or {}).get("payload") or {}).get("signal_key") or "")
         if not signal_key:

@@ -18,8 +18,10 @@ WHAT THIS MODULE HOLDS (data + pure functions; no network, no LLM):
   * FALSE_POSITIVE_SET -- the measured FP shapes (the 8/26 and 9/1 live rejections,
                           the CleanHub environmental sentences, the chemistry
                           sentence) that a correct attribution rail must PASS;
-  * UNDECIDED          -- the 9/14 jam sentence ('natural caffeine' on Energy):
-                          reported, never gated -- it needs Harrison's ruling;
+  * UNDECIDED          -- the 9/14 jam sentence ('natural caffeine' on Energy) and
+                          the 9/1 Pure-attached tail (trips again under fail-closed
+                          union inheritance, D-051 EF-7): reported, never gated --
+                          each needs Harrison's ruling;
   * new_preflight()    -- run_preflight with rail 2 swapped for the attribution
                           sibling (every OTHER rail unchanged), composed here so
                           run_preflight keeps its four parameters and no caller can
@@ -63,6 +65,16 @@ CLAIMS_HOLE_PROBES: dict[str, tuple[str, ...]] = {
         "Energy drinks from F3 are all-natural and clean.",
         # ambiguous attachment: Pure AND Energy in the same clause -> fail closed
         "F3 Pure and F3 Energy are both clean-sweetened for the same crowd.",
+        # D-051 EF-7: a Pure parenthetical between an Energy/Mood SUBJECT and its
+        # clean predicate must not clear the predicate (nearest-clause inheritance
+        # did; union inheritance does not)
+        "F3 Energy, like F3 Pure, is clean.",
+        "F3 Energy, similar to F3 Pure, is all-natural.",
+        "F3 Mood, our companion to F3 Pure, is the clean way to wind down.",
+        "F3 Energy: think F3 Pure, then clean caffeine on top.",
+        # D-051 EF-7: a disjunction of brands attaches the clean word to BOTH
+        "Clean energy from F3 Pure or F3 Energy.",
+        "F3 Energy or F3 Pure: clean, natural energy.",
     ),
     "nsf_on_pure_mood": (
         "F3 Pure is NSF Certified for Sport.",
@@ -90,10 +102,7 @@ CLAIMS_HOLE_PROBES: dict[str, tuple[str, ...]] = {
 FALSE_POSITIVE_SET: tuple[str, ...] = (
     # 8/26: the first live rejection, quoted in drafting.py
     "Explore the full stack in F3 Energy or the clean-sweetened version in F3 Pure.",
-    # 9/1 attempt 1: the Pure-attached shape
-    "If caffeine plus L-theanine is what you are after, F3 Pure and F3 Energy are both built "
-    "around that pairing, with F3 Pure using organic cane sugar, monk fruit and stevia as its "
-    "clean-sweetened base.",
+    # (the 9/1 attempt-1 shape moved to UNDECIDED -- D-051 EF-7, see below)
     # CleanHub: the object is the environment, not the product
     "F3 Energy partners with CleanHub to fund a cleaner planet with every case sold.",
     "Every F3 Energy purchase supports a cleaner future for the oceans.",
@@ -108,6 +117,14 @@ UNDECIDED: tuple[str, ...] = (
     # 'natural caffeine'; the live FAQ may.
     "F3 Energy carries 120 mg of natural caffeine from green tea plus a nootropic-leaning stack "
     "for training and competition.",
+    # 9/1 attempt 1: the Pure-attached tail after a clause naming Pure AND Energy.
+    # Was in FALSE_POSITIVE_SET under nearest-clause inheritance; D-051 EF-7 made
+    # inheritance the UNION of every brand named earlier (fail-closed), so it trips
+    # again. Harrison's ruling: write it as two sentences rather than keep an
+    # attachment heuristic that cleared "F3 Energy, like F3 Pure, is clean."
+    "If caffeine plus L-theanine is what you are after, F3 Pure and F3 Energy are both built "
+    "around that pairing, with F3 Pure using organic cane sugar, monk fruit and stevia as its "
+    "clean-sweetened base.",
 )
 
 

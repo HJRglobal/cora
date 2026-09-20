@@ -30,13 +30,25 @@ idempotent -- same tier, no new row -- so a re-run inside one fire never escalat
 ACKS. (a) Harrison's Accept OR Dismiss tap on the tier-3 card
 (knowledge_review.process_decision_tap reads payload.signal_key and calls ack());
 (b) a caller-observed human ack (a threaded reply on a decision alert) via ack();
-(c) the underlying fact clearing via clear(). Each is a ledger event.
+(c) the underlying fact clearing via clear(); (d) the tier-3 card reaching a
+terminal state by ANY other path (emoji-reaction executor, render-time LEX/PHI
+dismiss, self-heal, hand edit) -- fire() re-reads the card on every suppressed
+fire and records an implicit ack (via=card-resolved-out-of-band) when it is
+absent or no longer PENDING, then fires tier 1. Each is a ledger event.
 
 SUPPRESSION IS TIED TO A CARD. If the tier-3 card cannot be minted (the
 LEX/PHI decision screen excluded it, or the proposal row is not PENDING so no
 tap can ever arrive), nothing is suppressed: the caller keeps its normal surface
 (pass-through). A suppression with nothing to acknowledge would be the exact
 silence this module exists to end -- the ladder row's demotion trigger names it.
+The tie holds for the LIFE of the suppression, not only at mint (see ack (d)).
+
+CALLERS RECORD A FIRE ONLY AFTER ITS SURFACE DELIVERED. A fire that reached no
+human is not an unacknowledged alarm (D-051 EF-4): a consumer computes the
+outcome with dry_run=True, delivers on its normal surface, and records the fire
+only when that surface actually sent -- except at tier 3, where the card mint
+IS the surface and the fire is recorded regardless of Slack. Three Slack-down
+months must never climb the ladder and mute the first delivery that works.
 
 STORAGE. ONE append-only ledger, logs/repeat-signals.jsonl (same shape and
 reasons as run_marker: append-only, no read-modify-write, multi-process safe,
@@ -300,6 +312,26 @@ def _mint_card(signal_key: str, st: _State, *, subject: str, entity: str,
     return update_id
 
 
+def _card_still_pending(update_id: str | None) -> bool | None:
+    """Is the tier-3 card behind a suppression still PENDING?
+
+    True = a tap can still arrive (keep suppressing); False = the card is absent
+    or terminal (implicit ack); None = could not read the proposal file, so the
+    caller must NOT change state on it (see the suppressed branch of fire()).
+    A suppression with no update_id at all is a card that never existed -> False.
+    """
+    if not update_id:
+        return False
+    try:
+        from .knowledge_review import _find_update
+        row = _find_update(str(update_id))
+    except Exception:  # noqa: BLE001 -- unverifiable is not the same as resolved
+        log.warning("repeat_signal: could not verify card %s -- suppression kept",
+                    update_id, exc_info=True)
+        return None
+    return bool(row is not None and row.get("state") == "PENDING")
+
+
 # ── the API ──────────────────────────────────────────────────────────────────
 
 def fire(signal_key: str, *, fire_id: str, subject: str, entity: str,
@@ -326,12 +358,36 @@ def fire(signal_key: str, *, fire_id: str, subject: str, entity: str,
                        card_update_id=st.card_update_id, recorded=False)
 
     if st.suppressed:
-        if not dry_run:
-            _append({"event": EVENT_SUPPRESSED, "signal_key": key, "fire_id": fid,
-                     "subject": str(subject or "")[:300], "entity": str(entity or ""),
-                     "card_update_id": st.card_update_id})
-        return Outcome(tier=TIER_CARD, consecutive=st.consecutive + 1, suppressed=True,
-                       card_update_id=st.card_update_id, recorded=not dry_run)
+        # SUPPRESSION IS TIED TO A CARD -- and the tie is re-checked on EVERY
+        # suppressed fire, not only at mint time (D-051 EF-2). The card can reach
+        # a terminal state without passing through process_decision_tap: the
+        # emoji-reaction executor, the render-time LEX/PHI dismiss, the Step-0
+        # self-heal, a hand edit. None of those knew about the signal, so the
+        # ledger still said "suppressed" while nothing was left to tap -- the
+        # exact silence this module exists to end. A card that is absent or no
+        # longer PENDING is an implicit ack: record it, reset, and fall through
+        # to a fresh tier-1 fire. A card that CANNOT be read (transient import /
+        # I/O trouble) keeps the suppression: un-suppressing on an error would
+        # start a new cycle and mint a SECOND card beside a live one, which is
+        # the ladder row's demotion trigger.
+        pending = _card_still_pending(st.card_update_id)
+        if pending is False:
+            if not dry_run:
+                _append({"event": EVENT_ACK, "signal_key": key,
+                         "via": "card-resolved-out-of-band",
+                         "card_update_id": st.card_update_id})
+            log.info("repeat_signal: card %s for %s resolved out-of-band -- suppression "
+                     "lifted, next fire is tier 1", st.card_update_id, key)
+            st = _State(cycle=st.cycle + 1, subject=st.subject, entity=st.entity,
+                        owner_slack_id=st.owner_slack_id, owner_name=st.owner_name,
+                        normal_surface=st.normal_surface)
+        else:
+            if not dry_run:
+                _append({"event": EVENT_SUPPRESSED, "signal_key": key, "fire_id": fid,
+                         "subject": str(subject or "")[:300], "entity": str(entity or ""),
+                         "card_update_id": st.card_update_id})
+            return Outcome(tier=TIER_CARD, consecutive=st.consecutive + 1, suppressed=True,
+                           card_update_id=st.card_update_id, recorded=not dry_run)
 
     consecutive = st.consecutive + 1
     tier = min(consecutive, TIER_CARD)
@@ -396,16 +452,31 @@ def _az_date(ts: str) -> date | None:
     return dt.astimezone(_AZ).date()
 
 
-def tier2_signals(today: date | None = None, *, lookback_days: int = 1) -> list[dict[str, Any]]:
+#: The briefing window over the tier-2 fire row. THREE days, not one (D-051 EF-5):
+#: "Cora - Daily Briefing" fires Monday-Friday only
+#: (deployment/setup-daily-briefing-task.ps1: -Weekly -DaysOfWeek Monday..Friday),
+#: so a tier-2 fire on a Friday or Saturday has no briefing the next day -- with a
+#: 1-day window the line never rendered and the ladder went tier 1 -> tier 3 with
+#: the tier-2 surface silently skipped (the invoice check's day-9 fire IS a Friday
+#: in Oct 2026, Apr 2027 and Jul 2027). Friday -> Monday is three days.
+TIER2_BRIEFING_LOOKBACK_DAYS = 3
+
+
+def tier2_signals(today: date | None = None, *,
+                  lookback_days: int = TIER2_BRIEFING_LOOKBACK_DAYS) -> list[dict[str, Any]]:
     """Signals at tier 2 for Harrison's briefing line: their tier-2 FIRE row is
     stamped (Arizona date) within [today - lookback_days, today] AND the signal
     still stands at tier 2 (not yet fired again, not acked/cleared).
 
-    The window is one day wider than "today" on purpose: the 07:30 briefing runs
-    BEFORE the 08:45 gate check and the 09:38 invoice check, so a strictly
-    same-day read would never see either consumer's tier-2 fire. The bound keeps
-    the line from repeating -- once the window passes it is gone, and the next
-    fire moves the signal to tier 3 (a different surface) anyway.
+    The window is wider than "today" on purpose: the 07:30 briefing runs BEFORE
+    the 08:45 gate check and the 09:38 invoice check, so a strictly same-day
+    read would never see either consumer's tier-2 fire; and the briefing is
+    Mon-Fri only, so a Friday/Saturday fire must survive to Monday
+    (TIER2_BRIEFING_LOOKBACK_DAYS). The "still at tier 2" requirement is what
+    keeps the ladder honest inside the window: the next fire moves the signal
+    to tier 3 (a different surface) and the line drops; an ack/clear drops it too.
+    Within the window the line may render on up to three consecutive weekday
+    briefings -- bounded, and by date, never forever.
     """
     today = today or datetime.now(_AZ).date()
     rows = read_rows()

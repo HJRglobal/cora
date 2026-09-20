@@ -178,6 +178,96 @@ class TestValidate:
         assert reg2["available"] is False and "unreadable" in reg2["reason"]
         assert lr.summary(reg2)["available"] is False
 
+    # ── D-051 EF-8: the tier history is CHECKED against `tier` ──────────────
+
+    def _seeded(self, lane, tier, **over):
+        row = _row(lane=lane, tier=tier,
+                   events=[{"ts": "2026-09-19", "event": "seeded", "tier": "T0",
+                            "by": "code-13", "evidence": "e"}])
+        if tier != "T0":
+            row["evidence_monitor"] = {"description": "m", "failing_capable": True}
+        row.update(over)
+        return row
+
+    def test_a_raised_tier_with_no_event_is_named(self, tmp_path):
+        """The review's first failing input: s2-phantom-write-screen T0 -> T3 by
+        hand, no new event -> validate() was []. And the consequence it hid: the
+        enforce-mode acting drift on that lane disappeared."""
+        rows = [self._seeded(l, "T0") for l in lr.KNOWN_LANES]
+        rows[0]["tier"] = "T3"
+        rows[0]["acting_probe"] = "sentinel_mode"
+        reg = lr.load(_write(tmp_path, rows))
+        probs = lr.validate(reg)
+        assert any(f"{lr.KNOWN_LANES[0]}: tier T3 but the last tier-bearing event says T0" in p
+                   for p in probs), probs
+        # the drift WARN is silenced by the hand edit -- which is why validate must shout
+        assert lr.acting_drift(reg, {"sentinel_mode": lambda: "T2"}) == []
+        assert lr.summary(reg, probes={"sentinel_mode": lambda: "T2"})["schema_problems"]
+
+    def test_a_promotion_that_skips_a_tier_is_named(self, tmp_path):
+        rows = [self._seeded(l, "T0") for l in lr.KNOWN_LANES]
+        rows[1]["tier"] = "T2"
+        rows[1]["events"].append({"ts": "2026-09-20", "event": "promoted", "tier": "T2",
+                                  "by": "Harrison", "evidence": "tap"})
+        probs = lr.validate(lr.load(_write(tmp_path, rows)))
+        assert any("`promoted` T0 -> T2 is not exactly one rank" in p for p in probs), probs
+
+    def test_a_demotion_that_does_not_lower_or_says_nothing_is_named(self, tmp_path):
+        rows = [self._seeded(l, "T0") for l in lr.KNOWN_LANES]
+        rows[2]["tier"] = "T2"
+        rows[2]["events"] = [{"ts": "2026-09-19", "event": "seeded", "tier": "T2",
+                              "by": "code-13", "evidence": "e"},
+                             {"ts": "2026-09-20", "event": "demoted", "tier": "T2",
+                              "by": "auto", "evidence": "class WARN"}]
+        rows[3]["tier"] = "T2"
+        rows[3]["events"] = [{"ts": "2026-09-19", "event": "seeded", "tier": "T2",
+                              "by": "code-13", "evidence": "e"},
+                             {"ts": "2026-09-20", "event": "demoted", "by": "auto",
+                              "evidence": "class WARN"}]       # the review's third input
+        probs = lr.validate(lr.load(_write(tmp_path, rows)))
+        assert any("`demoted` T2 -> T2 does not lower the tier" in p for p in probs), probs
+        assert any("`demoted` event without a `tier`" in p for p in probs), probs
+
+    def test_a_legal_promotion_and_demotion_history_is_clean(self, tmp_path):
+        rows = [self._seeded(l, "T0") for l in lr.KNOWN_LANES]
+        rows[0]["tier"] = "T1"
+        rows[0]["events"].append({"ts": "2026-09-20", "event": "promoted", "tier": "T1",
+                                  "by": "Harrison", "evidence": "7 clean days"})
+        rows[0]["events"].append({"ts": "2026-09-21", "event": "confirmed", "by": "Harrison",
+                                  "evidence": "batch"})
+        rows[1]["tier"] = "T1"
+        rows[1]["events"] = [{"ts": "2026-09-19", "event": "seeded", "tier": "T2",
+                              "by": "code-13", "evidence": "e"},
+                             {"ts": "2026-09-20", "event": "demoted", "tier": "T1",
+                              "by": "auto", "evidence": "class WARN"}]
+        rows[1]["evidence_monitor"] = {"description": "m", "failing_capable": True}
+        rows[2]["tier"] = "CAP-T1"
+        rows[2]["events"].append({"ts": "2026-09-20", "event": "promoted", "tier": "CAP-T1",
+                                  "by": "Harrison", "evidence": "charter line 23"})
+        assert lr.validate(lr.load(_write(tmp_path, rows))) == []
+
+    def test_a_tier_on_a_note_or_confirmed_event_and_a_bad_event_tier_are_named(self, tmp_path):
+        rows = [self._seeded(l, "T0") for l in lr.KNOWN_LANES]
+        rows[0]["events"].append({"ts": "2026-09-20", "event": "note", "tier": "T1",
+                                  "by": "x", "evidence": "e"})
+        rows[1]["events"][0]["tier"] = "T9"
+        probs = lr.validate(lr.load(_write(tmp_path, rows)))
+        assert any("`note` event must not carry `tier`" in p for p in probs), probs
+        assert any("event tier 'T9'" in p for p in probs), probs
+
+    def test_the_shipped_seeded_events_carry_their_row_tier(self):
+        """Rule (a) is live from day one: every seeded event in the real file
+        says the tier its row holds, so a hand-edited `tier` now fails validate."""
+        reg = lr.load(_REAL)
+        for r in lr.lanes(reg):
+            seeded = [e for e in r["events"] if e.get("event") == "seeded"]
+            assert seeded and all(e.get("tier") == r["tier"] for e in seeded), r["lane"]
+        import copy
+        edited = copy.deepcopy(reg)
+        lr.row_for("s2-phantom-write-screen", edited)["tier"] = "T3"
+        assert any("s2-phantom-write-screen: tier T3 but the last tier-bearing event says T0" in p
+                   for p in lr.validate(edited))
+
     def test_env_override_redirects_the_default_path(self, tmp_path, monkeypatch):
         p = _write(tmp_path, self._all_rows())
         monkeypatch.setenv("CORA_LADDER_REGISTRY_PATH", str(p))

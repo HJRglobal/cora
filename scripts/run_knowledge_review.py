@@ -53,6 +53,9 @@ from cora.knowledge_review import (  # noqa: E402
     HARRISON_SLACK_USER_ID,
     UPDATE_TYPE_DECISION as _kr_UPDATE_TYPE_DECISION,
     UPDATE_TYPE_GENERIC,
+    _ack_repeat_signal as _kr_ack_repeat_signal,  # Code #13 EF-2: every terminal
+    # resolution of a repeat-signal card acks the signal (fail-soft, no-op for
+    # cards with no payload.signal_key)
 )
 from cora import review_lanes  # noqa: E402  (mechanical/judgment lane split)
 from cora.coras_read import build_coras_read_struct  # noqa: E402  (WS17-C enrichment)
@@ -334,6 +337,9 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
             if ok:
                 resolve_update(update.get("update_id", ""), "APPROVED",
                                reason="emoji_reaction")
+                # The card is terminal: a repeat-signal card must not stay
+                # suppressed with nothing left to tap (D-051 EF-2).
+                _kr_ack_repeat_signal(update, via="card-accept-emoji")
                 msg = (
                     f":inbox_tray: *Gap executor* `[{uid_short}]` decision filed to the "
                     f"non-canon inbox ({summary}):\n> {desc[:300]}"
@@ -342,6 +348,7 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
             elif summary.startswith("excluded:") and "screen_error" not in summary:
                 resolve_update(update.get("update_id", ""), "DISMISSED",
                                reason="lex_phi_excluded")
+                _kr_ack_repeat_signal(update, via="card-excluded")
                 success = False
                 msg = (f":no_entry_sign: *Gap executor* `[{uid_short}]` decision "
                        f"withheld -- LEX/PHI hard-exclusion (fail-closed). Dismissed.")
@@ -1030,6 +1037,9 @@ def _self_heal_decisions(entries: list, filed_ids: set, now_dt) -> tuple[int, in
             e["resolved_at"] = now_dt.isoformat()
             e["resolved_reason"] = "self_heal_inbox_filed"
             healed += 1
+            # terminal by another path -> the repeat signal behind a tier-3
+            # card is acked too (D-051 EF-2); no-op for ordinary decisions
+            _kr_ack_repeat_signal(e, via="card-self-healed")
             continue
         ts = str(e.get("dm_message_ts") or "").strip()
         if not ts:
@@ -1473,6 +1483,10 @@ def _screen_and_send_decision_cards(
             resolve_update(u["update_id"], "DISMISSED",
                            reason=f"lex_phi_excluded:{reason}")
             excluded += 1
+            # A card dismissed before it ever rendered is terminal: lift the
+            # suppression on the repeat signal that minted it (D-051 EF-2), or
+            # the signal sits mute behind a card nobody can tap.
+            _kr_ack_repeat_signal(u, via="card-excluded-at-render")
             log.info("decision-cards: excluded %s (%s)",
                      str(u.get("update_id", "?"))[:12], reason)
             continue
@@ -1820,6 +1834,11 @@ def main() -> int:
                  and update.get("update_type") == _kr_UPDATE_TYPE_DECISION)
         if not args.dry_run and not defer:
             resolve_update(uid, action)
+            if (action == "DISMISSED"
+                    and update.get("update_type") == _kr_UPDATE_TYPE_DECISION):
+                # an emoji dismiss on a repeat-signal card is Harrison's ack too
+                # (parity with process_decision_tap; D-051 EF-2)
+                _kr_ack_repeat_signal(update, via="card-dismiss-emoji")
 
         if action == "APPROVED":
             if defer and args.dry_run:

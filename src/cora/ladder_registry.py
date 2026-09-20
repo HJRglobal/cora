@@ -31,11 +31,16 @@ THE FILE. ``data/ladder-registry.yaml`` -- one row per lane:
                          Cora DO -- read by cora.capability_set for the honesty rail
     ask_hint             (optional) the `Try:` hint the honesty rail prints
     events[]             {ts, event: seeded|promoted|demoted|confirmed|note, by,
-                         evidence} -- append-only history; a tier change without an
-                         event is a schema violation
+                         evidence, tier?} -- append-only history; `tier` = the tier
+                         the lane holds AFTER the event (required on promoted /
+                         demoted, carried on every seeded event); a tier change
+                         without an event is a schema violation, ENFORCED: the
+                         last tier-bearing event must equal `tier`
 
 RULES (all deterministic; NO LLM reads or writes this file):
-  * every tier change is an `events[]` entry with evidence; no lane skips a tier;
+  * every tier change is an `events[]` entry with evidence; no lane skips a tier
+    (a `promoted` event is exactly +1 rank; a `demoted` event is strictly lower;
+    the last tier-bearing event == `tier`) -- see _tier_history_problems;
   * a lane acting ABOVE its registered tier (live probe) is a health WARN;
   * a lane in KNOWN_LANES with no row is a health WARN, and a row not in KNOWN_LANES
     is a schema WARN (the two lists are pinned to each other by tests);
@@ -151,6 +156,69 @@ def _monitor_failing_capable(row: dict[str, Any]) -> bool | None:
     return None
 
 
+#: Event kinds that MAY carry `tier` (the tier the lane holds AFTER the event).
+#: `promoted` and `demoted` MUST carry it: a tier change that does not say where
+#: it landed cannot be checked against `tier`, which is the whole point.
+TIER_BEARING_EVENTS: tuple[str, ...] = ("seeded", "promoted", "demoted")
+
+
+def _tier_history_problems(lane: str, tier: str, events: list[Any]) -> list[str]:
+    """The docstring's rules, ENFORCED (D-051 EF-8): before this, events carried no
+    tier, so a hand-edited `tier: T3` with no event, a T0->T2 promotion that skipped
+    T1, and a `demoted` event with the tier left high all validated clean -- and a
+    raised registered tier silenced the acting-drift WARN the registry exists to
+    produce. Rules over the tier-bearing events in order:
+
+      (a) when ANY event carries a tier, the LAST tier-bearing event's tier must
+          equal the row's `tier` (a tier change without an event is a violation);
+      (b) a `promoted` event lands exactly ONE rank above the previous tier-bearing
+          event (no lane skips a tier);
+      (c) a `demoted` event lands strictly BELOW the previous tier-bearing event;
+      (d) `promoted` / `demoted` without a `tier`, or a `tier` outside TIERS, is
+          malformed.
+    A row whose events carry no tier at all (a pre-EF-8 hand-written registry) is
+    left to the evidence rule above -- the shipped file carries a tier on every
+    seeded event so rule (a) is live from day one.
+    """
+    problems: list[str] = []
+    prev: str | None = None
+    last: str | None = None
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        kind = str(e.get("event") or "")
+        has_tier = "tier" in e and e.get("tier") not in (None, "")
+        if kind not in TIER_BEARING_EVENTS:
+            if has_tier:
+                problems.append(f"{lane}: `{kind}` event must not carry `tier` ({e.get('tier')!r})")
+            continue
+        if not has_tier:
+            if kind in ("promoted", "demoted"):
+                problems.append(f"{lane}: `{kind}` event without a `tier` (where did it land?)")
+            continue
+        et = str(e.get("tier"))
+        if et not in TIERS:
+            problems.append(f"{lane}: event tier {et!r} not in {list(TIERS)}")
+            continue
+        if kind == "promoted":
+            if prev is None:
+                problems.append(f"{lane}: `promoted` to {et} with no earlier tier-bearing event")
+            elif TIER_RANK[et] != TIER_RANK[prev] + 1:
+                problems.append(f"{lane}: `promoted` {prev} -> {et} is not exactly one rank "
+                                "(no lane skips a tier)")
+        elif kind == "demoted":
+            if prev is None:
+                problems.append(f"{lane}: `demoted` to {et} with no earlier tier-bearing event")
+            elif TIER_RANK[et] >= TIER_RANK[prev]:
+                problems.append(f"{lane}: `demoted` {prev} -> {et} does not lower the tier")
+        prev = et
+        last = et
+    if last is not None and last != tier:
+        problems.append(f"{lane}: tier {tier} but the last tier-bearing event says {last} "
+                        "(a tier change without an event is a schema violation)")
+    return problems
+
+
 def validate(reg: dict[str, Any]) -> list[str]:
     """Schema problems as human sentences (empty = clean). Never raises."""
     problems: list[str] = []
@@ -191,6 +259,7 @@ def validate(reg: dict[str, Any]) -> list[str]:
                     isinstance(e, dict) and str(e.get("event")) in ("seeded", "promoted", "confirmed")
                     and str(e.get("evidence") or "").strip() for e in events):
                 problems.append(f"{lane}: tier {tier} with no seeded/promoted/confirmed event carrying evidence")
+            problems.extend(_tier_history_problems(lane, tier, events))
         if lane not in KNOWN_LANES:
             problems.append(f"{lane}: not in KNOWN_LANES (add the lane to the tuple with its row)")
         terms = row.get("capability_terms")

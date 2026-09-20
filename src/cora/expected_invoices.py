@@ -77,11 +77,20 @@ STATUS_PRESENT = "PRESENT"
 STATUS_MISSING = "MISSING"
 STATUS_UNKNOWN = "UNKNOWN"
 
-#: Where a hand-downloaded invoice goes so the receipts flow files it: the
-#: "Receipts & Invoices Inbox" Drive folder (D-043 finance tier) and the
-#: receipts mailbox the yaml note names as the Ads billing-contact fix.
-RECEIPTS_INBOX_FOLDER_ID = "1I7zWcCIAOx7zdzIXcxx6WTLk1K40eizj"
-RECEIPTS_INBOX_URL = f"https://drive.google.com/drive/folders/{RECEIPTS_INBOX_FOLDER_ID}"
+#: Where a hand-downloaded invoice goes so THIS CHECK sees it next month: the
+#: receipts mailbox (the yaml note names it as the Ads billing-contact fix). Mail
+#: to it traverses the attachment filer, which is the ONLY writer of the content
+#: ledger `assess` reads (connectors/filer_ledger.py).
+#:
+#: NOT the "Receipts & Invoices Inbox" Drive folder (D-043 finance tier,
+#: 1I7zWcCIAOx7zdzIXcxx6WTLk1K40eizj). The first cut of the nudge advertised it as
+#: an equal drop point -- but nothing reads that folder into the filer content
+#: ledger (finance_receipts.py writes the folder and never the ledger; the
+#: unscheduled `--reconcile` scans {entity}/{subfolder} roots, not the inbox), so
+#: an owner who followed that instruction stayed MISSING, was nudged again and
+#: the signal escalated on a document that was in hand (D-051 EF-6). Advertise a
+#: drop point only when the check consults it; add a folder ingest first if the
+#: Drive path is ever wanted back.
 RECEIPTS_MAILBOX = "receipts@hjrglobal.com"
 
 #: Fail-closed nudge recipient when the yaml owner handle does not resolve on
@@ -336,10 +345,11 @@ def resolve_owner(handle: str) -> tuple[str, str, bool]:
 
 
 def format_owner_nudge(row: dict[str, Any], period: str, *, owner_name: str = "") -> str:
-    """The one nudge DM. Names the vendor, the period, the portal link, exactly
-    where to drop the download so the receipts flow files it, and the fact that
-    known_undelivered clears only by a human edit. No LLM, no PHI surface: every
-    field comes from the yaml the finance team maintains."""
+    """The one nudge DM. Names the vendor, the period, the portal link, the ONE
+    drop point this check actually consults (the receipts mailbox -> attachment
+    filer -> content ledger; see RECEIPTS_MAILBOX for why not the Drive folder),
+    and the fact that known_undelivered clears only by a human edit. No LLM, no
+    PHI surface: every field comes from the yaml the finance team maintains."""
     name = str(row.get("name") or "the expected invoice")
     entity = str(row.get("entity") or "")
     tag = f" [{entity}]" if entity else ""
@@ -356,10 +366,10 @@ def format_owner_nudge(row: dict[str, Any], period: str, *, owner_name: str = ""
         lines.append("• Portal: (no `portal_url` in finance-expected-invoices.yaml -- "
                      "add one so this nudge can link it)")
     lines.append(
-        f"• Drop the PDF in the Receipts & Invoices Inbox folder "
-        f"(<{RECEIPTS_INBOX_URL}|Drive folder {RECEIPTS_INBOX_FOLDER_ID}>) or email it "
-        f"to {RECEIPTS_MAILBOX} -- either lands in the receipts flow and the filer "
-        f"files it under invoices/.")
+        f"• Email the PDF to {RECEIPTS_MAILBOX} (attach it; forward the vendor email if "
+        f"you have one) -- the attachment filer files it under invoices/ and this "
+        f"check reads it as filed next month. A Drive upload is NOT read by this "
+        f"check, so please use the mailbox.")
     lines.append(
         "• known_undelivered clears only when a human edits the yaml after the first "
         "download lands -- until then this check reads the vendor as a tracked config "

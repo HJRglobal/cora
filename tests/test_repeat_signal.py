@@ -240,6 +240,122 @@ def test_malformed_ledger_lines_are_skipped_not_fatal():
     assert rs.state(KEY)["consecutive"] == 1
 
 
+# ── a card resolved by ANY other path lifts the suppression (D-051 EF-2) ─────
+
+class TestCardResolvedOutOfBand:
+    def _suppressed_card(self):
+        for fid in ("2026-06", "2026-07", "2026-08"):
+            o = _fire(fid)
+        assert o.suppressed and rs.state(KEY)["suppressed"] is True
+        return o.card_update_id
+
+    @pytest.mark.parametrize("terminal_state,reason", [
+        ("DISMISSED", "lex_phi_excluded"),          # render-time / apply-time exclusion
+        ("APPROVED", "emoji_reaction"),             # the emoji-reaction executor
+        ("APPROVED", "self_heal_inbox_filed"),      # the Step-0 self-heal
+    ])
+    def test_a_terminal_card_that_never_passed_through_the_tap_is_an_implicit_ack(
+            self, terminal_state, reason):
+        """The review's failing input: resolve_update(uid, 'DISMISSED',
+        reason='lex_phi_excluded') directly (no process_decision_tap, so no
+        _ack_repeat_signal). Before: the next three fires all came back
+        suppressed=True against a card nobody could tap."""
+        uid = self._suppressed_card()
+        assert kr.resolve_update(uid, terminal_state, reason=reason) is True
+        preview = _fire("2026-09", dry_run=True)
+        assert preview.tier == 1 and preview.suppressed is False and preview.recorded is False
+        assert rs.state(KEY)["suppressed"] is True, "a dry run changes nothing"
+        o4 = _fire("2026-09")
+        assert o4.tier == 1 and o4.consecutive == 1 and o4.suppressed is False
+        events = [r["event"] for r in _rows()]
+        assert events[-2:] == [rs.EVENT_ACK, rs.EVENT_FIRE]
+        assert _rows()[-2]["via"] == "card-resolved-out-of-band"
+        assert _rows()[-2]["card_update_id"] == uid
+        st = rs.state(KEY)
+        assert st["consecutive"] == 1 and st["suppressed"] is False and st["cycle"] == 1
+        # the next cycle's card must not collide with the resolved one
+        _fire("2026-10"), (o6 := _fire("2026-11"))
+        assert o6.tier == 3 and o6.suppressed and o6.card_update_id == uid + "-1"
+        assert len(_pending_cards()) == 1
+
+    def test_an_absent_card_row_is_an_implicit_ack_too(self):
+        uid = self._suppressed_card()
+        kr._PROPOSED_UPDATES_PATH.write_text("", encoding="utf-8")   # archived / hand-purged
+        kr._SEEN_IDS_CACHE = None
+        o4 = _fire("2026-09")
+        assert o4.tier == 1 and not o4.suppressed
+        assert _rows()[-2]["event"] == rs.EVENT_ACK and _rows()[-2]["card_update_id"] == uid
+
+    def test_a_pending_card_keeps_the_suppression(self):
+        self._suppressed_card()
+        o4 = _fire("2026-09")
+        assert o4.suppressed is True and _rows()[-1]["event"] == rs.EVENT_SUPPRESSED
+
+    def test_an_unreadable_card_keeps_the_suppression_rather_than_minting_a_second_card(
+            self, monkeypatch):
+        """Un-suppressing on a READ error would start a new cycle beside a live
+        card -- 'a second card for the same signal before ack' is the ladder
+        row's demotion trigger. Unverifiable != resolved."""
+        self._suppressed_card()
+        monkeypatch.setattr(kr, "_find_update",
+                            lambda uid: (_ for _ in ()).throw(OSError("proposal file")))
+        o4 = _fire("2026-09")
+        assert o4.suppressed is True and _rows()[-1]["event"] == rs.EVENT_SUPPRESSED
+        assert rs.EVENT_ACK not in [r["event"] for r in _rows()]
+
+    def test_the_gate_check_alarms_again_after_a_thumbs_down_emoji_dismiss(
+            self, monkeypatch, tmp_path):
+        """Probe C from the review, end to end on the gate consumer: day 3 mints
+        the card, the card is dismissed WITHOUT the tap, day 4 must be CRITICAL
+        again (not 'suppressed pending ack' against a DISMISSED card)."""
+        from cora import decision_lane as dl
+        import nightly_health_check as hc
+        monkeypatch.setattr(dl, "DELIVERY_LEDGER", tmp_path / "deliveries.jsonl")
+        monkeypatch.setenv("DECISION_ALERT_STATE_PATH", str(tmp_path / "alerts.json"))
+        content = "\n".join([
+            "# Decisions pending", "", "### Osprey ledger cutover",
+            "- **Entity**: OSN", "- **Question**: what to do",
+            "- **Decision-maker**: Harrison", "- **Blockers**: bandwidth",
+            "- **Severity**: P2", "- **Surfaced**: 2026-08-10",
+            "- **Last touched**: 2026-08-13", "- **Gate**: 2026-08-13",
+            "- **Owner of next nudge**: Harrison", "",
+        ])
+        path = tmp_path / "decisions-pending.md"
+        path.write_text(content, encoding="utf-8")
+        monkeypatch.setenv("STRATEGY_DECISIONS_PATH", str(path))
+        today = date(2026, 8, 19)
+        for d in range(3):
+            hc.check_decision_gates(today=today + timedelta(days=d))
+        cards = [u for u in kr.load_proposed_updates()
+                 if u.get("update_type") == kr.UPDATE_TYPE_DECISION]
+        assert len(cards) == 1 and cards[0]["state"] == "PENDING"
+        assert hc.check_decision_gates(today=today + timedelta(days=3)).status == "warn"
+        kr.resolve_update(cards[0]["update_id"], "DISMISSED", reason="lex_phi_excluded")
+        day5 = hc.check_decision_gates(today=today + timedelta(days=4))
+        assert day5.status == "critical" and "suppressed pending ack" not in day5.detail
+        key = rs.make_key("decision-gate", dl._topic_key("Osprey ledger cutover"), "OSN")
+        assert rs.state(key)["consecutive"] == 1 and rs.state(key)["suppressed"] is False
+
+    def test_run_knowledge_review_acks_at_every_other_terminal_resolution_site(self):
+        """The explicit acks (belt to fire()'s re-verify): the Step-0 self-heal
+        behaviourally, the other three sites by source pin."""
+        import run_knowledge_review as rkr
+        uid = self._suppressed_card()
+        entry = kr._find_update(uid)
+        healed, _ = rkr._self_heal_decisions([entry], {uid}, datetime.now(timezone.utc))
+        assert healed == 1 and entry["state"] == "APPROVED"
+        assert _rows()[-1]["event"] == rs.EVENT_ACK and _rows()[-1]["via"] == "card-self-healed"
+        src = (_REPO_ROOT / "scripts" / "run_knowledge_review.py").read_text(encoding="utf-8")
+        sites = {
+            "card-accept-emoji": "update",        # the emoji-reaction executor, APPROVED
+            "card-excluded": "update",            # the executor's LEX/PHI apply-time dismiss
+            "card-excluded-at-render": "u",       # _screen_and_send_decision_cards
+            "card-dismiss-emoji": "update",       # the Step-1 correlate DISMISSED
+        }
+        for via, var in sites.items():
+            assert f'_kr_ack_repeat_signal({var}, via="{via}")' in src, via
+
+
 # ── the card tap IS the ack (knowledge_review.process_decision_tap) ──────────
 
 class TestCardTapAck:
@@ -325,16 +441,38 @@ def test_tier2_line_reads_yesterdays_fire_because_the_briefing_runs_first():
 
 def test_tier2_line_never_repeats_past_its_window_and_never_at_tier_3():
     today = date(2026, 9, 19)
-    old = datetime(2026, 9, 16, 16, 45, tzinfo=timezone.utc)
+    # PIN CHANGED with D-051 EF-5: the window is TIER2_BRIEFING_LOOKBACK_DAYS=3
+    # (a Friday fire must reach Monday's briefing), so "gone" is FOUR days old.
+    old = datetime(2026, 9, 15, 16, 45, tzinfo=timezone.utc)
     _seed_fire_row(KEY, 1, old - timedelta(days=30), fid="a")
     _seed_fire_row(KEY, 2, old, fid="b")
-    assert rs.tier2_signals(today) == []           # three days old: gone, not repeated
+    assert rs.tier2_signals(today) == []           # four days old: gone, not repeated
     other = rs.make_key("t", "vendor Heron receipt", "OSN")
     now = datetime(2026, 9, 19, 16, 0, tzinfo=timezone.utc)
     _seed_fire_row(other, 1, now - timedelta(days=60), fid="a")
     _seed_fire_row(other, 2, now - timedelta(days=30), fid="b")
     _seed_fire_row(other, 3, now, fid="c")
     assert rs.tier2_signals(today) == []           # tier 3 is a different surface
+
+
+def test_tier2_fire_on_a_friday_reaches_mondays_briefing_and_no_further():
+    """D-051 EF-5 regression. The briefing is Mon-Fri only, so a tier-2 fire on
+    Friday 2026-10-09 09:38 AZ (the invoice check's day-9 slot IS a Friday in Oct
+    2026, Apr 2027 and Jul 2027) had NO briefing the next day; with a 1-day
+    window the line never rendered and the ladder went tier 1 -> tier 3 with the
+    tier-2 surface silently skipped. Monday must still see it; Tuesday must not
+    (bounded, never forever)."""
+    friday_fire = datetime(2026, 10, 9, 16, 38, tzinfo=timezone.utc)   # 09:38 AZ, a Friday
+    assert friday_fire.astimezone(rs._AZ).weekday() == 4
+    _seed_fire_row(KEY, 1, friday_fire - timedelta(days=30), fid="2026-08")
+    _seed_fire_row(KEY, 2, friday_fire, fid="2026-09")
+    assert rs.tier2_signals(date(2026, 10, 12)) != [], "Monday's briefing must carry the line"
+    assert rs.tier2_signals(date(2026, 10, 13)) == [], "Tuesday is past the window"
+    assert rs.TIER2_BRIEFING_LOOKBACK_DAYS == 3
+    # the reason for 3: the registered briefing trigger is weekdays only
+    ps1 = (_REPO_ROOT / "deployment" / "setup-daily-briefing-task.ps1").read_text(encoding="utf-8")
+    assert "-DaysOfWeek Monday, Tuesday, Wednesday, Thursday, Friday" in ps1
+    assert "Saturday" not in ps1 and "Sunday" not in ps1
 
 
 def test_an_acked_tier2_signal_drops_out_of_the_briefing():

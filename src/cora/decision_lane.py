@@ -67,6 +67,15 @@ DELIVERY_WINDOW_DAYS = 8
 #: (strategy_memo, channel_synthesis) may silence the control.
 PING_SURFACE_PREFIX = "ping:"
 
+#: The LEGACY spelling of the same ping. Before D-310 the health check recorded
+#: its alarm as a bare "health_check" surface, and the live ledger still holds
+#: those rows (16 as of 2026-09-19, latest 2026-09-18). Skipping only the new
+#: "ping:" prefix left them counting as deliveries, so the four blown gates would
+#: have stayed silent for up to 8 more days after the merge -- the self-clearing
+#: silence D-310 exists to end, reproduced once more by the fix (D-051 EF-3).
+#: A surface named here is never a delivery, whatever wrote it.
+LEGACY_PING_SURFACES: frozenset[str] = frozenset({"health_check"})
+
 _TEMPLATE_TOPIC = "[Topic]"
 
 # Field patterns. All tolerate the file's real formatting (bolded label, em
@@ -268,9 +277,10 @@ def delivery_index(*, ledger: Path | None = None,
     tail read would make "never delivered" indistinguishable from "delivered
     before the window", which is the distinction the alarm turns on.
 
-    Rows whose surface starts with PING_SURFACE_PREFIX are SKIPPED: an
-    escalation ping is not a delivery and must never suppress the control
-    (D-310). They stay in the file for the audit trail.
+    Rows whose surface starts with PING_SURFACE_PREFIX -- or IS one of the
+    LEGACY_PING_SURFACES spellings written before the prefix existed -- are
+    SKIPPED: an escalation ping is not a delivery and must never suppress the
+    control (D-310). They stay in the file for the audit trail.
     """
     now = now or datetime.now(timezone.utc)
     try:
@@ -289,7 +299,8 @@ def delivery_index(*, ledger: Path | None = None,
             continue
         if not isinstance(row, dict):
             continue
-        if str(row.get("surface") or "").startswith(PING_SURFACE_PREFIX):
+        surface = str(row.get("surface") or "")
+        if surface.startswith(PING_SURFACE_PREFIX) or surface in LEGACY_PING_SURFACES:
             continue
         key = str(row.get("key") or _topic_key(row.get("topic", "")))
         if not key:

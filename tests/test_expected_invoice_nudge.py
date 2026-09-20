@@ -215,10 +215,40 @@ def test_the_nudge_names_vendor_period_portal_drop_point_and_the_human_edit_rule
     text = ei.format_owner_nudge(row, "2026-07", owner_name="Tessa Miller")
     assert "Marigold Ads invoice" in text and "2026-07" in text and "[F3E]" in text
     assert PORTAL in text
-    assert ei.RECEIPTS_INBOX_FOLDER_ID in text and ei.RECEIPTS_MAILBOX in text
+    # PIN CHANGED with D-051 EF-6: the Drive folder is no longer advertised (see
+    # test_the_nudge_advertises_only_the_drop_point_this_check_reads)
+    assert ei.RECEIPTS_MAILBOX in text
     assert ("known_undelivered clears only when a human edits the yaml after the first "
             "download lands") in text
     assert text.startswith(":page_facing_up: Hi Tessa --")
+
+
+RECEIPTS_INBOX_FOLDER_ID = "1I7zWcCIAOx7zdzIXcxx6WTLk1K40eizj"
+
+
+def test_the_nudge_advertises_only_the_drop_point_this_check_reads(fixture_paths):
+    """D-051 EF-6 regression. The first cut told the owner to drop the PDF in the
+    Receipts & Invoices Inbox Drive folder 'and the filer files it under
+    invoices/' -- but nothing reads that folder into the filer content ledger
+    `assess` consults (only the mail-attachment filer writes it), so an owner who
+    followed the Drive instruction stayed MISSING next month, was nudged again
+    and the signal escalated on a document that was in hand. The nudge may name
+    only a drop point the check actually reads: the receipts mailbox."""
+    res = ei.assess("2026-07")
+    row = ei.nudge_candidates(res)[0]
+    text = ei.format_owner_nudge(row, "2026-07", owner_name="Tessa Miller")
+    assert RECEIPTS_INBOX_FOLDER_ID not in text
+    assert "drive.google.com" not in text and "Drop the PDF" not in text
+    assert ei.RECEIPTS_MAILBOX in text and "attachment filer" in text
+    assert "Drive upload is NOT read by this check" in text
+    assert not hasattr(ei, "RECEIPTS_INBOX_URL"), "an unused advertised path invites re-use"
+    # and the only ledger writer is the attachment filer path (the premise)
+    writers = []
+    for p in (_REPO_ROOT / "src" / "cora").rglob("*.py"):
+        s = p.read_text(encoding="utf-8")
+        if "filer-content-ledger" in s and "expected_invoices" not in p.name:
+            writers.append(p.name)
+    assert writers == ["filer_ledger.py"], writers
 
 
 def test_a_missing_portal_url_is_said_out_loud_not_blank():
@@ -320,6 +350,122 @@ def test_the_same_period_re_run_is_idempotent_and_consecutive_months_escalate(
     # key -- two signals, two independent ladders
     ws_key = "expected-invoice|Marigold Workspace invoice|HJRG"
     assert rs.state(ws_key)["consecutive"] == 3
+
+
+def test_a_present_month_clears_the_signal_so_non_consecutive_misses_never_climb(
+        tmp_path, monkeypatch, capsys):
+    """D-051 EF-1 regression: MISSING 07, MISSING 08, PRESENT 09, MISSING 10 ->
+    tier 1 on the 4th. Before: consecutive=3, a card minted, the owner DM
+    suppressed -- the contract says only CONSECUTIVE fires escalate, and nothing
+    in the runner ever called repeat_signal.clear()."""
+    monkeypatch.setattr(ei, "EXPECTATIONS_PATH", _write_list(tmp_path, [ADS]))
+    monkeypatch.setattr(ei, "LEDGER_PATH", _write_ledger(tmp_path, [
+        {"drive_path": "01-F3E/invoices/marigold-ads-monthly-invoice.pdf",
+         "filed_at": _ts(2026, 9, 12)}]))
+    monkeypatch.setenv("REPEAT_SIGNAL_LEDGER_PATH", str(tmp_path / "repeat-signals.jsonl"))
+    client = _fake_client()
+    monkeypatch.setattr(runner, "_client", lambda: client)
+    key = "expected-invoice|Marigold Ads invoice|F3E"
+    runner.main(["--post", "--period", "2026-07"])
+    runner.main(["--post", "--period", "2026-08"])
+    assert rs.state(key)["consecutive"] == 2
+    # a DRY run of the PRESENT month plans the clear but writes nothing
+    rows_before = rs.read_rows()
+    assert runner.main(["--period", "2026-09"]) == 0
+    assert "[clear] " + key in capsys.readouterr().out
+    assert rs.read_rows() == rows_before
+    runner.main(["--post", "--period", "2026-09"])
+    st = rs.state(key)
+    assert st["consecutive"] == 0 and st["suppressed"] is False and st["cycle"] == 1
+    clear_row = [r for r in rs.read_rows() if r["event"] == rs.EVENT_CLEAR][-1]
+    assert clear_row["signal_key"] == key and clear_row["why"] == "invoice filed for 2026-09"
+    runner.main(["--post", "--period", "2026-10"])
+    st = rs.state(key)
+    assert st["consecutive"] == 1 and st["tier"] == 1 and st["suppressed"] is False
+    # and the owner DM for the October miss actually went out (tier 1 = normal surface)
+    dms = [c for c in client.chat_postMessage.call_args_list if c.kwargs["channel"] == "D0MARIGOLD"]
+    assert len(dms) == 3 and "2026-10" in dms[-1].kwargs["text"]
+
+
+def test_a_vendor_removed_from_the_yaml_clears_its_live_signal(tmp_path, monkeypatch):
+    """The second half of EF-1: a key with the expected-invoice| prefix that no
+    longer has a yaml row is retired -- a tier-3 suppression must not outlive
+    the vendor it was about."""
+    monkeypatch.setattr(ei, "EXPECTATIONS_PATH", _write_list(tmp_path, [ADS, WORKSPACE]))
+    monkeypatch.setattr(ei, "LEDGER_PATH", _write_ledger(tmp_path, [
+        {"drive_path": "x/other.pdf", "filed_at": _ts(2026, 7, 2)}]))
+    monkeypatch.setenv("REPEAT_SIGNAL_LEDGER_PATH", str(tmp_path / "repeat-signals.jsonl"))
+    client = _fake_client()
+    monkeypatch.setattr(runner, "_client", lambda: client)
+    for p in ("2026-07", "2026-08", "2026-09"):
+        runner.main(["--post", "--period", p])
+    ads_key = "expected-invoice|Marigold Ads invoice|F3E"
+    assert rs.state(ads_key)["suppressed"] is True
+    monkeypatch.setattr(ei, "EXPECTATIONS_PATH", _write_list(tmp_path, [WORKSPACE]))
+    runner.main(["--post", "--period", "2026-10"])
+    assert rs.state(ads_key)["consecutive"] == 0 and rs.state(ads_key)["suppressed"] is False
+    last_clear = [r for r in rs.read_rows() if r["event"] == rs.EVENT_CLEAR][-1]
+    assert last_clear["signal_key"] == ads_key and "no longer in" in last_clear["why"]
+    # the Workspace signal (still in the yaml, still MISSING) is untouched
+    assert rs.state("expected-invoice|Marigold Workspace invoice|HJRG")["suppressed"] is True
+
+
+def test_three_slack_down_months_never_climb_the_ladder(fixture_paths, monkeypatch):
+    """D-051 EF-4 regression (Probe B). SLACK_BOT_TOKEN unset for three monthly
+    --post runs: each exits 1 with no DM and no channel post. Before: the ledger
+    still read consecutive=3, a card was minted, and the first month the token
+    worked the owner DM was SUPPRESSED (0 DMs sent). A fire that reached no human
+    is not an unacknowledged alarm; record it only after its surface delivered."""
+    monkeypatch.setattr(runner, "_client", lambda: None)
+    key = "expected-invoice|Marigold Ads invoice|F3E"
+    codes = [runner.main(["--post", "--period", p]) for p in ("2026-07", "2026-08", "2026-09")]
+    assert codes == [1, 1, 1]
+    assert rs.read_rows() == [] and rs.state(key)["consecutive"] == 0
+    client = _fake_client()
+    monkeypatch.setattr(runner, "_client", lambda: client)
+    assert runner.main(["--post", "--period", "2026-10"]) == 0
+    client.conversations_open.assert_called_once_with(users=[TESSA])
+    dms = [c for c in client.chat_postMessage.call_args_list if c.kwargs["channel"] == "D0MARIGOLD"]
+    assert len(dms) == 1 and "2026-10" in dms[0].kwargs["text"]
+    st = rs.state(key)
+    assert st["consecutive"] == 1 and st["tier"] == 1 and st["fire_ids"] == ["2026-10"]
+
+
+def test_a_channel_surface_signal_records_only_when_the_channel_post_succeeded(
+        tmp_path, monkeypatch):
+    """The un-flagged row's surface is the #hjrg-finance line: a failed channel
+    post means the fire never reached a human, so no row."""
+    monkeypatch.setattr(ei, "EXPECTATIONS_PATH", _write_list(tmp_path, [
+        {"name": "Marigold Ads invoice", "entity": "F3E", "match": ["marigold-ads"]}]))
+    monkeypatch.setattr(ei, "LEDGER_PATH", _write_ledger(tmp_path, [
+        {"drive_path": "x/other.pdf", "filed_at": _ts(2026, 7, 2)}]))
+    monkeypatch.setenv("REPEAT_SIGNAL_LEDGER_PATH", str(tmp_path / "repeat-signals.jsonl"))
+    client = _fake_client()
+    client.chat_postMessage.side_effect = RuntimeError("slack down")
+    monkeypatch.setattr(runner, "_client", lambda: client)
+    assert runner.main(["--post", "--period", "2026-07"]) == 1
+    assert rs.read_rows() == []
+    client.chat_postMessage.side_effect = None
+    assert runner.main(["--post", "--period", "2026-07"]) == 0
+    rows = rs.read_rows()
+    assert len(rows) == 1 and rows[0]["normal_surface"] == "#hjrg-finance" and rows[0]["tier"] == 1
+
+
+def test_tier_three_records_and_mints_regardless_of_slack(fixture_paths, monkeypatch):
+    """At tier 3 the surface IS the card mint (Harrison's tap is the only way
+    out), so the third fire is recorded even when Slack is down -- and the
+    channel report shows the quiet no_bell line the next time it can post."""
+    client = _fake_client()
+    monkeypatch.setattr(runner, "_client", lambda: client)
+    runner.main(["--post", "--period", "2026-07"])
+    runner.main(["--post", "--period", "2026-08"])
+    monkeypatch.setattr(runner, "_client", lambda: None)
+    assert runner.main(["--post", "--period", "2026-09"]) == 1
+    key = "expected-invoice|Marigold Ads invoice|F3E"
+    st = rs.state(key)
+    assert st["consecutive"] == 3 and st["suppressed"] is True and st["card_update_id"]
+    from cora import knowledge_review as kr
+    assert kr._find_update(st["card_update_id"])["state"] == "PENDING"
 
 
 def test_an_unflagged_missing_row_becomes_a_channel_surface_signal(tmp_path, monkeypatch):

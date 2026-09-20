@@ -114,13 +114,19 @@ class TestGate:
         assert set(rh.CLAIMS_HOLE_PROBES) - missed == {"clean_natural_on_energy_mood", "nsf_on_pure_mood", "sleep_on_mood"}
         lines = "\n".join(v.summary_lines())
         assert lines.startswith("SHIP: NO") and "sugar_free_on_pure" in lines and "comparative_category" in lines
-        assert "false positives: legacy trips 4/5, attribution trips 0/5" in lines
+        # PIN CHANGED with D-051 EF-7: the 9/1 Pure-attached tail left the FP set
+        # for UNDECIDED (it trips again under fail-closed union inheritance)
+        assert "false positives: legacy trips 3/4, attribution trips 0/4" in lines
 
-    def test_undecided_sentence_is_reported_not_gated(self):
+    def test_undecided_sentences_are_reported_not_gated(self):
         v = rh.evaluate()
-        (s,) = rh.UNDECIDED
-        assert v.undecided[s] == {"legacy": True, "attribution": True}
-        assert any("UNDECIDED" in ln for ln in v.summary_lines())
+        assert len(rh.UNDECIDED) == 2
+        for s in rh.UNDECIDED:
+            assert v.undecided[s] == {"legacy": True, "attribution": True}, s
+        assert sum("UNDECIDED" in ln for ln in v.summary_lines()) == 2
+        # the 9/1 shape is the one that moved (see TestFailClosedInheritance)
+        assert any("organic cane sugar, monk fruit and stevia" in s for s in rh.UNDECIDED)
+        assert not any("organic cane sugar" in s for s in rh.FALSE_POSITIVE_SET)
 
     def test_new_preflight_keeps_every_other_rail(self):
         r = rh.new_preflight("F3 Pure is NSF Certified for Sport and costs $39.99.")
@@ -135,7 +141,6 @@ class TestGate:
         assert d.sentences == len(corpus)
         assert set(d.only_legacy) == {
             "Explore the full stack in F3 Energy or the clean-sweetened version in F3 Pure.",
-            rh.FALSE_POSITIVE_SET[1],
             "F3 Energy partners with CleanHub to fund a cleaner planet with every case sold.",
             "Every F3 Energy purchase supports a cleaner future for the oceans.",
         }
@@ -143,8 +148,73 @@ class TestGate:
         assert len(d.attribution_trips) == len(rh.CLAIMS_HOLE_PROBES["clean_natural_on_energy_mood"])
 
 
+class TestFailClosedInheritance:
+    """D-051 EF-7 regression. Nearest-clause inheritance cleared a clean word
+    predicated OF Energy/Mood whenever the nearest preceding segment named Pure
+    alone ('F3 Energy, like F3 Pure, is clean.' -> legacy TRIP, attribution
+    pass, new_preflight PASSED) and the probe set was blind to the shape, so
+    evaluate() reported the class fully caught. A brand-less clean segment now
+    inherits the UNION of every brand named earlier; a bare coordinated brand
+    after 'or' folds into the clause it coordinates with."""
+
+    HOLES = (
+        "F3 Energy, like F3 Pure, is clean.",
+        "F3 Energy, similar to F3 Pure, is all-natural.",
+        "F3 Mood, our companion to F3 Pure, is the clean way to wind down.",
+        "F3 Energy: think F3 Pure, then clean caffeine on top.",
+        "Clean energy from F3 Pure or F3 Energy.",
+        "F3 Energy or F3 Pure: clean, natural energy.",
+    )
+
+    @pytest.mark.parametrize("sentence", HOLES)
+    def test_the_six_review_shapes_trip_the_attribution_rail_and_the_new_preflight(self, sentence):
+        assert pf.rail2_legacy_hit(sentence) is not None
+        assert pf.rail2_attribution_hit(sentence) is not None, sentence
+        assert rh.new_preflight(sentence).passed is False, sentence
+
+    def test_the_shapes_are_in_the_ruled_probe_set_so_the_harness_sees_them(self):
+        probes = rh.CLAIMS_HOLE_PROBES["clean_natural_on_energy_mood"]
+        for s in self.HOLES:
+            assert s in probes, s
+        assert rh.evaluate().uncaught_by_class["clean_natural_on_energy_mood"] == []
+
+    def test_the_nine_one_shape_trips_again_and_is_undecided_not_a_false_positive(self):
+        s = next(x for x in rh.UNDECIDED if "organic cane sugar" in x)
+        assert pf.rail2_attribution_hit(s) is not None
+        assert s not in rh.FALSE_POSITIVE_SET
+
+    def test_own_brand_attribution_still_clears_the_live_rejection(self):
+        """The 8/26 shape keeps clearing: the clean word sits in a clause that
+        names Pure ITSELF (own attribution wins over the union)."""
+        s = "Explore the full stack in F3 Energy or the clean-sweetened version in F3 Pure."
+        assert pf.rail2_attribution_hit(s) is None
+        assert pf.rail2_attribution_hit("F3 Pure is clean-sweetened; F3 Energy is the full stack.") is None
+
+    def test_bare_brand_segment_detector(self):
+        assert pf._bare_brand_segment(" F3 Energy.") and pf._bare_brand_segment(" and F3's Pure")
+        assert not pf._bare_brand_segment(" the clean-sweetened version in F3 Pure.")
+        assert not pf._bare_brand_segment(" energy drinks") and not pf._bare_brand_segment("")
+
+    def test_run_preflight_is_untouched_by_the_rail_change(self):
+        """Keep run_preflight byte-identical: still the legacy hit, so a live
+        draft's verdict cannot move with this harness-only change."""
+        for s in self.HOLES:
+            assert "R2" in pf.run_preflight(title="t", summary="", body_html="<p>%s</p>" % s).tripped_rail_ids
+
+
 class TestReDoS:
     """D-239: a growth-shape test on the input that REACHES each new construct."""
+
+    def test_coordinated_brand_runs_scale_linearly(self):
+        """EF-7's bare-brand fold: a run of ', F3 Pure' coordinations must not
+        grow a string per fold (parts are joined once per segment)."""
+        def elapsed(n):
+            sent = "F3 Energy" + (", F3 Pure" * n) + ", clean."
+            t0 = time.perf_counter()
+            assert pf.rail2_attribution_hit(sent) is not None
+            return time.perf_counter() - t0
+        base, dbl = elapsed(5000), elapsed(10000)
+        assert dbl < base * 2.6 + 0.05, "superlinear: %.4fs -> %.4fs" % (base, dbl)
 
     @staticmethod
     def _elapsed(fn, reps: int) -> float:
