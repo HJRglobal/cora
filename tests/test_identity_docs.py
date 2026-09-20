@@ -133,15 +133,39 @@ def test_inventory_carries_the_d308_doctrine_line():
 
 # -- drift guard 1: every credential key in .env.example is in the inventory --
 
-_CRED_SUFFIX = re.compile(r"(_TOKEN|_KEY|_SECRET|_PAT|_PAT_CORA|_PASS|_JSON|_WEBHOOK_URL)$")
+# Credential-shaped key NAMES. Widened (Code #13 RIDER 1 D-051 review, finding
+# C-docs-hygiene-2): the first cut matched only `_WEBHOOK_URL`, so HEALTH_PING_URL
+# -- a URL whose UUID IS the credential (the 2026-06-11 duplicate-line incident) --
+# had no inventory row and the guard stayed silent, as it would have for any future
+# `*_PASSPHRASE` / `*_PASSWORD` / `*_DSN` key. A `*_URL` is a credential by default;
+# the few public vendor ENDPOINT urls are named below, one by one, never by pattern.
+_CRED_SUFFIX = re.compile(
+    r"(_TOKEN|_KEY|_SECRET|_PAT|_PAT_CORA|_PASS|_PASSWORD|_PASSPHRASE|_JSON|_URL|_DSN)$"
+)
+
+# Public endpoint keys: the value is a vendor base/OAuth/MCP URL with no secret in it.
+# Adding a name here is a claim that the value can be pasted into a public doc.
+_PUBLIC_ENDPOINT_KEYS = frozenset({
+    "POLAR_API_BASE_URL",
+    "POLAR_MCP_URL",
+    "POLAR_OAUTH_URL",
+    "PHOTOROOM_BASE_URL",
+    "OTTERLY_BASE_URL",
+})
+
+
+def _credential_keys_in(text: str) -> set[str]:
+    """Credential-shaped key names on active or `# `-commented lines of an env file."""
+    keys = set()
+    for line in text.splitlines():
+        m = re.match(r"^#?\s?([A-Z][A-Z0-9_]+)=", line)
+        if m and _CRED_SUFFIX.search(m.group(1)) and m.group(1) not in _PUBLIC_ENDPOINT_KEYS:
+            keys.add(m.group(1))
+    return keys
 
 
 def _env_example_credential_keys() -> set[str]:
-    keys = set()
-    for line in _ENV_EXAMPLE.read_text(encoding="utf-8").splitlines():
-        m = re.match(r"^#?\s?([A-Z][A-Z0-9_]+)=", line)
-        if m and _CRED_SUFFIX.search(m.group(1)):
-            keys.add(m.group(1))
+    keys = _credential_keys_in(_ENV_EXAMPLE.read_text(encoding="utf-8"))
     assert keys, ".env.example parsed no credential keys -- test broken"
     return keys
 
@@ -150,6 +174,126 @@ def test_inventory_names_every_credential_key_in_env_example():
     inv = _identity_sections()[SECTIONS[0]]
     missing = sorted(k for k in _env_example_credential_keys() if f"`{k}`" not in inv)
     assert not missing, f"credential keys in .env.example with no inventory row: {missing}"
+
+
+# -- Code #13 RIDER 1 D-051 review remediation, group C-docs-hygiene --
+
+def test_credential_guard_sees_url_passphrase_password_dsn_keys():
+    """Finding C-docs-hygiene-2: the review's failing input was the committed
+    .env.example (carries `HEALTH_PING_URL=`) against the committed inventory (no
+    row) -- the old suffix set let that pass. Reproduce with the REAL parser over
+    the REAL file, then over a synthetic env text for the suffix classes the
+    review named, and pin that the public-endpoint allowlist is by NAME only."""
+    real = _env_example_credential_keys()
+    assert "HEALTH_PING_URL" in real, "the healthchecks URL is a credential-shaped key"
+    assert "CORA_BACKUP_PASSPHRASE" in real, "the commented DR passphrase line must be seen"
+    assert not (real & _PUBLIC_ENDPOINT_KEYS)
+    inv = _identity_sections()[SECTIONS[0]]
+    assert "`HEALTH_PING_URL`" in inv
+    assert "UUID" in inv and "2026-06-11" in inv  # the row names WHY the URL is a credential
+    synthetic = "\n".join([
+        "FOO_URL=",                  # url whose value would be the secret
+        "# BAR_PASSPHRASE=",         # commented, still documented
+        "BAZ_PASSWORD=x",
+        "QUX_DSN=",
+        "POLAR_API_BASE_URL=https://example.invalid",  # named public endpoint
+        "OTHER_BASE_URL=https://example.invalid",       # NOT named -> credential by default
+        "PLAIN_PORT=8787",
+        "  # INDENTED_KEY=",         # not a key line for the guard (leading spaces)
+    ])
+    got = _credential_keys_in(synthetic)
+    assert got == {"FOO_URL", "BAR_PASSPHRASE", "BAZ_PASSWORD", "QUX_DSN", "OTHER_BASE_URL"}, got
+    # the runbook sentence describes what the guard ACTUALLY checks
+    for token in ("`_PASSPHRASE`", "`_PASSWORD`", "`_URL`", "`_DSN`", "`HEALTH_PING_URL`", "NAMED allowlist"):
+        assert token in inv, token
+
+
+def test_credential_suffix_regex_is_linear_on_growth():
+    """Growth-shape pin for the widened `_CRED_SUFFIX` (every new regex gets one):
+    a `$`-anchored alternation of literals; time must stay flat as the key grows 100x."""
+    def _t(n: int) -> float:
+        s = "A" * n + "_URLX"  # near-miss on every branch, forces the full scan
+        t0 = time.perf_counter()
+        for _ in range(200):
+            _CRED_SUFFIX.search(s)
+        return time.perf_counter() - t0
+
+    small, big = _t(100), _t(10_000)
+    assert big < max(small * 50, 0.5), (small, big)
+    assert _CRED_SUFFIX.search("HEALTH_PING_URL") and _CRED_SUFFIX.search("X_PASSPHRASE")
+    assert not _CRED_SUFFIX.search("QBO_REDIRECT_URI") and not _CRED_SUFFIX.search("HEALTH_PORT")
+
+
+def test_dr_bundle_passphrase_is_named_everywhere_a_new_machine_looks():
+    """Finding C-docs-hygiene-3: the bootstrap pointer promised every credential is
+    'restored from the encrypted secrets bundle' while the passphrase that opens the
+    bundle was named nowhere an operator on a destroyed machine would look. Pin the
+    inventory row, the runbook cross-reference, the bootstrap clause and the
+    .env.example documentation (commented ONLY -- .env is inside the bundle)."""
+    inv = _identity_sections()[SECTIONS[0]]
+    rows = [l for l in inv.splitlines() if l.startswith("| ") and "`CORA_BACKUP_PASSPHRASE`" in l]
+    assert len(rows) == 1, rows
+    row = rows[0]
+    for phrase in ("NOT in `.env`", "User-scope", "password manager", "INSIDE the bundle", "D-040"):
+        assert phrase in row, phrase
+    assert "YES" not in row.split("|")[5]  # never reads as an admin identity
+    xref = inv.split("Bootstrap cross-reference:")  # the paragraph, not the row's "see ... below"
+    assert len(xref) == 2 and "PREREQUISITE" in xref[1] and "`CORA_BACKUP_PASSPHRASE`" in xref[1]
+    # bootstrap: the ONE pointer line carries the prerequisite, still ASCII, still one line
+    text = _BOOTSTRAP.read_text(encoding="utf-8")
+    block = text[text.index("## What's NOT covered by this runbook"):text.index("## Sanity check questions")]
+    pointer = [l for l in block.splitlines() if "Identity inventory" in l]
+    assert len(pointer) == 1 and pointer[0].isascii()
+    assert "`CORA_BACKUP_PASSPHRASE`" in pointer[0] and "password manager" in pointer[0]
+    assert "NOT in `.env`" in pointer[0]
+    # .env.example: documented exactly once, commented, no value; never active
+    ex = _ENV_EXAMPLE.read_text(encoding="utf-8")
+    assert len(re.findall(r"^# CORA_BACKUP_PASSPHRASE=\s*$", ex, flags=re.M)) == 1
+    assert not re.search(r"^CORA_BACKUP_PASSPHRASE=", ex, flags=re.M)
+    # the two scripts really read that key (live-symbol pin for the row's rail column)
+    for name in ("backup_logs.py", "restore_secrets.py"):
+        assert "CORA_BACKUP_PASSPHRASE" in (_REPO / "scripts" / name).read_text(encoding="utf-8"), name
+
+
+def test_cora_provisioning_names_the_second_consumer_and_the_code_send_lock():
+    """Finding C-docs-hygiene-1: the section presented the intake sweep as cora@'s
+    only consumer and 'gmail.send stays out of the DWD grant' as the send control.
+    The finance-receipt digest selects `enabled` + `dwd_eligible` rows (a WRITING
+    consumer) and the DWD grant is send-capable through gmail.modify / gmail.compose.
+    Pin the wording that states the exclusion and the real lock, and the live
+    symbols it names."""
+    sec = _identity_sections()[SECTIONS[2]]
+    inv = _identity_sections()[SECTIONS[0]]
+    dwd = _identity_sections()[SECTIONS[3]]
+    # the stale scope-as-control sentence is gone from the provisioning section
+    assert "stays out of the DWD grant" not in sec
+    for phrase in (
+        "exactly ONE consumer",
+        "`finance_receipts._digest_accounts`",
+        "skips `intake_route` rows by code",
+        "send lock is CODE, not a scope boundary",
+        "`CORA_SEND_LIVE`",
+        "`_gmail_send_raw`",
+        "`V1_MAILBOX_UNIVERSE`",
+        "`tests/test_no_raw_gmail_send.py`",
+    ):
+        assert phrase in sec, phrase
+    cora_row = [l for l in inv.splitlines() if l.startswith("| Google Workspace (cora@hjrglobal.com)")]
+    assert len(cora_row) == 1 and "`intake_route`" in cora_row[0] and "`finance_receipts._digest_accounts`" in cora_row[0]
+    assert "`CORA_SEND_LIVE`" in cora_row[0]
+    # the DWD section no longer cites the absence of gmail.send as the guarantee
+    assert "is NOT the send" in dwd and "`CORA_SEND_LIVE`" in dwd
+    # live-symbol pins: the named seam, gate and guard exist as described
+    fr = (_REPO / "src" / "cora" / "finance_receipts.py").read_text(encoding="utf-8")
+    assert "def _digest_accounts(" in fr and "dwd_eligible" in fr
+    sender = (_REPO / "src" / "cora" / "revops" / "sender.py").read_text(encoding="utf-8")
+    assert "def _gmail_send_raw(" in sender and "CORA_SEND_LIVE" in sender
+    assert len(re.findall(r"\.send\(userId=", sender)) == 1
+    trust = (_REPO / "src" / "cora" / "revops" / "send_trust.py").read_text(encoding="utf-8")
+    assert 'V1_MAILBOX_UNIVERSE = frozenset({"harrison@hjrglobal.com"})' in trust
+    assert (_REPO / "tests" / "test_no_raw_gmail_send.py").exists()
+    for scope in ("gmail.modify", "gmail.compose"):
+        assert f"`{scope}`" in sec, scope
 
 
 def test_inventory_records_slack_user_token_absent_and_not_added():

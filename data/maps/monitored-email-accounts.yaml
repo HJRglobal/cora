@@ -54,13 +54,21 @@
 #   Its ONLY consumer is scripts/run_mailbox_intake_sweep.py, which feeds each new
 #   human-authored message through info_intake.ingest (the SAME chokepoint as
 #   #info-for-cora: PHI + blanket-LEX refusal at ingest, propose-only, never
-#   autowrite) as a PENDING knowledge-review proposal. A row carrying this key
+#   autowrite) as a PENDING knowledge-review proposal. "Only consumer" holds by
+#   EXCLUSION, not by the flags alone: the weekly finance-receipt digest
+#   (finance_receipts._digest_accounts) selects every enabled + dwd_eligible row
+#   and would otherwise read this mailbox AND copy detected receipts into the
+#   shared Receipts & Invoices Drive folder, so it skips any row carrying this
+#   key (D-051 A-intake-roster-4; least privilege). A row carrying this key
 #   MUST also set thread_sweep / attachment_filer / drive_sweep EXPLICITLY false
 #   (all three default TRUE when absent, which would chunk-ingest the mailbox --
 #   the opposite posture) and fireflies_seat false (the capture seat is tracked in
 #   meeting-capture-roster.yaml; never double-flag it here). Absent key = an
 #   ordinary human mailbox (today's behaviour for every other row). Any other
 #   value is REFUSED by the sweep (the row is skipped + logged), never fallen open.
+#   Sender identity on this door is Gmail-AUTHENTICATED (Authentication-Results
+#   dmarc=pass, or spf+dkim pass, aligned to the From domain) -- a bare From:
+#   matching a roster address never resolves (D-051 A-intake-roster-5).
 
 accounts:
 

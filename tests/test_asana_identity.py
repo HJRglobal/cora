@@ -256,11 +256,14 @@ class TestHealthCheckIdentityAware:
         monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", "nonexistent-fixture.json")
         seen: dict[str, str] = {}
 
-        def fake_get(url, headers=None, timeout=None, **_kw):
+        def fake_get(url, headers=None, timeout=None, params=None, **_kw):
             r = MagicMock(status_code=200)
             if "asana.com" in url:
                 seen["auth"] = (headers or {}).get("Authorization", "")
-                r.json.return_value = {"data": {"name": "Cora Bot", "gid": "1"}}
+                seen["params"] = dict(params or {})
+                # PIN CHANGED (D-051 B-asana-identity-3): ok now REQUIRES the users/me
+                # email to be the cora@ seat -- the old fixture carried no email.
+                r.json.return_value = {"data": {"name": "Cora Bot", "gid": "1", "email": ai.CORA_SEAT_EMAIL}}
             else:
                 r.json.return_value = {"ok": True, "user": "x", "data": []}
             return r
@@ -272,6 +275,7 @@ class TestHealthCheckIdentityAware:
         assert asana[0].status == "ok"
         assert "identity: cora" in asana[0].detail and "Cora Bot" in asana[0].detail
         assert seen["auth"] == f"Bearer {_C}"
+        assert "email" in seen["params"].get("opt_fields", "")  # the check ASKS for the email
 
     def test_api_connectivity_cora_missing_key_warns_without_a_call(self, monkeypatch):
         import httpx
@@ -292,6 +296,79 @@ class TestHealthCheckIdentityAware:
         assert len(asana) == 1 and asana[0].status == "warn"
         assert "ASANA_PAT_CORA" in asana[0].detail
         assert not any("asana.com" in u for u in calls)  # no call with a fallback token
+
+
+# --- D-051 B-asana-identity-3: users/me is COMPARED against the identity ---
+
+def _hc_asana_result(monkeypatch, identity_flag: str | None, users_me_data: dict):
+    """Run check_api_connectivity with users/me answering *users_me_data* under
+    the given identity flag; return the single Asana CheckResult."""
+    import httpx
+    if identity_flag is None:
+        monkeypatch.delenv(ai.IDENTITY_ENV, raising=False)
+    else:
+        monkeypatch.setenv(ai.IDENTITY_ENV, identity_flag)
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", "nonexistent-fixture.json")
+
+    def fake_get(url, headers=None, timeout=None, params=None, **_kw):
+        r = MagicMock(status_code=200)
+        if "asana.com" in url:
+            r.json.return_value = {"data": users_me_data}
+        else:
+            r.json.return_value = {"ok": True, "user": "x", "data": []}
+        return r
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    asana = [r for r in hc.check_api_connectivity() if r.name == "Asana API"]
+    assert len(asana) == 1
+    return asana[0]
+
+
+class TestHealthCheckIdentityMismatch:
+    def test_harrison_pat_pasted_into_cora_key_is_critical(self, monkeypatch):
+        """The review's failing input: CORA_ASANA_IDENTITY=cora, ASANA_PAT_CORA holds
+        Harrison's token, users/me answers Harrison. The old check said 'ok'."""
+        r = _hc_asana_result(monkeypatch, "cora",
+                             {"name": "Harrison Fixture", "gid": "7", "email": "harrison@hjrglobal.com"})
+        assert r.status == "critical"
+        assert "IDENTITY MISMATCH" in r.detail and "identity: cora" in r.detail
+        assert "harrison@hjrglobal.com" in r.detail and ai.CORA_SEAT_EMAIL in r.detail
+        assert "ASANA_PAT_CORA" in r.detail  # the KEY to fix, by name
+        assert _H not in r.detail and _C not in r.detail  # never a token value
+
+    def test_cora_pat_under_harrison_identity_is_critical_the_other_direction(self, monkeypatch):
+        r = _hc_asana_result(monkeypatch, None,  # flag unset = harrison (the default)
+                             {"name": "Cora Bot", "gid": "42", "email": "Cora@HJRGlobal.com"})
+        assert r.status == "critical"
+        assert "IDENTITY MISMATCH" in r.detail and "identity: harrison" in r.detail
+        assert "ASANA_PAT" in r.detail and "swapped" in r.detail
+        assert _H not in r.detail and _C not in r.detail
+
+    def test_email_compared_case_insensitively(self, monkeypatch):
+        r = _hc_asana_result(monkeypatch, "cora",
+                             {"name": "Cora Bot", "gid": "42", "email": "  CORA@HJRGLOBAL.COM "})
+        assert r.status == "ok" and "identity: cora" in r.detail
+
+    def test_users_me_without_email_is_warn_unverifiable_never_ok(self, monkeypatch):
+        r = _hc_asana_result(monkeypatch, "cora", {"name": "Cora Bot", "gid": "42"})
+        assert r.status == "warn"
+        assert "identity unverifiable" in r.detail and "identity: cora" in r.detail
+        r2 = _hc_asana_result(monkeypatch, "cora", {"name": "Cora Bot", "gid": "42", "email": ""})
+        assert r2.status == "warn" and "identity unverifiable" in r2.detail
+
+    def test_harrison_identity_with_a_non_cora_email_is_ok(self, monkeypatch):
+        r = _hc_asana_result(monkeypatch, None,
+                             {"name": "Harrison Fixture", "gid": "7", "email": "harrison@hjrglobal.com"})
+        assert r.status == "ok" and "identity: harrison" in r.detail
+
+    def test_classifier_matrix(self):
+        assert ai.classify_users_me("cora", ai.CORA_SEAT_EMAIL)[0] == "ok"
+        assert ai.classify_users_me("cora", "harrison@hjrglobal.com")[0] == "critical"
+        assert ai.classify_users_me("harrison", ai.CORA_SEAT_EMAIL)[0] == "critical"
+        assert ai.classify_users_me("harrison", "harrison@hjrglobal.com")[0] == "ok"
+        assert ai.classify_users_me("cora", None)[0] == "warn"
+        assert ai.classify_users_me("harrison", "   ")[0] == "warn"
+        assert ai.CORA_SEAT_EMAIL == "cora@hjrglobal.com"
 
 
 # --- the <=1 adjacency: self-inventory names the active identity ---

@@ -149,14 +149,153 @@ class TestDiffIsExact:
         assert "LEX aggregate-only: harrison-only 1 / cora-only 0" in out
 
     def test_render_caps_long_lists(self, mod):
+        # PIN CHANGED (D-051 B-asana-identity-2): names are rendered from the
+        # exhaustive VISIBILITY diff, not the 25/50 windows (which are counts only).
         h = mod.View(identity="harrison", me={})
         c = mod.View(identity="cora", me={})
-        h.plate["U1"] = {"tasks": [{"gid": str(i), "name": f"t{i:03d}", "lex": False} for i in range(50)]}
-        c.plate["U1"] = {"tasks": []}
+        h.visibility["U1"] = {"tasks": [{"gid": str(i), "name": f"t{i:03d}", "lex": False} for i in range(50)]}
+        c.visibility["U1"] = {"tasks": []}
+        h.plate["U1"] = c.plate["U1"] = {"tasks": []}
         h.hygiene["U1"] = c.hygiene["U1"] = {"tasks": []}
         d = mod.diff_views(h, c)
         out = mod.render(d, roster=[("Someone", "U1")], catchalls={}, project_names={}, max_list=5)
         assert "... and 45 more" in out
+
+
+# --- D-051 B-asana-identity-1: only 403/404 is a membership signal ---
+
+class TestActionListIsMembershipOnly:
+    @pytest.mark.parametrize("code", [429, 500, 503, 599, "absent"])
+    def test_transient_cora_error_is_retry_not_add_seat(self, mod, code):
+        """The review's failing input: harrison sees P1, cora GET -> 429 (or the
+        getter's synthetic 599). The old render told Harrison to ADD the seat."""
+        h = mod.View(identity="harrison", me={"name": "H", "gid": "7"})
+        c = mod.View(identity="cora", me={"name": "Cora Bot", "gid": "42"})
+        h.catchall["P1"] = {"tasks": [{"gid": "X", "name": "x", "lex": False}]}
+        c.catchall["P1"] = {"error": code}
+        d = mod.diff_views(h, c)
+        out = mod.render(d, roster=[], catchalls={"P1": ["F3E"]}, project_names={"P1": "[F3E] Ops"})
+        assert "ADD THE cora@ SEAT TO" not in out
+        assert f"RETRY: [F3E] [F3E] Ops [P1] (cora GET -> {code} -- transient/error, NOT a membership signal)" in out
+        # the action list does not claim every project is reachable while a retry is pending
+        assert "no membership gap confirmed -- 1 project(s) pending RETRY" in out
+        assert "the cora@ seat reaches every catch-all project" not in out
+
+    @pytest.mark.parametrize("code", [403, 404])
+    def test_membership_gap_codes_still_produce_the_action_line(self, mod, code):
+        h = mod.View(identity="harrison", me={})
+        c = mod.View(identity="cora", me={})
+        h.catchall["P1"] = {"tasks": [{"gid": "X", "name": "x", "lex": False}]}
+        c.catchall["P1"] = {"error": code}
+        d = mod.diff_views(h, c)
+        out = mod.render(d, roster=[], catchalls={"P1": ["F3E"]}, project_names={"P1": "[F3E] Ops"})
+        assert f"ADD THE cora@ SEAT TO: [F3E] [F3E] Ops [P1] (cora GET -> {code})" in out
+        assert "RETRY: [F3E]" not in out
+        assert mod._MEMBERSHIP_GAP_CODES == frozenset({403, 404})
+
+    def test_getter_network_error_is_599_and_lands_in_retry(self, mod):
+        """make_getter's synthetic 599 (httpx.RequestError) must never read as a gap."""
+        import httpx
+
+        def boom(*_a, **_k):
+            raise httpx.ConnectError("fixture")
+
+        cm = MagicMock()
+        cm.__enter__.return_value = MagicMock(get=boom)
+        cm.__exit__.return_value = False
+        with patch.object(mod.httpx, "Client", MagicMock(return_value=cm)):
+            get = mod.make_getter("t")
+            res = mod.fetch_project_tasks(get, "P1")
+        assert res == {"error": 599}
+        assert 599 not in mod._MEMBERSHIP_GAP_CODES
+
+
+# --- D-051 B-asana-identity-2: the visibility diff is exhaustive, the windows are counts ---
+
+def _paged_getter(gids: list[str], hidden: frozenset[str] = frozenset()):
+    """A fake Asana that honours limit/offset over an ordered task list, with
+    *hidden* gids invisible to this token (the cora@ seat not in their project)."""
+    visible = [{"gid": g, "name": g} for g in gids if g not in hidden]
+    pages: list[dict] = []
+
+    def get(path, params):
+        if path == "/users/me":
+            return 200, {"data": {"name": "who", "gid": "1"}}
+        params = params or {}
+        limit = int(params["limit"])
+        start = int(params.get("offset") or 0)
+        pages.append(dict(params))
+        page = visible[start:start + limit]
+        nxt = {"offset": str(start + limit)} if start + limit < len(visible) else None
+        return 200, {"data": page, "next_page": nxt}
+
+    get.pages = pages  # type: ignore[attr-defined]
+    return get
+
+
+class TestVisibilityDiffIsExhaustive:
+    def test_hidden_task_inside_window_is_not_reported_as_a_shift(self, mod):
+        """The review's failing input: 30 tasks T01..T30, cora cannot see T03.
+        The 25-window diff said cora-only [T26] -- but Harrison sees T26."""
+        gids = [f"T{i:02d}" for i in range(1, 31)]
+        roster = [("Harrison", "7")]
+        h = mod.collect_view("harrison", _paged_getter(gids), roster, {})
+        c = mod.collect_view("cora", _paged_getter(gids, hidden=frozenset({"T03"})), roster, {})
+        d = mod.diff_views(h, c)
+        # the window data still shows the shift (that IS what the plate would show) ...
+        assert d["plate"]["7"]["cora_only"] == [("T26", "T26")]
+        # ... but the visibility diff is the true comparison
+        vis = d["visibility"]["7"]
+        assert vis["harrison_count"] == 30 and vis["cora_count"] == 29
+        assert vis["harrison_only"] == [("T03", "T03")] and vis["cora_only"] == []
+        assert vis["harrison_capped"] is False and vis["cora_capped"] is False
+        out = mod.render(d, roster=roster, catchalls={}, project_names={})
+        assert "T26" not in out, "a task that merely shifted into Cora's window must never be named"
+        assert "harrison-only (1) -- Cora cannot see:" in out and "- T03  [T03]" in out
+        assert "COUNTS ONLY, not a visibility signal" in out
+        assert "window contents differ: 1 / 1 -- see the visibility diff" in out
+
+    def test_hidden_task_beyond_both_windows_is_surfaced(self, mod):
+        """Invisible task at position 60 of 70 -- past BOTH the 25 plate window and
+        the 50 hygiene window: every window diff is EMPTY and the loss was never
+        reported. Harrison (100+ open tasks) is the user most affected."""
+        gids = [f"T{i:02d}" for i in range(1, 71)]
+        roster = [("Harrison", "7")]
+        h = mod.collect_view("harrison", _paged_getter(gids), roster, {})
+        c = mod.collect_view("cora", _paged_getter(gids, hidden=frozenset({"T60"})), roster, {})
+        d = mod.diff_views(h, c)
+        for window in ("plate", "hygiene"):
+            assert d[window]["7"]["harrison_only"] == [] and d[window]["7"]["cora_only"] == [], window
+        assert d["visibility"]["7"]["harrison_only"] == [("T60", "T60")]
+        assert d["visibility"]["7"]["harrison_count"] == 70 and d["visibility"]["7"]["cora_count"] == 69
+        out = mod.render(d, roster=roster, catchalls={}, project_names={})
+        assert "- T60  [T60]" in out and "Cora cannot see" in out
+
+    def test_visibility_walk_paginates_at_api_max_and_flags_the_cap(self, mod):
+        from cora.tools import asana_client as ac
+        n = mod._VISIBILITY_MAX_TASKS + 5
+        gids = [f"T{i:04d}" for i in range(n)]
+        get = _paged_getter(gids)
+        res = mod.fetch_user_tasks(get, "7", mod._VISIBILITY_MAX_TASKS)
+        assert len(res["tasks"]) == mod._VISIBILITY_MAX_TASKS and res["capped"] is True
+        assert all(p["limit"] <= ac._API_MAX_LIMIT for p in get.pages)
+        assert get.pages[0]["limit"] == ac._API_MAX_LIMIT and "offset" not in get.pages[0]
+        assert len(get.pages) == mod._VISIBILITY_MAX_TASKS // ac._API_MAX_LIMIT
+        h = mod.View(identity="harrison", me={})
+        c = mod.View(identity="cora", me={})
+        h.visibility["7"] = res
+        c.visibility["7"] = res
+        out = mod.render(mod.diff_views(h, c), roster=[("Harrison", "7")], catchalls={}, project_names={})
+        assert f"CAP {mod._VISIBILITY_MAX_TASKS} REACHED" in out
+
+    def test_windows_are_still_fetched_byte_for_byte(self, mod):
+        """The 25/50 windows remain real GETs with the live limits (they are what the
+        plate / nudge would show); the visibility walk is a THIRD query."""
+        gids = [f"T{i:02d}" for i in range(1, 61)]
+        get = _paged_getter(gids)
+        mod.collect_view("harrison", get, [("Harrison", "7")], {})
+        first_page_limits = [p["limit"] for p in get.pages if "offset" not in p]
+        assert first_page_limits == [25, 50, 100]
 
 
 # --- read-boundary withholding (D-145) ---
@@ -252,7 +391,10 @@ class TestZeroNonGet:
         assert p["completed_since"] == "now"
         assert p["opt_fields"] == ",".join(ac._DEFAULT_TASK_OPT_FIELDS)
         limits = {c.kwargs["params"]["limit"] for c in task_calls}
-        assert limits == {ac._DEFAULT_MAX_TASKS, mod._HYGIENE_MAX_TASKS}  # plate 25 + hygiene 50
+        # PIN CHANGED (D-051 B-asana-identity-2): plate 25 + hygiene 50 + the exhaustive
+        # visibility walk (first page at _API_MAX_LIMIT=100, still GET-only).
+        assert limits == {ac._DEFAULT_MAX_TASKS, mod._HYGIENE_MAX_TASKS, ac._API_MAX_LIMIT}
+        assert mod._VISIBILITY_MAX_TASKS == 1000
         proj_calls = [c for c in client.get.call_args_list if "/projects/" in c.args[0] and c.args[0].endswith("/tasks")]
         assert proj_calls
         pp = proj_calls[0].kwargs["params"]

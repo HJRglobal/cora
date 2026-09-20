@@ -409,8 +409,16 @@ def _save_watermarks(marks: dict[str, int]) -> None:
     _WATERMARKS_PATH.write_text(json.dumps(marks, indent=2), encoding="utf-8")
 
 
+#: Roster key that marks a SYSTEM INTAKE mailbox (cora@; run_mailbox_intake_sweep
+#: is its only consumer). Any row carrying it -- whatever the value -- is
+#: excluded here: a knowledge-intake mailbox must never file receipts to the
+#: shared Drive folder (least privilege, D-307/D-308; D-051 A-intake-roster-4).
+_INTAKE_ROUTE_KEY = "intake_route"
+
+
 def _digest_accounts() -> list[str]:
-    """All enabled, DWD-eligible monitored mailboxes ('all inboxes' per spec)."""
+    """All enabled, DWD-eligible monitored mailboxes ('all inboxes' per spec),
+    EXCEPT rows carrying ``intake_route`` (system intake mailboxes)."""
     try:
         raw = yaml.safe_load(_ACCOUNTS_PATH.read_text(encoding="utf-8")) or {}
     except Exception as exc:  # noqa: BLE001
@@ -418,6 +426,10 @@ def _digest_accounts() -> list[str]:
         return []
     out: list[str] = []
     for acct in raw.get("accounts", []) or []:
+        if not isinstance(acct, dict):
+            continue
+        if _INTAKE_ROUTE_KEY in acct:
+            continue
         if acct.get("enabled") and acct.get("dwd_eligible"):
             email = str(acct.get("email") or "").strip().lower()
             if email and email not in out:

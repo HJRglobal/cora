@@ -335,7 +335,7 @@ For deeper troubleshooting see `deployment/runbook.md`.
 - **Slack workspace itself** — cloud-hosted by Slack, survives any local machine destruction.
 - **Anthropic billing / usage caps** — cloud-side, survives local destruction. Worth a quick check at console.anthropic.com after bootstrap to confirm budget alerts are still configured.
 - **The full team's individual Slack usage** — Cora's reply behavior is restored; team channels and members are workspace-side.
-- **Every non-Slack/Anthropic identity and credential (Google SA + DWD, cora@hjrglobal.com, Asana PATs, Fireflies, HubSpot, QBO, ...)** -- see the Identity inventory in `deployment/runbook.md` (sections "Identity inventory", "Rotation: Asana PAT (Cora)", "Provisioning: cora@hjrglobal.com", "Provisioning: Google service account + DWD"); restored from the encrypted secrets bundle, never regenerated here.
+- **Every non-Slack/Anthropic identity and credential (Google SA + DWD, cora@hjrglobal.com, Asana PATs, Fireflies, HubSpot, QBO, ...)** -- see the Identity inventory in `deployment/runbook.md` (sections "Identity inventory", "Rotation: Asana PAT (Cora)", "Provisioning: cora@hjrglobal.com", "Provisioning: Google service account + DWD"); restored from the encrypted secrets bundle (`restore_secrets.py`), never regenerated here -- PREREQUISITE: the bundle decrypts ONLY with `CORA_BACKUP_PASSPHRASE`, which lives in the password manager (and as a User-scope env var on the old host), NOT in `.env` and NOT in the bundle; fetch it from the password manager FIRST or nothing below restores.
 
 ---
 

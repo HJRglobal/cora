@@ -29,11 +29,24 @@ live consumers send:
   4. hygiene-nudge query           -> the same GET /tasks shape as (2) with limit=50
                                       (scripts/run_asana_hygiene_nudges.py:236
                                       get_user_tasks(str(asana_gid), max_tasks=50))
+  5. visibility query              -> the same GET /tasks shape as (2) paginated to
+                                      EXHAUSTION (cap _VISIBILITY_MAX_TASKS=1000,
+                                      still GET-only). This is the ONLY per-user
+                                      query whose set difference is reported by
+                                      name: (2) and (4) are first-N WINDOWS, so a
+                                      window diff names tasks that merely shifted
+                                      position (Harrison sees them) and misses any
+                                      invisible task beyond the window. The windows
+                                      are reported as labelled COUNTS only.
 
-Output: per-query counts under both identities and the set difference of task /
-project gids with NAMES ONLY -- no descriptions, no notes. A project Cora cannot
-reach (403/404 under ASANA_PAT_CORA) is printed as a report line naming it for
-Harrison to add the cora@ seat to in Asana. NEVER a code workaround.
+Output: per-query counts under both identities and, for the visibility query and
+the catch-alls, the set difference of task / project gids with NAMES ONLY -- no
+descriptions, no notes. A project Cora cannot reach (403/404 under ASANA_PAT_CORA
+-- _MEMBERSHIP_GAP_CODES) is printed as an ACTION line naming it for Harrison to
+add the cora@ seat to in Asana. NEVER a code workaround. Any OTHER cora-side error
+(429, 5xx, the getter's synthetic 599 on a network error, "absent") is a RETRY
+line, never a membership signal -- an action list that told Harrison to change
+Asana membership on a rate-limit would be wrong in the irreversible direction.
 
 PHI posture (D-145): tasks in LEX-prefixed projects and tasks whose name trips
 phi_guard.is_phi_risk are COUNTED but their names are withheld; LEX catch-all
@@ -78,6 +91,12 @@ CAPTURE_MAP_FILE = _REPO_ROOT / "data" / "maps" / "meeting-capture-projects.yaml
 _TIMEOUT = 10.0
 # scripts/run_asana_hygiene_nudges.py:236 -- get_user_tasks(str(asana_gid), max_tasks=50)
 _HYGIENE_MAX_TASKS = 50
+# The visibility comparison paginates to exhaustion under this cap (GET-only; the
+# cap only bounds the walk). A user at the cap is flagged, never silently truncated.
+_VISIBILITY_MAX_TASKS = 1000
+# The ONLY cora-side status codes that mean "the cora@ seat is not a member".
+# Everything else (429 / 5xx / 599 network / "absent") is transient -> RETRY.
+_MEMBERSHIP_GAP_CODES = frozenset({403, 404})
 # asana_client.get_project_tasks opt_fields (kept in the same order).
 _PROJECT_TASK_OPT_FIELDS = ["name", "due_on", "due_at", "completed", "assignee.name", "permalink_url"]
 _WITHHELD = "[name withheld -- LEX/PHI-shaped]"
@@ -157,7 +176,9 @@ def fetch_user_tasks(get: Getter, user_gid: str, max_tasks: int) -> dict[str, An
                               per_item=lambda t: not is_system_noise_task(t.get("name", "")))
     if status != 200:
         return {"error": status}
-    return {"tasks": [_task_row(t) for t in tasks]}
+    # capped: the walk stopped at max_tasks, so more may exist. Meaningful for the
+    # exhaustive visibility query (flagged in the report); normal for the windows.
+    return {"tasks": [_task_row(t) for t in tasks], "capped": len(tasks) >= max_tasks}
 
 
 def fetch_project_tasks(get: Getter, project_gid: str) -> dict[str, Any]:
@@ -225,8 +246,9 @@ def load_catchall_projects(path: Path = CAPTURE_MAP_FILE) -> dict[str, list[str]
 class View:
     identity: str
     me: dict[str, Any] = field(default_factory=dict)
-    plate: dict[str, dict[str, Any]] = field(default_factory=dict)      # user_gid -> result
-    hygiene: dict[str, dict[str, Any]] = field(default_factory=dict)    # user_gid -> result
+    plate: dict[str, dict[str, Any]] = field(default_factory=dict)      # user_gid -> result (window 25)
+    hygiene: dict[str, dict[str, Any]] = field(default_factory=dict)    # user_gid -> result (window 50)
+    visibility: dict[str, dict[str, Any]] = field(default_factory=dict)  # user_gid -> result (exhaustive)
     catchall: dict[str, dict[str, Any]] = field(default_factory=dict)   # project_gid -> result
 
 
@@ -238,6 +260,7 @@ def collect_view(identity: str, get: Getter, roster: list[tuple[str, str]],
     for _name, gid in roster:
         v.plate[gid] = fetch_user_tasks(get, gid, _DEFAULT_MAX_TASKS)
         v.hygiene[gid] = fetch_user_tasks(get, gid, _HYGIENE_MAX_TASKS)
+        v.visibility[gid] = fetch_user_tasks(get, gid, _VISIBILITY_MAX_TASKS)
     for pgid in catchalls:
         v.catchall[pgid] = fetch_project_tasks(get, pgid)
     return v
@@ -253,6 +276,7 @@ def diff_results(h: dict[str, Any], c: dict[str, Any]) -> dict[str, Any]:
         "harrison_count": None, "cora_count": None,
         "harrison_error": h.get("error"), "cora_error": c.get("error"),
         "harrison_only": [], "cora_only": [],
+        "harrison_capped": bool(h.get("capped")), "cora_capped": bool(c.get("capped")),
     }
     hm = _gid_map(h) if "error" not in h else None
     cm = _gid_map(c) if "error" not in c else None
@@ -269,6 +293,7 @@ def diff_results(h: dict[str, Any], c: dict[str, Any]) -> dict[str, Any]:
 def diff_views(h: View, c: View) -> dict[str, Any]:
     keys = {"plate": set(h.plate) | set(c.plate),
             "hygiene": set(h.hygiene) | set(c.hygiene),
+            "visibility": set(h.visibility) | set(c.visibility),
             "catchall": set(h.catchall) | set(c.catchall)}
     return {
         "me": {"harrison": h.me, "cora": c.me},
@@ -276,6 +301,8 @@ def diff_views(h: View, c: View) -> dict[str, Any]:
                   for k in sorted(keys["plate"])},
         "hygiene": {k: diff_results(h.hygiene.get(k, {"error": "absent"}), c.hygiene.get(k, {"error": "absent"}))
                     for k in sorted(keys["hygiene"])},
+        "visibility": {k: diff_results(h.visibility.get(k, {"error": "absent"}), c.visibility.get(k, {"error": "absent"}))
+                       for k in sorted(keys["visibility"])},
         "catchall": {k: diff_results(h.catchall.get(k, {"error": "absent"}), c.catchall.get(k, {"error": "absent"}))
                      for k in sorted(keys["catchall"])},
     }
@@ -311,23 +338,47 @@ def render(delta: dict[str, Any], roster: list[tuple[str, str]], catchalls: dict
     L.append("")
 
     names_by_gid = {gid: name for name, gid in roster}
-    for section, title in (("plate", "plate-tool tasks query (GET /tasks, limit 25, rich opt_fields)"),
-                           ("hygiene", "hygiene-nudge query (GET /tasks, limit 50)")):
+
+    # The visibility comparison -- the ONE per-user diff whose names are reported.
+    # It walks GET /tasks to exhaustion under both tokens, so harrison-only really
+    # is "Cora cannot see" and cora-only really is "Harrison cannot see".
+    L.append(f"visibility diff (GET /tasks paginated to exhaustion, cap {_VISIBILITY_MAX_TASKS}) -- the comparison to act on")
+    for ugid, d in delta.get("visibility", {}).items():
+        who = names_by_gid.get(ugid, ugid)
+        L.append(f"  {who}: harrison {_fmt_count(d['harrison_count'], d['harrison_error'])} / "
+                 f"cora {_fmt_count(d['cora_count'], d['cora_error'])}")
+        if d.get("harrison_capped") or d.get("cora_capped"):
+            L.append(f"    CAP {_VISIBILITY_MAX_TASKS} REACHED -- the walk stopped; this diff may be incomplete")
+        if d["harrison_only"]:
+            L.append(f"    harrison-only ({len(d['harrison_only'])}) -- Cora cannot see:")
+            L.extend(_fmt_list(d["harrison_only"], max_list))
+        if d["cora_only"]:
+            L.append(f"    cora-only ({len(d['cora_only'])}) -- Harrison cannot see:")
+            L.extend(_fmt_list(d["cora_only"], max_list))
+    L.append("")
+
+    # The two live WINDOWS -- counts only. A first-N window under each token is not
+    # a visibility comparison: a task that merely shifts into Cora's window reads as
+    # "cora-only" though Harrison sees it, and an invisible task past position N is
+    # never reported. Names for these live in the visibility diff above.
+    for section, title in (("plate", f"plate-tool window (GET /tasks, limit {_DEFAULT_MAX_TASKS}, rich opt_fields) -- "
+                                     "what the plate would show; COUNTS ONLY, not a visibility signal"),
+                           ("hygiene", f"hygiene-nudge window (GET /tasks, limit {_HYGIENE_MAX_TASKS}) -- "
+                                       "what the nudge would iterate; COUNTS ONLY, not a visibility signal")):
         L.append(title)
         for ugid, d in delta[section].items():
             who = names_by_gid.get(ugid, ugid)
-            L.append(f"  {who}: harrison {_fmt_count(d['harrison_count'], d['harrison_error'])} / "
-                     f"cora {_fmt_count(d['cora_count'], d['cora_error'])}")
-            if d["harrison_only"]:
-                L.append(f"    harrison-only ({len(d['harrison_only'])}) -- Cora cannot see:")
-                L.extend(_fmt_list(d["harrison_only"], max_list))
-            if d["cora_only"]:
-                L.append(f"    cora-only ({len(d['cora_only'])}):")
-                L.extend(_fmt_list(d["cora_only"], max_list))
+            line = (f"  {who}: harrison {_fmt_count(d['harrison_count'], d['harrison_error'])} / "
+                    f"cora {_fmt_count(d['cora_count'], d['cora_error'])}")
+            if d["harrison_only"] or d["cora_only"]:
+                line += (f"  (window contents differ: {len(d['harrison_only'])} / {len(d['cora_only'])}"
+                         " -- see the visibility diff)")
+            L.append(line)
         L.append("")
 
     L.append("meeting-capture catch-all projects (GET /projects/<gid>/tasks, incomplete-only)")
     action_lines: list[str] = []
+    retry_lines: list[str] = []
     for pgid, d in delta["catchall"].items():
         entities = "/".join(catchalls.get(pgid, ["?"]))
         pname = project_names.get(pgid) or "(name unavailable)"
@@ -335,7 +386,14 @@ def render(delta: dict[str, Any], roster: list[tuple[str, str]], catchalls: dict
         L.append(f"  [{entities}] {pname} [{pgid}]: harrison {_fmt_count(d['harrison_count'], d['harrison_error'])} / "
                  f"cora {_fmt_count(d['cora_count'], d['cora_error'])}")
         if d["cora_error"] is not None and d["harrison_error"] is None:
-            action_lines.append(f"  ADD THE cora@ SEAT TO: [{entities}] {pname} [{pgid}] (cora GET -> {d['cora_error']})")
+            # Only a 403/404 under the cora@ token is a MEMBERSHIP signal. A 429,
+            # a 5xx, the getter's synthetic 599 or an "absent" view is transient:
+            # it goes to RETRY, never to the action list Harrison acts on in Asana.
+            if d["cora_error"] in _MEMBERSHIP_GAP_CODES:
+                action_lines.append(f"  ADD THE cora@ SEAT TO: [{entities}] {pname} [{pgid}] (cora GET -> {d['cora_error']})")
+            else:
+                retry_lines.append(f"  RETRY: [{entities}] {pname} [{pgid}] (cora GET -> {d['cora_error']}"
+                                   " -- transient/error, NOT a membership signal)")
         elif is_lex:
             # LEX catch-alls are aggregate-only (D-145): counts + project name, never tasks.
             if d["harrison_only"] or d["cora_only"]:
@@ -348,11 +406,19 @@ def render(delta: dict[str, Any], roster: list[tuple[str, str]], catchalls: dict
                 L.append(f"    cora-only ({len(d['cora_only'])}):")
                 L.extend(_fmt_list(d["cora_only"], max_list))
     L.append("")
-    L.append("HARRISON ACTION LIST (Asana membership -- never a code workaround)")
+    L.append("HARRISON ACTION LIST (Asana membership -- never a code workaround; 403/404 under the cora@ token ONLY)")
     if action_lines:
         L.extend(action_lines)
+    elif retry_lines:
+        L.append(f"  (no membership gap confirmed -- {len(retry_lines)} project(s) pending RETRY below)")
     else:
         L.append("  (none -- the cora@ seat reaches every catch-all project Harrison's PAT reaches)")
+    L.append("")
+    L.append("RETRY (transient/error under the cora@ token -- NOT a membership signal; re-run before acting)")
+    if retry_lines:
+        L.extend(retry_lines)
+    else:
+        L.append("  (none)")
     return "\n".join(L)
 
 

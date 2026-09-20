@@ -25,7 +25,14 @@ For every roster row with ``intake_route == knowledge_review`` (today: cora@):
      attachment filer's Claude prompt, which this path never runs);
   3. resolve the SENDER to a roster human (monitored-email-accounts email +
      known_aliases -> slack_user_id). A non-roster sender is skipped fail-closed,
-     counted, never proposed; a message the mailbox sent itself is skipped too;
+     counted, never proposed; a message the mailbox sent itself is skipped too.
+     The From: header alone is forgeable (RFC 5322), and this is a knowledge
+     door keyed on identity, so the address resolves to a roster human ONLY when
+     Gmail's own Authentication-Results header (authserv-id mx.google.com) says
+     dmarc=pass, or spf=pass AND dkim=pass, with the authenticated domain equal
+     to the From domain. A missing / unparseable header or any other verdict is
+     skipped as ``unauthenticated_sender`` (counted, logged by reason + sender
+     domain, never the body) -- D-051 A-intake-roster-5;
   4. hand the message to info_intake.ingest(route="mailbox") -- REUSED, never copied.
      ingest already carries the unconditional PHI screen, the blanket LEX-CONTENT
      refusal, the durable-fact screen, dedup, and payload.source="info-for-cora", so
@@ -33,6 +40,14 @@ For every roster row with ``intake_route == knowledge_review`` (today: cora@):
      the R3 autowrite SOURCE exclusion applies unchanged (Tier-0 by construction:
      CORA_AUTOWRITE_LIVE never reaches this mailbox);
   5. advance the per-mailbox watermark (atomic write) -- ONLY with --apply.
+
+ORDER + CAP (D-051 A-intake-roster-2): Gmail's messages.list returns NEWEST first.
+The sweep lists the WHOLE window (paged, bounded by _MAX_LIST_PAGES), then
+processes the OLDEST ``--max-messages`` of it in chronological order, so at the
+cap the watermark = newest message actually processed and the newer remainder is
+the next run's backlog -- WARNED by count, never silently skipped. (Processing in
+API order and then advancing to "newest processed" -- the first cut -- skipped
+every older unseen message forever the moment the cap was hit.)
 
 NO size floor: a one-line human note is the primary use case (smoke 4).
 
@@ -94,10 +109,32 @@ TASK_NAME = "Cora - Mailbox Intake Sweep"
 #: First run with no watermark: how far back to look. Bounded on purpose -- an
 #: unbounded first pass would re-read the mailbox's whole history.
 DEFAULT_BOOTSTRAP_DAYS = 7
-#: Safety cap on messages processed per mailbox per run. Cap-aware watermark
-#: (D-038): when the cap is hit the watermark advances only to the newest message
-#: actually processed, never to "now".
+#: Safety cap on messages PROCESSED (fetched + classified) per mailbox per run.
+#: The whole window is LISTED (ids only, cheap) and the OLDEST cap of it is
+#: processed, so the cap-aware watermark (D-038) -- advance only to the newest
+#: message actually processed, never to "now" -- really does leave the newer
+#: remainder for the next run instead of skipping the older one.
 DEFAULT_MAX_MESSAGES = 100
+#: Listing ceiling (pages of <=100 ids). Unreachable for one small intake
+#: mailbox over a 7-day bootstrap; if it IS hit the listing is truncated at the
+#: NEWEST ids, so the oldest are unknown and the watermark is FROZEN + WARNED
+#: rather than advanced past mail never seen (narrow --bootstrap-days).
+_MAX_LIST_PAGES = 50
+
+# -- Sender authentication (D-051 A-intake-roster-5) ---------------------------
+#: The authserv-id of the MTA that received the message for a Workspace mailbox.
+#: Only an Authentication-Results header stamped by it is trusted; Gmail
+#: prepends its own trace headers above any a sender supplied, so the FIRST such
+#: header in payload order is Gmail's.
+_TRUSTED_AUTHSERV_ID = "mx.google.com"
+#: RFC 8601 pieces. Each regex is linear: one bounded character class per token,
+#: no nested quantifiers (ReDoS class, D-051 lessons); growth-shape tested.
+_AR_COMMENT_RE = re.compile(r"\([^()]*\)")
+_AR_METHOD_RE = re.compile(r"^\s*([A-Za-z0-9-]+)\s*=\s*([A-Za-z0-9]+)")
+_AR_PROP_RE = re.compile(
+    r"\b(header\.from|header\.d|header\.i|smtp\.mailfrom)\s*=\s*\"?([^\s;\"]+)",
+    re.IGNORECASE,
+)
 
 # -- CODE skip rules ----------------------------------------------------------
 # Automated-sender LOCALPARTS. Anchored at both ends; the optional tail admits a
@@ -134,6 +171,10 @@ SKIP_AUTOMATED_SENDER = "automated_sender"
 SKIP_AUTOMATED_SUBJECT = "automated_subject"
 SKIP_SELF = "self_sent"
 SKIP_NON_ROSTER = "non_roster_sender"
+#: A roster address in From: that Gmail did NOT authenticate (no trusted
+#: Authentication-Results, or a verdict other than dmarc=pass / spf+dkim pass
+#: aligned to the From domain). Fail-closed: skipped, counted, never proposed.
+SKIP_UNAUTHENTICATED = "unauthenticated_sender"
 SKIP_EMPTY = "empty"
 
 
@@ -196,9 +237,15 @@ def write_watermarks(marks: dict[str, int]) -> None:
 
 def next_watermark(processed: int, cap: int, newest_processed_ts: int, sync_start: int) -> int:
     """Cap-aware (D-038, the gmail sweep's _next_watermark): under the cap we
-    drained the window -> sync_start; at the cap there is backlog we never saw ->
-    advance only to the newest message actually processed; nothing processed ->
-    0 (caller treats 0 as 'no change')."""
+    drained the window -> sync_start; at the cap there is NEWER backlog we listed
+    but did not process -> advance only to the newest message actually processed
+    so the next run's ``after:`` re-lists exactly that remainder; nothing
+    processed -> 0 (caller treats 0 as 'no change').
+
+    This is only correct because sweep_mailbox processes the OLDEST ``cap``
+    messages of the listed window (A-intake-roster-2). Fed the newest ``cap``
+    (Gmail's native list order) the same arithmetic would skip every older
+    unseen message forever."""
     if processed < cap:
         return sync_start
     if newest_processed_ts > 0:
@@ -290,11 +337,77 @@ def is_automated_subject(subject: str) -> bool:
     return bool(_AUTOMATED_SUBJECT_RE.search(s))
 
 
+def _domain_of(value: str) -> str:
+    """'tommy@f3energy.com' / '@f3energy.com' / 'f3energy.com.' -> 'f3energy.com'."""
+    v = (value or "").strip().strip('"').lower()
+    if "@" in v:
+        v = v.rpartition("@")[2]
+    return v.rstrip(".")
+
+
+def parse_authentication_results(values: list[str] | None) -> dict[str, dict[str, str]]:
+    """The FIRST Authentication-Results header stamped by the trusted receiving
+    MTA (_TRUSTED_AUTHSERV_ID), parsed per RFC 8601 into
+    {method: {"result": ..., "<ptype.property>": ...}}. {} when no trusted header
+    exists or it is unparseable. Headers claiming any other authserv-id are
+    ignored: a sender can write its own Authentication-Results line, but it
+    cannot make Gmail's MX stamp one above it."""
+    for raw in values or []:
+        text = _AR_COMMENT_RE.sub(" ", str(raw or ""))
+        text = _AR_COMMENT_RE.sub(" ", text)  # one nesting level of CFWS, still linear
+        parts = [p for p in text.split(";")]
+        if not parts:
+            continue
+        authserv = parts[0].strip().split()
+        if not authserv or authserv[0].lower() != _TRUSTED_AUTHSERV_ID:
+            continue
+        out: dict[str, dict[str, str]] = {}
+        for seg in parts[1:]:
+            m = _AR_METHOD_RE.match(seg)
+            if not m:
+                continue
+            method, result = m.group(1).lower(), m.group(2).lower()
+            props: dict[str, str] = {"result": result}
+            for pm in _AR_PROP_RE.finditer(seg):
+                props[pm.group(1).lower()] = pm.group(2)
+            out.setdefault(method, props)   # first resinfo per method wins
+        return out
+    return {}
+
+
+def sender_authenticated(auth_results: list[str] | None, from_addr: str) -> bool:
+    """True ONLY when Gmail authenticated the From domain: dmarc=pass aligned to
+    the From domain, or spf=pass AND dkim=pass each aligned to it. Anything else
+    -- no trusted header, unparseable, fail/none/neutral/softfail/temperror,
+    or a pass for a DIFFERENT domain -- is False (fail-closed)."""
+    from_domain = _domain_of(from_addr)
+    if not from_domain:
+        return False
+    parsed = parse_authentication_results(auth_results)
+    if not parsed:
+        return False
+    dmarc = parsed.get("dmarc") or {}
+    if dmarc.get("result") == "pass" and _domain_of(dmarc.get("header.from", "")) == from_domain:
+        return True
+    spf = parsed.get("spf") or {}
+    dkim = parsed.get("dkim") or {}
+    spf_ok = (spf.get("result") == "pass"
+              and _domain_of(spf.get("smtp.mailfrom", "")) == from_domain)
+    dkim_domain = _domain_of(dkim.get("header.i", "") or dkim.get("header.d", ""))
+    dkim_ok = dkim.get("result") == "pass" and dkim_domain == from_domain
+    return bool(spf_ok and dkim_ok)
+
+
 def skip_reason(*, sender: str, subject: str, body: str, mailbox: str,
-                sender_index: dict[str, tuple[str, str]]) -> str:
+                sender_index: dict[str, tuple[str, str]],
+                auth_results: list[str] | None = None) -> str:
     """'' when the message should reach ingest(); otherwise the SKIP_* reason.
     Order: automated sender -> automated subject -> self-sent -> non-roster ->
-    empty. Fail-closed: an unresolvable sender is skipped, never proposed."""
+    UNAUTHENTICATED -> empty. Fail-closed: an unresolvable sender is skipped,
+    never proposed, and a roster address Gmail did not authenticate for its own
+    domain (``auth_results`` = the message's Authentication-Results headers in
+    payload order; None/[] = no header) is skipped too -- the From: header alone
+    never resolves an identity (A-intake-roster-5)."""
     addr = sender_email(sender)
     if is_automated_sender(addr):
         return SKIP_AUTOMATED_SENDER
@@ -304,6 +417,8 @@ def skip_reason(*, sender: str, subject: str, body: str, mailbox: str,
         return SKIP_SELF
     if addr not in sender_index:
         return SKIP_NON_ROSTER
+    if not sender_authenticated(auth_results, addr):
+        return SKIP_UNAUTHENTICATED
     if not (subject or "").strip() and not (body or "").strip():
         return SKIP_EMPTY
     return ""
@@ -336,37 +451,48 @@ def _service(mailbox: str):
     return _build_service(mailbox)
 
 
-def list_message_ids(service, since_ts: int, max_results: int) -> list[str]:
-    """messages.list with after:<since>; paged; capped. num_retries=2 mirrors the
-    gmail sweep's getProfile call (a single transient 429/500 must not skip a
-    mailbox for a night)."""
+def list_message_ids(service, since_ts: int,
+                     max_pages: int = _MAX_LIST_PAGES) -> tuple[list[str], bool]:
+    """messages.list with after:<since> over the WHOLE window (paged, 100/page,
+    at most ``max_pages`` pages), in Gmail's native NEWEST-first order. Returns
+    (ids, truncated): truncated=True means the ceiling cut the listing at its
+    newest ids and the oldest are unknown. num_retries=2 mirrors the gmail
+    sweep's getProfile call (a single transient 429/500 must not skip a mailbox
+    for a night)."""
     ids: list[str] = []
     page_token: str | None = None
-    while len(ids) < max_results:
+    pages = 0
+    while True:
         kwargs: dict[str, Any] = {
             "userId": "me",
             "q": f"after:{int(since_ts)}",
-            "maxResults": min(max_results - len(ids), 100),
+            "maxResults": 100,
         }
         if page_token:
             kwargs["pageToken"] = page_token
         resp = service.users().messages().list(**kwargs).execute(num_retries=2)
+        pages += 1
         for m in resp.get("messages") or []:
             if m.get("id"):
                 ids.append(m["id"])
         page_token = resp.get("nextPageToken")
         if not page_token:
-            break
-    return ids[:max_results]
+            return ids, False
+        if pages >= max_pages:
+            return ids, True
 
 
 def fetch_message(service, message_id: str) -> dict[str, Any]:
-    """Full message -> {message_id, sender, subject, body, internal_ms}."""
+    """Full message -> {message_id, sender, subject, body, internal_ms,
+    auth_results}. ``auth_results`` = EVERY Authentication-Results header value
+    in payload order (Gmail's own is first; a sender-supplied one may follow)."""
     from cora.connectors.gmail_reader import _extract_text_from_part
     msg = service.users().messages().get(
         userId="me", id=message_id, format="full").execute(num_retries=2)
-    headers = {h["name"].lower(): h["value"]
-               for h in (msg.get("payload") or {}).get("headers", [])}
+    raw_headers = (msg.get("payload") or {}).get("headers", []) or []
+    headers = {h["name"].lower(): h["value"] for h in raw_headers}
+    auth_results = [h.get("value", "") for h in raw_headers
+                    if str(h.get("name", "")).lower() == "authentication-results"]
     body = _extract_text_from_part(msg.get("payload") or {}).strip()
     return {
         "message_id": msg.get("id") or message_id,
@@ -374,6 +500,7 @@ def fetch_message(service, message_id: str) -> dict[str, Any]:
         "subject": headers.get("subject", ""),
         "body": body[:4000],
         "internal_ms": int(msg.get("internalDate") or 0),
+        "auth_results": auth_results,
     }
 
 
@@ -394,23 +521,41 @@ def sweep_mailbox(
     sync_start = int(time.time())
     since = watermarks.get(mailbox) or (sync_start - bootstrap_days * 86400)
     summary: dict[str, Any] = {
-        "mailbox": mailbox, "since": since, "fetched": 0, "outcomes": {},
-        "skips": {}, "new_watermark": 0, "error": "",
+        "mailbox": mailbox, "since": since, "listed": 0, "fetched": 0, "backlog": 0,
+        "outcomes": {}, "skips": {}, "new_watermark": 0, "error": "",
     }
     try:
         svc = service or _service(mailbox)
-        ids = list_message_ids(svc, since, max_messages)
+        all_ids, truncated = list_message_ids(svc, since)
     except Exception as exc:  # noqa: BLE001 -- a dark mailbox skips, never crashes the run
         summary["error"] = f"list failed: {type(exc).__name__}"
         log.warning("%s: messages.list failed (%s) -- skipping this mailbox, "
                     "watermark untouched", mailbox, type(exc).__name__)
         return summary
+    # OLDEST-first (A-intake-roster-2): Gmail lists newest first; reverse, then
+    # take the oldest `max_messages`. The newer remainder is next run's backlog
+    # -- its ids were listed, so the cap-hit is a counted WARNING, not a silent skip.
+    ids = list(reversed(all_ids))[:max_messages]
+    backlog = max(0, len(all_ids) - len(ids))
+    summary["listed"] = len(all_ids)
     summary["fetched"] = len(ids)
-    log.info("%s: %d message(s) since %d%s", mailbox, len(ids), since,
+    summary["backlog"] = backlog
+    log.info("%s: %d message(s) since %d%s", mailbox, len(all_ids), since,
              "" if apply else " [DRY-RUN]")
+    if backlog:
+        log.warning("%s: CAP HIT -- processing the OLDEST %d of %d listed; %d newer "
+                    "message(s) remain as BACKLOG for the next run (watermark advances "
+                    "only to the newest processed, never to now)",
+                    mailbox, len(ids), len(all_ids), backlog)
+    if truncated:
+        log.warning("%s: listing ceiling (%d pages) hit -- the window's OLDEST mail is "
+                    "unknown, so the watermark is FROZEN this run; narrow "
+                    "--bootstrap-days or raise the cap and re-run",
+                    mailbox, _MAX_LIST_PAGES)
 
     newest_processed = 0
-    frozen = False  # an ingest ERROR freezes the watermark for the rest of the run
+    # an ingest ERROR (or a truncated listing) freezes the watermark for the run
+    frozen = bool(truncated)
     for mid in ids:
         try:
             m = fetch_message(svc, mid)
@@ -421,10 +566,17 @@ def sweep_mailbox(
             continue
         ts_s = int(m["internal_ms"] // 1000) if m["internal_ms"] else 0
         reason = skip_reason(sender=m["sender"], subject=m["subject"], body=m["body"],
-                             mailbox=mailbox, sender_index=sender_index)
+                             mailbox=mailbox, sender_index=sender_index,
+                             auth_results=m.get("auth_results"))
         if reason:
             summary["skips"][reason] = summary["skips"].get(reason, 0) + 1
-            log.info("  id=%s -> skipped (%s)", mid, reason)
+            if reason == SKIP_UNAUTHENTICATED:
+                # Reason + sender DOMAIN only -- never the body, never the address
+                # (a forged From is attacker-chosen text).
+                log.warning("  id=%s -> skipped (%s) from-domain=%s", mid, reason,
+                            _domain_of(sender_email(m["sender"])) or "?")
+            else:
+                log.info("  id=%s -> skipped (%s)", mid, reason)
             if not frozen and ts_s > newest_processed:
                 newest_processed = ts_s
             continue
@@ -452,8 +604,11 @@ def sweep_mailbox(
         log.warning("%s: watermark FROZEN this run (a message errored) -- the next "
                     "run re-reads from %d", mailbox, since)
     else:
+        # processed = the WHOLE listed window; under the cap it was drained
+        # (-> sync_start), at/over it only the oldest `cap` were processed
+        # (-> newest processed, the backlog's lower bound).
         summary["new_watermark"] = next_watermark(
-            len(ids), max_messages, newest_processed, sync_start)
+            len(all_ids), max_messages, newest_processed, sync_start)
     return summary
 
 
@@ -499,7 +654,8 @@ def main(argv: list[str] | None = None) -> int:
             exit_code = 2
         queued += s["outcomes"].get(info_intake.QUEUED, 0) + s["outcomes"].get(
             info_intake.SUPERSEDES, 0)
-        log.info("%s: outcomes=%s skips=%s watermark->%s", s["mailbox"],
+        log.info("%s: listed=%d processed=%d backlog=%d outcomes=%s skips=%s watermark->%s",
+                 s["mailbox"], s.get("listed", 0), s.get("fetched", 0), s.get("backlog", 0),
                  s["outcomes"] or "{}", s["skips"] or "{}",
                  s["new_watermark"] or "(unchanged)")
         if s["new_watermark"]:

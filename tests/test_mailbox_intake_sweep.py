@@ -124,28 +124,64 @@ def _b64(s: str) -> str:
     return base64.urlsafe_b64encode(s.encode("utf-8")).decode("ascii").rstrip("=")
 
 
-def _gmail_msg(mid: str, *, sender: str, subject: str, body: str, internal_ms: int) -> dict:
+def _sender_domain(sender: str) -> str:
+    import email.utils
+    return email.utils.parseaddr(sender)[1].rpartition("@")[2].lower()
+
+
+def _auth_header(domain: str, verdict: str = "pass", *, authserv: str = "mx.google.com",
+                 spf: str | None = None, dkim: str | None = None,
+                 dkim_domain: str | None = None, dmarc_domain: str | None = None) -> str:
+    """Gmail-shaped Authentication-Results header (RFC 8601), synthetic values.
+    verdict = the dmarc result; spf/dkim default to the same verdict."""
+    spf = spf or verdict
+    dkim = dkim or verdict
+    dd = dkim_domain or domain
+    md = dmarc_domain or domain
+    return (f"{authserv};\n       dkim={dkim} header.i=@{dd} header.s=test header.b=abc;\n"
+            f"       spf={spf} (google.com: domain of someone@{domain} designates 192.0.2.1 "
+            f"as permitted sender) smtp.mailfrom=someone@{domain};\n"
+            f"       dmarc={verdict} (p=NONE sp=NONE dis=NONE) header.from={md}")
+
+
+def _gmail_msg(mid: str, *, sender: str, subject: str, body: str, internal_ms: int,
+               auth: str | list[str] | None = "pass") -> dict:
+    """auth: 'pass' (default -- Gmail authenticated the From domain), 'fail',
+    None (no Authentication-Results header at all), or explicit header values."""
+    headers = [
+        {"name": "From", "value": sender},
+        {"name": "To", "value": CORA_MAILBOX},
+        {"name": "Subject", "value": subject},
+    ]
+    if isinstance(auth, str):
+        auth = [_auth_header(_sender_domain(sender), auth)]
+    for v in (auth or []):
+        # Gmail's trace header sits ABOVE the sender's own headers
+        headers.insert(0, {"name": "Authentication-Results", "value": v})
     return {
         "id": mid, "threadId": f"t-{mid}", "internalDate": str(internal_ms),
         "payload": {
             "mimeType": "text/plain",
-            "headers": [
-                {"name": "From", "value": sender},
-                {"name": "To", "value": CORA_MAILBOX},
-                {"name": "Subject", "value": subject},
-            ],
+            "headers": headers,
             "body": {"data": _b64(body)},
         },
     }
 
 
 class _FakeService:
-    """users().messages().list/get(...).execute(num_retries=...) over a fixed set.
-    Records every method name touched so a test can prove the surface is GET-only."""
+    """users().messages().list/get(...).execute(num_retries=...) over a fixed set,
+    listed in INSERTION order (build fixtures newest-first to mirror Gmail).
+    Records every method name touched so a test can prove the surface is GET-only.
+    honour_after=True filters the listing by the q='after:<s>' watermark (the
+    cap test's second run); off by default so the shared fixtures never rot
+    against the wall clock."""
 
-    def __init__(self, messages: list[dict]):
+    def __init__(self, messages: list[dict], *, honour_after: bool = False):
         self._by_id = {m["id"]: m for m in messages}
         self.calls: list[str] = []
+        self.list_kwargs: list[dict] = []
+        self.get_ids: list[str] = []
+        self._honour_after = honour_after
 
     def users(self):
         return self
@@ -155,11 +191,17 @@ class _FakeService:
 
     def list(self, **kw):
         self.calls.append("list")
-        ids = [{"id": i} for i in self._by_id]
+        self.list_kwargs.append(dict(kw))
+        rows = list(self._by_id.values())
+        if self._honour_after:
+            after = int(str(kw.get("q", "after:0")).split("after:")[1].split()[0])
+            rows = [m for m in rows if int(m["internalDate"]) // 1000 > after]
+        ids = [{"id": m["id"]} for m in rows]
         return _Exec({"messages": ids[: kw.get("maxResults", 100)]})
 
     def get(self, **kw):
         self.calls.append("get")
+        self.get_ids.append(kw["id"])
         return _Exec(self._by_id[kw["id"]])
 
 
@@ -251,13 +293,19 @@ class TestRealRosterRow:
         # header-stripped fail-closed, and the row is never chunk-ingested anyway.
         assert not any(CORA_MAILBOX in emails for emails in idx.by_slack.values())
 
-    def test_finance_receipts_digest_includes_the_row(self):
-        # DOCUMENTED CONSEQUENCE (ruled dwd_eligible: true): the finance-receipt
-        # digest sweeps 'all enabled DWD mailboxes', so cora@ is one of them. A
-        # receipt emailed to cora@ would be classified/filed like any inbox's.
-        # Flagged in the report as a design consequence, not an accident.
+    def test_finance_receipts_digest_excludes_the_row(self):
+        # D-051 A-intake-roster-4 (was pinned the OTHER way as a "documented
+        # consequence"): the weekly finance-receipt digest selects every enabled
+        # + dwd_eligible row and its upload_file path COPIES detected receipts
+        # into the shared Receipts & Invoices Drive folder -- a second,
+        # Drive-WRITING consumer the roster header denied. A knowledge-intake
+        # system mailbox must never file receipts (least privilege), so
+        # _digest_accounts skips any row carrying intake_route and the header's
+        # "only consumer" claim is TRUE by that exclusion.
         from cora import finance_receipts as fr
-        assert CORA_MAILBOX in fr._digest_accounts()
+        assert CORA_MAILBOX not in fr._digest_accounts()
+        head = REAL_ROSTER.read_text(encoding="utf-8").split("\naccounts:")[0]
+        assert "_digest_accounts" in head and "skips any row carrying this" in head
 
     def test_person_identity_tolerates_the_row(self):
         from cora import person_identity as pid
@@ -354,6 +402,7 @@ class TestSkipRules:
     def test_skip_reason_order_and_fail_closed(self, sweep):
         idx = sweep.build_sender_index()
         k = dict(mailbox=CORA_MAILBOX, sender_index=idx)
+        ok_auth = [_auth_header("example-hjr.test")]
         assert sweep.skip_reason(sender="Fireflies <noreply@fireflies.ai>", subject="Recap",
                                  body="x", **k) == sweep.SKIP_AUTOMATED_SENDER
         assert sweep.skip_reason(sender="Quill Marsh <quill@example-hjr.test>",
@@ -362,15 +411,100 @@ class TestSkipRules:
                                  **k) == sweep.SKIP_SELF
         assert sweep.skip_reason(sender="Stranger <stranger@outside.test>", subject="hi",
                                  body="x", **k) == sweep.SKIP_NON_ROSTER
-        assert sweep.skip_reason(sender="quill@example-hjr.test", subject="", body="  ",
-                                 **k) == sweep.SKIP_EMPTY
+        # A-intake-roster-5: a roster address with NO Gmail authentication is
+        # skipped BEFORE the empty check -- the pin used to expect "" here.
         assert sweep.skip_reason(sender="Quill Marsh <quill@example-hjr.test>",
-                                 subject="one-line note", body="", **k) == ""
+                                 subject="one-line note", body="", **k) == sweep.SKIP_UNAUTHENTICATED
+        assert sweep.skip_reason(sender="quill@example-hjr.test", subject="", body="  ",
+                                 auth_results=ok_auth, **k) == sweep.SKIP_EMPTY
+        assert sweep.skip_reason(sender="Quill Marsh <quill@example-hjr.test>",
+                                 subject="one-line note", body="", auth_results=ok_auth,
+                                 **k) == ""
 
     def test_alias_sender_resolves(self, sweep):
         idx = sweep.build_sender_index()
         assert sweep.skip_reason(sender="rook@example-f3.test", subject="n", body="b",
-                                 mailbox=CORA_MAILBOX, sender_index=idx) == ""
+                                 mailbox=CORA_MAILBOX, sender_index=idx,
+                                 auth_results=[_auth_header("example-f3.test")]) == ""
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# D-051 A-intake-roster-5: sender identity is Gmail-AUTHENTICATED, never From: alone
+# ═════════════════════════════════════════════════════════════════════════════
+class TestSenderAuthentication:
+    QUILL = "Quill Marsh <quill@example-hjr.test>"
+
+    def _reason(self, sweep, auth):
+        return sweep.skip_reason(sender=self.QUILL, subject="A note", body="body",
+                                 mailbox=CORA_MAILBOX, sender_index=sweep.build_sender_index(),
+                                 auth_results=auth)
+
+    def test_forged_from_with_dmarc_fail_is_skipped(self, sweep):
+        # THE failing input: an outsider writes From: <roster human> and the
+        # sender domain's DMARC posture lets Google deliver it to Inbox.
+        assert self._reason(sweep, [_auth_header("example-hjr.test", "fail")]) == sweep.SKIP_UNAUTHENTICATED
+
+    def test_genuine_dmarc_pass_resolves(self, sweep):
+        assert self._reason(sweep, [_auth_header("example-hjr.test", "pass")]) == ""
+
+    def test_header_absent_is_skipped(self, sweep):
+        assert self._reason(sweep, None) == sweep.SKIP_UNAUTHENTICATED
+        assert self._reason(sweep, []) == sweep.SKIP_UNAUTHENTICATED
+
+    @pytest.mark.parametrize("verdict", ["none", "neutral", "softfail", "temperror", "permerror", "bestguesspass"])
+    def test_other_verdicts_are_skipped(self, sweep, verdict):
+        assert self._reason(sweep, [_auth_header("example-hjr.test", verdict)]) == sweep.SKIP_UNAUTHENTICATED
+
+    def test_spf_and_dkim_pass_aligned_resolves_without_dmarc(self, sweep):
+        h = _auth_header("example-hjr.test", "none", spf="pass", dkim="pass")
+        assert self._reason(sweep, [h]) == ""
+
+    def test_spf_pass_alone_or_dkim_pass_alone_is_skipped(self, sweep):
+        assert self._reason(sweep, [_auth_header("example-hjr.test", "none", spf="pass", dkim="fail")]) \
+            == sweep.SKIP_UNAUTHENTICATED
+        assert self._reason(sweep, [_auth_header("example-hjr.test", "none", spf="fail", dkim="pass")]) \
+            == sweep.SKIP_UNAUTHENTICATED
+
+    def test_pass_for_a_different_domain_is_skipped(self, sweep):
+        # dmarc=pass header.from=attacker.test while From: says example-hjr.test
+        h = _auth_header("attacker.test", "pass")
+        assert self._reason(sweep, [h]) == sweep.SKIP_UNAUTHENTICATED
+        # dkim aligned to the wrong domain, spf aligned: still not both aligned
+        h = _auth_header("example-hjr.test", "none", spf="pass", dkim="pass", dkim_domain="attacker.test")
+        assert self._reason(sweep, [h]) == sweep.SKIP_UNAUTHENTICATED
+
+    def test_sender_supplied_header_is_ignored(self, sweep):
+        # (1) a header claiming another authserv-id is not trusted at all
+        assert self._reason(sweep, [_auth_header("example-hjr.test", "pass", authserv="attacker.test")]) \
+            == sweep.SKIP_UNAUTHENTICATED
+        # (2) Gmail's header sits FIRST; a sender-supplied mx.google.com lookalike
+        #     BELOW it cannot override Gmail's fail
+        gmail_fail = _auth_header("example-hjr.test", "fail")
+        forged_pass = _auth_header("example-hjr.test", "pass")
+        assert self._reason(sweep, [gmail_fail, forged_pass]) == sweep.SKIP_UNAUTHENTICATED
+
+    def test_parser_shape(self, sweep):
+        parsed = sweep.parse_authentication_results([_auth_header("example-hjr.test")])
+        assert parsed["dmarc"]["result"] == "pass"
+        assert parsed["dmarc"]["header.from"] == "example-hjr.test"
+        assert parsed["spf"]["smtp.mailfrom"] == "someone@example-hjr.test"
+        assert parsed["dkim"]["header.i"] == "@example-hjr.test"
+        assert sweep.parse_authentication_results(["garbage with no semicolons"]) == {}
+        assert sweep.parse_authentication_results([None, ""]) == {}
+        assert sweep._domain_of("Tommy@F3Energy.com.") == "f3energy.com"
+        assert sweep._domain_of('"@example.test"') == "example.test"
+
+    def test_auth_regexes_growth_shape(self, sweep):
+        # Every new regex stays linear on adversarial input (ReDoS class).
+        for n in (1_000, 20_000):
+            t0 = time.perf_counter()
+            sweep.parse_authentication_results(["mx.google.com; dmarc=pass " + "(" * n + " header.from=x"])
+            sweep.parse_authentication_results(["mx.google.com; " + "(a)" * n + " dmarc=pass header.from=x"])
+            sweep.parse_authentication_results(["mx.google.com; dmarc=pass header.from=" + "a" * n])
+            sweep.parse_authentication_results(["mx.google.com;" + " dkim=pass;" * n])
+            sweep.parse_authentication_results(["mx.google.com; dmarc" + " " * n + "=" + " " * n + "pass"])
+            sweep.parse_authentication_results(["mx.google.com; " + "header.from=x " * n])
+            assert time.perf_counter() - t0 < 1.0
 
     # Growth-shape: every new regex stays linear on adversarial input (ReDoS class).
     def test_localpart_regex_growth_shape(self, sweep):
@@ -488,6 +622,32 @@ class TestIntake:
         assert s["skips"] == {sweep.SKIP_SELF: 1}
         k.propose_update.assert_not_called()
 
+    def test_forged_roster_from_is_skipped_never_proposed(self, sweep, tmp_path, caplog):
+        """A-intake-roster-5 regression, end to end through the REAL ingest
+        chokepoint: From: <roster human> with Gmail's dmarc=fail (a) is skipped as
+        unauthenticated_sender, (b) never reaches ingest/propose_update, (c) is
+        logged by reason + domain only -- never the body or the forged address."""
+        body = "The Tucson stove vendor is Apex Appliance as of this week."
+        msgs = [_gmail_msg("x1", sender="Quill Marsh <quill@example-hjr.test>",
+                           subject="Vendor change", body=body, internal_ms=_NOW_MS, auth="fail")]
+        caplog.set_level(logging.INFO, logger="mailbox_intake_sweep")
+        s, k, _ = self._run(sweep, msgs, apply=True, known_answers=tmp_path / "ka")
+        assert s["skips"] == {sweep.SKIP_UNAUTHENTICATED: 1}
+        assert s["outcomes"] == {}
+        k.propose_update.assert_not_called()
+        skipped = [r for r in caplog.records if "unauthenticated_sender" in r.getMessage()]
+        assert skipped and skipped[0].levelno == logging.WARNING
+        assert "example-hjr.test" in skipped[0].getMessage()
+        assert "Apex" not in skipped[0].getMessage() and "quill@" not in skipped[0].getMessage()
+        # header absent entirely -> same fail-closed skip
+        msgs = [_gmail_msg("x2", sender="quill@example-hjr.test", subject="Vendor change",
+                           body=body, internal_ms=_NOW_MS, auth=None)]
+        s, k, _ = self._run(sweep, msgs, apply=True, known_answers=tmp_path / "ka")
+        assert s["skips"] == {sweep.SKIP_UNAUTHENTICATED: 1}
+        k.propose_update.assert_not_called()
+        # the watermark still advances past a skipped forgery (it is not an error)
+        assert s["new_watermark"] > 0
+
     def test_dry_run_proposes_nothing(self, sweep, tmp_path):
         msgs = [_gmail_msg("d1", sender="quill@example-hjr.test", subject="Tucson stove vendor",
                            body="The Tucson stove vendor is Apex Appliance as of this week.",
@@ -584,6 +744,73 @@ class TestWatermark:
         assert sweep.next_watermark(100, 100, 50, 1000) == 50      # capped -> newest processed
         assert sweep.next_watermark(100, 100, 0, 1000) == 0        # capped, nothing -> unchanged
 
+    def test_newest_first_listing_with_cap_never_skips_the_older_backlog(self, sweep, tmp_path, caplog):
+        """A-intake-roster-2 regression (the review's failing input): three roster
+        notes at t-4000s (m1), t-2000s (m2), t-1s (m3); Gmail lists NEWEST first
+        [m3, m2, m1]; --max-messages 2. The first cut processed [m3, m2] and set the
+        watermark to ts(m3), so m1 was never listed again -- skipped forever, with
+        no warning. Now the OLDEST two are processed, the watermark is ts(m2), the
+        cap-hit is WARNED with the backlog count, and the next run lists m3."""
+        base_s = _NOW_MS // 1000
+        body = "The Tucson stove vendor is Apex Appliance as of this week."
+        m1 = _gmail_msg("m1", sender="quill@example-hjr.test", subject="note one",
+                        body=body, internal_ms=(base_s - 4000) * 1000)
+        m2 = _gmail_msg("m2", sender="quill@example-hjr.test", subject="note two",
+                        body=body + " Two.", internal_ms=(base_s - 2000) * 1000)
+        m3 = _gmail_msg("m3", sender="quill@example-hjr.test", subject="note three",
+                        body=body + " Three.", internal_ms=(base_s - 1) * 1000)
+        svc = _FakeService([m3, m2, m1], honour_after=True)   # Gmail order: newest first
+        row = sweep.load_intake_mailboxes()[0]
+        marks = {CORA_MAILBOX: base_s - 10_000}
+        caplog.set_level(logging.INFO, logger="mailbox_intake_sweep")
+        with patch.object(ii, "knowledge_review", _kr()), \
+                patch.object(ii, "_default_known_answers_dir", lambda: tmp_path / "ka"):
+            s = sweep.sweep_mailbox(row, sender_index=sweep.build_sender_index(),
+                                    watermarks=marks, apply=True, max_messages=2,
+                                    bootstrap_days=7, service=svc)
+        assert s["listed"] == 3 and s["fetched"] == 2 and s["backlog"] == 1
+        assert s["outcomes"] == {ii.QUEUED: 2}
+        # processed the OLDEST two, in chronological order
+        assert svc.get_ids == ["m1", "m2"]
+        assert s["new_watermark"] == base_s - 2000          # ts(m2): the backlog's lower bound
+        assert s["new_watermark"] < base_s - 1              # NOT ts(m3)
+        warn = [r for r in caplog.records if "CAP HIT" in r.getMessage()]
+        assert warn and warn[0].levelno == logging.WARNING and "1 newer" in warn[0].getMessage()
+        # second run from the written watermark: m3 IS listed and processed
+        marks2 = {CORA_MAILBOX: s["new_watermark"]}
+        svc2 = _FakeService([m3, m2, m1], honour_after=True)
+        with patch.object(ii, "knowledge_review", _kr()), \
+                patch.object(ii, "_default_known_answers_dir", lambda: tmp_path / "ka"):
+            s2 = sweep.sweep_mailbox(row, sender_index=sweep.build_sender_index(),
+                                     watermarks=marks2, apply=True, max_messages=2,
+                                     bootstrap_days=7, service=svc2)
+        assert s2["listed"] == 1 and s2["backlog"] == 0 and s2["outcomes"] == {ii.QUEUED: 1}
+        assert s2["new_watermark"] == pytest.approx(int(time.time()), abs=30)  # drained
+
+    def test_listing_ceiling_freezes_the_watermark(self, sweep, tmp_path, caplog):
+        # The paged listing stops at _MAX_LIST_PAGES; a truncated listing means the
+        # window's oldest ids are unknown, so the watermark must NOT advance.
+        class _Paged(_FakeService):
+            def list(self, **kw):
+                self.calls.append("list")
+                return _Exec({"messages": [{"id": "p1"}], "nextPageToken": "more"})
+        p1 = _gmail_msg("p1", sender="quill@example-hjr.test", subject="n",
+                        body="The Tucson stove vendor is Apex Appliance as of this week.",
+                        internal_ms=_NOW_MS)
+        svc = _Paged([p1])
+        ids, truncated = sweep.list_message_ids(svc, 0, max_pages=3)
+        assert truncated is True and ids == ["p1", "p1", "p1"] and svc.calls.count("list") == 3
+        row = sweep.load_intake_mailboxes()[0]
+        caplog.set_level(logging.WARNING, logger="mailbox_intake_sweep")
+        with patch.object(sweep, "_MAX_LIST_PAGES", 2), \
+                patch.object(ii, "knowledge_review", _kr()), \
+                patch.object(ii, "_default_known_answers_dir", lambda: tmp_path / "ka"):
+            s = sweep.sweep_mailbox(row, sender_index=sweep.build_sender_index(),
+                                    watermarks={}, apply=True, max_messages=100,
+                                    bootstrap_days=7, service=svc)
+        assert s["new_watermark"] == 0
+        assert any("listing ceiling" in r.getMessage() for r in caplog.records)
+
     def test_roundtrip_atomic_and_env_redirected(self, sweep, tmp_path, monkeypatch):
         p = tmp_path / "wm.json"
         monkeypatch.setenv("MAILBOX_INTAKE_WATERMARK_PATH", str(p))
@@ -675,9 +902,47 @@ class TestProbeAndPs1:
         assert '. "$PSScriptRoot\\_task-action.ps1"' in src          # run_hidden wrapper
         assert "New-WrappedTaskAction" in src
         assert "run_mailbox_intake_sweep.py" in src and "--apply" in src
-        assert '$FireAt     = "06:10"' in src
+        assert '$FireAt     = "06:11"' in src
         assert "-RunLevel Limited" in src
         assert "pin-scheduled-task-models.ps1 -Apply" in src
+
+    _INTAKE_PS1 = "setup-mailbox-intake-task.ps1"
+
+    def test_fire_time_agrees_across_ps1_yaml_env_and_is_unclaimed_in_repo(self):
+        """A-intake-roster-3: the PS1 registered at 06:10, which is gap-autofill's
+        LIVE slot (moved there by the 2026-06-13 restagger; its setup script still
+        says 06:00, so a grep of setup scripts cannot see the occupant), while the
+        yaml and .env.example disagreed with the PS1 and each other. The four
+        surfaces must name ONE minute, and no other deployment script (incl. the
+        restagger's NEW values) may claim it. The live-registry check itself is
+        recorded in the PS1 header (read-only schtasks, 2026-09-19)."""
+        import re
+        ps1 = (_REPO / "deployment" / self._INTAKE_PS1).read_text(encoding="utf-8")
+        fire = re.search(r'\$FireAt\s*=\s*"(\d\d:\d\d)"', ps1).group(1)
+        header_at = re.search(r"once a\n# day at (\d\d:\d\d) AZ", ps1).group(1)
+        why = re.search(r"# WHY (\d\d:\d\d):", ps1).group(1)
+        yaml_src = (_REPO / "data" / "maps" / "scheduled-task-state.yaml").read_text(encoding="utf-8")
+        yaml_row = yaml_src.split("- name: Cora - Mailbox Intake Sweep", 1)[1]
+        yaml_at = re.search(r"daily (\d\d:\d\d) AZ", yaml_row).group(1)
+        env = (_REPO / ".env.example").read_text(encoding="utf-8")
+        env_block = env.split("cora@hjrglobal.com -- Cora's SYSTEM mailbox", 1)[1]
+        env_at = re.search(r"daily (\d\d:\d\d) AZ", env_block).group(1)
+        assert fire == header_at == why == yaml_at == env_at == "06:11"
+        # repo-side belt: no other Cora setup/restagger script claims the minute
+        claimed: dict[str, set[str]] = {}
+        for p in (_REPO / "deployment").glob("*.ps1"):
+            if p.name == self._INTAKE_PS1:
+                continue
+            src = p.read_text(encoding="utf-8", errors="replace")
+            found = set(re.findall(r'\$(?:FireAt|HourMin)\s*=\s*"(\d\d:\d\d)"', src))
+            found |= set(re.findall(r"-At\s+\"?'?(\d\d:\d\d)", src))
+            found |= set(re.findall(r"New\s*=\s*'(\d\d:\d\d)'", src))
+            if found:
+                claimed[p.name] = found
+        holders = sorted(n for n, mins in claimed.items() if fire in mins)
+        assert not holders, f"{fire} is claimed by {holders}"
+        # and the belt really sees the live occupant of the old slot
+        assert any("06:10" in mins for mins in claimed.values())
 
     def test_sweep_script_is_ascii(self):
         for name in ("run_mailbox_intake_sweep.py", "probe_cora_mailbox_dwd.py"):
@@ -770,20 +1035,78 @@ class TestApplyTimeRecheck:
         assert self._row(ledger)["state"] == "PENDING"
 
     def test_scheduled_executor_dismisses_excluded(self, tmp_path, monkeypatch):
+        # D-051 A-intake-roster-1: this test used to MagicMock resolve_update and
+        # assert only the call args, which is how the no-op went unseen. It now
+        # runs the REAL resolve_update over a seeded PENDING row and asserts the
+        # ledger state.
         import scripts.run_knowledge_review as rkr
-        monkeypatch.setenv("KNOWN_ANSWERS_DIR", str(tmp_path / "ka"))
+        ledger = self._seed(tmp_path, monkeypatch, uid="ic-2",
+                            text="The LEX-ZQX99 site kiosk vendor changed this month.")
         monkeypatch.setattr(rkr, "_post_to_slack", lambda *a: None)
-        resolved = MagicMock(return_value=True)
-        monkeypatch.setattr(rkr, "resolve_update", resolved)
-        update = {"update_id": "ic-2", "update_type": "generic", "description": "d",
-                  "payload": {"entity": "FNDR", "source": "info-for-cora",
-                              "text": "The LEX-ZQX99 site kiosk vendor changed this month."}}
+        update = self._row(ledger, "ic-2")
         ok = rkr._execute_approved_update(update, "fake-slack-token-not-a-secret", logging.getLogger("t"))
         assert ok is False
-        resolved.assert_called_once()
-        assert resolved.call_args.args[1] == "DISMISSED"
-        assert resolved.call_args.kwargs["reason"] == "lex_phi_excluded"
-        assert not (tmp_path / "ka").exists()
+        row = self._row(ledger, "ic-2")
+        assert row["state"] == "DISMISSED"
+        assert row["resolved_reason"] == "lex_phi_excluded"
+        assert not (tmp_path / "known-answers").exists()
+
+    def _run_step1(self, tmp_path, monkeypatch, ledger, uid):
+        """Drive rkr.main() (Step-1 resolve + the executor loop) with the REAL
+        resolve_update over the tmp ledger; only Slack egress is stubbed."""
+        import scripts.run_knowledge_review as rkr
+        (tmp_path / "reply.jsonl").write_text("", encoding="utf-8")
+        monkeypatch.setattr(kr, "_REPLY_LOG_PATH", tmp_path / "reply.jsonl")
+        kr._SEEN_IDS_CACHE = None
+        kr._ARCHIVE_IDS_CACHE = None
+        monkeypatch.setattr(rkr, "_LOCK_PATH", tmp_path / "kr.lock")
+        monkeypatch.setattr(rkr, "LOG_DIR", tmp_path / "logs")
+        monkeypatch.setattr(rkr, "_MECHANICAL_BATCH_STATE_PATH", tmp_path / "batch.json")
+        monkeypatch.setattr(rkr, "_attach_coras_read", lambda items, log: None)
+        monkeypatch.setenv("SLACK_BOT_TOKEN", "fake-slack-token-not-a-secret")
+        monkeypatch.setenv("CORA_AUTOWRITE_LIVE", "off")
+        update = self._row(ledger, uid)
+        reaction = {"action": "APPROVED", "channel_id": "D1", "message_ts": "1790000000.0001",
+                    "reactor_id": self.HARRISON, "reaction": "+1"}
+        monkeypatch.setattr(rkr, "correlate_reactions_to_updates", lambda: [(update, reaction)])
+        monkeypatch.setattr(rkr, "_post_to_slack", lambda *a: None)
+        ack = MagicMock()
+        monkeypatch.setattr(rkr, "_ack_correlated_reaction", ack)
+        monkeypatch.setattr(rkr, "send_dm_to_harrison", lambda *a, **k: "hdr")
+        monkeypatch.setattr(rkr, "send_individual_dms", lambda *a, **k: {})
+        monkeypatch.setattr(rkr, "_route_operational_to_owners", lambda *a, **k: 0)
+        monkeypatch.setattr("sys.argv", ["run_knowledge_review.py"])
+        rkr.main()
+        return ack
+
+    def test_step1_emoji_path_dismisses_excluded_note_in_the_ledger(self, tmp_path, monkeypatch):
+        """A-intake-roster-1 (HIGH) regression, the review's failing input: Harrison
+        thumbs-up-reacts to a generic source=info-for-cora card whose FNDR-tagged
+        text carries a synthetic LEX token. Before the fix Step-1 resolved the row
+        APPROVED first, so the executor's DISMISSED was a no-op -- the ledger read
+        APPROVED / resolved_reason None while Slack said 'Dismissed.'"""
+        ledger = self._seed(tmp_path, monkeypatch, uid="ic-4",
+                            text="The LEX-ZQX99 site kiosk vendor changed this month.")
+        ack = self._run_step1(tmp_path, monkeypatch, ledger, "ic-4")
+        row = self._row(ledger, "ic-4")
+        assert row["state"] == "DISMISSED"
+        assert row["resolved_reason"] == "lex_phi_excluded"
+        assert not (tmp_path / "known-answers").exists()
+        # and the D2 ack is truthful about the failed apply
+        assert ack.call_count == 1 and ack.call_args.kwargs.get("success") is False
+
+    def test_step1_emoji_path_resolves_clean_note_approved_after_the_write(self, tmp_path, monkeypatch):
+        """The deferred row must still reach a terminal state on success: APPROVED
+        with the emoji reason, mirroring the decision branch, AFTER the durable
+        known-answers write."""
+        ledger = self._seed(tmp_path, monkeypatch, uid="ic-5",
+                            text="The Anaheim warehouse is at 123 Main St.")
+        ack = self._run_step1(tmp_path, monkeypatch, ledger, "ic-5")
+        row = self._row(ledger, "ic-5")
+        assert row["state"] == "APPROVED"
+        assert row["resolved_reason"] == "emoji_reaction"
+        assert "123 Main St." in (tmp_path / "known-answers" / "fndr.md").read_text(encoding="utf-8")
+        assert ack.call_count == 1 and ack.call_args.kwargs.get("success") is True
 
     def test_scheduled_executor_transient_failure_leaves_pending(self, tmp_path, monkeypatch):
         import scripts.run_knowledge_review as rkr

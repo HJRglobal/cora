@@ -255,6 +255,17 @@ def _post_to_slack(token: str, channel: str, text: str) -> None:
         )
 
 
+def _is_contributed_note(update: dict) -> bool:
+    """A #info-for-cora / cora@-mailbox contribution: update_type generic with
+    payload.source == 'info-for-cora'. Shared by the Step-1 defer predicate and
+    the executor branch so the two can never disagree about which rows are
+    apply-first-then-resolve (A-intake-roster-1)."""
+    if update.get("update_type") != "generic":
+        return False
+    payload = update.get("payload") or {}
+    return isinstance(payload, dict) and payload.get("source") == "info-for-cora"
+
+
 def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger) -> bool:
     """Execute one approved gap update. Dispatches by update_type.
 
@@ -462,15 +473,21 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
             log.info("gap-executor: hubspot_note posted to #%s uid=%s", notify_ch, uid_short)
             _post_to_slack(slack_token, notify_ch, msg)
 
-        elif update_type == "generic" and payload.get("source") == "info-for-cora":
+        elif _is_contributed_note(update):
             # WS17-B item 5: an approved #info-for-cora contribution actually
             # LEARNS now -- it's written to the entity's known-answers file (the
             # runtime-loaded store), not just posted as a Slack suggestion.
+            # APPLY-FIRST-THEN-RESOLVE (A-intake-roster-1): the Step-1 loop
+            # defers this row exactly as it defers a decision, so the resolves
+            # below act on a PENDING row. A transient failure (the else branch)
+            # leaves it PENDING for the next run's correlate to retry.
             sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
             from cora.gap_autofill import apply_contributed_note
             ok, summary = apply_contributed_note(payload)
             snippet = (payload.get("text") or desc)[:300]
             if ok:
+                resolve_update(update.get("update_id", ""), "APPROVED",
+                               reason="emoji_reaction")
                 msg = (f":white_check_mark: *Gap executor* `[{uid_short}]` learned a "
                        f"contributed note ({summary}):\n> {snippet}")
                 log.info("gap-executor: info-for-cora note applied uid=%s", uid_short)
@@ -486,8 +503,11 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
                 # D-145 "again at apply" (Code #13 Rider 1 S-A ruling (c)): the
                 # applier's deterministic LEX/PHI re-screen refused the durable
                 # write -> terminal DISMISSED (reason lex_phi_excluded), the same
-                # contract the decision branch above applies. A refused row must
-                # not sit PENDING to be retried or to read as a transient failure.
+                # contract the decision branch above applies -- and it only
+                # holds because Step-1 DEFERS this row (see _is_contributed_note
+                # in main): resolve_update mutates PENDING rows only. A refused
+                # row must not sit PENDING to be retried or to read as a
+                # transient failure.
                 resolve_update(update.get("update_id", ""), "DISMISSED",
                                reason="lex_phi_excluded")
                 success = False
@@ -1843,8 +1863,17 @@ def main() -> int:
         # with no TTL + dm_ts set nothing would ever retry it. A dry run also
         # skips EXECUTING decisions (the decision branch has a durable write +
         # its own resolve, unlike the advisory branches).
+        # Code #13 Rider 1 D-051 remediation (A-intake-roster-1): the SAME
+        # exemption covers a contributed note (generic + source=info-for-cora,
+        # the #info-for-cora + cora@ mailbox intake). Its branch has a durable
+        # known-answers write AND its own terminal resolve (APPROVED on write,
+        # DISMISSED lex_phi_excluded on the applier's LEX/PHI re-screen).
+        # resolve_update only mutates a PENDING row, so resolving here FIRST made
+        # that branch's DISMISSED a silent no-op: a refused note stayed APPROVED
+        # with no resolved_reason while the Slack post read "Dismissed."
         defer = (action == "APPROVED"
-                 and update.get("update_type") == _kr_UPDATE_TYPE_DECISION)
+                 and (update.get("update_type") == _kr_UPDATE_TYPE_DECISION
+                      or _is_contributed_note(update)))
         if not args.dry_run and not defer:
             resolve_update(uid, action)
             if (action == "DISMISSED"
@@ -1855,7 +1884,8 @@ def main() -> int:
 
         if action == "APPROVED":
             if defer and args.dry_run:
-                log.info("[DRY RUN] would file decision %s to the inbox", uid[:8])
+                log.info("[DRY RUN] would apply-then-resolve %s %s",
+                         update.get("update_type"), uid[:8])
             else:
                 approved_updates.append(update)
         elif action == "DISMISSED":

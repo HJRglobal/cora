@@ -342,6 +342,31 @@ def test_digest_accounts_enabled_dwd_only():
     assert fr._digest_accounts() == ["hannah@hjrglobal.com", "tommy@f3energy.com"]
 
 
+def test_digest_accounts_skip_intake_route_rows(tmp_path, monkeypatch):
+    """D-051 A-intake-roster-4: a SYSTEM INTAKE mailbox (roster row carrying
+    intake_route, e.g. cora@) is enabled + dwd_eligible like a human's, so the
+    digest selected it and would file receipts emailed to it into the shared
+    Drive folder. Any row carrying the key -- whatever its value, even a typo --
+    is excluded; the other rows are unaffected."""
+    accounts = tmp_path / "accounts-with-intake.yaml"
+    accounts.write_text(_ACCOUNTS_YAML + """  - email: intake@hjrglobal.com
+    name: Intake (system mailbox)
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: false
+    attachment_filer: false
+    drive_sweep: false
+    intake_route: knowledge_review
+  - email: typo@hjrglobal.com
+    name: Typo (system mailbox)
+    enabled: true
+    dwd_eligible: true
+    intake_route: knowlege_review
+""", encoding="utf-8")
+    monkeypatch.setattr(fr, "_ACCOUNTS_PATH", accounts)
+    assert fr._digest_accounts() == ["hannah@hjrglobal.com", "tommy@f3energy.com"]
+
+
 def test_format_digest_rows_and_empty():
     text = fr.format_digest([], 5)
     assert "no new receipts" in text

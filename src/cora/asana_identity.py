@@ -47,6 +47,51 @@ _PAT_KEY_BY_IDENTITY: dict[str, str] = {
 }
 VALID_IDENTITIES: tuple[str, ...] = tuple(_PAT_KEY_BY_IDENTITY)
 
+#: The Asana seat the ``cora`` identity's token MUST belong to. A users/me probe
+#: under ``ASANA_PAT_CORA`` that answers with any other email means a privileged
+#: token was pasted into the least-privilege key (D-051 finding B-asana-identity-3:
+#: every surface would say "cora" while every write stayed attributed to Harrison).
+CORA_SEAT_EMAIL = "cora@hjrglobal.com"
+
+STATUS_OK = "ok"
+STATUS_WARN = "warn"
+STATUS_CRITICAL = "critical"
+
+
+def classify_users_me(identity: str, email: str | None) -> tuple[str, str]:
+    """Classify a users/me answer against the identity the token was resolved for.
+
+    Returns ``(status, reason)`` with status one of ``ok`` / ``warn`` / ``critical``:
+
+      * no email in the answer          -> ``warn``  "identity unverifiable" (never ok)
+      * identity cora, email != cora@   -> ``critical`` (the privileged token is still
+                                           in use under the least-privilege flag)
+      * identity harrison, email == cora@ -> ``critical`` (the keys are swapped)
+      * otherwise                       -> ``ok``
+
+    The email is compared case-insensitively and whitespace-trimmed. The reason
+    carries key NAMES and the seat email only -- never a token value.
+    """
+    normalized = (email or "").strip().lower()
+    if not normalized:
+        return STATUS_WARN, (
+            "identity unverifiable -- users/me returned no email, so the active token "
+            f"could not be matched against {IDENTITY_ENV}={identity}"
+        )
+    is_cora_seat = normalized == CORA_SEAT_EMAIL
+    if identity == IDENTITY_CORA and not is_cora_seat:
+        return STATUS_CRITICAL, (
+            f"IDENTITY MISMATCH -- {IDENTITY_ENV}={identity} but the token in {CORA_PAT_ENV} "
+            f"answers users/me as {normalized}, not {CORA_SEAT_EMAIL}; a privileged token is "
+            "still in use under the least-privilege flag (re-paste the cora@ seat's PAT)"
+        )
+    if identity == IDENTITY_HARRISON and is_cora_seat:
+        return STATUS_CRITICAL, (
+            f"IDENTITY MISMATCH -- {IDENTITY_ENV}={identity} but the token in {HARRISON_PAT_ENV} "
+            f"answers users/me as {CORA_SEAT_EMAIL}; the two PAT keys appear swapped"
+        )
+    return STATUS_OK, f"users/me = {normalized}"
+
 
 class AsanaIdentityError(Exception):
     """Raised when the identity flag is unrecognised or the ACTIVE identity's

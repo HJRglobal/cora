@@ -501,9 +501,16 @@ admin, never a human-shaped seat, never for testing convenience.
 
 **How to read the table.** "present"/"ABSENT" = whether the live `.env` carried a
 `KEY=` line on 2026-09-19, checked by count only
-(`Select-String .env -Pattern "^KEY="`), never by value. A credential key that is
-in `.env.example` but not in this table is a drift the test
-`tests/test_identity_docs.py` fails on: add the row when you add the key.
+(`Select-String .env -Pattern "^KEY="`), never by value. Drift guard: a key in
+`.env.example` (active or `# `-commented) whose NAME ends in `_TOKEN`, `_KEY`,
+`_SECRET`, `_PAT`, `_PASS`, `_PASSWORD`, `_PASSPHRASE`, `_JSON`, `_URL` or `_DSN`
+and has no row in this table fails `tests/test_identity_docs.py` -- add the row when
+you add the key. The guard keeps a short NAMED allowlist of public vendor ENDPOINT
+keys that carry no secret (`POLAR_API_BASE_URL`, `POLAR_MCP_URL`, `POLAR_OAUTH_URL`,
+`PHOTOROOM_BASE_URL`, `OTTERLY_BASE_URL`); a `*_URL` whose VALUE is the secret
+(`HEALTH_PING_URL`, any webhook URL) is a credential and gets a row. A key that is a
+credential but has none of those suffixes is invisible to the guard: add the row
+AND a suffix, never rely on the guard alone.
 
 | System | Identity (who Cora is there) | Credential KEY NAME (.env) | Appears as | Admin? | Rail (code) |
 |---|---|---|---|---|---|
@@ -513,7 +520,7 @@ in `.env.example` but not in this table is a drift the test
 | Anthropic | API key (model vendor; no identity surface) | `ANTHROPIC_API_KEY` (present) | n/a | n/a | `claude_client` token-budget guard (D-084); model never holds a credential |
 | OpenAI | API key (KB embeddings only) | `OPENAI_API_KEY` (present) | n/a | n/a | embeddings batching cap (`knowledge_base/embeddings.py`) |
 | Google Workspace (service account) | SA `cora-calendar@cora-calendar-readonly.iam.gserviceaccount.com` impersonating roster mailboxes via domain-wide delegation | `GOOGLE_SERVICE_ACCOUNT_JSON` (PATH to the key file under gitignored `.credentials/`; present). The DWD client id is the `client_id` field INSIDE that file -- never copied into a doc. `CORA_DRIVE_IMPERSONATE` (ABSENT; code default `harrison@hjrglobal.com`) | the impersonated user (a draft lands in that user's Drafts; reads run as that user) | no admin ROLE; the granted scope STRINGS are the guarantee (see Provisioning: Google service account + DWD) | scope strings matched character-for-character; `gmail.send` + `spreadsheets` write WITHHELD; Tier-1 header strip (`historical_access`); D-145 at ingest |
-| Google Workspace (cora@hjrglobal.com) | Workspace USER: Tier-0 intake mailbox (S-A), Fireflies capture identity, Cora-voice send mailbox (R4, drafts only today) | none -- no password or per-user credential in `.env` or the repo; reached only through the SA + DWD like every roster mailbox | cora@hjrglobal.com | no admin role (D-307) | see Provisioning: cora@hjrglobal.com |
+| Google Workspace (cora@hjrglobal.com) | Workspace USER: Tier-0 intake mailbox (S-A), Fireflies capture identity, Cora-voice send mailbox (R4, drafts only today) | none -- no password or per-user credential in `.env` or the repo; reached only through the SA + DWD like every roster mailbox | cora@hjrglobal.com | no admin role (D-307) | ONE mail consumer: the intake sweep (`scripts/run_mailbox_intake_sweep.py`, propose-only). Every roster reader that selects mailboxes by `enabled` + `dwd_eligible` alone -- the weekly finance-receipt digest (`finance_receipts._digest_accounts`, which FILES receipt-shaped attachments to Drive) first among them -- skips `intake_route` rows BY CODE; the chunk-ingesting consumers (thread sweep / attachment filer / drive sweep) are off via the row's false flags. Send lock is code-only (`CORA_SEND_LIVE`), not a scope boundary; see Provisioning: cora@hjrglobal.com |
 | Fireflies | "Cora Global" seat on cora@hjrglobal.com (bot named "Cora NoteTaker") | `FIREFLIES_API_KEY` (present); fallback names `FIREFLIES_API_TOKEN`, `FIREFLIES_TOKEN` (ABSENT) | Cora Global / Cora NoteTaker | **YES -- the ONE admin-level Cora identity.** The platform's API model requires it: the workspace-wide `users` query (`fireflies_connector.list_team_members`, admin-only, verified 2026-06-08) and org-wide capture. This is the D-308 precedent, not a template. | credential inside the code seam; `capture_identity` in `data/maps/meeting-capture-roster.yaml`; LEX recaps -> custodians only (`meeting_recap`); coverage nudges roster-scoped (`fireflies_seat` flag) |
 | Asana | TODAY: Harrison's personal PAT ("Cora Email Watch") -- every Cora write is attributed to Harrison. AFTER the S-B flip: cora@hjrglobal.com MEMBER seat (13 named teams, never Harrison Private) | `ASANA_PAT` (Harrison's; present), `ASANA_PAT_CORA` (Cora's; present since 2026-09-11), selector `CORA_ASANA_IDENTITY` (ABSENT = `harrison`; the key lands with S-B) | Harrison today; Cora after the flip | today: inherits Harrison's privileges (a human credential in Cora's keyring); after: Member, never admin (R2) | staged-write gate on every Asana write tool; `pm_metrics` ledger = the Cora-side attribution ground truth; see Rotation: Asana PAT (Cora) |
 | HubSpot | Private app on portal 246351746 | `HUBSPOT_PRIVATE_APP_TOKEN` (present), `HUBSPOT_PORTAL_ID` | the private app; every deal carries a HUMAN `hubspot_owner_id` | no seat, no admin (R7) | portal guard (D-029); staged-write gate; no Cora owner id exists |
@@ -525,12 +532,17 @@ in `.env.example` but not in this table is a drift the test
 | Notion | Internal integration token | `NOTION_API_KEY` (present) | the integration | no | read lane (press sweep, KB sync); `notion_connector.py` also carries 2 POST/PATCH sites -- NOT audited in this inventory |
 | Airtable | API key (read) + a separate WRITE key | `AIRTABLE_API_KEY` (present), `AIRTABLE_WRITE_API_KEY` (ABSENT = the org-tracker write lane is dark) | the token owner | no | `airtable_org_tracker` refuses to write without the WRITE key |
 | MCP local-HTTP bridge (SHELVED) | Loopback bridge for Claude Code; the plugin won | `CORA_MCP_HTTP_TOKEN`, `CORA_MCP_HTTP_CERT`, `CORA_MCP_HTTP_KEY`, `CORA_MCP_HTTP_PORT` (all documented, unused) | n/a | n/a | 127.0.0.1 bind + Host allowlist; mode=ro |
+| healthchecks.io (dead-man heartbeat) | Outbound ping URL; the UUID INSIDE the URL is the credential (anyone holding it can keep the check green) | `HEALTH_PING_URL` (present; exactly ONE line -- the 2026-06-11 incident was a second, placeholder line that dotenv took as the value), `HEALTH_PING_INTERVAL_S` (interval only) | n/a | no | `health_endpoint` ping loop: off when blank; skips the ping while the heartbeat is stale so a wedged bot still trips the external alert |
+| DR secrets bundle (`backup_logs.py` / `restore_secrets.py`) | Passphrase that encrypts `.env` + the SA JSON into `secrets-YYYY-MM-DD.enc`; the ONLY way back into every other row after a machine loss | `CORA_BACKUP_PASSPHRASE` -- deliberately NOT in `.env` (count 0) and only `# `-commented in `.env.example`: `.env` is INSIDE the bundle, so the passphrase must live OUTSIDE what it encrypts. Held as a persistent User-scope Windows env var on the host + the canonical copy in the password manager (2026-06-09 DR hardening, D-040). | n/a | n/a | `backup_logs.py` SKIPS the secrets step when the key is unset (never writes plaintext); `restore_secrets.py` reads the env var, else prompts. A new machine cannot restore any credential in this table without it -- see the Bootstrap cross-reference below |
 | Other API keys (no identity surface) | vendor keys | `POLAR_API_KEY` / `POLAR_CLIENT_ID` / `POLAR_CLIENT_SECRET`, `PHOTOROOM_API_KEY`, `MAKE_SALES_DECK_WEBHOOK_URL`, `PERPLEXITY_API_KEY`, `GEMINI_API_KEY`, `OTTERLY_API_KEY` (present); `APOLLO_API_KEY` (LEGACY -- not read by current code) | n/a | n/a | per-connector caps and fail-soft |
 
 Bootstrap cross-reference: `deployment/bootstrap-new-machine.md` regenerates ONLY
 the 4 Slack/Anthropic secrets; every other row above is a Harrison-provisioned
 credential that a new machine restores from the encrypted secrets bundle
-(`backup_logs.py` / `restore_secrets.py`), not by regeneration.
+(`backup_logs.py` / `restore_secrets.py`), not by regeneration. PREREQUISITE: that
+restore needs `CORA_BACKUP_PASSPHRASE` (the DR secrets bundle row) from the password
+manager -- it is not in `.env`, not in the bundle and not on the destroyed machine.
+Without it the bundle is opaque and every row above must be re-provisioned by hand.
 
 ---
 
@@ -620,7 +632,19 @@ Cora account.
    approval verified at the consumer), LEX/PHI content refused at ingest and again
    at apply (D-145), never autowritten (`CORA_AUTOWRITE_LIVE` tiers do not apply --
    Tier-0 by construction). Same code path as #info-for-cora (`info_intake.ingest`),
-   never a second copy.
+   never a second copy. **cora@'s mail has exactly ONE consumer**: that intake sweep
+   (`scripts/run_mailbox_intake_sweep.py`, task "Cora - Mailbox Intake Sweep"). The
+   false ingest flags switch off the chunk-ingesting consumers (thread sweep,
+   attachment filer, drive sweep), but the weekly finance-receipt digest
+   (`finance_receipts._digest_accounts`, task `cowork-cora-finance-receipt-digest`,
+   Mon 10:30 AZ) selects mailboxes by `enabled` + `dwd_eligible` alone and would
+   otherwise FILE a receipt-shaped attachment forwarded to cora@ into the Receipts &
+   Invoices Inbox Drive folder and list it in #hjr-finance -- a second, WRITING
+   consumer. It skips `intake_route` rows by code (Code #13 RIDER 1 D-051
+   remediation), so an invoice emailed to cora@ as a knowledge note is a pending
+   proposal and nothing else. Any future roster reader keyed on `enabled` +
+   `dwd_eligible` must skip `intake_route` rows the same way; the roster comment and
+   the `.env.example` cora@ block state the ONE-consumer rule for that reason.
 2. **Fireflies capture identity.** `data/maps/meeting-capture-roster.yaml`
    `capture_identity: "cora@hjrglobal.com"` -- the ONE Fireflies seat ("Cora
    Global", ACTIVE + ADMIN since 2026-08-28; bot "Cora NoteTaker") whose connected
@@ -629,7 +653,18 @@ Cora account.
    `load_dwd_humans()` (the weekly coverage monitor) never nudges cora@.
 3. **Cora-voice send mailbox (R4).** Today T0: Cora drafts into cora@'s Drafts and a
    human taps Send. T1 (send-trust ladder with mailbox = cora@) waits for the
-   October external-WRITE gate; `gmail.send` stays out of the DWD grant until then.
+   October external-WRITE gate. **The send lock is CODE, not a scope boundary.** The
+   DWD grant is already send-capable: `gmail.modify` and `gmail.compose` (both
+   requested by code) and the granted `https://mail.google.com/` each authorize
+   `users.messages.send`, so withholding `gmail.send` is hygiene, not the control.
+   What keeps cora@ -- and every mailbox -- from sending is `CORA_SEND_LIVE`
+   (default off; env off beats approval) gating the ONE send call site in the
+   codebase, `src/cora/revops/sender.py` `_gmail_send_raw` (CI guard
+   `tests/test_no_raw_gmail_send.py`), whose mailbox must also sit in the playbook
+   allowlist AND the code-level `V1_MAILBOX_UNIVERSE` (`harrison@hjrglobal.com`
+   only today -- cora@ is not in it). Opening T1 for cora@ is a code change to
+   that universe plus the flag, reviewed under D-051; no Admin-console change
+   makes or unmakes it.
 
 **Human operator = Harrison, via the Google account switcher.** Two Workspace
 accounts live in one browser profile, so any Chrome-driven session that touches
@@ -685,7 +720,7 @@ list in step with `grep -rn "googleapis.com/auth/" src/ scripts/`):
 | Scope (suffix of `https://www.googleapis.com/auth/`) | Builder(s) | Lane |
 |---|---|---|
 | `gmail.modify` | `src/cora/connectors/gmail_reader.py:36` | thread sweep, attachment filer, intake |
-| `gmail.compose` | `src/cora/tools/gmail_client.py:42` | draft-only lane (`gmail.send` is NOT requested and NOT granted) |
+| `gmail.compose` | `src/cora/tools/gmail_client.py:42` | draft lane; the scope itself permits `messages.send` -- draft-only is enforced by CODE (`CORA_SEND_LIVE`, see Provisioning: cora@hjrglobal.com item 3), not by the absence of `gmail.send` (NOT requested and NOT granted) |
 | `calendar.events` | `src/cora/tools/calendar_client.py:54`, `src/cora/tools/tool_dispatch.py:6989` | `events.list` + event create |
 | `calendar.freebusy` | `src/cora/tools/calendar_client.py:53` | `freebusy.query` only (`events.list` 403s under it) |
 | `drive.readonly` | `src/cora/connectors/drive_sweep.py:474`, `scripts/run_drive_sweep.py:27`, `scripts/backfill_drive_assets.py:22`, `scripts/run_lex_dump_folder_sync.py:115` | Drive sweeps |
@@ -700,7 +735,12 @@ console before pruning any of them -- this document is not the console.
 **Deliberately WITHHELD:** `gmail.send` (a posture change gated on the October
 external-WRITE seam, R4) and `spreadsheets` (write) -- "Cora cannot write the
 Standing ACTUALS sheet" is guaranteed by the SCOPE today; granting write would
-downgrade that guarantee to policy. The 13WCF worksheet writes use direct SA auth on
+downgrade that guarantee to policy. The two differ in kind: withholding
+`spreadsheets` IS the write lock, but withholding `gmail.send` is NOT the send
+lock -- `gmail.modify`, `gmail.compose` and the granted `https://mail.google.com/`
+already authorize `messages.send`. The send lock is code-only (`CORA_SEND_LIVE` +
+the single call site in `revops/sender.py`); keep `gmail.send` out as hygiene, but
+never cite its absence as the guarantee. The 13WCF worksheet writes use direct SA auth on
 directly-shared files, outside DWD entirely.
 
 **Impersonation default:** `CORA_DRIVE_IMPERSONATE` (default `harrison@hjrglobal.com`

@@ -1,6 +1,6 @@
 # Setup Windows Scheduled Task: "Cora - Mailbox Intake Sweep" (Code #13 Rider 1
 # S-A, cq-8d16f1a557e5). Runs scripts/run_mailbox_intake_sweep.py --apply once a
-# day at 06:10 AZ: for every roster row in data/maps/monitored-email-accounts.yaml
+# day at 06:11 AZ: for every roster row in data/maps/monitored-email-accounts.yaml
 # carrying intake_route: knowledge_review (today: cora@hjrglobal.com) it reads new
 # Gmail messages via DWD, skips automated senders / Calendar + Fireflies subject
 # shapes / non-roster senders IN CODE, and hands each roster-human message to
@@ -8,13 +8,21 @@
 # ONE PENDING knowledge-review proposal for the 07:00 review DM. Propose-only;
 # never autowrite; PHI + LEX-content refused at ingest and again at apply.
 #
-# WHY 06:10: after the 06:05 #info-for-cora sweep (the ruled 06:20 was moved -- see NOTE)
-# and before the 07:00 knowledge review, so a note emailed overnight rides the
-# same morning's review DM. NOTE (VERIFY-FIRST 2026-09-19): 06:20 is ALSO the slot
-# of cowork-cora-inventory-state-sync (data/maps/scheduled-task-state.yaml). Two
-# tasks on one clock time is below the weekly health metric's >2 alarm, but the
-# B1 stagger doctrine prefers unique minutes; 06:10 was verified FREE across
-# deployment/*.ps1 on 2026-09-19, so the task fires at 06:10 (B1 unique minutes).
+# WHY 06:11: after the 06:05 #info-for-cora sweep and the 06:07 meeting-capture
+# ensure, before the 07:00 knowledge review, so a note emailed overnight rides
+# the same morning's review DM. SLOT CHECK against the LIVE registry
+# (schtasks /query /fo csv /v, read-only, 2026-09-19 -- D-051 A-intake-roster-3):
+# the ruled 06:20 is cowork-cora-inventory-state-sync; the first cut's 06:10 was
+# "verified free across deployment/*.ps1" but 06:10 is the LIVE slot of
+# cowork-cora-gap-autofill (restagger-morning-tasks-2026-06-13.ps1 moved it
+# 06:00 -> 06:10; setup-gap-autofill-task.ps1 still says 06:00, so a grep of the
+# setup scripts cannot see the occupant -- check the live registry, not the
+# repo). 06:11 is used by NO Cora task: the 5-minute cora-watchdog ticks land on
+# :02/:07/:12/..., the 15-minute delegated-work ticks on :00/:15/:30/:45, and the
+# next daily/weekly slots are 06:15 (cashflow-forecast-snapshot) and 06:20.
+# B1 unique-minute doctrine satisfied. The same minute is recorded in
+# data/maps/scheduled-task-state.yaml, .env.example and the test pin
+# (tests/test_mailbox_intake_sweep.py) -- a test asserts all four agree.
 # WHY 30 min: one small mailbox, a bounded message cap (100), no model call.
 #
 # WINDOWLESS by construction (D-266..D-269) via the shared run_hidden helper.
@@ -37,7 +45,7 @@ $RepoRoot   = "C:\Users\Harri\code\cora"
 $PythonExe  = "C:\Users\Harri\code\cora\.venv\Scripts\python.exe"
 $TaskName   = "Cora - Mailbox Intake Sweep"
 $ScriptPath = "C:\Users\Harri\code\cora\scripts\run_mailbox_intake_sweep.py"
-$FireAt     = "06:10"
+$FireAt     = "06:11"
 
 if (-not (Test-Path $PythonExe)) {
     Write-Error "Python not found at $PythonExe. Check the venv."

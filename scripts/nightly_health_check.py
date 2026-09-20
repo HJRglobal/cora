@@ -2068,8 +2068,12 @@ def check_api_connectivity() -> list[CheckResult]:
         results.append(CheckResult("Slack API", "critical", f"Connection error: {exc}"))
 
     # Asana -- the ACTIVE identity's token via the single resolver (S-B). The
-    # detail names the identity so a users/me answer that says "Harrison" under
-    # CORA_ASANA_IDENTITY=cora reads as the misconfiguration it is.
+    # users/me answer is COMPARED against the identity, not just interpolated:
+    # under CORA_ASANA_IDENTITY=cora the token must answer as the cora@ seat
+    # (asana_identity.CORA_SEAT_EMAIL) or the check is CRITICAL -- a Harrison PAT
+    # mis-pasted into ASANA_PAT_CORA would otherwise keep full privilege after the
+    # flip while every surface says "cora" (D-051 B-asana-identity-3). An answer
+    # with no email is WARN "identity unverifiable", never ok.
     try:
         from cora import asana_identity  # noqa: PLC0415
         try:
@@ -2080,13 +2084,17 @@ def check_api_connectivity() -> list[CheckResult]:
         if asana_pat:
             r = httpx.get(
                 "https://app.asana.com/api/1.0/users/me",
+                params={"opt_fields": "name,email,gid"},
                 headers={"Authorization": f"Bearer {asana_pat}"},
                 timeout=10
             )
             if r.status_code == 200:
-                name = r.json().get("data", {}).get("name", "")
+                data = r.json().get("data", {}) or {}
+                name = str(data.get("name", "") or "")
+                status, reason = asana_identity.classify_users_me(asana_ident, data.get("email"))
                 results.append(CheckResult(
-                    "Asana API", "ok", f"Connected — {name} (identity: {asana_ident})"))
+                    "Asana API", status,
+                    f"Connected — {name} (identity: {asana_ident}; {reason})"))
             else:
                 results.append(CheckResult("Asana API", "warn",
                                            f"Returned {r.status_code} (identity: {asana_ident})"))
