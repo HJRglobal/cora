@@ -482,6 +482,82 @@ _NATURAL_OCCURRENCE_RES = (
     re.compile(r"\bnaturally\s{1,3}in\b", re.IGNORECASE),
 )
 
+# rail 2, ATTRIBUTION SCOPE (Code #13 slice 6, cq-85b35413b020; C6 (b) ruled
+# 2026-09-01 CONDITIONED on a differential harness). NOT WIRED into run_preflight:
+# the ruling lets the loosened rail ship only when the harness (rail2_harness)
+# shows every ruled claims-hole probe caught, and two of the ruled classes
+# (sugar-free on Pure, comparative category claims) have NO mechanical rail today,
+# so the gate cannot pass and the legacy same-sentence scan stays the shipping
+# rail. Both hit functions are exported so the harness, its pinned test module and
+# the Monday differential script measure them side by side on the same corpus.
+#
+# WHAT "ATTRIBUTION" MEANS HERE: the clean word is predicated OF the Energy or Mood
+# line. A clean token is exempt only in two positive, narrow shapes -- (1) it sits
+# in a clause segment that names F3 Pure and NOT Energy/Mood ("... or the clean-
+# sweetened version in F3 Pure": the 8/26 and 9/1 live rejections); (2) its object
+# is the ENVIRONMENT, not a product ("a cleaner planet", the CleanHub article).
+# Who said it is never an exemption (the Earthbar attributed quote is a TRUE
+# positive), an ALL-CAPS or Title-Case clean word is not an exemption, and a clause
+# that names Pure AND Energy is ambiguous -> trips (fail closed). Segments split on
+# , ; : and "or / while / whereas / versus" -- deliberately NOT on "and": "F3 Pure
+# is clean-sweetened and F3 Energy is too" attaches clean to Energy across "and".
+_CLEAN_ENVIRONMENT_RES = (
+    re.compile(r"\bclean(?:er|est)?\s{1,3}(?:planet|oceans?|future|water|beaches|coast(?:line)?s?|"
+               r"environment|earth|world|air|grid|rivers?|streets?|communit(?:y|ies))\b",
+               re.IGNORECASE),
+    re.compile(r"\bclean(?:ed|ing|s)?[\s-]{1,3}ups?\b", re.IGNORECASE),
+)
+_CLAUSE_SPLIT_RE = re.compile(r"[,;:]|\b(?:or|while|whereas|versus|vs\.?)\b", re.IGNORECASE)
+
+
+def rail2_legacy_hit(sentence: str) -> tuple[str, str] | None:
+    """The SHIPPING rail-2 test for one sentence: (clean_token, 'ENERGY/MOOD') when
+    any clean token shares the sentence with the Energy or Mood LINE (natural-
+    occurrence phrasings redacted first); None otherwise. Extracted verbatim from
+    run_preflight so the harness can call it in isolation."""
+    sent = sentence or ""
+    lines = brand_lines_in(sent)
+    if not (lines & {"ENERGY", "MOOD"}):
+        return None
+    scan_sent = _redact(sent, _NATURAL_OCCURRENCE_RES)
+    toks = {w.lower().strip("'&/-") for w in _words(scan_sent)}
+    hit = toks & _CLEAN_TOKENS
+    if not hit:
+        return None
+    return sorted(hit)[0], "/".join(sorted(lines & {"ENERGY", "MOOD"}))
+
+
+def rail2_attribution_hit(sentence: str) -> tuple[str, str] | None:
+    """The ATTRIBUTION-scoped rail-2 test (see the block comment above): trips when
+    a clean token is predicated of Energy/Mood -- i.e. it is neither Pure-attached
+    within its own clause segment nor an environmental object. NOT the shipping
+    rail; measured by rail2_harness."""
+    sent = sentence or ""
+    lines = brand_lines_in(sent)
+    if not (lines & {"ENERGY", "MOOD"}):
+        return None
+    scan_sent = _redact(_redact(sent, _NATURAL_OCCURRENCE_RES), _CLEAN_ENVIRONMENT_RES)
+    # A clause with no brand of its own inherits the nearest PRECEDING clause's
+    # line(s): "..., with F3 Pure using organic cane sugar, monk fruit and stevia as
+    # its clean-sweetened base" attaches to Pure (the 9/1 shape), while "F3 Energy
+    # delivers exactly what our customers are seeking, clean energy" attaches to
+    # Energy (the Earthbar quote). A clean clause BEFORE any brand clause inherits
+    # nothing and therefore trips (fail closed).
+    carry: set[str] = set()
+    for seg in _CLAUSE_SPLIT_RE.split(scan_sent):
+        own = brand_lines_in(seg)
+        if own:
+            carry = own
+        toks = {w.lower().strip("'&/-") for w in _words(seg)}
+        hit = toks & _CLEAN_TOKENS
+        if not hit:
+            continue
+        seg_lines = own or carry
+        if "PURE" in seg_lines and not (seg_lines & {"ENERGY", "MOOD"}):
+            continue  # the ONE cleared attachment: the clean word sits with Pure alone
+        return sorted(hit)[0], "/".join(sorted(lines & {"ENERGY", "MOOD"}))
+    return None
+
 # rail 3 -- Mood is never a sleep aid. Cleared framing is "composure, not sedation",
 # so the cleared/negated forms are redacted before the scan (otherwise the
 # checklist's OWN approved phrase would trip its own rail).
@@ -798,21 +874,14 @@ def run_preflight(
                 break
 
     # --- rail 2: clean/natural in the same sentence as the Energy or Mood LINE ---
+    # The LEGACY same-sentence scan is the shipping rail (Code #13 slice 6: the
+    # attribution-scoped sibling rail2_attribution_hit is measured by rail2_harness
+    # and stays unwired until its gate passes -- see the rail-2 block above).
     for name, text in fields:
         for sent in sentences(text):
-            lines = brand_lines_in(sent)
-            if not (lines & {"ENERGY", "MOOD"}):
-                continue
-            scan_sent = _redact(sent, _NATURAL_OCCURRENCE_RES)
-            toks = {w.lower().strip("'&/-") for w in _words(scan_sent)}
-            hit = toks & _CLEAN_TOKENS
+            hit = rail2_legacy_hit(sent)
             if hit:
-                trips.append(_trip(
-                    "R2", name,
-                    "%r near %s: %s" % (sorted(hit)[0],
-                                        "/".join(sorted(lines & {"ENERGY", "MOOD"})),
-                                        sent),
-                ))
+                trips.append(_trip("R2", name, "%r near %s: %s" % (hit[0], hit[1], sent)))
                 break
 
     # --- rail 3: sleep-aid language in a doc about a product ---
