@@ -615,6 +615,58 @@ def egress_rails_section() -> dict:
         return {"available": False, "reason": str(exc)}
 
 
+def ladder_registry_section() -> dict:
+    """Code #13 slice 7 (cq-6afa86210ba0): the autonomy-ladder registry summary for
+    the Monday digest -- lanes by tier, pending confirms, schema problems, acting
+    drift -- single-sourced from cora.ladder_registry so this digest and the
+    nightly check can never disagree. Fail-soft."""
+    try:
+        from cora import ladder_registry as lr  # noqa: PLC0415
+        reg = lr.load()
+        s = lr.summary(reg)
+        if not s.get("available"):
+            return {"available": False, "reason": s.get("reason")}
+        s["tiers"] = list(lr.TIERS)
+        return s
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "reason": str(exc)}
+
+
+def missed_nightly_section(days: int = 7) -> dict:
+    """Code #13 slice 2 (cq-fb50c9e6c911): the missed-nightly catch-up ledger over
+    the last *days* windows -- per-day decision counts, tasks replayed, days with
+    no decision row (the lane itself did not fire). Fail-soft."""
+    try:
+        from datetime import datetime as _dt, timedelta as _td  # noqa: PLC0415
+        from cora import nightly_catchup as nc  # noqa: PLC0415
+        rows = nc.read_ledger()
+        now_az = _dt.now(nc.AZ)
+        today = now_az.date()
+        out_days: list[dict] = []
+        totals: dict[str, int] = {}
+        replayed: dict[str, int] = {}
+        missing_plan = 0
+        for i in range(days):
+            d = today - _td(days=i)
+            s = nc.summarize_day(rows, d)
+            if not s.get("present"):
+                # today counts as missing only once the 08:30 fire is due
+                if d != today or (now_az.hour, now_az.minute) >= (8, 40):
+                    missing_plan += 1
+                out_days.append({"day": d.isoformat(), "present": False})
+                continue
+            for k, v in (s.get("counts") or {}).items():
+                totals[k] = totals.get(k, 0) + int(v)
+            for r in s.get("replays") or []:
+                replayed[str(r.get("task"))] = replayed.get(str(r.get("task")), 0) + 1
+            out_days.append({"day": d.isoformat(), "present": True, "counts": s.get("counts"),
+                             "replays": len(s.get("replays") or [])})
+        return {"available": True, "window_days": days, "days": out_days, "totals": totals,
+                "replayed_tasks": replayed, "missing_plan_days": missing_plan}
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "reason": str(exc)}
+
+
 def _fmt_bytes(n: int) -> str:
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024 or unit == "GB":
@@ -716,6 +768,27 @@ def threshold_alarms(report: dict) -> list[str]:
     fw = report.get("flywheel", {})
     if fw.get("available"):
         alarms.extend(f"FLYWHEEL: {msg}" for msg in fw.get("alarm_lines", []))
+    # Code #13 slice 7: registry drift (schema violations + lanes acting above tier).
+    lad = report.get("ladder_registry", {})
+    if lad.get("available"):
+        probs = list(lad.get("schema_problems") or []) + list(lad.get("acting_drift") or [])
+        if probs:
+            alarms.append("LADDER REGISTRY: " + "; ".join(probs[:5])
+                          + (f" (+{len(probs) - 5} more)" if len(probs) > 5 else ""))
+    elif "ladder_registry" in report:
+        alarms.append(f"LADDER REGISTRY unavailable: {lad.get('reason')} -- absence IS drift.")
+    # Code #13 slice 2: a trigger that keeps missing is a scheduler problem, not a
+    # catch-up problem; a lane that stops deciding is itself the missed fire.
+    mn = report.get("missed_nightly", {})
+    if mn.get("available"):
+        hot = {t: n for t, n in (mn.get("replayed_tasks") or {}).items() if n >= 2}
+        if hot:
+            alarms.append("MISSED-NIGHT CATCH-UP: replayed on 2+ of the last "
+                          f"{mn.get('window_days', 7)} nights -- "
+                          + ", ".join(f"{t} x{n}" for t, n in sorted(hot.items())) + ".")
+        if int(mn.get("missing_plan_days") or 0) >= 2:
+            alarms.append(f"MISSED-NIGHT CATCH-UP: no decision row on {mn['missing_plan_days']} of the last "
+                          f"{mn.get('window_days', 7)} days -- the catch-up lane itself is not firing.")
     return alarms
 
 
@@ -834,6 +907,26 @@ def format_slack(report: dict) -> str:
             + f" | quarantined {cm.get('quarantined', 0)} | unpinned {cm.get('unpinned', 0)}"
             + (f" | +{len(cm['added'])}/-{len(cm['removed'])} tasks"
                if (cm.get('added') or cm.get('removed')) else "")
+        )
+    lad = report.get("ladder_registry", {})
+    if lad.get("available"):
+        bt = lad.get("by_tier") or {}
+        drift = len(lad.get("schema_problems") or []) + len(lad.get("acting_drift") or [])
+        lines.append(
+            f"*Ladder registry:* {lad.get('lanes', 0)} lanes | "
+            + " / ".join(f"{t} {bt.get(t, 0)}" for t in (lad.get("tiers") or []))
+            + f" | pending confirm {len(lad.get('pending_confirmation') or [])} | drift {drift}"
+        )
+    mn = report.get("missed_nightly", {})
+    if mn.get("available"):
+        tot = mn.get("totals") or {}
+        present = sum(1 for d in (mn.get("days") or []) if d.get("present"))
+        rep = mn.get("replayed_tasks") or {}
+        lines.append(
+            f"*Missed-night catch-up ({mn.get('window_days', 7)}d):* decision rows {present}/"
+            f"{mn.get('window_days', 7)} | fired {tot.get('fired', 0)} | replayed {tot.get('run', 0)} | "
+            f"cannot-check {tot.get('cannot_check', 0)}"
+            + (" | replayed: " + ", ".join(f"{t} x{n}" for t, n in sorted(rep.items())) if rep else "")
         )
     lines.append(f"_token method: {report.get('token_method')}_")
     return "\n".join(lines)
@@ -989,6 +1082,37 @@ def render(report: dict) -> None:
         print(f"    {er.get('line')}")
         print(f"    {er.get('flip_criterion')}")
 
+    # 9. autonomy-ladder registry (Code #13 slice 7)
+    lad = report.get("ladder_registry", {})
+    print("\n[9] AUTONOMY-LADDER REGISTRY (data/ladder-registry.yaml)")
+    if not lad.get("available"):
+        print(f"    unavailable: {lad.get('reason')}")
+    else:
+        bt = lad.get("by_tier") or {}
+        print(f"    {lad.get('lanes', 0)} lanes | " + " / ".join(f"{t} {bt.get(t, 0)}" for t in (lad.get("tiers") or []))
+              + f" | pending Harrison confirm: {len(lad.get('pending_confirmation') or [])}")
+        for p in (lad.get("schema_problems") or []):
+            print(f"    SCHEMA: {p}")
+        for p in (lad.get("acting_drift") or []):
+            print(f"    DRIFT:  {p}")
+        if not (lad.get("schema_problems") or lad.get("acting_drift")):
+            print("    schema clean, no acting drift")
+
+    # 10. missed-nightly catch-up (Code #13 slice 2)
+    mn = report.get("missed_nightly", {})
+    print(f"\n[10] MISSED-NIGHT CATCH-UP (last {mn.get('window_days', 7)} windows)")
+    if not mn.get("available"):
+        print(f"    unavailable: {mn.get('reason')}")
+    else:
+        for d in mn.get("days") or []:
+            if d.get("present"):
+                print(f"    {d['day']}  " + ", ".join(f"{k}={v}" for k, v in sorted((d.get("counts") or {}).items()))
+                      + f"  replays={d.get('replays', 0)}")
+            else:
+                print(f"    {d['day']}  (no decision row)")
+        if mn.get("replayed_tasks"):
+            print("    replayed: " + ", ".join(f"{t} x{n}" for t, n in sorted(mn["replayed_tasks"].items())))
+
     print("\n" + "=" * 72)
 
 
@@ -1005,6 +1129,8 @@ def build_report(log_days: int, use_api: bool) -> dict:
         "scheduled_tasks": scheduled_tasks(),
         "flywheel": flywheel_metrics_section(),
         "dashboard_drift": dashboard_drift_section(),
+        "ladder_registry": ladder_registry_section(),
+        "missed_nightly": missed_nightly_section(),
         "claude_mirror": claude_mirror_section(),
         "egress_rails": egress_rails_section(),
     }

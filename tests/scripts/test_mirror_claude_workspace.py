@@ -451,9 +451,25 @@ def test_zone_x_generated_files_trip_the_drive_sweep_belt():
     import sys as _sys
     _sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
     from cora.kb_exclusions import is_cora_internal_title
-    for name in ("cora-mirror-LADDER-ROW.md", "cora-mirror-INDEX.md",
+    for name in ("cora-mirror-LADDER-ROW.md", "cora-mirror-LADDER-REGISTRY.md", "cora-mirror-INDEX.md",
                  "cora-mirror-daily-brief.md", "cora-mirror-MEMORY.md"):
         assert is_cora_internal_title(name, broad=True), name
+
+
+def test_apply_renders_the_ladder_registry_and_supersedes_the_single_row(roots):
+    """Code #13 slice 7: the registry rides ZONE-X as cora-mirror-LADDER-REGISTRY.md
+    (every KNOWN lane present) and the old single-lane file becomes a SUPERSEDED
+    stub -- generated classes are outside removal detection, so a plain drop from
+    the plan would leave the stale row on Drive forever."""
+    from cora import ladder_registry as lr
+    _run(["--apply"])
+    reg = (roots["zx"] / m.LADDER_REGISTRY_FILENAME).read_text(encoding="utf-8")
+    assert "READ-ONLY MIRROR" in reg and "# Cora autonomy-ladder registry" in reg
+    for lane in lr.KNOWN_LANES:
+        assert f"| {lane} |" in reg, lane
+    old = (roots["zx"] / "cora-mirror-LADDER-ROW.md").read_text(encoding="utf-8")
+    assert "SUPERSEDED" in old and m.LADDER_REGISTRY_FILENAME in old
+    assert m.render_ladder_registry() == m.render_ladder_registry()   # byte-stable across runs
 
 
 def test_null_at_utc_status_does_not_crash_health(roots, monkeypatch):

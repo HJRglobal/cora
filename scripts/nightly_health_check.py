@@ -689,6 +689,95 @@ def check_run_markers(now: datetime | None = None) -> CheckResult:
         "%d issue(s): %s" % (len(findings), " | ".join(m for _sev, m in findings)))
 
 
+def check_missed_nightly_catchup(now: datetime | None = None) -> CheckResult:
+    """Code #13 slice 2 (cq-fb50c9e6c911): READ the missed-nightly catch-up lane's
+    ledger for today's window. The lane itself runs as its own 08:30 task
+    ("Cora - Missed Nightly Catch-Up", scripts/check_missed_nightly.py) -- never
+    from here: this check runs inside run_hidden's kill-on-close job, so a
+    replay spawned here would die with it, and a synchronous replay would delay
+    the report by hours.
+
+    WARN when: no decision row exists for today after the 08:30 fire (the lane is
+    not registered or did not fire -- a lost night would go unnoticed again, the
+    9/9 shape); any task was REPLAYED (the night was not clean; the replay is the
+    audit trail); any task read cannot_check (Running / scheduler unreadable) or
+    skipped_imminent; a replay failed or timed out. OK only when every task in
+    the set fired on schedule (or a replay finished clean). Never CRITICAL.
+    """
+    name = "Missed-nightly catch-up"
+    try:
+        sys.path.insert(0, str(_REPO_ROOT / "src"))
+        from cora import nightly_catchup as nc  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(name, "warn", f"nightly_catchup module unavailable: {exc}")
+    try:
+        if now is None:
+            now_az = datetime.now(nc.AZ)
+        elif now.tzinfo is None:
+            now_az = now.replace(tzinfo=nc.AZ)
+        else:
+            now_az = now.astimezone(nc.AZ)
+        day = now_az.date()
+        summary = nc.summarize_day(nc.read_ledger(), day)
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(name, "warn", f"catch-up ledger unreadable: {exc}")
+    if not summary.get("present"):
+        if (now_az.hour, now_az.minute) < (8, 40):
+            return CheckResult(name, "ok",
+                               f"no decision row yet for {day} -- the 08:30 fire has not happened")
+        return CheckResult(
+            name, "warn",
+            f"NO catch-up decision row for {day} -- '{nc.TASK_NAME}' did not fire or is not "
+            "registered (deployment/setup-missed-nightly-catchup-task.ps1); a lost night would "
+            "go unnoticed (the 9/9 shape)")
+    counts = summary.get("counts") or {}
+    decisions = summary.get("decisions") or []
+    attention = [d for d in decisions if str(d.get("action")) in nc.ATTENTION_ACTIONS]
+    replays = summary.get("replays") or []
+    failed = [r for r in replays if str(r.get("action")) != "ran"]
+    head = f"{day}: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+    if attention or failed:
+        parts = [f"{d.get('task')} {d.get('action')}" for d in attention]
+        parts += [f"{r.get('task')} replay {r.get('action')} rc={r.get('rc')}" for r in failed]
+        return CheckResult(name, "warn", head + " -- " + "; ".join(parts))
+    tail = f"; {len(replays)} replay(s) finished clean" if replays else "; every task fired on schedule"
+    return CheckResult(name, "ok", head + tail)
+
+
+def check_ladder_registry() -> CheckResult:
+    """Code #13 slice 7 (cq-6afa86210ba0): the autonomy-ladder REGISTRY
+    (data/ladder-registry.yaml) read for drift. WARN when the file is missing or
+    unparseable (it is a Code #13 deliverable -- absence IS drift, unlike the
+    mirror's ok-until-adopted posture), on any schema violation (a KNOWN lane with
+    no row, a row not in KNOWN_LANES, a tier above T1 without a failing-capable
+    monitor, a tier above T0 with no evidenced event ...), and on ACTING DRIFT: a
+    lane whose live flag reads above its registered tier (S2' / the capability
+    rail in enforce while registered T0; revops in tier1 while T0 ...). Pending
+    Harrison confirms are rendered, not alarmed -- the batch confirm is his tap.
+    """
+    name = "Autonomy-ladder registry"
+    try:
+        sys.path.insert(0, str(_REPO_ROOT / "src"))
+        from cora import ladder_registry as lr  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(name, "warn", f"ladder_registry module unavailable: {exc}")
+    try:
+        reg = lr.load()
+        s = lr.summary(reg)
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(name, "warn", f"registry read failed: {exc}")
+    if not s.get("available"):
+        return CheckResult(name, "warn",
+                           f"registry UNAVAILABLE: {s.get('reason')} -- data/ladder-registry.yaml is a "
+                           "Code #13 deliverable; absence IS drift")
+    head = (f"{s['lanes']} lanes | " + " / ".join(f"{t} {s['by_tier'].get(t, 0)}" for t in lr.TIERS)
+            + f" | pending Harrison confirm {len(s['pending_confirmation'])}")
+    problems = list(s.get("schema_problems") or []) + list(s.get("acting_drift") or [])
+    if problems:
+        return CheckResult(name, "warn", head + f" | {len(problems)} drift: " + "; ".join(problems))
+    return CheckResult(name, "ok", head + " | schema clean, no acting drift")
+
+
 def check_qbo_monitor(now: datetime | None = None) -> CheckResult:
     """The QBO token monitor must keep FIRING daily -- if it silently stops, a
     realm could expire unnoticed and finance answers fail silently. WARN if it's
@@ -2240,6 +2329,8 @@ def main() -> int:
     log.info("Checking QBO token monitor freshness...")
     all_results.append(check_qbo_monitor())
     all_results.append(check_run_markers())
+    log.info("Reading the missed-nightly catch-up ledger (Code #13 slice 2)...")
+    all_results.append(check_missed_nightly_catchup())
     all_results.append(check_info_for_cora_watermark())
 
     log.info("Checking dynamic-answers snapshot freshness...")
@@ -2291,7 +2382,10 @@ def main() -> int:
     log.info("Checking PARKED rows whose trigger has fired...")
     all_results.append(check_parked_aging())
 
-    log.info("Reading the egress-rail observe week (sentinel + phantom-write-claim)...")
+    log.info("Reading the autonomy-ladder registry for drift (Code #13 slice 7)...")
+    all_results.append(check_ladder_registry())
+
+    log.info("Reading the egress-rail observe week (sentinel + phantom-write-claim + phantom-capability-claim)...")
     all_results.append(check_egress_rails())
 
     run_time = time.time() - t0

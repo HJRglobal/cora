@@ -1274,22 +1274,38 @@ def _quarantine_index_write(plan: Plan) -> None:
                                cls="quarantine"))
 
 
+# Code #13 slice 7 (cq-6afa86210ba0): the single-lane row this constant carried is
+# now ONE row of data/ladder-registry.yaml, rendered beside it as
+# cora-mirror-LADDER-REGISTRY.md. The old file is kept as a SUPERSEDED stub because
+# generated classes sit outside SOURCE_CLASSES removal detection (a plain delete
+# from the plan would leave the stale row on Drive forever).
 _LADDER_ROW = """<!-- READ-ONLY MIRROR -- working knowledge, not canon. -->
 
-# Autonomy-ladder row -- claude-workspace-mirror
+# Autonomy-ladder row -- claude-workspace-mirror (SUPERSEDED 2026-09-19)
 
-| field | value |
-|---|---|
-| lane | claude-workspace-mirror |
-| tier | T0 (permanent cap) |
-| promotion_criteria | none sought -- read-only sources, writes only to the two mirror roots, no egress, no LLM |
-| demotion | n/a |
-| evidence_monitor | the PARITY-REPORT.md WARNs (missing root / new quarantine / new skill / task-estate delta / stale run) |
-| audit_surface | PARITY-REPORT.md + the Monday cora_health_report digest line |
-| authority | Harrison (allowlist yaml is Harrison-edited; Cowork proposes) |
-
-Registry file = #13 (October). Until then this row lives here + verbatim in the cascade report.
+This single-lane row was superseded by the autonomy-ladder REGISTRY
+(data/ladder-registry.yaml, Code #13 slice 7), rendered beside this file as
+cora-mirror-LADDER-REGISTRY.md. The claude-workspace-mirror lane is one row there
+(tier T0, permanent cap). Nothing here is canon.
 """
+LADDER_REGISTRY_FILENAME = "cora-mirror-LADDER-REGISTRY.md"
+
+
+def render_ladder_registry() -> str:
+    """The ZONE-X copy of the registry (Code #13 slice 7): deterministic markdown
+    from cora.ladder_registry, KB-excluded by the `_shared/projects/cora` folder pin
+    AND the `cora-mirror-` title belt. Fail-soft: an unreadable registry renders its
+    reason -- never an empty file that reads as 'no lanes'."""
+    try:
+        from cora import ladder_registry  # noqa: PLC0415
+        reg = ladder_registry.load()
+        return ladder_registry.render_markdown(
+            reg, source_note="rendered by the claude-workspace mirror from data/ladder-registry.yaml; "
+                             "edit the YAML in a Code/Cowork commit, never this file")
+    except Exception as exc:  # noqa: BLE001
+        return ("<!-- READ-ONLY MIRROR -- working knowledge, not canon. -->\n\n"
+                "# Cora autonomy-ladder registry\n\n"
+                f"REGISTRY UNAVAILABLE: {type(exc).__name__}: {exc}\n")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1326,6 +1342,9 @@ def main(argv: list[str] | None = None) -> int:
     _quarantine_index_write(plan)
     plan.writes.append(Planned(dest=_zx("cora-mirror-LADDER-ROW.md"), zone="X",
                                text=_LADDER_ROW, cls="ladder"))
+    # Code #13 slice 7: the registry itself, rendered (replaces the single row above).
+    plan.writes.append(Planned(dest=_zx(LADDER_REGISTRY_FILENAME), zone="X",
+                               text=render_ladder_registry(), cls="ladder"))
     parity_text = render_parity(plan, prev, removals, cfg)
     plan.writes.append(Planned(dest=_zk("PARITY-REPORT.md"), zone="K",
                                text=_generated_header("PARITY-REPORT.md") + parity_text,

@@ -1,0 +1,408 @@
+# Cora autonomy-ladder REGISTRY (Code #13 slice 7, cq-6afa86210ba0; charter v1
+# section 1 R-A; roadmap v2 WS-B). Schema + rules: src/cora/ladder_registry.py.
+#
+# ONE ROW PER LANE. Tier = what the lane does WITHOUT a human tap, as evidenced by
+# code (T0 propose-only -> T1 approve-then-act -> T2 act-with-audit -> T3 standing;
+# CAP-T1 = a deliberate permanent T1 cap). `status` is the LIFECYCLE (live | dark |
+# unbuilt | cowork-estate) and is NOT a tier. `evidence_monitor.failing_capable`
+# must be true for any tier above T1 (no failing-capable monitor = no promotion
+# past T1). Every tier change is an `events[]` entry with evidence; no lane skips
+# a tier; demotion is automatic on an unapproved action / failed audit / class WARN.
+#
+# WRITTEN ONLY BY A CODE/COWORK COMMIT. The bot never writes this file. Every row
+# is `confirmed_by: pending-Harrison` until his ONE batch confirm (Code #13 report
+# ask block) flips it. The rendered markdown rides ZONE-X via the claude-workspace
+# mirror as cora-mirror-LADDER-REGISTRY.md (KB-excluded by folder pin + title belt).
+#
+# Rows carried VERBATIM (values) from their bespoke sources: s2-phantom-write-screen
+# + c2-mechanical-batch-expiry (Code #12 report section 4), cora-self-inventory
+# (ingest-integrity report section 4), claude-workspace-mirror
+# (_mirror/cora-mirror-LADDER-ROW.md). The bespoke key `demotion` is `demotion_triggers` here.
+version: 1
+
+lanes:
+  - lane: s2-phantom-write-screen
+    title: "S2' phantom-write-claim + fabricated-id screen (slack_egress.screen_phantom_write_claims)"
+    tier: T0
+    status: live
+    promotion_criteria: "7 clean days on ALL rails with the rails ARMED for the whole window (health line says \"criterion MET\") -> Harrison flips CORA_SENTINEL_ENFORCE=enforce (.env + restart)"
+    demotion_triggers: "any false-positive correction in enforce -> back to observe (flag)"
+    evidence_monitor:
+      description: "nightly check_egress_rails + Monday digest section; tests/test_phantom_write_claim.py replays the incident; data/state/egress-rails-armed.json is the coverage record"
+      failing_capable: true
+    audit_surface: "log key phantom-write-claim kind=... mode=... channel= user= (bot format, cora.slack_egress)"
+    authority: Harrison
+    confirmed_by: pending-Harrison
+    acting_probe: sentinel_mode
+    events:
+      - ts: 2026-09-19
+        event: seeded
+        by: code-13
+        evidence: "_shared/projects/cora/2026-09-09_fndr_cora-code-12-queue-metabolism-CASCADE-REPORT.md section 4 (T0 OBSERVE, verbatim)"
+
+  - lane: c2-mechanical-batch-expiry
+    title: "C2 run_knowledge_review._expire_low_risk_mechanical + the weekly mechanical batch card"
+    tier: T1
+    status: live
+    promotion_criteria: "none sought; the class/entity/clock are ruled constants"
+    demotion_triggers: "any LEX/PHI text on the card -> the content screen is the demotion trigger (fail closed)"
+    evidence_monitor:
+      description: "run log line expired_low_risk: (carded / never-carded / screened counts) + flywheel_metrics.expired_low_risk_7d on the digest"
+      failing_capable: true
+    audit_surface: "resolved_reason=expired_low_risk + surfaced on the ledger row; the card text"
+    authority: Harrison
+    confirmed_by: pending-Harrison
+    events:
+      - ts: 2026-09-19
+        event: seeded
+        by: code-13
+        evidence: "Code #12 report section 4 ('T1-class named terminal, bounded to 3 types x 2 entities x 14d, content-screened; the card is propose-only'). NOTE: the expiry ACTS without a tap, bounded by ruled constants -- within-tier by ruling, not drift."
+
+  - lane: claude-workspace-mirror
+    title: "claude-workspace mirror (scripts/mirror_claude_workspace.py) -- permanent T0 cap"
+    tier: T0
+    status: live
+    promotion_criteria: "none sought -- read-only sources, writes only to the two mirror roots, no egress, no LLM"
+    demotion_triggers: "n/a (permanent cap)"
+    evidence_monitor:
+      description: "the PARITY-REPORT.md WARNs (missing root / new quarantine / new skill / task-estate delta / stale run)"
+      failing_capable: true
+    audit_surface: "PARITY-REPORT.md + the Monday cora_health_report digest line"
+    authority: "Harrison (allowlist yaml is Harrison-edited; Cowork proposes)"
+    confirmed_by: pending-Harrison
+    events:
+      - ts: 2026-09-19
+        event: seeded
+        by: code-13
+        evidence: "_shared/projects/cora/_mirror/cora-mirror-LADDER-ROW.md (verbatim; superseded by this registry's rendered file)"
+
+  - lane: cora-self-inventory
+    title: "cora_self_inventory tool (deterministic self-inventory; I4)"
+    tier: T0
+    status: live
+    promotion_criteria: "none sought -- reads live signals (KB stats, sync_state, Task Scheduler registry, run markers, kb_exclusions, PARITY-REPORT.md, the channel's tool set); no writes, no egress, no LLM"
+    demotion_triggers: "n/a (permanent read-only cap)"
+    evidence_monitor:
+      description: "the nightly health check + the #fndr acceptance re-ask; the D-169 safe-set battery (tests/test_phantom_preview_force.py) pins that it never displaces a write"
+      failing_capable: true
+    audit_surface: "tool log line cora_self_inventory actor= entity= detail=; self-inventory intent -> forcing tool log line"
+    authority: Harrison
+    confirmed_by: pending-Harrison
+    events:
+      - ts: 2026-09-19
+        event: seeded
+        by: code-13
+        evidence: "_shared/projects/cora/2026-09-08_fndr_cora-ingest-integrity-bundle-CASCADE-REPORT.md section 4 (verbatim)"
+
+  - lane: task-estate-manifest
+    title: "task-estate manifest generator (DR/VM step 1, M1) -- NOT BUILT on main"
+    tier: T0
+    status: unbuilt
+    promotion_criteria: "none sought -- permanent read-only cap once built"
+    demotion_triggers: "n/a"
+    evidence_monitor:
+      description: "the --diff WARN (planned); no lane exists on main as of 2026-09-19 (DR/VM step-1 parked to wk 9/28)"
+      failing_capable: false
+    audit_surface: "DR-MANIFEST.md + Monday digest line (planned)"
+    authority: Harrison
+    confirmed_by: pending-Harrison
+    events:
+      - ts: 2026-09-19
+        event: seeded
+        by: code-13
+        evidence: "_shared/projects/cora/_notes/2026-09-08_fndr_cora-code-prompt-dr-manifest-vm-step1-KICKOFF.md line 39 (row fields); lane absent on main"
+
+  - lane: f3e-blog-one-tap
+    title: "F3E blog publish lane: auto-draft -> Harrison one-tap -> publish (publish_cards.process_tap)"
+    tier: CAP-T1
+    status: live
+    promotion_criteria: "none -- full-auto publishing is structurally absent by ruling (charter v1 section 1 line 23; 2026-08-26 report)"
+    demotion_triggers: "a publish without Harrison's tap (process_tap's actor gate) -> the lane is off until reviewed"
+    evidence_monitor:
+      description: "the publish ledger (CORA_F3E_BLOG_LEDGER_PATH) + the two-stage read-back after publish + the preflight rails (fail-closed)"
+      failing_capable: true
+    audit_surface: "publish ledger row + the note to #f3-marketing + the Monday 08:50 pipeline log"
+    authority: Harrison
+    confirmed_by: pending-Harrison
+    events:
+      - ts: 2026-09-19
+        event: seeded
+        by: code-13
+        evidence: "charter v1 section 1 line 23 ('the blog one-tap lane = permanent T1'); code: publish_cards.process_tap Harrison-only gate"
+
+  - lane: inventory-adjust-g1
+    title: "F3E inventory adjust (f3e_shopify_set_inventory) under G1 HYBRID authorization"
+    tier: T1
+    status: live
+    promotion_criteria: "T2 would need a failing-capable monitor over logs/shopify-inventory-writes.jsonl (none reads it today) -- Harrison's ruling (Code #13 ask block)"
+    demotion_triggers: "a write with no preview->confirm pair on the ledger, or a write by a non-member out of channel -> back to propose-only"
+    evidence_monitor:
+      description: "logs/shopify-inventory-writes.jsonl (written by tool_dispatch, READ BY NO MONITOR today); the channel itself"
+      failing_capable: false
+    audit_surface: "the write channel post + logs/shopify-inventory-writes.jsonl"
+    authority: Harrison
+    confirmed_by: pending-Harrison
+    events:
+      - ts: 2026-09-19
+        event: seeded
+        by: code-13
+        evidence: "HONEST tier by code: tool_dispatch runs the F-23 two-call preview->confirm even in-channel (the G1 grant is an ENTITY grant, commit 5e5822c) = requester-approve-then-act. The kickoff wrote T2; seeded T1 pending Harrison's ruling."
+
+  - lane: delegated-work-phase1
+    title: "cora_delegate_work Phase 1 (four archetypes; CORA_DELEGATED_WORK flag)"
+    tier: T1
+    status: live
+    promotion_criteria: "none sought in Phase 1; a T2 would need the job-failure monitor to be failing-capable on delivery, not just on spawn"
+    demotion_triggers: "a job that writes outside its Drive artifact + threaded summary, or runs unconfirmed -> flag back to log"
+    evidence_monitor:
+      description: "delegated-work ledgers + cora_delegated_jobs health read; a FAILED job surfaces (dw-d1c6b3fba5e1 9/10)"
+      failing_capable: true
+    audit_surface: "the threaded summary + the Drive artifact + the delegated-work ledger"
+    authority: Harrison
+    confirmed_by: pending-Harrison
+    acting_probe: delegated_level
+    events:
+      - ts: 2026-09-19
+        event: seeded
+        by: code-13
+        evidence: "code: two-call staged write (requester confirm) behind delegated_work.delegated_level(); memory project_cora_delegated_work_phase1"
+
+  - lane: email-triage-tier1
+    title: "fndr-email-triage-twice-daily (Cowork-estate task, Sonnet) -- Tier 1 packet"
+    tier: T0
+    status: cowork-estate
+    promotion_criteria: "none sought (drafts only; never sends, D-137)"
+    demotion_triggers: "any send or any write outside the packet -> task disabled"
+    evidence_monitor:
+      description: "GAP: a non-empty packet run lacks a Fable-spawn stamp or degrade line (cq-8324caf8fa08); the slice-9 file-drop run marker is the intended monitor"
+      failing_capable: false
+    audit_surface: "the packet file in the Founder OS + the ZONE-X mirror body of the task"
+    authority: Harrison
+    confirmed_by: pending-Harrison
+    events:
+      - ts: 2026-09-19
+        event: seeded
+        by: code-13
+        evidence: "_shared/projects/cora/_mirror/cowork-scheduled-tasks/cora-mirror-fndr-email-triage-twice-daily.md; cq-8324caf8fa08 = the evidence_monitor gap"
+
+  - lane: email-triage-tier2
+    title: "fndr-email-triage Tier 2 (Fable subagent leg staging Gmail DRAFTS; never sends)"
+    tier: T0
+    status: cowork-estate
+    promotion_criteria: "none sought until the October external-WRITE seam"
+    demotion_triggers: "any send -> task disabled"
+    evidence_monitor:
+      description: "GAP: same as tier 1 (cq-8324caf8fa08); drafts are visible in Gmail Drafts"
+      failing_capable: false
+    audit_surface: "Gmail Drafts + the packet file"
+    authority: Harrison
+    confirmed_by: pending-Harrison
+    events:
+      - ts: 2026-09-19
+        event: seeded
+        by: code-13
+        evidence: "the ZONE-X mirror body line 8 ('NEVER sends, D-137')"
+
+  - lane: revops-send
+    title: "Revenue-ops send path (revops.send_trust; CORA_SEND_LIVE) -- DARK"
+    tier: T0
+    status: dark
+    promotion_criteria: "the revops internal ladder (data/maps/send-trust.yaml) governs per-playbook tiers; CORA_SEND_LIVE=tier1 is Harrison's flip after the October external-WRITE gate"
+    demotion_triggers: "any send while CORA_SEND_LIVE is off -> the flag is the demotion (fail-closed)"
+    evidence_monitor:
+      description: "send_trust.effective_tier reads the flag per call; the revops ledger + revops_ledger_status tool"
+      failing_capable: true
+    audit_surface: "the revops ledger + the threaded Tier-0 draft"
+    authority: Harrison
+    confirmed_by: pending-Harrison
+    acting_probe: send_live_mode
+    events:
+      - ts: 2026-09-19
+        event: seeded
+        by: code-13
+        evidence: ".env carries no CORA_SEND_LIVE key (name check) -> Tier 0 forced for every playbook (send_trust.send_live_mode)"
+
+  - lane: one-cora-ensure
+    title: "One-Cora ensure lane (meeting_capture.execute_ensure: guest-add / copy cora@ onto qualifying meetings)"
+    tier: T2
+    status: live
+    promotion_criteria: "n/a -- acting under Harrison's 2026-09-08 live flip (CORA_ONECORA_ENSURE=live); T3 is not sought"
+    demotion_triggers: "a guest-add or copy on a vetoed / carve-out / [no-bot] event (carve_out_breaches on the 07:22 audit) -> automatic back to plan mode + alarm"
+    evidence_monitor:
+      description: "the 07:22 auditor (Fireflies API diff, never the KB): captured / missed / unconvened buckets + carve-out breaches; the ensure ledger"
+      failing_capable: true
+    audit_surface: "logs/meeting-capture-ledger.jsonl (ensure rows) + the 07:22 audit post to #founder-operations"
+    authority: Harrison
+    confirmed_by: pending-Harrison
+    acting_probe: ensure_mode
+    events:
+      - ts: 2026-09-19
+        event: seeded
+        by: code-13
+        evidence: "decisions.md 2026-09-08 'One Cora Notetaker' (live flip); .env carries CORA_ONECORA_ENSURE (name check); history before this registry is not reconstructed"
+
+  - lane: honesty-rail-capability-screen
+    title: "Honesty rail: capability-denial + internal-tool-name screen (slack_egress.screen_capability_claims; Code #13 slice 1)"
+    tier: T0
+    status: live
+    promotion_criteria: "a full armed week with phantom-capability-claim reading 0 beside the S2' pair -> the same CORA_SENTINEL_ENFORCE flip (enforce = PREPEND the honest template / redact the symbol, never a strip)"
+    demotion_triggers: "any false-positive correction in enforce -> back to observe (flag)"
+    evidence_monitor:
+      description: "nightly check_egress_rails (third key) + Monday digest; tests/test_capability_claim_screen.py replays the 9/10 founder-DM transcript; per-key first_armed in egress-rails-armed.json"
+      failing_capable: true
+    audit_surface: "log key phantom-capability-claim kind=denial|toolname ... (bot format, cora.slack_egress)"
+    authority: Harrison
+    confirmed_by: pending-Harrison
+    acting_probe: sentinel_mode
+    events:
+      - ts: 2026-09-19
+        event: seeded
+        by: code-13
+        evidence: "Code #13 kickoff section 1 slice 1 (cq-2a88e32a75ea); born T0 OBSERVE"
+
+  - lane: founder-dm-queue-verbs
+    title: "Founder-DM typed queue verbs (S1' + RIDER 2 normalizer/refusal; code_queue.match_queue_verb)"
+    tier: T1
+    status: live
+    promotion_criteria: "none sought -- the typed verb IS the approval; nothing runs without it"
+    demotion_triggers: "a verb executed that the founder did not type (an over-matching normalizer) -> the normalizer is disabled; ambiguity must refuse"
+    evidence_monitor:
+      description: "the ledger `staged`/`approved` events carry via=typed_verb (D-314: verify on the ledger, never the reply); founder-dm queue verb log lines incl. outcome=parse_refused"
+      failing_capable: true
+    audit_surface: "data/state/code-session-queue.jsonl events + logs/cora-*.log founder-dm lines"
+    authority: Harrison
+    confirmed_by: pending-Harrison
+    events:
+      - ts: 2026-09-19
+        event: seeded
+        by: code-13
+        evidence: "Code #12 S1' (cq-554184feb53b) + Code #13 RIDER 2 (cq-70d7b203f7ad)"
+
+  - lane: nightly-catchup
+    title: "Missed-start catch-up for the nightly ingest set (scripts/check_missed_nightly.py; Code #13 slice 2)"
+    tier: T2
+    status: live
+    promotion_criteria: "n/a -- an internal-only re-run of Cora's own tasks; the kickoff asks Harrison to confirm T2 act-with-audit or demote to T0 (propose card only)"
+    demotion_triggers: "a task run twice for one window, a run outside 06:00-12:00 AZ, or a run while Task Scheduler reports the task Running -> the lane is demoted to dry-run (propose) until reviewed"
+    evidence_monitor:
+      description: "logs/nightly-catchup.jsonl (plan + per-task rows) read by nightly_health_check.check_missed_nightly_catchup (WARNs on ran / cannot_check / no decision row) + the Monday digest"
+      failing_capable: true
+    audit_surface: "logs/nightly-catchup.jsonl + run markers (catch_up: true) + logs/tasks/<slug>-<date>.log headers of the replayed runs"
+    authority: Harrison
+    confirmed_by: pending-Harrison
+    events:
+      - ts: 2026-09-19
+        event: seeded
+        by: code-13
+        evidence: "Code #13 kickoff section 1 slice 2 (cq-fb50c9e6c911); the 9/9 host outage lost 13 nightly fires and nothing noticed"
+
+  - lane: one-cora-rsvp-accept
+    title: "One-Cora RSVP-accept as cora@ after a guest-add (calendar_client.set_own_response; Code #13 slice 3)"
+    tier: T2
+    status: live
+    promotion_criteria: "n/a -- acts by Harrison's 2026-09-08 R1 ruling (the ruling is the promotion tap)"
+    demotion_triggers: "any RSVP on a vetoed / carve-out / LEX-organizer-withheld event -> automatic back to propose-only + alarm"
+    evidence_monitor:
+      description: "the 07:22 auditor diffing the Fireflies API (never the KB); the ensure ledger rsvp-accept rows carry (link, start); a ledger scan for an rsvp row whose event also has a same-day skip row is the demotion detector"
+      failing_capable: true
+    audit_surface: "logs/meeting-capture-ledger.jsonl action=rsvp-accept rows + the 07:22 audit post"
+    authority: Harrison
+    confirmed_by: pending-Harrison
+    acting_probe: ensure_mode
+    events:
+      - ts: 2026-09-19
+        event: seeded
+        by: code-13
+        evidence: "decisions.md 2026-09-08 R1 ruling (RSVP-accept as cora@ = THE fix); cq-19b0298cf5be; Code #13 slice 3"
+
+  - lane: meeting-recap-card
+    title: "Meeting recap card -> organizer confirm -> internal attendees' DMs (meeting_recap; Code #13 slice 5)"
+    tier: T0
+    status: live
+    promotion_criteria: "T1 would let the organizer's confirm be assumed for recurring internal meetings -- not sought; external attendees NEVER receive anything at any tier"
+    demotion_triggers: "any DM to an external attendee, or any LEX recap to a non-custodian -> the card is disabled (fail closed)"
+    evidence_monitor:
+      description: "the recap send ledger (MEETING_RECAP_LEDGER_PATH): negative assertion that no external address ever appears; tests/test_meeting_recap.py"
+      failing_capable: true
+    audit_surface: "the organizer card + the send ledger"
+    authority: Harrison
+    confirmed_by: pending-Harrison
+    capability_terms: ["recap card", "meeting recap", "recap"]
+    ask_hint: "after a captured meeting the organizer gets a card; tap 'send recap to internal attendees'"
+    events:
+      - ts: 2026-09-19
+        event: seeded
+        by: code-13
+        evidence: "decisions.md 2026-09-08 R2 ruling; cq-7a724ee43964; Code #13 slice 5"
+
+  - lane: drive-sweep-allowlist
+    title: "Harrison's per-user Drive sweep in ALLOWLIST-BY-FOLDER mode (D-303; drive_sweep; Code #13 slice 8)"
+    tier: T2
+    status: live
+    promotion_criteria: "n/a -- an ingest lane; extending the allowlist to staff sweeps is a follow-up ruling after one clean week"
+    demotion_triggers: "an out-of-allowlist file found ingested (the dry-run manifest is the detector) -> the sweep for that account falls back to hold-all until reviewed"
+    evidence_monitor:
+      description: "the sweep line `skipped_outside_allowlist=N` + `held=N` per run; the --dry-run out-of-tree manifest; kb_exclusions belt tests"
+      failing_capable: true
+    audit_surface: "logs/drive-sweep-<date>.log sweep line + the purge manifest (Harrison-run, stop window)"
+    authority: Harrison
+    confirmed_by: pending-Harrison
+    events:
+      - ts: 2026-09-19
+        event: seeded
+        by: code-13
+        evidence: "D-303 ruled 2026-09-10 (allowlist-by-folder, v1 = HJR-Founder-OS root); cq-c5ed06e1f0bf; Code #13 slice 8"
+
+  - lane: repeat-signal-escalation
+    title: "Repeat-signal escalation (G3, D-302): consecutive unacked signals change surface/owner; 3rd -> ONE propose-only card + suppression"
+    tier: T0
+    status: live
+    promotion_criteria: "none sought -- the card never acts (D-054 propose-only)"
+    demotion_triggers: "a second card for the same signal before ack, or a suppression that hides a NEW signal -> the module falls back to pass-through"
+    evidence_monitor:
+      description: "the escalation ledger (every escalation = a row); fixture: the same signal x3 -> exactly one card, suppression, reset on ack"
+      failing_capable: true
+    audit_surface: "the escalation ledger + the briefing line + the decisions-pending card"
+    authority: Harrison
+    confirmed_by: pending-Harrison
+    events:
+      - ts: 2026-09-19
+        event: seeded
+        by: code-13
+        evidence: "D-302 ruled 2026-09-10; audit 2026-09-19 section 3 (decision gates re-alarm every 8-9 d and self-clear); Code #13 slice 9"
+
+  - lane: expected-invoice-owner-nudge
+    title: "Expected Invoice Check: portal-only vendor MISSING -> T0 nudge DM to the named owner (expected_invoices; Code #13 slice 9a)"
+    tier: T0
+    status: live
+    promotion_criteria: "none sought -- retrieval is the human owner's process (Tessa); the check only nudges"
+    demotion_triggers: "a nudge to anyone but the yaml-named owner, or a nudge with a PHI/LEX byte -> off"
+    evidence_monitor:
+      description: "the invoice-check log line + the repeat-signal ledger (MISSING is the first consumer); known_undelivered clears only by a human edit"
+      failing_capable: true
+    audit_surface: "the owner DM + the check's log"
+    authority: Harrison
+    confirmed_by: pending-Harrison
+    events:
+      - ts: 2026-09-19
+        event: seeded
+        by: code-13
+        evidence: "D-302 ruled 2026-09-10 (day ~9 + owner-DM nudge); cq-21207e34a954"
+
+  - lane: cowork-run-marker-contract
+    title: "Cowork-estate file-drop run markers (_runs/<task>/<date>.json) read into the mirror parity report (Code #13 slice 9c)"
+    tier: T0
+    status: live
+    promotion_criteria: "none sought -- a read-only reader; the footer injection is Harrison's pin-script -Apply"
+    demotion_triggers: "n/a (read-only)"
+    evidence_monitor:
+      description: "the parity report's per-task marker table: a task with no marker after its window reads 'did not run', never 'ok'"
+      failing_capable: true
+    audit_surface: "PARITY-REPORT.md + the Monday digest line"
+    authority: Harrison
+    confirmed_by: pending-Harrison
+    events:
+      - ts: 2026-09-19
+        event: seeded
+        by: code-13
+        evidence: "cq-06045f418bd2; coverage measured 4 of 74 tasks on 9/8; a task that fires and writes nothing == one that never fired"

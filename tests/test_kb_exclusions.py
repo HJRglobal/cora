@@ -453,6 +453,7 @@ class TestCoraWorkspaceFolderPin:
             assert is_cora_internal_title(name, broad=True), name
         assert is_cora_internal_title("cora-mirror-INDEX.md", broad=True)
         assert is_cora_internal_title("cora-mirror-LADDER-ROW.md")
+        assert is_cora_internal_title("cora-mirror-LADDER-REGISTRY.md")   # Code #13 slice 7
 
     def test_door_and_belt_are_independent(self):
         # The leak class the pin closes: a token-less name under the folder is
