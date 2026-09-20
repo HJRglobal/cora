@@ -217,3 +217,31 @@ users:
       - legal
       - cap_table
       - phi
+
+  U0B3KH5UZJ7:  # Tessa Miller -- Operations Coordinator (HJRG; F3E/OSN/HJRP per org-roles); invoice-nudge owner (Code #13 slice 9a). Ruled 2026-09-19 (9.14).
+    name: Tessa Miller
+    allowed_entities:
+      - FNDR
+      - HJRG
+      - F3E
+      - OSN
+      - HJRP
+    sensitive_topics_blocked:
+      - phi
+      - hr
+      - legal
+      - cap_table
+
+  U0B4L7886PJ:  # Jerry Reick -- HJRG Staff Accountant (ARs across entities, expense allocation). Ruled 2026-09-19 (9.14).
+    name: Jerry Reick
+    allowed_entities:
+      - FNDR
+      - HJRG
+      - F3E
+      - OSN
+      - HJRP
+    sensitive_topics_blocked:
+      - phi
+      - hr
+      - legal
+      - cap_table

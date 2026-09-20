@@ -61,7 +61,7 @@ if ($existing) {
 . "$PSScriptRoot\_task-action.ps1"
 $action = New-WrappedTaskAction -TaskName $TaskName `
     -Execute $PythonExe `
-    -Argument "`"$ScriptPath`" --apply" `
+    -Argument "`"$ScriptPath`"" `
     -WorkingDirectory $RepoRoot
 
 $trigger = New-ScheduledTaskTrigger -Daily -At $FireAt

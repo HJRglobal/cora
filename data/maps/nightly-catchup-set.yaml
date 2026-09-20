@@ -47,7 +47,7 @@ tasks:
   - name: cowork-cora-qbo-token-refresh
     trigger_az: "02:00"
     max_minutes: 30
-    enabled: false
+    enabled: true
     command: 'C:\Users\Harri\code\cora\.venv\Scripts\python.exe "C:\Users\Harri\code\cora\scripts\qbo_oauth_flow.py" --refresh-all'
     notes: "candidate -- lost on 9/9 too; a missed refresh is a token-expiry risk; Harrison's call"
   - name: cowork-cora-kb-sync-gmail
@@ -92,7 +92,7 @@ tasks:
   - name: cowork-cora-reconciliation
     trigger_az: "05:30"
     max_minutes: 120
-    enabled: false
+    enabled: true
     command: 'cmd.exe /c cd /d "C:\Users\Harri\code\cora" & "C:\Users\Harri\code\cora\.venv\Scripts\python.exe" "C:\Users\Harri\code\cora\scripts\run_reconciliation.py"'
     notes: "candidate -- registered by setup-kb-sync-tasks.ps1 as the 8th kb-sync task; self-bounded at 50 min; Harrison's call"
   - name: Cora - Drive Materialization
@@ -109,13 +109,13 @@ tasks:
     trigger_az: "06:05"
     grace_min: 130
     max_minutes: 20
-    enabled: false
+    enabled: true
     command: 'C:\Users\Harri\code\cora\.venv\Scripts\python.exe "C:\Users\Harri\code\cora\scripts\run_info_for_cora_sweep.py"'
     notes: "candidate -- gated lane; Harrison's call"
   - name: cowork-cora-gap-autofill
     trigger_az: "06:10"
     grace_min: 130
     max_minutes: 60
-    enabled: false
+    enabled: true
     command: 'C:\Users\Harri\code\cora\.venv\Scripts\python.exe "C:\Users\Harri\code\cora\scripts\run_gap_autofill.py"'
     notes: "candidate -- gated lane (proposals to the 07:00 review); Harrison's call"
