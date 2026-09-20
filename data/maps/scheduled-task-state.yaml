@@ -153,3 +153,7 @@ run_markers:
     cadence_hours: 24         # daily 08:30 AZ (Code #13 slice 2; deployment/setup-missed-nightly-catchup-task.ps1)
     expects_output: false     # a night where every task fired legitimately replays 0 tasks
     registered: 2026-09-19T00:00:00+00:00   # the marker WARNs 'never recorded' until Harrison registers the task -- that is the reminder
+  - name: Cora - Mailbox Intake Sweep
+    cadence_hours: 24         # daily 06:10 AZ (Code #13 Rider 1 S-A; deployment/setup-mailbox-intake-task.ps1)
+    expects_output: false     # a day with no human note emailed to cora@ legitimately queues 0 proposals
+    registered: 2026-09-19T00:00:00+00:00   # the marker WARNs 'never recorded' until Harrison registers the task -- that is the reminder

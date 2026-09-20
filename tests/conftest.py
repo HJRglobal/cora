@@ -434,6 +434,11 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     # Code #13 slice 2: the missed-nightly catch-up lane's own ledger (redirected
     # in the SAME commit that introduced the writer, per the S4 doctrine above).
     monkeypatch.setenv("NIGHTLY_CATCHUP_LEDGER_PATH", str(tmp_path / "nightly-catchup.jsonl"))
+    # Code #13 Rider 1 S-A: the cora@ mailbox intake sweep's per-mailbox watermark
+    # (writer: scripts/run_mailbox_intake_sweep.py --apply). Redirected in the
+    # SAME patch that introduced the writer.
+    monkeypatch.setenv("MAILBOX_INTAKE_WATERMARK_PATH",
+                       str(tmp_path / "mailbox-intake-watermark.json"))
     # Found by WIDENING the isolation rail's suffix list to include *_LEDGER
     # (session #11 S4). Both were live, unredirected write paths that the
     # PATH/DIR/ROOT-only scanner could not see -- and decision_inbox has TWO env
@@ -604,6 +609,9 @@ _GUARDED_LEDGERS = (
     "data/state/egress-rails-armed.json",
     # Code #13 slice 2: the missed-nightly catch-up ledger (writer: scripts/check_missed_nightly.py).
     "logs/nightly-catchup.jsonl",
+    # Code #13 Rider 1 S-A: the cora@ mailbox intake sweep's watermark (writer:
+    # scripts/run_mailbox_intake_sweep.py --apply; redirected via MAILBOX_INTAKE_WATERMARK_PATH).
+    "data/state/mailbox-intake-watermark.json",
 )
 
 

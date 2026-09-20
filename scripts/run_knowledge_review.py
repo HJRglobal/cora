@@ -482,6 +482,19 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
                 except Exception:  # noqa: BLE001
                     log.warning("golden-set auto-growth failed (non-fatal)",
                                 exc_info=True)
+            elif summary.startswith("excluded:") and "screen_error" not in summary:
+                # D-145 "again at apply" (Code #13 Rider 1 S-A ruling (c)): the
+                # applier's deterministic LEX/PHI re-screen refused the durable
+                # write -> terminal DISMISSED (reason lex_phi_excluded), the same
+                # contract the decision branch above applies. A refused row must
+                # not sit PENDING to be retried or to read as a transient failure.
+                resolve_update(update.get("update_id", ""), "DISMISSED",
+                               reason="lex_phi_excluded")
+                success = False
+                msg = (f":no_entry_sign: *Gap executor* `[{uid_short}]` contributed note "
+                       f"withheld -- LEX/PHI hard-exclusion (fail-closed). Dismissed.")
+                log.warning("gap-executor: info-for-cora note excluded uid=%s: %s",
+                            uid_short, summary)
             else:
                 success = False
                 msg = f":warning: *Gap executor* `[{uid_short}]` note apply failed: {summary}"

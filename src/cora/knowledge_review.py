@@ -1319,7 +1319,9 @@ def process_one_tap_action(
 
     Returns (outcome, user_message) where outcome is one of:
       not_authorized | not_found | already_resolved | approved | apply_failed |
-      dismissed.
+      excluded | dismissed. `excluded` = the applier's deterministic LEX/PHI
+      re-screen refused the durable write (summary "excluded:..."); the row is
+      DISMISSED with reason lex_phi_excluded, mirroring process_decision_tap.
 
     Authorization is per ITEM (review_lanes.can_approve), not per reactor. For
     every card this handler renders today that resolves to Harrison-only, which
@@ -1383,6 +1385,18 @@ def process_one_tap_action(
 
         ok, summary = apply_knowledge_update(update)
         if not ok:
+            if summary.startswith("excluded:") and "screen_error" not in summary:
+                # D-145 "again at apply" (Code #13 Rider 1 S-A ruling (c)): the
+                # applier's DETERMINISTIC LEX/PHI re-screen refused the durable
+                # write. Same contract as the decision path below -- a refused
+                # row is terminal (DISMISSED, reason lex_phi_excluded), never left
+                # PENDING to be re-tapped or to auto-expire as if it were retryable.
+                resolve_update(update_id, "DISMISSED", reason="lex_phi_excluded")
+                log.warning("knowledge_review: %s excluded at apply (%s)",
+                            update_id[:8], summary)
+                return ("excluded",
+                        "🚫 Withheld — this looks LEX/PHI-scoped, so it can't be "
+                        "saved (fail-closed). Dismissed.")
             log.warning("knowledge_review: one-tap approve apply failed %s: %s",
                         update_id[:8], summary)
             # Left PENDING; apply failures here are ~always permanent (empty

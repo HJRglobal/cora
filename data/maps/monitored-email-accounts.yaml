@@ -49,6 +49,18 @@
 #   HJR-Founder-OS root (== drive_sweep.FOUNDERS_OS_ROOT_ID, pinned by test). A
 #   tree-adjacent BUSINESS folder found by the migration manifest
 #   (scripts/drive_sweep_allowlist_manifest.py) is ADDED here, never purged.
+# intake_route: knowledge_review -- (Code #13 Rider 1 S-A, cq-8d16f1a557e5; the
+#   8/18 PROVISION ruling) this mailbox is a SYSTEM INTAKE mailbox, not a human's.
+#   Its ONLY consumer is scripts/run_mailbox_intake_sweep.py, which feeds each new
+#   human-authored message through info_intake.ingest (the SAME chokepoint as
+#   #info-for-cora: PHI + blanket-LEX refusal at ingest, propose-only, never
+#   autowrite) as a PENDING knowledge-review proposal. A row carrying this key
+#   MUST also set thread_sweep / attachment_filer / drive_sweep EXPLICITLY false
+#   (all three default TRUE when absent, which would chunk-ingest the mailbox --
+#   the opposite posture) and fireflies_seat false (the capture seat is tracked in
+#   meeting-capture-roster.yaml; never double-flag it here). Absent key = an
+#   ordinary human mailbox (today's behaviour for every other row). Any other
+#   value is REFUSED by the sweep (the row is skipped + logged), never fallen open.
 
 accounts:
 
@@ -71,6 +83,26 @@ accounts:
     asana_gid: "1204525779609669"
     slack_user_id: U0B2RM2JYJ1
     fireflies_seat: true
+
+  # Cora's own SYSTEM mailbox (Code #13 Rider 1 S-A, cq-8d16f1a557e5; finishes the
+  # 8/18 PROVISION ruling). NOT a human: never chunk-ingested (all three sweep
+  # flags EXPLICITLY false -- the defaults are true), never Fireflies-nudged (the
+  # capture seat lives in meeting-capture-roster.yaml; fireflies_seat stays false
+  # here so the 10-seat coverage pin is untouched), no slack_user_id / asana_gid.
+  # Its ONE consumer is scripts/run_mailbox_intake_sweep.py via intake_route (see
+  # the header): a roster human's email to cora@ becomes ONE pending
+  # knowledge-review proposal; automated senders (Fireflies / Calendar / noreply)
+  # and non-roster senders are skipped in CODE.
+  - email: cora@hjrglobal.com
+    name: Cora (system mailbox)
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: false
+    attachment_filer: false
+    drive_sweep: false
+    entity_default: FNDR
+    fireflies_seat: false
+    intake_route: knowledge_review
 
   - email: hannah@hjrglobal.com
     name: Hannah Grant

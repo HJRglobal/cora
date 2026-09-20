@@ -1889,15 +1889,41 @@ def apply_contributed_note(payload: dict[str, Any]) -> tuple[bool, str]:
         # paraphrases, 6/06 and 6/30), so nothing live is lost today; it would matter
         # only if the dark message event is ever lit up. Flagged in the cascade report
         # so it is a decision rather than an accident.
+        #
+        # The refusal summaries below start with "excluded:" (the decision path's
+        # apply_decision_accept contract): both executors -- the one-tap button
+        # (knowledge_review.process_one_tap_action) and the scheduled
+        # run_knowledge_review -- resolve such an item DISMISSED with reason
+        # lex_phi_excluded instead of leaving a refused row PENDING (Code #13
+        # Rider 1 S-A ruling (c), D-145 "again at apply"). A transient failure
+        # keeps the plain "apply failed:" shape and stays PENDING/retryable.
         if entity.startswith("LEX"):
             log.info("gap_autofill: contributed note refused (LEX entity) -- not persisted")
-            return False, "LEX contributions are not captured through this path"
+            return False, "excluded: LEX contributions are not captured through this path"
         # Normalize to a single line so the dedup search below is reliable and the
         # stored fact is a clean one-liner (adversarial review LOW: a multi-line
         # contribution otherwise defeated the line-anchored dedup regex).
         text = re.sub(r"\s+", " ", (payload.get("text") or payload.get("note") or "")).strip()
         if not text:
             return False, "info-for-cora payload has no text -- skipped"
+        # D-145 "again at apply", CONTENT-keyed (Code #13 Rider 1 S-A ruling (c)).
+        # The entity check above is keyed on the payload's entity TAG; a payload
+        # tagged FNDR whose text carries LEX tokens (a mis-resolved entity, or a
+        # producer that never ran the ingest-side screen -- the cora@ mailbox
+        # route reuses info_intake.ingest, but this executor is reachable from ANY
+        # source="info-for-cora" producer) sailed past it. Same detector the
+        # ingest side uses, so the two screens cannot disagree; fail CLOSED on a
+        # detector error.
+        try:
+            from .info_intake import is_lex_content
+            lex_content = is_lex_content(text)
+        except Exception:  # noqa: BLE001 -- refuse rather than risk a LEX write
+            log.warning("gap_autofill: LEX content check failed; refusing fail-closed",
+                        exc_info=True)
+            lex_content = True
+        if lex_content:
+            log.info("gap_autofill: contributed note refused (LEX content) -- not persisted")
+            return False, "excluded: LEX content is not captured through this path"
         # R5a belt (D-123 class): this file is ALWAYS-INJECTED context and the
         # egress boundary deliberately preserves `<...>`, so a live `<!channel>`
         # broadcast or a labelled attacker link must never be written here.
@@ -1928,7 +1954,7 @@ def apply_contributed_note(payload: dict[str, Any]) -> tuple[bool, str]:
         # cheaper error than persisting PHI into a durable knowledge surface.
         if is_phi_risk(text) or is_lex_billing_status_phi(text) or is_clinical_phi(text):
             log.info("gap_autofill: contributed note refused (PHI) -- not persisted")
-            return False, "contribution looks like PHI -- not persisted"
+            return False, "excluded: contribution looks like PHI -- not persisted"
         author = (payload.get("author_name") or "").strip()
         # Source-aware provenance (WS17-C): a folded team note/bookmark/correction
         # records the channel it came from; a #info-for-cora post records that.

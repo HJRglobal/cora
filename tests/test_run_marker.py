@@ -189,6 +189,8 @@ class TestRegistryAndWiring:
             "cowork-cora-session-capture": "scripts/run_session_capture.py",
             # Code #13 slice 2: the missed-nightly catch-up lane
             "Cora - Missed Nightly Catch-Up": "scripts/check_missed_nightly.py",
+            # Code #13 Rider 1 S-A: the cora@ mailbox intake sweep
+            "Cora - Mailbox Intake Sweep": "scripts/run_mailbox_intake_sweep.py",
         }
         for entry in data.get("run_markers") or []:
             path = scripts.get(entry["name"])
