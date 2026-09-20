@@ -391,13 +391,29 @@ _CAP_CANT_VERB = (
     r"interact\s+with|connect\s+to|talk\s+to|search|retrieve|fetch|list|manage|edit|write\s+to|log\s+into|"
     r"delete|complete|mark|schedule|draft|dm|message)\b"
 )
-_CAP_NOT_CONNECTED = (
-    r"\b(?:isn'?t|is\s+not|aren'?t|are\s+not|not)\s+(?:currently\s+|yet\s+)?"
+# The "not connected / available / set up / integrated / enabled" alternation needs
+# a BOT-SUBJECT in the same clause (D-051 Code #13 review AD-5): the bare form read
+# third-person business facts as capability denials whenever the sentence also
+# named a family word -- "The Asana board is not set up for that project yet",
+# "Klaviyo isn't integrated with the CRM yet", "The calendar invite is not available
+# yet", "Our inventory isn't available at the Anaheim warehouse". Three anchors:
+# the bot as subject ("I'm not connected", "my tools aren't wired to"), the bot as
+# the beneficiary ("HubSpot isn't connected FOR ME / TO ME / ON MY END"), or a tool
+# / connector / integration as subject ("that connector isn't enabled").
+_CAP_NOT_STATE = (
     r"(?:connected|available|accessible|exposed|wired(?:\s+up)?|hooked\s+up|integrated|enabled|set\s+up|"
-    r"provisioned|plugged\s+in)\b"
+    r"provisioned|plugged\s+in)"
+)
+_CAP_NOT_CONNECTED = (
+    r"\b(?:I\s+(?:am|'m)\s+not|I'm\s+not|I\s+am\s+not)\s+(?:currently\s+|yet\s+)?" + _CAP_NOT_STATE + r"\b"
+    r"|\bmy\s+(?:tools?|toolset|connectors?|integrations?|access)\s+(?:isn'?t|is\s+not|aren'?t|are\s+not)\s+"
+    r"(?:currently\s+|yet\s+)?" + _CAP_NOT_STATE + r"\b"
+    r"|\b(?:that|this|the)\s+(?:tool|connector|integration|hook)\s+(?:isn'?t|is\s+not)\s+"
+    r"(?:currently\s+|yet\s+)?" + _CAP_NOT_STATE + r"\b"
+    r"|\b(?:isn'?t|is\s+not|aren'?t|are\s+not|not)\s+(?:currently\s+|yet\s+)?" + _CAP_NOT_STATE
+    + r"\s+(?:(?:to|for)\s+me|on\s+my\s+(?:end|side)|in\s+my\s+(?:tools?|toolset))\b"
     r"|\bnot\s+available\s+to\s+me\b"
     r"|\b(?:outside|beyond)\s+(?:of\s+)?my\s+(?:reach|access|tools|toolset|capabilities|scope|purview)\b"
-    r"|\bI\s+(?:am|'m)\s+not\s+(?:connected|wired|hooked\s+up|integrated|plugged\s+in)\b"
 )
 _CAP_USE_INTERFACE = (
     r"\b(?:use|check|open|go\s+to|try|log\s+into|do\s+(?:that|this|it)\s+(?:in|through|via))\s+"
@@ -411,6 +427,31 @@ _CAP_USE_INTERFACE = (
 _DENIAL_RE = re.compile(
     "(?:" + _CAP_NEG_HAVE + "|" + _CAP_NO_HAVE + "|" + _CAP_CANT_VERB + "|" + _CAP_NOT_CONNECTED
     + "|" + _CAP_USE_INTERFACE + ")",
+    re.IGNORECASE,
+)
+# RULED refusals the model is REQUIRED to voice are exempt BY SHAPE (D-051 Code #13
+# review AD-6): the capability set reads the tool REGISTRY, but a Tier-3 finance
+# refusal ("I can't pull P&L figures in this channel -- ask in #f3e-finance"), the
+# D-043 own-mailbox refusal ("only your own mailbox is in scope for me") and a
+# Harrison-only / custodian-only scope line are zero-tool_use turns that name a
+# family the registry offers -- the PROMPT-level tier rule forbids the pull, not the
+# registry. Enforce would have PREPENDED "Try: ask me for a QuickBooks P&L" under
+# the very refusal that was enforcing the guardrail. A sentence that redirects to
+# another channel, scopes to "this channel", names the own-mailbox rule or a
+# Harrison- / founder- / custodian-only scope is a refusal, not a denial. Bounded
+# classes only (ReDoS discipline).
+_RULED_REFUSAL_RE = re.compile(
+    r"(?:\b(?:not\s+)?in\s+this\s+channel\b"
+    r"|\bthis\s+channel\s+(?:isn'?t|is\s+not|doesn'?t|does\s+not|can'?t)\b"
+    r"|\bask\s+(?:me\s+)?(?:again\s+)?(?:in|over\s+in|from|via)\s+(?:the\s+)?(?:#|<#|[a-z0-9_-]{1,40}\s+channel\b)"
+    r"|\b(?:in|from|via|over\s+in|to)\s+#[a-z0-9_-]{1,60}"
+    r"|\b(?:finance|leadership|founder)\s+channel\b"
+    r"|\b(?:your|their|his|her|the)\s+own\s+(?:mailbox|inbox|emails?|mail|drive)\b"
+    r"|\bown[- ]mailbox[- ]only\b"
+    r"|\b(?:harrison|founder|owner|custodian|admin)[- ]only\b"
+    r"|\bonly\s+(?:harrison|the\s+founder|a\s+custodian|phi\s+custodians?)\b"
+    r"|\btier[- ]?[123]\b"
+    r"|\bout\s+of\s+scope\s+(?:for\s+me\s+)?(?:in|here)\b)",
     re.IGNORECASE,
 )
 _DEVELOPER_SURFACE_RE = re.compile(r"(?:^|-)cora-(?:build|health|security|dev)\b", re.IGNORECASE)
@@ -428,7 +469,8 @@ def is_developer_surface(channel_name: str) -> bool:
 def _denial_window(text: str, start: int, end: int) -> str:
     """The sentence the denial sits in (bounded 160 chars back / 220 ahead), so the
     capability term is looked for where the denial's OBJECT lives -- after it
-    ("...visibility into the code queue") or before it ("HubSpot isn't connected")."""
+    ("...visibility into the code queue") or before it ("HubSpot isn't connected
+    for me")."""
     lo = max(0, start - 160)
     hi = min(len(text), end + 220)
     before = text[lo:start]
@@ -477,6 +519,13 @@ def screen_capability_claims(text, *, tool_use_count, channel_name: str = "", us
     zero); the toolname half runs regardless of the count. A capability set that
     cannot be derived (registry import failure) is EMPTY -> no denial can trip
     (fail-open on the reference set, never on the claim), logged once per turn.
+
+    RULED tier / scope refusals are EXEMPT BY SHAPE (AD-6, ``_RULED_REFUSAL_RE``):
+    a sentence that redirects to another channel, scopes to "this channel", names
+    the own-mailbox rule or a Harrison- / founder- / custodian-only scope is the
+    guardrail speaking, not a denial -- the capability set reads the tool registry,
+    which cannot see the prompt-level tier rule that forbids the pull. Refusal
+    shapes outside that list still read as denials until the set is tier-scoped.
     """
     if not isinstance(text, str) or not text:
         return text
@@ -522,6 +571,8 @@ def screen_capability_claims(text, *, tool_use_count, channel_name: str = "", us
             from .capability_set import find_capability_term  # lazy
             for m in _DENIAL_RE.finditer(masked):
                 window = _denial_window(masked, m.start(), m.end())
+                if _RULED_REFUSAL_RE.search(window):
+                    continue   # AD-6: a tier / scope refusal the model must voice, not a denial
                 hit = find_capability_term(window, terms)
                 if hit is None:
                     continue

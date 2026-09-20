@@ -157,8 +157,15 @@ _SOURCE_NOUN = (
     r"(?:cowork|cascade|claude|code|session)\s+(?:stuff|material|knowledge|docs|notes|history))"
 )
 # An object followed by a specifier is a CONTENT question ("the fireflies transcript
-# FROM the Gotham call", "the slack thread WHERE Matt approved the PO").
-_TAIL = r"(?![^\n]{0,40}?\b(?:from|about|for|re|regarding|on|where|when|that|which|of|between)\b)"
+# FROM the Gotham call", "the slack thread WHERE Matt approved the PO"), and so is an
+# object followed by a WORK verb ("read the files in the Founder-OS folder AND
+# SUMMARIZE them" -- D-051 Code #13 review AD-2: the folder noun alone routed that
+# content request to the inventory dump).
+_TAIL = (
+    r"(?![^\n]{0,40}?\b(?:from|about|for|re|regarding|on|where|when|that|which|of|between|"
+    r"and\s+(?:then\s+)?(?:summari[sz]e|tell|give|send|draft|write|list|pull|make|let|explain|compare|"
+    r"put|post|share|email|dm|create|update|flag|note|report|find|check))\b)"
+)
 _P_HAVE_KNOW = re.compile(
     _LEAD + r"(?:do|did|can|could|would|don't|dont|do\s+not)\s+" + _YOU + r"\s+" + _ADV
     + r"(?:have|know\s+(?:about|of)|know|see|access|ingest|index|read|hold|store|sync|remember|"
@@ -233,32 +240,60 @@ _IMPERATIVE_WRITE_RE = re.compile(
 )
 
 # Code #13 slice 1, routing half (cq-2e02f1fd0f65; ruled 2026-09-10): "can you
-# access / see / reach / read <connector | tool | file | folder>" JOINS the force.
+# access / see / reach / read <connector | tool | folder>" JOINS the force.
 # This REVERSES the lens-E #2 choice above ("the model has those tools in its list
 # and answers 'can you access HubSpot' from it"): the 9/10 founder-DM transcript
 # shows the model DENYING capabilities it had, so the answer is now inventory-
 # derived -- the tool renders live connectors as NOT-sources and names the door.
-# Deliberately NO specifier-tail guard here: "QBO for OSN" is an entity qualifier
-# on a connector, not a content object. The imperative-write exclusion still runs
-# first, so "send the Shopify file to Larry" is never hijacked.
+# The imperative-write exclusion still runs first, so "send the Shopify file to
+# Larry" is never hijacked.
+#
+# SHAPE (D-051 Code #13 review AD-2): the connector noun must END the clause. The
+# first cut had no tail at all, so ordinary TOOL-USE asks were forced to the
+# inventory ("can you see my calendar FOR FRIDAY?", "can you query QBO FOR OSN'S Q2
+# REVENUE?", "can you open the Asana TASK ...", "can you use the web TO FIND ...")
+# -- and because a forced tool sets web_gate_skip, the web was withheld on the very
+# phrase that asked for it. "QBO for OSN" stays a meta-question: the ruled entity
+# qualifier is admitted EXPLICITLY (an entity code, never "for Friday"), which is
+# why this is a clause-END requirement and not the generic _TAIL specifier guard.
+# The generic tool-use verbs (use / query / pull from / get into / hit / open) are
+# gone from these two patterns: with an object clause they are ASKS, and without
+# one the access / see / reach / read forms already cover the meta-question.
+# Content-object nouns (file / folder / document / spreadsheet / sheet) are gone
+# from the connector class: they are the model's to read, and "can you read the
+# files in that folder?" still routes through _P_HAVE_KNOW's folder SOURCE noun.
 _CONNECTOR_NOUN = (
     r"(?:hubspot|asana|quickbooks(?:\s+online)?|qbo|shopify|(?:google\s+)?calendar|deposco|klaviyo|"
     r"make(?:\.com)?|notion|(?:the\s+)?web|web\s+search|(?:live\s+)?tools?|connectors?|integrations?|apis?|"
-    r"files?|folders?|documents?|docs|spreadsheets?|sheets?|(?:google\s+)?drive)"
+    r"(?:google\s+)?drive)"
+)
+# "QBO for OSN" / "HubSpot for F3E" -- an ENTITY code after the connector is a
+# qualifier on the connector, never a content object (ruled 2026-09-10).
+_CONNECTOR_ENTITY_QUALIFIER = (
+    r"(?:\s+for\s+(?:the\s+)?(?:osn(?:g[wmf]|vv)?|f3e?|f3c|lex(?:-(?:llc|lts|lbhs|lla))?|llc|lts|lbhs|lla|ufl|"
+    r"bdm|hjrp(?:-\w{1,6})?|hjrg|hjr|fndr|hjrprod|pod|hrllc|pure|lexington|founder))?"
+)
+# The clause END: an optional bounded adverbial, then punctuation / end of line /
+# "or|and <another connector>". Anything else after the noun is an object clause
+# and the message stays with the model + its tool list.
+_CONNECTOR_CLAUSE_END = (
+    _CONNECTOR_ENTITY_QUALIFIER
+    + r"(?:\s+(?:at\s+all|right\s+now|yet|now|today|still|too|as\s+well|directly|live|from\s+here|here|"
+    r"for\s+me|on\s+your\s+end))?"
+    r"\s*(?:$|[?!.,;:)\n]|\s+(?:or|and)\s+(?:the\s+|our\s+|my\s+)?" + _CONNECTOR_NOUN + r"\b)"
 )
 _P_CAN_ACCESS_CONNECTOR = re.compile(
     _LEAD + r"(?:can|could|do|did|don't|dont|do\s+not|can't|cant|will|would)\s+" + _YOU + r"\s+" + _ADV
-    + r"(?:have\s+access\s+to|access|see|reach|read|use|connect\s+to|talk\s+to|pull\s+from|query|"
-    r"get\s+(?:to|into|at)|log\s+into|hit|open|touch|work\s+with)\s+"
+    + r"(?:have\s+access\s+to|access|see|reach|read|connect\s+to|talk\s+to|log\s+into|touch|work\s+with)\s+"
     r"(?:the\s+|our\s+|my\s+|your\s+|any\s+|all\s+(?:the\s+)?|those\s+|these\s+|that\s+)?"
-    + _CONNECTOR_NOUN + r"\b",
+    + _CONNECTOR_NOUN + r"\b" + _CONNECTOR_CLAUSE_END,
     re.IGNORECASE,
 )
 _P_ABLE_TO_ACCESS_CONNECTOR = re.compile(
     _LEAD + r"are\s+" + _YOU + r"\s+" + _ADV
     + r"(?:able\s+to|allowed\s+to|permitted\s+to|set\s+up\s+to|wired\s+(?:up\s+)?to|connected\s+to|"
-    r"hooked\s+up\s+to|plugged\s+into|integrated\s+with)\s+(?:(?:access|see|reach|read|use|query)\s+)?"
-    r"(?:the\s+|our\s+|my\s+)?" + _CONNECTOR_NOUN + r"\b",
+    r"hooked\s+up\s+to|plugged\s+into|integrated\s+with)\s+(?:(?:access|see|reach|read)\s+)?"
+    r"(?:the\s+|our\s+|my\s+)?" + _CONNECTOR_NOUN + r"\b" + _CONNECTOR_CLAUSE_END,
     re.IGNORECASE,
 )
 

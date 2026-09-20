@@ -316,3 +316,113 @@ class TestWiring:
         assert er.RAIL_CAPABILITY == se.CAPABILITY_LOG_KEY
         assert er.RAIL_CAPABILITY in er.RAIL_KEYS
         assert er._FIRING_RE[er.RAIL_CAPABILITY].search("phantom-capability-claim kind=denial phrase='x'")
+
+
+# ── D-051 Code #13 review AD-4 / AD-5 / AD-6: honest sentences that named a family word ──
+# Every sentence here tripped kind=denial on the branch tip (verified in observe mode);
+# none is a denial of something the bot has in that channel.
+BENIGN_FAMILY_WORDS_AD4 = [
+    # (sentence, entity, founder, channel) -- the family word each one carried
+    ("I can't check the stock at the Tucson store from here.", "OSN", False, "osn-leadership"),   # 'stock' <- cora_self_inventory
+    ("I can't see the image you attached", "FNDR", True, "dm"),                                    # 'image' <- f3_generate_image
+    ("I don't have access to the meeting notes from Friday's call.", "FNDR", True, "dm"),         # 'notes' <- cora_my_notes
+    ("I can't open the deck you shared.", "FNDR", True, "dm"),                                     # 'deck' <- f3_create_sales_deck
+    ("I don't have access to that Slack channel's history.", "F3E", False, "f3e-sales"),          # 'slack' <- slack_send_dm
+    ("I can't see Larry's emails -- only your own mailbox is in scope for me.", "F3E", False, "f3e-sales"),  # 'mailbox' <- gmail_inbox
+    ("I can't DM Tessa -- she isn't on the roster.", "F3E", False, "f3e-sales"),                  # 'dm' <- slack_send_dm
+]
+THIRD_PERSON_FACTS_AD5 = [
+    "The Asana board is not set up for that project yet.",
+    "Klaviyo isn't integrated with the CRM yet, so the list won't sync.",
+    "The calendar invite is not available yet; Tessa hasn't sent it.",
+    "Our inventory isn't available at the Anaheim warehouse until Friday.",
+]
+RULED_REFUSALS_AD6 = [
+    "I can't pull P&L figures in this channel -- ask in #f3e-finance.",                         # Tier-3 finance refusal
+    "I can't pull P&L figures in this channel -- ask in <#C0BAK65N4TA|hjr-finance>.",           # the same, Slack channel token
+    "I can't see Larry's emails -- only your own mailbox is in scope for me.",                  # D-043 Tier-2 own-mailbox
+    "That list is Harrison-only, so I can't share the open decisions here.",                    # founder-only scope
+]
+# ... while REAL denials of offered capabilities keep tripping (the rail is not blunted)
+STILL_TRIP = [
+    ("I don't have access to HubSpot, so I can't see the pipeline from here.", "F3E", False, "f3e-sales"),
+    ("HubSpot isn't connected for me, so I can't see the pipeline.", "F3E", False, "f3e-sales"),   # AD-5 beneficiary anchor
+    ("I'm not connected to HubSpot.", "F3E", False, "f3e-sales"),                                   # AD-5 bot-subject anchor
+    ("I don't have a way to send a DM to Tommy.", "F3E", False, "f3e-sales"),                       # AD-4 compound alias
+    ("I don't have a way to generate an image for that.", "F3E", False, "f3e-sales"),               # AD-4 compound alias
+    ("I can't pull up my inbox from here.", "F3E", False, "f3e-sales"),                             # AD-4 compound alias
+    ("I can't check the stock levels for the 12-pack.", "F3E", False, "f3e-sales"),                 # F3E DOES have inventory tools
+]
+
+
+class TestBenignFamilyWordsAD4:
+    @pytest.mark.parametrize("sentence,entity,founder,channel", BENIGN_FAMILY_WORDS_AD4)
+    def test_medium_words_and_attachments_never_trip(self, observe, caplog, sentence, entity, founder, channel):
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        out = _screen(sentence, entity=entity, founder=founder, channel=channel, user="U_X")
+        assert out == sentence and _hits(caplog, "denial") == [], sentence
+
+    def test_self_inventory_tool_contributes_no_family(self):
+        """cora_self_inventory is the inventory-of-SOURCES tool: OSN (no inventory tool
+        since D-027) must not gain 'inventory' / 'stock' from its NAME."""
+        osn = cs.capability_terms("OSN", cross_entity=False, founder=False)
+        for t in ("inventory", "stock", "stock levels", "inventory levels"):
+            assert t not in osn, t
+        f3e = cs.capability_terms("F3E", cross_entity=False, founder=False)
+        assert "inventory" in f3e and "stock levels" in f3e          # the f3e_*inventory* tools still carry it
+
+    def test_bare_medium_aliases_are_gone_and_compounds_remain(self):
+        f = cs.capability_terms("FNDR", cross_entity=True, founder=True)
+        for bare in ("slack", "image", "images", "deck", "notes", "mailbox", "emails", "email", "inbox", "dm", "dms"):
+            assert bare not in f, bare
+        for compound in ("slack dm", "send a dm", "generate an image", "sales deck", "my notes", "my inbox", "gmail"):
+            assert compound in f, compound
+
+
+class TestThirdPersonFactsAD5:
+    @pytest.mark.parametrize("sentence", THIRD_PERSON_FACTS_AD5)
+    def test_business_facts_about_external_systems_never_trip(self, observe, caplog, sentence):
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        out = _screen(sentence, entity="F3E", founder=False, channel="f3e-sales", user="U_TOMMY")
+        assert out == sentence and _hits(caplog, "denial") == [], sentence
+        assert se._DENIAL_RE.search(sentence) is None                 # no bot-subject -> not a denial phrase at all
+
+    def test_not_connected_growth_shape_is_linear(self):
+        import time
+        for adv in ("I am not " + " " * 40_000 + "x", "is not " + "currently " * 5_000, "my tools " * 5_000):
+            t0 = time.perf_counter()
+            se._DENIAL_RE.search(adv)
+            assert time.perf_counter() - t0 < 0.2, adv[:20]
+
+
+class TestRuledRefusalsExemptAD6:
+    @pytest.mark.parametrize("sentence", RULED_REFUSALS_AD6)
+    def test_tier_and_scope_refusals_are_exempt_by_shape(self, observe, caplog, sentence):
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        out = _screen(sentence, entity="F3E", founder=False, channel="f3e-sales", user="U_TOMMY")
+        assert out == sentence and _hits(caplog, "denial") == [], sentence
+
+    def test_enforce_never_prepends_a_try_hint_under_a_tier_refusal(self, observe, monkeypatch, caplog):
+        """The whole point: enforce must not invite the finance ask in the Tier-3 channel."""
+        monkeypatch.setenv("CORA_SENTINEL_ENFORCE", "enforce")
+        text = RULED_REFUSALS_AD6[0]
+        assert _screen(text, entity="F3E", founder=False, channel="f3e-sales", user="U_TOMMY") == text
+        assert se.CAPABILITY_HONEST_TEMPLATE not in text
+
+    def test_docstring_states_the_exemption(self):
+        assert "EXEMPT BY SHAPE" in (se.screen_capability_claims.__doc__ or "")
+
+    def test_ruled_refusal_growth_shape_is_linear(self):
+        import time
+        for adv in ("ask in " + " " * 40_000 + "x", "this channel " * 4_000, "in #" + "a" * 40_000, "own " * 10_000):
+            t0 = time.perf_counter()
+            se._RULED_REFUSAL_RE.search(adv)
+            assert time.perf_counter() - t0 < 0.2, adv[:20]
+
+
+class TestRealDenialsStillTripAfterAD456:
+    @pytest.mark.parametrize("sentence,entity,founder,channel", STILL_TRIP)
+    def test_offered_capability_denials_trip_once(self, observe, caplog, sentence, entity, founder, channel):
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        _screen(sentence, entity=entity, founder=founder, channel=channel, user="U_X")
+        assert len(_hits(caplog, "denial")) == 1, sentence

@@ -1143,6 +1143,81 @@ def sweep_user(
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 
+def collapse_alias_accounts(accounts: list[dict]) -> tuple[list[dict], dict[str, list[str]]]:
+    """Collapse roster rows that are the SAME physical Drive into one sweep row.
+
+    THE DEFECT (D-051 Code #13 review AD-1): harrison@f3energy.com and
+    harrison@lexingtonservices.com are Workspace aliases of harrison@hjrglobal.com
+    -- DWD impersonation of either lands in the same Drive (three nights of logs:
+    ``enumerated=81 ... dedup=81``, the primary's exact file set). The D-303
+    allowlist lives on the PRIMARY row only, and ruling (c) withdraws the cross-
+    user dedup mark on an outside-allowlist skip so a DIFFERENT account's denylist
+    sweep can still ingest a shared file -- which handed every Downloads / Desktop /
+    loose file the primary skipped straight to the alias row, ingesting it under
+    entity_default F3E. Had an alias row ever run FIRST, it would have ingested the
+    whole enumeration under F3E and the primary would have seen dedup for everything.
+
+    Identity is ROSTER-derived (no network: the gmail sweep's getProfile canonical
+    mailbox has no Drive twin the tests can exercise): two enabled rows are one
+    Drive when they share a ``slack_user_id`` or one names the other in
+    ``known_aliases`` (union-find, so a three-row group folds through either edge).
+    Live evidence pins every such group as a single Drive today (Harrison x3,
+    Larry x2: larry@bigd.media enumerates the primary's set, dedup=all).
+
+    The PRIMARY of a group is the row the others POINT TO in ``known_aliases``
+    (harrison@hjrglobal.com is named by both alias rows and names neither); on a
+    tie (Larry's rows name each other) the first in roster order -- the same row
+    that swept first before this collapse, so nothing changes hands. Returns
+    ``(kept_rows, {primary_email: [skipped alias emails]})`` in roster order.
+    """
+    rows = [a for a in accounts if isinstance(a, dict) and str(a.get("email") or "").strip()]
+    n = len(rows)
+    parent = list(range(n))
+
+    def _find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def _union(i: int, j: int) -> None:
+        ri, rj = _find(i), _find(j)
+        if ri != rj:
+            parent[max(ri, rj)] = min(ri, rj)
+
+    emails = [str(a.get("email") or "").strip().lower() for a in rows]
+    by_email = {e: i for i, e in enumerate(emails) if e}
+    pointed_to: dict[int, int] = {}
+    for i, a in enumerate(rows):
+        sid = str(a.get("slack_user_id") or "").strip()
+        if sid:
+            for j in range(i):
+                if str(rows[j].get("slack_user_id") or "").strip() == sid:
+                    _union(i, j)
+        for alias in (a.get("known_aliases") or []):
+            if not isinstance(alias, str):
+                continue
+            j = by_email.get(alias.strip().lower())
+            if j is not None and j != i:
+                _union(i, j)
+                pointed_to[j] = pointed_to.get(j, 0) + 1
+
+    groups: dict[int, list[int]] = {}
+    for i in range(n):
+        groups.setdefault(_find(i), []).append(i)          # members land in roster order
+
+    kept: list[dict] = []
+    alias_map: dict[str, list[str]] = {}
+    for root in sorted(groups, key=lambda r: min(groups[r])):
+        members = groups[root]
+        primary = max(members, key=lambda i: (pointed_to.get(i, 0), -i))
+        kept.append(rows[primary])
+        skipped = [str(rows[i].get("email")) for i in members if i != primary]
+        if skipped:
+            alias_map[str(rows[primary].get("email"))] = skipped
+    return kept, alias_map
+
+
 def run_sweep(
     sa_json_path: str,
     accounts_yaml_path: str,
@@ -1152,7 +1227,8 @@ def run_sweep(
     dry_run: bool = False,
     only_email: str | None = None,
 ) -> dict:
-    """Sweep all enabled drive_sweep accounts. Returns aggregate stats."""
+    """Sweep all enabled drive_sweep accounts (alias rows of one physical Drive
+    collapsed to the primary row -- see collapse_alias_accounts). Returns aggregate stats."""
     with open(accounts_yaml_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
@@ -1162,8 +1238,23 @@ def run_sweep(
         and a.get("drive_sweep", False)
     ]
 
+    # ONE physical Drive = ONE sweep (D-096, the gmail sweep's alias collapse; D-051
+    # Code #13 review AD-1). Runs on the FULL enabled roster BEFORE any --account
+    # filter, so a targeted alias run still sweeps under the primary identity.
+    accounts, alias_map = collapse_alias_accounts(accounts)
+    for primary_email, aliases in alias_map.items():
+        log.info("drive_sweep: alias collapse -- sweeping %s once (skipping alias rows: %s); one physical "
+                 "Drive is one sweep, so a denylist alias row can never re-ingest what the primary's "
+                 "allowlist skipped (D-096 / D-303)", primary_email, ", ".join(aliases))
+
     if only_email:
-        accounts = [a for a in accounts if a["email"] == only_email]
+        # A requested email matches a kept row directly OR via one of its alias rows.
+        wanted = only_email.lower()
+        accounts = [
+            a for a in accounts
+            if str(a.get("email", "")).lower() == wanted
+            or wanted in {str(x).lower() for x in alias_map.get(a.get("email", ""), [])}
+        ]
 
     log.info("drive_sweep: starting sweep of %d accounts (freshness=%dd, dry_run=%s)",
              len(accounts), freshness_days, dry_run)

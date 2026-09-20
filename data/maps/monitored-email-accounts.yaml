@@ -36,7 +36,13 @@
 #   even inside the allowlist; markdown inside the Founder-OS tree stays
 #   static_md-owned. Absent key = denylist (today's behaviour). Any other value
 #   is REFUSED (the row is not swept) -- a typo must never fall open to denylist.
-#   Set it on the PRIMARY mailbox row only; alias rows carry no mode.
+#   Set it on the PRIMARY mailbox row only; alias rows carry no mode. Alias rows
+#   of the SAME physical Drive (a shared slack_user_id, or a known_aliases entry
+#   naming the primary) are COLLAPSED by run_sweep into ONE sweep of the primary
+#   row (D-096; D-051 Code #13 review AD-1 -- a denylist alias row must never
+#   re-ingest what the primary's allowlist skipped) and should ALSO carry
+#   drive_sweep: false as the data-layer belt (harrison@f3energy.com and
+#   harrison@lexingtonservices.com do, 2026-09-19).
 # drive_sweep_allowlist: [ "<folder id>", ... ] -- the allowlisted Drive folder
 #   ids for drive_sweep_mode: allowlist. MUST be non-empty in allowlist mode (an
 #   empty list is REFUSED: it would silently ingest nothing forever). v1 = the
@@ -250,7 +256,14 @@ accounts:
     dwd_eligible: true
     thread_sweep: true
     attachment_filer: true
-    drive_sweep: true
+    # ALIAS of harrison@hjrglobal.com -- the SAME physical Drive (D-096 physical-
+    # mailbox collapse; D-051 Code #13 review AD-1). Three nights of drive-sweep
+    # logs (9/17-9/19) show this row enumerating the primary's exact file set and
+    # ingesting NOTHING (enumerated=81 ... dedup=81). Left on, this denylist row
+    # would re-ingest under F3E every outside-allowlist file the primary's D-303
+    # allowlist skipped. run_sweep also collapses alias rows in code (shared
+    # slack_user_id / known_aliases); this flag is the data-layer belt.
+    drive_sweep: false
     entity_default: F3E
     known_aliases:
       - harrison@hjrglobal.com
@@ -362,7 +375,12 @@ accounts:
     dwd_eligible: true
     thread_sweep: true
     attachment_filer: true
-    drive_sweep: true
+    # ALIAS of harrison@hjrglobal.com -- the SAME physical Drive (D-096; D-051 Code
+    # #13 review AD-1): 9/17-9/19 logs show enumerated=81 ... dedup=81, zero ingests.
+    # Left on, this denylist row would re-ingest under LEX every outside-allowlist
+    # file the primary's D-303 allowlist skipped. Data-layer belt beside the
+    # run_sweep alias collapse.
+    drive_sweep: false
     entity_default: LEX
     known_aliases:
       - harrison@hjrglobal.com

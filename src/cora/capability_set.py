@@ -79,7 +79,31 @@ _GENERIC_TOKENS: frozenset[str] = frozenset({
     "ai", "visibility", "action", "content", "personal", "travel", "capital", "completion",
     "brand", "cultural", "creator", "production", "press", "program", "points", "channel",
     "items", "by", "location", "sales", "compliance", "my", "on",
+    # D-051 Code #13 review AD-4: a tool-name half that names the MEDIUM, not the
+    # capability. slack_send_dm made bare "slack" a capability in every entity ("I
+    # don't have access to that Slack channel's history" is honest -- the bot has
+    # a DM tool, not the channel's history); gmail_inbox made bare "inbox" one ("I
+    # can't see Larry's emails -- only your own mailbox is in scope" is the D-043
+    # Tier-2 refusal, not a denial). Both families still contribute through their
+    # COMPOUND aliases below ("slack dm", "my inbox").
+    "slack", "inbox", "email",
 })
+
+# Registry tokens that contribute ONLY through their alias rows, never as a bare
+# word (AD-4): f3_generate_image's "image" would otherwise make "I can't see the
+# image you attached" a denial, f3_create_sales_deck's "deck" "I can't open the
+# deck you shared", cora_my_notes' "notes" "I don't have the meeting notes from
+# Friday's call", slack_send_dm's "dm" "I can't DM Tessa -- she isn't on the
+# roster". The alias rows spell the ACTUAL capability as a compound.
+_ALIAS_ONLY_TOKENS: frozenset[str] = frozenset({"dm", "image", "deck", "notes"})
+
+# Tools that say nothing about what the bot REACHES and are dropped from the
+# family derivation entirely (AD-4): cora_self_inventory is the inventory-of-
+# SOURCES tool -- its name made "inventory" / "stock" a capability in EVERY
+# entity, including OSN, which has had no inventory tool since D-027 ("I can't
+# check the stock at the Tucson store from here" is honest there). Only the
+# f3e_*inventory* tools carry the inventory family now.
+_SELF_TOOL_PREFIX = "cora_self_"
 
 # Tool-name token PAIRS that identify a family only together (see _GENERIC_TOKENS:
 # the halves are ordinary words). (token_a, token_b) -> alias key.
@@ -111,22 +135,35 @@ _TOKEN_ALIASES: dict[str, tuple[str, ...]] = {
     "qbo": ("qbo", "quickbooks", "quickbooks online", "p&l", "p and l", "profit and loss",
             "balance sheet", "ar aging", "ap aging", "general ledger"),
     "calendar": ("calendar", "google calendar", "calendar events"),
-    "gmail": ("gmail", "email", "emails", "inbox", "mailbox"),
+    # AD-4: the gmail family names the bot's OWN-inbox door (D-043 Tier 2), never a
+    # bare "emails" / "mailbox" ("I can't see Larry's emails -- only your own
+    # mailbox is in scope for me" is the ruled refusal).
+    "gmail": ("gmail", "my inbox", "your inbox", "my mailbox", "your mailbox", "my emails", "your emails",
+              "gmail inbox", "draft an email", "email drafts", "pull up my inbox"),
     "shopify": ("shopify", "shopify store", "shopify inventory", "dtc inventory"),
     "inventory": ("inventory", "inventory levels", "stock levels", "stock"),
     "deposco": ("deposco", "warehouse inventory"),
-    "dm": ("dm", "dms", "direct message", "direct messages", "slack dm", "slack message"),
+    # AD-4: compounds that name the SEND capability; bare "dm" / "slack" are gone
+    # ("I can't DM Tessa -- she isn't on the roster" is a roster fact).
+    "dm": ("direct message", "direct messages", "slack dm", "slack dms", "slack message", "slack messages",
+           "send a dm", "send dms", "send a direct message", "dm a teammate", "dm someone"),
     "queue": ("code queue", "queue item", "queue items", "staged item", "staged items",
               "code session", "code sessions", "code session queue", "backlog item",
               "build queue", "the queue"),
     "delegate": ("delegate", "delegated work", "delegated job", "background job",
                  "research brief"),
-    "notes": ("notes", "personal notes", "my notes", "your notes", "saved notes"),
+    # AD-4: the PERSONAL-notes door, never bare "notes" (meeting notes are content).
+    "notes": ("personal notes", "my notes", "your notes", "saved notes", "save a note", "save notes",
+              "remember that for me"),
     "dossier": ("dossier", "person dossier"),
     "ads": ("ads", "ad performance", "ad spend", "meta ads", "google ads", "ads data"),
     "blog": ("blog", "blog drafts", "blog post drafts", "blog cards"),
-    "deck": ("sales deck", "deck", "pitch deck"),
-    "image": ("image", "images", "image generation"),
+    # AD-4: the GENERATION capabilities, never a bare "deck" / "image" (a deck or
+    # image someone SHARED is an attachment the bot may truly not see).
+    "deck": ("sales deck", "sales decks", "pitch deck", "create a deck", "build a deck", "generate a deck",
+             "make a deck"),
+    "image": ("image generation", "generate an image", "generate images", "create an image", "make an image",
+              "generate a picture"),
     "plate": ("plate", "my plate", "on my plate"),
     "decisions": ("open decisions", "decisions", "stalled decisions", "pending decisions"),
     "contracts": ("contracts dashboard", "contracts"),
@@ -261,6 +298,8 @@ def capability_terms(entity: str | None, *, cross_entity: bool = False,
     names = _offered_tool_names(entity, cross_entity)
     present_tokens: set[str] = set()
     for name in names:
+        if name.lower().startswith(_SELF_TOOL_PREFIX):
+            continue   # AD-4: the inventory-of-SOURCES tool reaches nothing (see _SELF_TOOL_PREFIX)
         toks = [t for t in _TOKEN_SPLIT_RE.split(name.lower()) if t]
         if toks and toks[0] == "cora" and len(toks) > 1:
             toks = toks[1:]
@@ -283,8 +322,8 @@ def capability_terms(entity: str | None, *, cross_entity: bool = False,
         if tok == "queue":
             continue  # queue objects are added below with the founder-aware hint
         hint = _FAMILY_HINTS.get(tok, f"ask me directly -- I have {tok.replace('_', ' ')} tools in this channel")
-        if "_" not in tok:
-            terms.setdefault(_norm(tok), hint)   # a compound key contributes ONLY its aliases
+        if "_" not in tok and tok not in _ALIAS_ONLY_TOKENS:
+            terms.setdefault(_norm(tok), hint)   # a compound / alias-only key contributes ONLY its aliases
         for alias in _TOKEN_ALIASES.get(tok, ()):
             terms.setdefault(_norm(alias), hint)
     if "queue" in present_tokens or founder:

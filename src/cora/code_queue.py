@@ -3001,8 +3001,13 @@ _QUEUE_VERBS: tuple[str, ...] = ("stage", "approve", "dismiss", "ship")
 # `<@U..>` / `<#C..>` / `<!here>` / `<http...>` are Slack tokens, not placeholders --
 # a verb followed by one of those is NOT a queue-verb attempt (a DM "dismiss <@U1>'s
 # concern" is ordinary prose and stays with the model).
+# ONE character class between the verb and the reference (D-051 Code #13 review,
+# AD-3): the earlier `\s*[`'"]*\s*` -- three adjacent optional atoms over overlapping
+# input -- backtracked QUADRATICALLY on a verb followed by whitespace ('stage' + 40k
+# spaces + 'x' spun ~8.8 s on the bolt worker, ahead of the rate limiter, for ANY DM
+# sender). The GRAMMAR regex behind match_queue_verb is untouched (D-281).
 _VERB_ATTEMPT_RE = re.compile(
-    r"\b(stage|approve|dismiss|ship)\b\s*[`'\"]*\s*(?:cq-\S*|<(?![@#!]|https?:)[^>\n]{0,80}>)",
+    r"\b(stage|approve|dismiss|ship)\b[\s`'\"]*(?:cq-\S*|<(?![@#!]|https?:)[^>\n]{0,80}>)",
     re.IGNORECASE)
 PARSE_REFUSED_REPLY = ("I see a queue verb but couldn't parse it. Nothing was changed. "
                        "Send exactly `stage cq-<12 hex>` on its own line.")

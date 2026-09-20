@@ -287,6 +287,13 @@ Get-Content logs\cora-instances.jsonl -Tail 1
   re-appears was re-ingested by a DENYLIST account that can also see it (cross-user
   dedup deliberately does not let an allowlist skip poison other accounts) -- that is
   the other account's row to decide, not a sweep bug.
+- Harrison's ALIAS rows (harrison@f3energy.com, harrison@lexingtonservices.com) are
+  the SAME physical Drive as the primary and are NOT such an account: run_sweep
+  collapses them into the primary's sweep (`alias collapse -- sweeping
+  harrison@hjrglobal.com once (skipping alias rows: ...)` on the sweep log) and both
+  rows carry `drive_sweep: false` (D-051 Code #13 review AD-1). If an outside file
+  ever re-appears under `user_email harrison@f3energy.com` or `@lexingtonservices.com`,
+  that IS a sweep bug -- the collapse or the flag regressed.
 - `cora_self_inventory` in a founder channel lists the mode + allowlisted folder
   under `DRIVE SWEEP MODES`.
 

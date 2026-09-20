@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -247,6 +248,33 @@ class TestRosterPin:
         head = text.split("\naccounts:", 1)[0]          # the TOP-LEVEL key, not the PHI-note prose
         assert "# drive_sweep_mode: allowlist" in head and "# drive_sweep_allowlist:" in head
 
+    HARRISON_ALIASES = ("harrison@f3energy.com", "harrison@lexingtonservices.com")
+
+    def test_harrison_alias_rows_are_off_the_drive_sweep_and_collapse_to_the_primary(self):
+        """D-051 Code #13 review AD-1 (data layer): the two alias rows impersonate the SAME
+        Drive as the primary (9/17-9/19 logs: enumerated=81 ... dedup=81, zero ingests).
+        Left on as denylist rows they re-ingested every outside-allowlist file the
+        primary skipped. Both carry drive_sweep: false AND the roster-derived collapse
+        folds them into the primary (the code-layer belt for the day the flag flips)."""
+        rows = self._rows()
+        for alias in self.HARRISON_ALIASES:
+            row = next(r for r in rows if r["email"] == alias)
+            assert row.get("drive_sweep") is False, alias
+            assert "harrison@hjrglobal.com" in row.get("known_aliases", []), alias
+        # the code belt, on the roster as if every row were on: one Drive, one sweep
+        candidates = [r for r in rows if r.get("enabled", True) and r.get("dwd_eligible")]
+        kept, alias_map = drive_sweep.collapse_alias_accounts(candidates)
+        kept_emails = [r["email"] for r in kept]
+        assert "harrison@hjrglobal.com" in kept_emails
+        assert set(alias_map["harrison@hjrglobal.com"]) == set(self.HARRISON_ALIASES)
+        for alias in self.HARRISON_ALIASES:
+            assert alias not in kept_emails
+        # Larry's two rows name each other -> tie -> the first in roster order keeps sweeping
+        assert alias_map.get("larry@hjrglobal.com") == ["larry@bigd.media"]
+        # the live enabled drive_sweep set no longer contains an alias row at all
+        live = [r for r in candidates if r.get("drive_sweep")]
+        assert not {r["email"] for r in live} & set(self.HARRISON_ALIASES)
+
 
 # ── run_sweep: cross-user dedup + aggregate ──────────────────────────────────
 def _two_account_yaml(tmp_path) -> str:
@@ -280,6 +308,86 @@ class TestRunSweepAllowlist:
         assert agg["skipped_outside_allowlist"] == 1 and agg["dedup_skipped"] == 0 and agg["chunks_ingested"] == 1
         complete = [r.getMessage() for r in caplog.records if "COMPLETE --" in r.getMessage()]
         assert complete and "skipped_outside_allowlist=1" in complete[-1]
+
+    # ── D-051 Code #13 review AD-1 (code layer): one physical Drive = ONE sweep ──
+    PRIMARY_ROW = {"email": "harrison@hjrglobal.com", "name": "Harrison", "enabled": True, "dwd_eligible": True,
+                   "drive_sweep": True, "entity_default": "FNDR", "slack_user_id": "U0B2RM2JYJ1",
+                   "drive_sweep_mode": "allowlist", "drive_sweep_allowlist": [FOS]}
+    ALIAS_ROW = {"email": "harrison@f3energy.com", "name": "Harrison (F3E)", "enabled": True, "dwd_eligible": True,
+                 "drive_sweep": True, "entity_default": "F3E", "slack_user_id": "U0B2RM2JYJ1",
+                 "known_aliases": ["harrison@hjrglobal.com"]}
+    UNRELATED_ROW = {"email": "tommy@f3energy.com", "name": "Tommy", "enabled": True, "dwd_eligible": True,
+                     "drive_sweep": True, "entity_default": "F3E", "slack_user_id": "U0B3RU5Q55G"}
+
+    def _alias_yaml(self, tmp_path, rows) -> str:
+        p = tmp_path / "alias-accounts.yaml"
+        p.write_text(yaml.dump({"accounts": rows}), encoding="utf-8")
+        return str(p)
+
+    def _run(self, tmp_path, rows, caplog, only_email=None):
+        listed = [_f("intree", "velvet-harbor-receipt.pdf", "application/pdf", "ACC"),   # inside the allowlist
+                  _f("dl1", "copper-meadow-scan.pdf", "application/pdf", "DL")]          # Downloads-shaped: outside
+        svc = _Tree(TREE)
+        with patch("cora.connectors.drive_sweep._build_drive_service",
+                   side_effect=lambda sa, email: _flat(listed, svc)) as build, \
+             patch("cora.connectors.drive_sweep._build_sheets_service", return_value=None), \
+             patch("cora.connectors.drive_sweep._expanded_excluded_folder_ids", return_value=(EXPANDED, True)), \
+             patch("cora.connectors.drive_sweep._extract_content", return_value="Meaningful business content " * 20), \
+             patch("cora.connectors.drive_sweep._ingest_file", return_value=1) as ingest, \
+             caplog.at_level(logging.INFO, logger="cora.drive_sweep"):
+            agg = drive_sweep.run_sweep("/fake/sa.json", self._alias_yaml(tmp_path, rows), _kb(), _anth(),
+                                        freshness_days=30, only_email=only_email)
+        return agg, ingest, build
+
+    @pytest.mark.parametrize("primary_first", [True, False])
+    def test_alias_row_of_the_same_drive_cannot_reingest_what_the_primary_skipped(self, tmp_path, caplog,
+                                                                                    primary_first):
+        """The review's failing input. BEFORE: primary_first=True ingested
+        [('intree', harrison@hjrglobal.com, FNDR), ('dl1', harrison@f3energy.com, F3E)] --
+        the outside skip withdrew the dedup mark and the alias row (denylist, same
+        Drive) ingested the Downloads file under F3E; primary_first=False ingested BOTH
+        under F3E and the primary saw dedup for everything. AFTER: one sweep, the
+        primary's, whatever the roster order; the outside file is skipped + counted."""
+        rows = [self.PRIMARY_ROW, self.ALIAS_ROW] if primary_first else [self.ALIAS_ROW, self.PRIMARY_ROW]
+        agg, ingest, build = self._run(tmp_path, rows, caplog)
+        assert build.call_count == 1 and build.call_args[0][1] == "harrison@hjrglobal.com"
+        assert [(c[0][1]["id"], c[0][4]["email"], c[0][4]["entity_default"]) for c in ingest.call_args_list] == [
+            ("intree", "harrison@hjrglobal.com", "FNDR")]
+        assert agg["accounts_swept"] == 1 and agg["skipped_outside_allowlist"] == 1 and agg["dedup_skipped"] == 0
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any("alias collapse -- sweeping harrison@hjrglobal.com once (skipping alias rows: "
+                   "harrison@f3energy.com)" in m for m in msgs)
+
+    def test_only_email_naming_an_alias_sweeps_the_primary_identity(self, tmp_path, caplog):
+        """A targeted `--account <alias>` run must not re-create the alias-identity sweep
+        (the gmail sweep's D-051 ruling, mirrored): the filter runs AFTER the collapse."""
+        agg, ingest, build = self._run(tmp_path, [self.PRIMARY_ROW, self.ALIAS_ROW, self.UNRELATED_ROW], caplog,
+                                       only_email="harrison@f3energy.com")
+        assert build.call_count == 1 and build.call_args[0][1] == "harrison@hjrglobal.com"
+        assert agg["accounts_swept"] == 1 and agg["skipped_outside_allowlist"] == 1
+
+    def test_unrelated_denylist_account_is_untouched_by_the_collapse(self, tmp_path, caplog):
+        """Ruling (c) still holds for a DIFFERENT human's account: tommy@ (no shared
+        identity) still ingests the shared outside file the primary skipped."""
+        agg, ingest, build = self._run(tmp_path, [self.PRIMARY_ROW, self.ALIAS_ROW, self.UNRELATED_ROW], caplog)
+        assert [c[0][1] for c in build.call_args_list] == ["harrison@hjrglobal.com", "tommy@f3energy.com"]
+        assert {(c[0][1]["id"], c[0][4]["email"]) for c in ingest.call_args_list} == {
+            ("intree", "harrison@hjrglobal.com"), ("dl1", "tommy@f3energy.com")}
+        assert agg["accounts_swept"] == 2 and agg["skipped_outside_allowlist"] == 1 and agg["dedup_skipped"] == 1
+
+    def test_collapse_groups_by_slack_id_or_known_aliases_and_picks_the_pointed_to_primary(self):
+        lex_alias = {"email": "harrison@lexingtonservices.com", "entity_default": "LEX",
+                     "known_aliases": ["harrison@hjrglobal.com"]}                # no slack id: folds via known_aliases
+        larry_a = {"email": "larry@hjrglobal.com", "slack_user_id": "U_L", "known_aliases": ["larry@bigd.media"]}
+        larry_b = {"email": "larry@bigd.media", "slack_user_id": "U_L", "known_aliases": ["larry@hjrglobal.com"]}
+        rows = [self.ALIAS_ROW, larry_a, self.UNRELATED_ROW, lex_alias, self.PRIMARY_ROW, larry_b]
+        kept, alias_map = drive_sweep.collapse_alias_accounts(rows)
+        assert [r["email"] for r in kept] == ["harrison@hjrglobal.com", "larry@hjrglobal.com", "tommy@f3energy.com"]
+        assert alias_map == {"harrison@hjrglobal.com": ["harrison@f3energy.com", "harrison@lexingtonservices.com"],
+                             "larry@hjrglobal.com": ["larry@bigd.media"]}
+        # no identity signals at all -> nothing folds, order kept
+        plain = [{"email": "a@x.com"}, {"email": "b@x.com"}, {"email": ""}, "junk"]
+        assert drive_sweep.collapse_alias_accounts(plain) == ([{"email": "a@x.com"}, {"email": "b@x.com"}], {})
 
     def test_aggregate_key_list_carries_the_new_counter(self):
         assert "skipped_outside_allowlist" in drive_sweep.AGGREGATE_COUNTER_KEYS

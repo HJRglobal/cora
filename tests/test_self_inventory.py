@@ -77,8 +77,14 @@ POSITIVE = [
     "do you have access to the web?",
     "can you see my calendar?",
     "are you able to reach Shopify?",
-    "can you read the files in that folder?",
+    "can you read the files in that folder?",               # via the folder SOURCE noun (_P_HAVE_KNOW)
     "Cora, can you connect to Deposco?",
+    # AD-2 clause-end shapes that MUST still route: bounded adverbial, entity
+    # qualifier, two connectors, no punctuation at all, a following line.
+    "do you have access to HubSpot at all?",
+    "can you access HubSpot or Asana?",
+    "can you access hubspot",
+    "can you access hubspot\nthanks",
 ]
 NEGATIVE = [
     # ordinary asks the first cut hijacked (27 of 50 realistic role-based asks)
@@ -102,6 +108,22 @@ NEGATIVE = [
     "do you know the Shopify inventory for the 12-pack?",
     "what's in the Asana project for Pure Launch?",
     "can you pull my HubSpot deals?",                    # an ASK for the tool, not a meta-question
+    # D-051 Code #13 review AD-2: the connector noun must END the clause -- a
+    # connector followed by an object clause is a TOOL-USE ask (calendar / QBO /
+    # Asana / HubSpot / Shopify tool, or a web search), never the inventory dump.
+    # The first cut FORCED all eleven of these to cora_self_inventory, and since a
+    # forced tool sets web_gate_skip, the web was withheld on the explicit web asks.
+    "can you use the web to find F3's competitor pricing?",
+    "will you use the web search to find the venue address?",
+    "Can you use web search to check F3's Amazon rank?",
+    "can you see my calendar for Friday?",
+    "can you query QBO for OSN's Q2 revenue?",
+    "can you open the Asana task for the Sprouts appeal?",
+    "could you read the files in the Founder-OS folder and summarize them?",
+    "can you hit HubSpot and tell me which deals are stalled?",
+    "can you pull from Shopify the 12-pack inventory?",
+    "can you see the spreadsheet Justin sent?",
+    "can you get into HubSpot and update the deal stage?",  # a write intent the imperative strip cannot see
     # imperative writes are never meta-questions (lens E #1)
     "Complete the 'send Larry the deck' task -- the deck is in your knowledge base right",
     "Mark the Sprouts task done since the appeal letter is in your memory now",
@@ -142,6 +164,23 @@ class TestPredicate:
             t0 = time.perf_counter()
             si.is_self_inventory_question(adversarial[:2000])
             assert time.perf_counter() - t0 < 0.05, adversarial[:20]
+
+    def test_connector_clause_end_growth_shape_is_linear(self):
+        """AD-2 growth-shape pin for the new clause-END tail (every new regex gets one):
+        a connector followed by whitespace / an unterminated qualifier / repeated
+        'or' / repeated 'and the web' must fail fast, and the forced route must
+        still fire on the bare meta-question the tail exists to admit."""
+        import time
+        for adversarial in ("can you access hubspot" + " " * 1990,
+                            "can you access hubspot for " + "x" * 1900,
+                            "can you " + "still " * 300 + "access hubspot?",
+                            "are you able to reach shopify" + " or " * 400,
+                            "can you access the web" + " and the web" * 150):
+            t0 = time.perf_counter()
+            si.is_self_inventory_question(adversarial[:2000])
+            assert time.perf_counter() - t0 < 0.05, adversarial[:30]
+        assert si.is_self_inventory_question("can you access hubspot" + " " * 1900) is True   # whitespace then EOL
+        assert si.is_self_inventory_question("can you access hubspot" + " " * 1900 + "x") is False
 
 
 # ── registry parsing ─────────────────────────────────────────────────────────

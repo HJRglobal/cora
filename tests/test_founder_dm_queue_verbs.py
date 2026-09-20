@@ -367,6 +367,22 @@ class TestVerbAttempt:
     def test_prose_is_not_an_attempt(self, text):
         assert cq.looks_like_queue_verb_attempt(text) is None
 
+    def test_verb_plus_whitespace_growth_shape_is_linear(self):
+        """D-051 Code #13 review AD-3: 'stage' + 40k spaces + 'x' (Slack's cap; strip()
+        leaves it because of the trailing char) spun ~8.8 s in the old three-atom
+        `\\s*[`'"]*\\s*` gap. Any DM sender reached this ahead of the rate limiter.
+        The fixed single class must stay linear -- well under 0.2 s at 40k."""
+        import time
+        text = "stage" + " " * 40_000 + "x"
+        assert cq.normalize_verb_text(text) == text        # strip() cannot help: trailing char
+        assert cq.match_queue_verb(text) is None
+        t0 = time.perf_counter()
+        assert cq.looks_like_queue_verb_attempt(text) is None
+        assert cq._VERB_ATTEMPT_RE.search(text) is None
+        assert time.perf_counter() - t0 < 0.2
+        # the quote-alternating shape (already linear) and a real attempt still match
+        assert cq.looks_like_queue_verb_attempt("stage " + "' " * 5_000 + "cq-<12 hex>") == "stage"
+
     def test_refusal_carries_zero_write_claim_lexicon(self, caplog):
         """The refusal must not itself trip S2' or be mangled by the sanitizer."""
         import logging
