@@ -7,10 +7,16 @@
 # 08:45 health check READS that ledger; it never runs the replay itself (it sits
 # inside run_hidden's kill-on-close job, so a detached child would die with it).
 #
-# WHY 08:30: after every nightly deadline (the last trigger, Drive Sweep 06:00,
-# plus the 150-minute grace = 08:30) and 15 minutes before the health check.
+# WHY 08:30: STRICTLY after every nightly deadline (trigger + grace; the latest,
+# Drive Sweep 06:00 + 145 min = 08:25, and the 06:05/06:10 candidates at 130 min)
+# and 15 minutes before the health check. nightly_catchup.load_set() refuses a set
+# whose deadline is not before LANE_FIRE_AZ (08:30) -- a task whose deadline is at or
+# after the fire reads skipped_not_due every day and is never replayed.
 # WHY 4h: gmail (3h) + Drive Sweep (registered unlimited; bounded here to 3h) are
-# replayed synchronously; the lane also refuses to START anything after 12:00 AZ.
+# replayed synchronously. The enabled set's max_minutes sum exceeds 4h, so the loop
+# budgets against nightly_catchup.LANE_BUDGET_MIN (= this limit): what does not fit
+# is ledgered `not-started` (never killed mid-replay with no row); it also re-checks
+# the 12:00 window end and the midday triggers before EACH spawn, not once at 08:30.
 #
 # WINDOWLESS by construction (D-266..D-269) via the shared run_hidden helper.
 # ASCII-only per D-016. D-005: absolute .venv python. RunLevel Limited.

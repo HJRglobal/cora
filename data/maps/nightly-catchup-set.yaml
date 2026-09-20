@@ -23,6 +23,12 @@
 # the run_hidden prefix stripped, so setup-script drift can never re-run a stale
 # command. `max_minutes` bounds the synchronous wait per replay.
 #
+# DEADLINE RULE: every row's deadline (trigger_az + grace_min, default 150) must be
+# STRICTLY before the lane's single 08:30 AZ fire (nightly_catchup.LANE_FIRE_AZ) or
+# the task reads skipped_not_due at every fire and is never replayed; load_set()
+# refuses the set otherwise. Rows triggered at/after 05:55 carry an explicit
+# grace_min for that reason (Drive Sweep 06:00 -> 145 = 08:25; 06:05 / 06:10 -> 130).
+#
 # `enabled: false` rows are CANDIDATES the 9/9 outage also lost but the kickoff did
 # not name (reconciliation is registered as the 8th 'kb sync' task; qbo-token-refresh
 # missing a night is a token-expiry risk; gap-autofill / info-for-cora are gated
@@ -95,17 +101,20 @@ tasks:
     command: 'C:\Users\Harri\code\cora\.venv\Scripts\python.exe "C:\Users\Harri\code\cora\scripts\run_drive_materialization.py"'
   - name: Cora - Drive Sweep
     trigger_az: "06:00"
+    grace_min: 145
     max_minutes: 180
     command: 'C:\Users\Harri\code\cora\.venv\Scripts\python.exe "C:\Users\Harri\code\cora\scripts\run_drive_sweep.py" --with-slack'
     notes: "registered ExecutionTimeLimit is unlimited (PT0S); the replay is bounded here. --with-slack posts the sweep summary -- a replay posts too (Harrison confirms this is fine, Code #13 report ask block)"
   - name: cowork-cora-info-for-cora-sweep
     trigger_az: "06:05"
+    grace_min: 130
     max_minutes: 20
     enabled: false
     command: 'C:\Users\Harri\code\cora\.venv\Scripts\python.exe "C:\Users\Harri\code\cora\scripts\run_info_for_cora_sweep.py"'
     notes: "candidate -- gated lane; Harrison's call"
   - name: cowork-cora-gap-autofill
     trigger_az: "06:10"
+    grace_min: 130
     max_minutes: 60
     enabled: false
     command: 'C:\Users\Harri\code\cora\.venv\Scripts\python.exe "C:\Users\Harri\code\cora\scripts\run_gap_autofill.py"'

@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -43,6 +45,7 @@ _SCRIPT = _REPO / "scripts" / "check_missed_nightly.py"
 
 DAY_0909 = date(2026, 9, 9)
 DAY_0910 = date(2026, 9, 10)
+DAY_0911 = date(2026, 9, 11)
 ENABLED_TWELVE = [
     "cowork-cora-kb-sync-slack", "cowork-cora-kb-sync-gmail", "cowork-cora-kb-sync-asana",
     "cowork-cora-kb-sync-fireflies", "cowork-cora-claude-mirror", "cowork-cora-kb-sync-static",
@@ -95,12 +98,78 @@ def ledger(tmp_path, monkeypatch):
 
 # ── slug + set ────────────────────────────────────────────────────────────────
 
+#: the --name values the LIVE registered actions carry for the three space-named tasks
+#: (Get-ScheduledTask read 2026-09-19, D-051 review B-2) -- the real log filenames
+LIVE_SLUGS = {
+    "Cora - Drive Sweep": "Cora-Drive-Sweep",
+    "Cora - LEX Dump Folder Sync": "Cora-LEX-Dump-Folder-Sync",
+    "Cora - Drive Materialization": "Cora-Drive-Materialization",
+    "Cora - Daily Synthesis (F3E)": "Cora-Daily-Synthesis-F3E",     # the _task-action.ps1 docstring example
+}
+
+
 class TestSlugAndSet:
-    @pytest.mark.parametrize("name", ENABLED_TWELVE + CANDIDATES_FOUR + [
-        "Cora - Daily Synthesis (F3E)", "", "..weird..", "a" * 100, "Cora - Missed Nightly Catch-Up"])
-    def test_slug_rule_matches_the_launcher_byte_for_byte(self, name):
+    @pytest.mark.parametrize("name,expected", sorted(LIVE_SLUGS.items()))
+    def test_slug_rule_is_get_task_slug_not_run_hidden(self, name, expected):
+        """B-2 regression: the old rule copied run_hidden.sanitize_slug (no dash-run
+        collapse) and produced 'Cora---Drive-Sweep', a file the estate never writes;
+        the registered action says `--name Cora-Drive-Sweep`."""
+        assert nc.sanitize_slug(name) == expected
         rh = _load_launcher()
-        assert nc.sanitize_slug(name) == rh.sanitize_slug(name)
+        assert rh.sanitize_slug(name) != expected                     # the old oracle really differs on these
+        # the launcher re-sanitizes the --name it receives: our slug must be its fixed point
+        assert rh.sanitize_slug(expected) == expected
+
+    @pytest.mark.parametrize("name", ENABLED_TWELVE + CANDIDATES_FOUR + [
+        "Cora - Daily Synthesis (F3E)", "", "..weird..", "a" * 100, "Cora - Missed Nightly Catch-Up",
+        "A - " + "b" * 100, ("y" * 79) + " zzz", "...", "..\\..\\evil"])
+    def test_slug_is_a_fixed_point_of_the_launcher_and_never_has_a_dash_run(self, name):
+        rh = _load_launcher()
+        s = nc.sanitize_slug(name)
+        assert rh.sanitize_slug(s) == s and "--" not in s and s == nc.sanitize_slug(s)
+        assert len(s) <= 80 and s and not s.startswith(("-", ".")) and not s.endswith(("-", "."))
+
+    @pytest.mark.skipif(os.name != "nt", reason="PowerShell helper")
+    def test_slug_rule_matches_get_task_slug_for_real(self):
+        """Derive the oracle by CALLING Get-TaskSlug (the function that writes every
+        registered --name), not by re-typing it."""
+        helper = _REPO / "deployment" / "_task-action.ps1"
+        names = ENABLED_TWELVE + CANDIDATES_FOUR + ["Cora - Daily Synthesis (F3E)", "Cora - Missed Nightly Catch-Up",
+                                                    "A - " + "b" * 100, ("y" * 79) + " zzz", "..\\..\\evil", "..."]
+        quoted = ",".join("'" + n.replace("'", "''") + "'" for n in names)
+        ps = ('. "%s"\n$names = @(%s)\nforeach ($n in $names) { Write-Output (Get-TaskSlug $n) }'
+              % (helper, quoted))
+        proc = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                              capture_output=True, text=True, timeout=180)
+        assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+        ps_slugs = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+        assert len(ps_slugs) == len(names)
+        for name, slug in zip(names, ps_slugs):
+            assert nc.sanitize_slug(name) == slug, f"{name!r}: python {nc.sanitize_slug(name)!r} != Get-TaskSlug {slug!r}"
+
+    def test_slug_regexes_are_linear_growth_shape(self):
+        """The two new patterns (unsafe-run, dash-run) and the --name parser are
+        single-level: 200x the input must cost well under 100x the time."""
+        import time as _t
+        small = ("- " * 500) + ("x" * 500) + ("--" * 500)
+        big = small * 200
+        t0 = _t.perf_counter(); nc.sanitize_slug(small); t_small = _t.perf_counter() - t0
+        t0 = _t.perf_counter(); nc.sanitize_slug(big); t_big = _t.perf_counter() - t0
+        assert t_big < 1.0, f"200x input took {t_big:.3f}s (small {t_small:.5f}s)"
+        args = "run_hidden.py " + ("--nam " * 20000) + "--name " + ("s" * 20000) + " -- child"
+        t0 = _t.perf_counter(); got = nc.slug_from_action(args); t_parse = _t.perf_counter() - t0
+        assert t_parse < 1.0 and got == "s" * 80
+
+    def test_slug_from_action_reads_the_live_name_and_prefers_it(self):
+        args = ('"C:\\x\\deployment\\run_hidden.py" --name Cora-Drive-Sweep -- '
+                '"C:\\x\\.venv\\Scripts\\python.exe" "C:\\x\\scripts\\run_drive_sweep.py" --with-slack')
+        assert nc.slug_from_action(args) == "Cora-Drive-Sweep"
+        assert nc.slug_from_action('"C:\\x\\scripts\\a.py" --with-kb') is None       # not wrapped
+        assert nc.slug_from_action("run_hidden.py --name=odd/..\\name -- c") == "odd-..-name"  # re-sanitized (no traversal)
+        t = nc.NightlyTask(name="Cora - Drive Sweep", trigger_az="06:00")
+        assert nc.effective_slug(t, nc.TaskState(state="Ready", slug="Hand-Registered")) == "Hand-Registered"
+        assert nc.effective_slug(t, nc.TaskState(state="Ready")) == "Cora-Drive-Sweep"
+        assert nc.effective_slug(t, None) == "Cora-Drive-Sweep"
 
     def test_shipped_set_loads_sorted_with_twelve_enabled_and_four_candidates(self):
         window, tasks = nc.load_set(_REAL_SET)
@@ -494,3 +563,325 @@ class TestDigest:
         s = chr_.missed_nightly_section()
         assert s["available"] is False and "boom" in s["reason"]
         assert chr_.threshold_alarms({"missed_nightly": s}) == []
+
+
+# ── D-051 review group B regressions ─────────────────────────────────────────
+
+class TestB1UnverifiedNightReadsWarn:
+    def test_all_skipped_window_plan_row_at_1235_is_a_warn_naming_the_tasks(self, ledger, tmp_path):
+        """B-1 FAILING INPUT: host down 02:00-12:30; both StartWhenAvailable tasks fire at
+        boot ~12:35; the catch-up plans skipped_window x12 + skipped_disabled_in_set x4
+        (nothing replayed, nothing verified). The old check said 'ok ... every task
+        fired on schedule'. Nine ingest tasks were lost for the day."""
+        window, tasks = nc.load_set(_REAL_SET)
+        decisions = _decide(tasks, window, DAY_0910, _az(DAY_0910, 12, 35), tmp_path, [], _ready(tasks))
+        assert nc.counts(decisions) == {"skipped_window": 12, "skipped_disabled_in_set": 4}
+        nc.append_ledger(nc.plan_row(DAY_0910, _az(DAY_0910, 12, 35), "apply", decisions), ledger)
+        r = nhc.check_missed_nightly_catchup(now=_az(DAY_0910, 12, 35))
+        assert r.status == "warn", r.detail
+        assert "every task fired" not in r.detail
+        assert "cowork-cora-kb-sync-gmail skipped_window (not verified)" in r.detail
+        assert "Cora - Drive Sweep skipped_window (not verified)" in r.detail
+        assert "cowork-cora-qbo-token-refresh" not in r.detail          # disabled-in-set is not an alarm
+
+    @pytest.mark.parametrize("action", ["skipped_not_due", "skipped_disabled", "cannot_check"])
+    def test_an_enabled_task_with_no_evidence_is_never_ok(self, ledger, action):
+        _plan(ledger, DAY_0910, [("a", "fired"), ("b", action)])
+        r = nhc.check_missed_nightly_catchup(now=_az(DAY_0910, 8, 45))
+        assert r.status == "warn" and f"b {action} (not verified)" in r.detail
+
+    def test_ok_tail_is_derived_from_counts(self, ledger):
+        _plan(ledger, DAY_0910, [("a", "fired"), ("b", "fired"), ("c", "skipped_already_ran"), ("d", "skipped_disabled_in_set")])
+        nc.append_ledger({"row": "task", "window_date": "2026-09-10", "task": "c", "action": "ran", "rc": 0}, ledger)
+        r = nhc.check_missed_nightly_catchup(now=_az(DAY_0910, 8, 45))
+        assert r.status == "ok" and "1 replay(s) finished clean" in r.detail
+        _plan(ledger, DAY_0909, [("a", "fired"), ("b", "fired"), ("d", "skipped_disabled_in_set")])
+        r2 = nhc.check_missed_nightly_catchup(now=_az(DAY_0909, 9, 5))
+        assert r2.status == "ok" and "every task fired on schedule (2/2 enabled)" in r2.detail
+
+    def test_a_deferred_spawn_row_is_a_warn(self, ledger):
+        _plan(ledger, DAY_0910, [("a", "run"), ("b", "run")])
+        nc.append_ledger({"row": "task", "window_date": "2026-09-10", "task": "a", "action": "ran", "rc": 0}, ledger)
+        nc.append_ledger({"row": "task", "window_date": "2026-09-10", "task": "b", "action": "not-started", "rc": None,
+                          "reason": "budget"}, ledger)
+        r = nhc.check_missed_nightly_catchup(now=_az(DAY_0910, 12, 40))
+        assert r.status == "warn" and "b deferred at spawn time: not-started" in r.detail
+        s = nc.summarize_day(nc.read_ledger(), DAY_0910)
+        assert [x["task"] for x in s["replays"]] == ["a"] and [x["task"] for x in s["deferred"]] == ["b"]
+
+
+class TestB2LiveSlug:
+    def test_header_under_the_live_name_is_the_evidence_for_a_space_named_task(self, tmp_path):
+        """B-2 FAILING INPUT: the live log is logs/tasks/Cora-Drive-Sweep-<date>.log; the old
+        rule looked for Cora---Drive-Sweep-<date>.log (never written) -> `run` on a clean day."""
+        _write_header(tmp_path, "Cora-Drive-Sweep", _az(DAY_0910, 6, 0, 2))
+        assert nc.header_stamps(tmp_path, "Cora---Drive-Sweep", DAY_0910) == []
+        window, tasks = nc.load_set(_REAL_SET)
+        by = {d.task.name: d for d in _decide(tasks, window, DAY_0910, _az(DAY_0910, 9, 0), tmp_path, [], _ready(tasks))}
+        assert by["Cora - Drive Sweep"].action == "fired"
+
+    def test_no_scheduler_dry_run_reads_the_three_space_named_tasks_as_fired(self, ledger, tmp_path, capsys, monkeypatch):
+        mod = _load_script()
+        monkeypatch.setenv("TASK_RUNS_LEDGER_PATH", str(tmp_path / "task-runs.jsonl"))
+        window, tasks = nc.load_set(_REAL_SET)
+        for t in tasks:
+            _write_header(tmp_path, LIVE_SLUGS.get(t.name, t.name), t.trigger_dt(DAY_0910) + timedelta(seconds=1))
+        rc = mod.main(["--day", "2026-09-10", "--log-dir", str(tmp_path), "--no-scheduler", "--json"],
+                      now_az=_az(DAY_0910, 9, 0))
+        out = capsys.readouterr().out
+        assert rc == 0
+        plan = json.loads(out[out.index("{"):])
+        by = {d["task"]: d["action"] for d in plan["decisions"]}
+        assert {by[n] for n in ENABLED_TWELVE} == {"fired"}
+        assert "run" not in by.values()
+
+    def test_evidence_and_replay_use_the_live_action_name(self, ledger, tmp_path, monkeypatch):
+        """A hand-registered action whose --name differs from the rule: the lane reads
+        THAT file and replays under THAT slug (the header lands where the estate looks)."""
+        mod = _load_script()
+        monkeypatch.setenv("TASK_RUNS_LEDGER_PATH", str(tmp_path / "task-runs.jsonl"))
+        set_yaml = tmp_path / "set.yaml"
+        set_yaml.write_text("tasks:\n  - name: Cora - Drive Sweep\n    trigger_az: '06:00'\n    grace_min: 145\n    command: c\n"
+                            "  - name: Cora - Drive Materialization\n    trigger_az: '05:45'\n    command: c2\n", encoding="utf-8")
+        _write_header(tmp_path, "Odd-Live-Name", _az(DAY_0910, 6, 0, 2))
+        wrapped = 'C:\\x\\deployment\\run_hidden.py --name Odd-Live-Name -- "C:\\x\\d.py" --with-slack'
+        wrapped2 = 'C:\\x\\deployment\\run_hidden.py --name Cora-Drive-Materialization -- "C:\\x\\m.py"'
+        states, actions = mod.parse_task_states(
+            "Cora - Drive Sweep|Ready|2026-09-11T06:00:00||C:\\x\\pythonw.exe|" + wrapped + "\n"
+            "Cora - Drive Materialization|Ready|2026-09-11T05:45:00||C:\\x\\pythonw.exe|" + wrapped2 + "\n")
+        assert states["Cora - Drive Sweep"].slug == "Odd-Live-Name"
+        calls = []
+
+        class _Proc:
+            def wait(self, timeout=None):
+                return 0
+
+        rc = mod.main(["--apply", "--set", str(set_yaml), "--log-dir", str(tmp_path)], now_az=_az(DAY_0910, 8, 30),
+                      states_reader=lambda names: (states, actions), popen=lambda c, **k: calls.append(c) or _Proc())
+        assert rc == 0
+        assert len(calls) == 1 and "--name Cora-Drive-Materialization -- " in calls[0]   # Drive Sweep read as fired via Odd-Live-Name
+        rows = [json.loads(l) for l in ledger.read_text(encoding="utf-8").splitlines()]
+        assert rows[0]["counts"] == {"fired": 1, "run": 1}
+        assert [r for r in rows if r["row"] == "task"][0]["slug"] == "Cora-Drive-Materialization"
+
+    def test_apply_with_no_scheduler_is_refused(self, ledger, tmp_path):
+        mod = _load_script()
+        spawned = []
+        rc = mod.main(["--apply", "--no-scheduler", "--log-dir", str(tmp_path)], now_az=_az(DAY_0910, 8, 30),
+                      popen=lambda *a, **k: spawned.append(a))
+        assert rc == 2 and spawned == [] and not ledger.exists()
+
+
+class TestB3PastDayDryRun:
+    def test_past_day_dry_run_evaluates_inside_that_window(self, ledger, tmp_path, capsys, monkeypatch):
+        """B-3 FAILING INPUT: `--day 2026-09-09 --no-scheduler` run at 19:37 AZ on 9/19
+        printed skipped_window x12 -- zero `run` rows for the night that lost 13 tasks."""
+        mod = _load_script()
+        monkeypatch.setenv("TASK_RUNS_LEDGER_PATH", str(tmp_path / "task-runs.jsonl"))
+        _shape_0909(tmp_path)
+        spawned = []
+        rc = mod.main(["--day", "2026-09-09", "--log-dir", str(tmp_path), "--no-scheduler"],
+                      now_az=_az(date(2026, 9, 19), 19, 37), popen=lambda *a, **k: spawned.append(a))
+        out = capsys.readouterr().out
+        assert rc == 0 and spawned == [] and not ledger.exists()
+        assert "evaluated as of 11:59:59 AZ on 2026-09-09" in out
+        assert "run=12" in out.split("counts:")[1] and "skipped_window" not in out.split("counts:")[1]
+
+    def test_now_override_pins_the_clock_for_a_dry_run(self, ledger, tmp_path, capsys, monkeypatch):
+        mod = _load_script()
+        monkeypatch.setenv("TASK_RUNS_LEDGER_PATH", str(tmp_path / "task-runs.jsonl"))
+        rc = mod.main(["--day", "2026-09-09", "--now", "03:00", "--log-dir", str(tmp_path), "--no-scheduler"],
+                      now_az=_az(date(2026, 9, 19), 19, 37))
+        out = capsys.readouterr().out
+        assert rc == 0 and "evaluated as of 03:00:00 AZ on 2026-09-09 (--now)" in out
+        assert "skipped_not_due=12" in out.split("counts:")[1]       # slack's 04:30 deadline is the earliest
+        assert mod.main(["--day", "2026-09-09", "--now", "25:00", "--no-scheduler"], now_az=_az(date(2026, 9, 19), 19, 37)) == 2
+
+    def test_apply_refusals_stay_on_the_real_clock(self, ledger, tmp_path):
+        mod = _load_script()
+        real = _az(date(2026, 9, 19), 19, 37)
+        assert mod.main(["--apply", "--day", "2026-09-09", "--log-dir", str(tmp_path)], now_az=real,
+                        states_reader=lambda n: ({}, {})) == 2
+        assert mod.main(["--apply", "--now", "08:45", "--log-dir", str(tmp_path)], now_az=real,
+                        states_reader=lambda n: ({}, {})) == 2
+        assert not ledger.exists()
+
+
+class TestB4DeadlinesBeforeTheFire:
+    def test_every_shipped_deadline_is_strictly_before_the_lane_fire(self):
+        _, tasks = nc.load_set(_REAL_SET)
+        fire = nc.lane_fire_dt(DAY_0910)
+        assert nc.LANE_FIRE_AZ == "08:30"
+        for t in tasks:
+            assert t.deadline_dt(DAY_0910) < fire, f"{t.name} deadline {t.deadline_dt(DAY_0910)} >= fire"
+        by = {t.name: t for t in tasks}
+        assert by["Cora - Drive Sweep"].grace_min == 145
+        assert by["cowork-cora-info-for-cora-sweep"].grace_min == 130 and by["cowork-cora-gap-autofill"].grace_min == 130
+
+    def test_flipped_candidates_and_drive_sweep_decide_run_at_the_fire(self, tmp_path):
+        """B-4 FAILING INPUT: enabled: true on the 06:05/06:10 rows -> at the 08:30:05 fire
+        they read skipped_not_due (deadline 08:35/08:40) and never replay; Drive Sweep at
+        08:29:59 read skipped_not_due too (deadline exactly 08:30:00)."""
+        _, tasks = nc.load_set(_REAL_SET)
+        flipped = [nc.NightlyTask(name=t.name, trigger_az=t.trigger_az, grace_min=t.grace_min,
+                                  max_minutes=t.max_minutes, enabled=True, command=t.command) for t in tasks
+                   if t.trigger_az >= "06:00"]
+        assert [t.name for t in flipped] == ["Cora - Drive Sweep", "cowork-cora-info-for-cora-sweep", "cowork-cora-gap-autofill"]
+        at_fire = _decide(flipped, nc.Window(), DAY_0910, _az(DAY_0910, 8, 30, 5), tmp_path, [], _ready(flipped))
+        assert [d.action for d in at_fire] == ["run", "run", "run"]
+        early = _decide(flipped[:1], nc.Window(), DAY_0910, _az(DAY_0910, 8, 29, 59), tmp_path, [], _ready(flipped))
+        assert early[0].action == "run"
+
+    def test_load_set_refuses_a_deadline_at_or_after_the_fire(self, tmp_path):
+        bad = tmp_path / "late.yaml"
+        bad.write_text("tasks:\n  - name: ok\n    trigger_az: '04:00'\n  - name: late\n    trigger_az: '06:05'\n"
+                       "    enabled: false\n  - name: exact\n    trigger_az: '06:00'\n", encoding="utf-8")
+        with pytest.raises(ValueError) as ei:
+            nc.load_set(bad)
+        msg = str(ei.value)
+        assert "late (06:05 + 150m = 08:35)" in msg and "exact (06:00 + 150m = 08:30)" in msg
+        assert "ok (" not in msg
+        mod = _load_script()
+        assert mod.main(["--set", str(bad), "--no-scheduler"], now_az=_az(DAY_0910, 8, 45)) == 2
+
+    def test_ps1_fire_time_and_limit_pin_the_module_constants(self):
+        text = (_REPO / "deployment" / "setup-missed-nightly-catchup-task.ps1").read_text(encoding="ascii")
+        assert f'$FireAt     = "{nc.LANE_FIRE_AZ}"' in text
+        assert f"(New-TimeSpan -Hours {nc.LANE_BUDGET_MIN // 60})" in text and nc.LANE_BUDGET_MIN % 60 == 0
+        assert "150-minute grace = 08:30" not in text          # the stale 'after every deadline' claim
+
+
+class TestB5PerSpawnRecheck:
+    def _set(self, tmp_path):
+        set_yaml = tmp_path / "set.yaml"
+        set_yaml.write_text(
+            "tasks:\n"
+            "  - name: cowork-cora-kb-sync-gmail\n    trigger_az: '02:30'\n    max_minutes: 180\n    command: gmail\n"
+            "  - name: cowork-cora-kb-sync-asana\n    trigger_az: '03:00'\n    max_minutes: 60\n    command: asana\n"
+            "  - name: cowork-cora-claude-mirror\n    trigger_az: '03:45'\n    max_minutes: 30\n    command: mirror\n"
+            "  - name: cowork-cora-kb-sync-static\n    trigger_az: '04:00'\n    max_minutes: 60\n    command: static\n",
+            encoding="utf-8")
+        return set_yaml
+
+    def test_recheck_rules(self):
+        t = nc.NightlyTask(name="cowork-cora-claude-mirror", trigger_az="03:45")
+        w = nc.Window()
+        ok_state = nc.TaskState(state="Ready", next_run=_az(DAY_0910, 12, 15))
+        assert nc.recheck_before_spawn(t, window=w, day=DAY_0910, now_az=_az(DAY_0910, 11, 0), state=ok_state, budget_left_s=9999) is None
+        assert nc.recheck_before_spawn(t, window=w, day=DAY_0910, now_az=_az(DAY_0910, 12, 2), state=ok_state, budget_left_s=9999)[0] == "skipped_window"
+        assert nc.recheck_before_spawn(t, window=w, day=DAY_0910, now_az=_az(DAY_0910, 11, 58), state=ok_state, budget_left_s=9999)[0] == "skipped_imminent"
+        assert nc.recheck_before_spawn(t, window=w, day=DAY_0910, now_az=_az(DAY_0910, 11, 0), state=ok_state, budget_left_s=30)[0] == "not-started"
+        assert nc.recheck_before_spawn(t, window=w, day=DAY_0910, now_az=_az(DAY_0910, 11, 0),
+                                       state=nc.TaskState(state="Running"), budget_left_s=9999)[0] == "cannot_check"
+        assert nc.recheck_before_spawn(t, window=w, day=DAY_0910, now_az=_az(DAY_0910, 11, 0), state=None, budget_left_s=9999) is None
+
+    def test_long_gmail_replay_pushes_the_mirror_past_noon_and_it_is_not_spawned(self, ledger, tmp_path, monkeypatch):
+        """B-5 FAILING INPUT: host down 02:15-05:30; gmail replays to 11:31, asana to 12:01;
+        the mirror was spawned at ~12:02 and overlapped the scheduler's 12:15 mirror fire
+        (two writers on the same files). Now: the re-check at 12:02 writes skipped_window."""
+        mod = _load_script()
+        monkeypatch.setenv("TASK_RUNS_LEDGER_PATH", str(tmp_path / "task-runs.jsonl"))
+        set_yaml = self._set(tmp_path)
+        now = {"t": _az(DAY_0910, 8, 30)}
+        durations = {"gmail": 181, "asana": 30}      # minutes each replay "takes"
+        calls = []
+
+        class _Proc:
+            def __init__(self, child):
+                self.child = child
+
+            def wait(self, timeout=None):
+                now["t"] = now["t"] + timedelta(minutes=durations.get(self.child, 1))
+                return 0
+
+        def popen(cmdline, **kw):
+            child = cmdline.split(" -- ", 1)[1]
+            calls.append(child)
+            return _Proc(child)
+
+        def reader(names):
+            return ({n: nc.TaskState(state="Ready", next_run=_az(DAY_0910, 12, 15) if "mirror" in n else _az(DAY_0911, 3, 0))
+                     for n in names}, {})
+
+        rc = mod.main(["--apply", "--set", str(set_yaml), "--log-dir", str(tmp_path)],
+                      now_az=_az(DAY_0910, 8, 30), states_reader=reader, popen=popen, clock=lambda: now["t"])
+        assert calls == ["gmail", "asana"], calls                      # mirror + static NOT spawned
+        rows = [json.loads(l) for l in ledger.read_text(encoding="utf-8").splitlines()]
+        task_rows = {r["task"]: r for r in rows if r["row"] == "task"}
+        assert task_rows["cowork-cora-kb-sync-gmail"]["action"] == "ran"
+        assert task_rows["cowork-cora-kb-sync-asana"]["action"] == "ran"
+        assert task_rows["cowork-cora-claude-mirror"]["action"] == "skipped_window"
+        assert task_rows["cowork-cora-kb-sync-static"]["action"] == "skipped_window"
+        assert rc == 1                                                # the night is NOT recovered
+        # a deferred row never blocks a later honest replay of the same window
+        _, tasks2 = nc.load_set(set_yaml)
+        decisions = _decide(tasks2, nc.Window(), DAY_0910, _az(DAY_0910, 11, 0), tmp_path, [], _ready(tasks2), rows)
+        by = {d.task.name: d.action for d in decisions}
+        assert by["cowork-cora-kb-sync-gmail"] == "skipped_already_ran" and by["cowork-cora-claude-mirror"] == "run"
+
+    def test_imminent_at_spawn_time_is_re_read_from_the_scheduler(self, ledger, tmp_path, monkeypatch):
+        mod = _load_script()
+        monkeypatch.setenv("TASK_RUNS_LEDGER_PATH", str(tmp_path / "task-runs.jsonl"))
+        set_yaml = self._set(tmp_path)
+        now = {"t": _az(DAY_0910, 8, 30)}
+        calls = []
+
+        class _Proc:
+            def wait(self, timeout=None):
+                now["t"] = now["t"] + timedelta(minutes=200)   # gmail runs to 11:50
+                return 0
+
+        def reader(names):
+            # plan-time read: next runs far away; the per-spawn re-read (ONE name) says 12:00 (imminent at 11:50)
+            nr = _az(DAY_0910, 12, 0) if len(names) == 1 else _az(DAY_0911, 3, 45)
+            return ({n: nc.TaskState(state="Ready", next_run=nr) for n in names}, {})
+
+        rc = mod.main(["--apply", "--set", str(set_yaml), "--log-dir", str(tmp_path)], now_az=_az(DAY_0910, 8, 30),
+                      states_reader=reader, popen=lambda c, **k: calls.append(c.split(" -- ", 1)[1]) or _Proc(),
+                      clock=lambda: now["t"])
+        rows = {r["task"]: r for r in (json.loads(l) for l in ledger.read_text(encoding="utf-8").splitlines()) if r["row"] == "task"}
+        assert calls == ["gmail"]
+        assert rows["cowork-cora-kb-sync-asana"]["action"] == "skipped_imminent"
+        assert "imminent at spawn time" in rows["cowork-cora-kb-sync-asana"]["reason"]
+        assert rc == 0     # imminent = the scheduler's own fire covers it
+
+    def test_budget_exhaustion_writes_not_started_rows_and_caps_the_wait(self, ledger, tmp_path, monkeypatch):
+        """The 960-minute enabled sum cannot fit the 4h limit: what does not fit is
+        ledgered `not-started` instead of being killed mid-replay with no row."""
+        mod = _load_script()
+        monkeypatch.setenv("TASK_RUNS_LEDGER_PATH", str(tmp_path / "task-runs.jsonl"))
+        set_yaml = self._set(tmp_path)
+        now = {"t": _az(DAY_0910, 6, 30)}          # early enough that the window never closes first
+        waits = []
+
+        class _Proc:
+            def wait(self, timeout=None):
+                waits.append(timeout)
+                now["t"] = now["t"] + timedelta(seconds=timeout)   # each replay uses its whole allowance
+                return 0
+
+        def reader(names):
+            return ({n: nc.TaskState(state="Ready", next_run=_az(DAY_0911, 3, 0)) for n in names}, {})
+
+        rc = mod.main(["--apply", "--set", str(set_yaml), "--log-dir", str(tmp_path)], now_az=_az(DAY_0910, 6, 30),
+                      states_reader=reader, popen=lambda c, **k: _Proc(), clock=lambda: now["t"])
+        rows = {r["task"]: r for r in (json.loads(l) for l in ledger.read_text(encoding="utf-8").splitlines()) if r["row"] == "task"}
+        assert waits == [180 * 60, 60 * 60]                       # gmail 180m + asana 60m = the 240m budget
+        assert rows["cowork-cora-claude-mirror"]["action"] == "not-started"
+        assert rows["cowork-cora-kb-sync-static"]["action"] == "not-started"
+        assert "budget" in rows["cowork-cora-claude-mirror"]["reason"] and rc == 1
+        # the wait is capped by the budget LEFT, not just max_minutes
+        now["t"] = _az(DAY_0910, 6, 30)
+        waits.clear()
+        ledger.unlink()
+        set2 = tmp_path / "set2.yaml"
+        set2.write_text("tasks:\n  - name: a\n    trigger_az: '02:00'\n    max_minutes: 200\n    command: a\n"
+                        "  - name: b\n    trigger_az: '03:00'\n    max_minutes: 200\n    command: b\n", encoding="utf-8")
+        mod.main(["--apply", "--set", str(set2), "--log-dir", str(tmp_path)], now_az=_az(DAY_0910, 6, 30),
+                 states_reader=reader, popen=lambda c, **k: _Proc(), clock=lambda: now["t"])
+        assert waits == [200 * 60, 40 * 60]
+
+    def test_lane_budget_matches_the_registered_limit(self):
+        assert nc.LANE_BUDGET_MIN == 240
+        _, tasks = nc.load_set(_REAL_SET)
+        assert sum(t.max_minutes for t in tasks if t.enabled) > nc.LANE_BUDGET_MIN   # the premise the budget guards

@@ -706,8 +706,14 @@ def check_missed_nightly_catchup(now: datetime | None = None) -> CheckResult:
     not registered or did not fire -- a lost night would go unnoticed again, the
     9/9 shape); any task was REPLAYED (the night was not clean; the replay is the
     audit trail); any task read cannot_check (Running / scheduler unreadable) or
-    skipped_imminent; a replay failed or timed out. OK only when every task in
-    the set fired on schedule (or a replay finished clean). Never CRITICAL.
+    skipped_imminent; any ENABLED task read skipped_window / skipped_not_due /
+    skipped_disabled -- NOT verified: nothing proved it fired and nothing replayed
+    it (a host down until noon reads every task skipped_window; that is the 9/9
+    shape one step longer, D-051 review B-1); the replay loop deferred a spawn
+    (skipped_window / skipped_imminent / not-started at spawn time); a replay
+    failed or timed out. OK only when every ENABLED task fired on schedule (or a
+    replay finished clean) -- the tail is derived from the counts, never a
+    constant. Never CRITICAL.
     """
     name = "Missed-nightly catch-up"
     try:
@@ -737,15 +743,29 @@ def check_missed_nightly_catchup(now: datetime | None = None) -> CheckResult:
             "go unnoticed (the 9/9 shape)")
     counts = summary.get("counts") or {}
     decisions = summary.get("decisions") or []
-    attention = [d for d in decisions if str(d.get("action")) in nc.ATTENTION_ACTIONS]
+    enabled = [d for d in decisions if str(d.get("action")) != "skipped_disabled_in_set"]
+    attention = [d for d in enabled if str(d.get("action")) in nc.ATTENTION_ACTIONS]
+    unverified = [d for d in enabled if str(d.get("action")) not in nc.VERIFIED_ACTIONS
+                  and str(d.get("action")) not in nc.ATTENTION_ACTIONS]   # an action this check does not know
     replays = summary.get("replays") or []
+    deferred = summary.get("deferred") or []
     failed = [r for r in replays if str(r.get("action")) != "ran"]
     head = f"{day}: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
-    if attention or failed:
-        parts = [f"{d.get('task')} {d.get('action')}" for d in attention]
+    if attention or unverified or failed or deferred:
+        parts = [f"{d.get('task')} {d.get('action')}"
+                 + (" (not verified)" if str(d.get("action")) in nc.UNVERIFIED_ACTIONS else "")
+                 for d in attention]
+        parts += [f"{d.get('task')} {d.get('action')} (unknown action -- not verified)" for d in unverified]
         parts += [f"{r.get('task')} replay {r.get('action')} rc={r.get('rc')}" for r in failed]
+        parts += [f"{r.get('task')} deferred at spawn time: {r.get('action')}" for r in deferred]
         return CheckResult(name, "warn", head + " -- " + "; ".join(parts))
-    tail = f"; {len(replays)} replay(s) finished clean" if replays else "; every task fired on schedule"
+    fired = sum(1 for d in enabled if str(d.get("action")) == "fired")
+    if replays:
+        tail = f"; {len(replays)} replay(s) finished clean"
+    elif enabled and fired == len(enabled):
+        tail = f"; every task fired on schedule ({fired}/{len(enabled)} enabled)"
+    else:
+        tail = f"; {fired}/{len(enabled)} enabled task(s) fired on schedule"
     return CheckResult(name, "ok", head + tail)
 
 

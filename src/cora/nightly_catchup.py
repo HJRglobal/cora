@@ -69,29 +69,86 @@ DEFAULT_TASK_LOG_DIR = _REPO_ROOT / "logs" / "tasks"
 AZ = timezone(timedelta(hours=-7))   # Arizona has no DST -- a fixed offset is exact
 TASK_NAME = "Cora - Missed Nightly Catch-Up"
 EARLY_MIN = 10          # a fire this many minutes BEFORE the trigger still counts
+#: the lane's single daily fire (deployment/setup-missed-nightly-catchup-task.ps1 $FireAt).
+#: load_set() REFUSES a set whose deadline (trigger + grace) is not strictly before it:
+#: such a task reads skipped_not_due at the fire every day and is never replayed
+#: (D-051 review B-4: the 06:05/06:10 candidates at the 150-min default grace).
+LANE_FIRE_AZ = "08:30"
+#: the registered ExecutionTimeLimit (4h) the replay loop budgets against; when the
+#: budget is spent the remaining `run` decisions are ledgered `not-started`, never
+#: left to the scheduler's kill mid-replay with no row at all (D-051 review B-5).
+LANE_BUDGET_MIN = 240
+#: a spawn with less than this left in the budget is not-started (a task killed
+#: seconds after launch is worse than one honestly left for tomorrow's health check)
+MIN_SPAWN_BUDGET_S = 60
 
 ACTIONS: tuple[str, ...] = (
     "fired", "skipped_not_due", "skipped_window", "skipped_already_ran", "cannot_check",
-    "skipped_disabled", "skipped_disabled_in_set", "skipped_imminent", "run",
+    "skipped_disabled", "skipped_disabled_in_set", "skipped_imminent", "run", "not-started",
 )
-#: actions the health check treats as "the night was not clean"
-ATTENTION_ACTIONS: frozenset[str] = frozenset({"run", "cannot_check", "skipped_imminent"})
+#: actions the health check treats as "the night was not clean". An ENABLED task
+#: whose decision is skipped_window / skipped_not_due / skipped_disabled is NOT
+#: verified (nothing proved it fired, nothing replayed it) -- the 9/9 shape one step
+#: longer (a host down until noon: every task skipped_window, report 'ok'). Only
+#: fired and skipped_already_ran (this lane replayed it earlier today) are clean.
+ATTENTION_ACTIONS: frozenset[str] = frozenset({
+    "run", "cannot_check", "skipped_imminent",
+    "skipped_window", "skipped_not_due", "skipped_disabled",
+})
+#: the subset of ATTENTION_ACTIONS that means "no evidence either way" (rendered
+#: '(not verified)' by the health check)
+UNVERIFIED_ACTIONS: frozenset[str] = frozenset({"skipped_window", "skipped_not_due", "skipped_disabled", "cannot_check"})
+#: plan decisions that count as clean for an enabled task
+VERIFIED_ACTIONS: frozenset[str] = frozenset({"fired", "skipped_already_ran"})
+#: `task`-row actions where a child process WAS spawned (or the spawn was attempted):
+#: these -- and only these -- make a later run of the lane read skipped_already_ran
+#: and count as a replay in the Monday digest.
+SPAWNED_ACTIONS: frozenset[str] = frozenset({"ran", "error", "timeout"})
+#: `task`-row actions written by the replay loop's per-spawn re-check INSTEAD of a
+#: spawn (the plan said `run`; the moment of the spawn said otherwise)
+DEFERRED_ACTIONS: frozenset[str] = frozenset({"skipped_window", "skipped_imminent", "cannot_check", "not-started"})
 
 # run_hidden's header: "=== run_hidden <slug> | <UTC> UTC | <AZ> AZ ===" (deployment/run_hidden.py _header)
 _HEADER_RE = re.compile(
     r"^=== run_hidden (?P<slug>\S+) \| (?P<utc>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) UTC \| "
     r"(?P<az>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) AZ ===")
-_SAFE_SLUG_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
+# Get-TaskSlug (deployment/_task-action.ps1): a RUN of unsafe characters -> ONE dash,
+# then any remaining dash run -> one dash. Both patterns are single-level (linear).
+_UNSAFE_RUN_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_DASH_RUN_RE = re.compile(r"-{2,}")
+# the launcher's own `--name <slug>` inside a registered action's Arguments
+_ACTION_NAME_RE = re.compile(r"--name(?:=|\s+)(?P<slug>\S+)")
 
 
 def sanitize_slug(raw: str) -> str:
-    """Byte-for-byte the launcher's rule (deployment/run_hidden.py sanitize_slug /
-    _task-action.ps1 Get-TaskSlug); pinned equal by tests so the log filename this
-    lane reads is the one the launcher writes."""
-    cleaned = "".join(c if c in _SAFE_SLUG_CHARS else "-" for c in (raw or ""))
-    cleaned = cleaned.strip("-. ")
-    cleaned = cleaned[:80].strip("-. ")
-    return cleaned or "task"
+    """The slug the ESTATE registers: a faithful port of _task-action.ps1 Get-TaskSlug
+    (the function that writes `--name <slug>` into every wrapped action), NOT of
+    run_hidden.sanitize_slug. The two differ on runs of unsafe characters:
+    Get-TaskSlug collapses them ("Cora - Drive Sweep" -> "Cora-Drive-Sweep", the
+    registered --name and the real log filename), run_hidden does not
+    ("Cora---Drive-Sweep", a file the estate never writes). run_hidden re-sanitizes
+    the --name it receives, and every Get-TaskSlug output is a fixed point of that
+    rule, so this slug IS the log filename (D-051 review B-2). Callers still prefer
+    the slug parsed from the LIVE action (slug_from_action) when they have it."""
+    s = _UNSAFE_RUN_RE.sub("-", raw or "")
+    s = _DASH_RUN_RE.sub("-", s)
+    s = s.strip("-. ")
+    s = s[:80].strip("-. ")
+    return s or "task"
+
+
+def slug_from_action(arguments: str) -> str | None:
+    """The `--name <slug>` the live registered action hands run_hidden, or None for an
+    action that is not run_hidden-wrapped. Re-sanitized (idempotent for any value
+    Get-TaskSlug produced) so a hand-registered odd value can never name a path
+    outside logs/tasks."""
+    args = str(arguments or "")
+    if "run_hidden.py" not in args:
+        return None
+    m = _ACTION_NAME_RE.search(args)
+    if not m:
+        return None
+    return sanitize_slug(m.group("slug"))
 
 
 @dataclass(frozen=True)
@@ -135,6 +192,11 @@ class Window:
         return self.start_dt(day) <= now_az < self.end_dt(day)
 
 
+def lane_fire_dt(day: date) -> datetime:
+    hh, mm = (int(x) for x in LANE_FIRE_AZ.split(":"))
+    return datetime.combine(day, time(hh, mm), tzinfo=AZ)
+
+
 @dataclass
 class Decision:
     task: NightlyTask
@@ -150,7 +212,11 @@ class Decision:
 # ── config ───────────────────────────────────────────────────────────────────
 def load_set(path: Path | None = None) -> tuple[Window, list[NightlyTask]]:
     """The window + tasks, tasks sorted by trigger (the ruled order). Malformed rows
-    are skipped with a warning; a missing file yields no tasks (the caller WARNs)."""
+    are skipped with a warning; a missing file yields no tasks (the caller WARNs).
+    RAISES ValueError when any task's deadline (trigger + grace) is not strictly
+    before the lane's LANE_FIRE_AZ fire: that row would read skipped_not_due at
+    every fire and never be replayed -- a silent hole, so the set is refused loudly
+    (the lane writes no plan row and the 08:45 health check WARNs)."""
     p = Path(path) if path is not None else DEFAULT_SET_PATH
     try:
         import yaml  # lazy
@@ -181,6 +247,14 @@ def load_set(path: Path | None = None) -> tuple[Window, list[NightlyTask]]:
         except (TypeError, ValueError) as exc:
             log.warning("nightly_catchup: skipping task row %r: %s", row.get("name"), exc)
     tasks.sort(key=lambda t: t.trigger_dt(date(2000, 1, 1)))
+    probe = date(2000, 1, 1)
+    late = [t for t in tasks if t.deadline_dt(probe) >= lane_fire_dt(probe)]
+    if late:
+        raise ValueError(
+            "nightly_catchup: deadline (trigger + grace_min) must be strictly before the lane's "
+            f"{LANE_FIRE_AZ} AZ fire, or the task reads skipped_not_due every day and is never replayed: "
+            + ", ".join(f"{t.name} ({t.trigger_az} + {t.grace_min}m = {t.deadline_dt(probe).strftime('%H:%M')})"
+                        for t in late))
     return window, tasks
 
 
@@ -246,6 +320,13 @@ class TaskState:
     state: str | None = None          # Ready | Running | Disabled | ...
     next_run: datetime | None = None  # AZ-aware
     last_run: datetime | None = None  # AZ-aware
+    slug: str | None = None           # the live action's `--name <slug>` (the real log filename)
+
+
+def effective_slug(task: NightlyTask, state: TaskState | None) -> str:
+    """The log slug to READ and to REPLAY under: the live registered --name when the
+    scheduler read gave one, else the Get-TaskSlug-faithful rule."""
+    return (state.slug if state is not None and state.slug else None) or task.slug
 
 
 def decide(tasks: list[NightlyTask], *, window: Window, day: date, now_az: datetime,
@@ -255,8 +336,11 @@ def decide(tasks: list[NightlyTask], *, window: Window, day: date, now_az: datet
     """One Decision per task, in trigger order. ``states`` None = the scheduler query
     itself failed -> every otherwise-runnable task is cannot_check."""
     out: list[Decision] = []
+    # only a row where a child was SPAWNED counts as "already ran": a not-started /
+    # skipped_window row from the replay loop's re-check must not block tomorrow's
+    # (or a hand-run's) honest replay of the same window
     already = {(str(r.get("window_date")), str(r.get("task"))) for r in ledger_rows or []
-               if r.get("row") == "task"}
+               if r.get("row") == "task" and str(r.get("action") or "") not in DEFERRED_ACTIONS}
     for task in sorted(tasks, key=lambda t: t.trigger_dt(day)):
         if not task.enabled:
             out.append(Decision(task, "skipped_disabled_in_set", "enabled: false in the set (candidate)"))
@@ -297,6 +381,27 @@ def decide(tasks: list[NightlyTask], *, window: Window, day: date, now_az: datet
             continue
         out.append(Decision(task, "run", f"no fire evidence for {day.isoformat()}; deadline passed"))
     return out
+
+
+def recheck_before_spawn(task: NightlyTask, *, window: Window, day: date, now_az: datetime,
+                         state: TaskState | None, budget_left_s: float) -> tuple[str, str] | None:
+    """The plan said `run` at 08:30; is a spawn still right NOW? Earlier replays can
+    run for hours, so the window / imminent / single-instance rules are re-applied
+    at each spawn, plus the lane's own time budget. None = spawn; else the
+    (action, reason) of the `task` row to write INSTEAD of spawning."""
+    if now_az >= window.end_dt(day):
+        return ("skipped_window",
+                f"now {now_az.strftime('%H:%M')} AZ is past the window end {window.end_az} (earlier replays ran long)")
+    if budget_left_s < MIN_SPAWN_BUDGET_S:
+        return ("not-started",
+                f"lane budget ({LANE_BUDGET_MIN} min) exhausted before this spawn -- {max(0, int(budget_left_s))}s left")
+    if state is not None and state.state and state.state.lower() == "running":
+        return ("cannot_check", "Task Scheduler reports the task RUNNING at spawn time -- never a second instance")
+    if (state is not None and state.next_run is not None
+            and timedelta(0) <= (state.next_run - now_az) < timedelta(minutes=window.imminent_min)):
+        return ("skipped_imminent",
+                f"next scheduled run {state.next_run.strftime('%H:%M')} AZ is imminent at spawn time")
+    return None
 
 
 # ── ledger ───────────────────────────────────────────────────────────────────
@@ -357,18 +462,26 @@ def counts(decisions: list[Decision]) -> dict[str, int]:
 
 def summarize_day(rows: list[dict], day: date) -> dict[str, Any]:
     """What the health check renders for one window date: the latest plan's counts +
-    the replay rows. {present: bool, counts, replays: [...], plan_ts}."""
+    the replay rows. {present: bool, counts, replays: [...], deferred: [...], plan_ts}.
+    `replays` = task rows where a child was spawned; `deferred` = task rows the replay
+    loop wrote INSTEAD of a spawn (DEFERRED_ACTIONS) -- the digest counts only the
+    former as replays, the health check WARNs on both."""
     todays = rows_for_day(rows, day)
     plans = [r for r in todays if r.get("row") == "plan"]
-    replays = [r for r in todays if r.get("row") == "task"]
-    if not plans and not replays:
-        return {"present": False, "counts": {}, "replays": [], "plan_ts": ""}
+    task_rows = [r for r in todays if r.get("row") == "task"]
+    if not plans and not task_rows:
+        return {"present": False, "counts": {}, "replays": [], "deferred": [], "plan_ts": ""}
     plan = plans[-1] if plans else {}
+
+    def _slim(r: dict) -> dict:
+        return {"task": r.get("task"), "action": r.get("action"), "rc": r.get("rc"),
+                "duration_s": r.get("duration_s"), "reason": r.get("reason")}
+
     return {"present": True, "counts": dict(plan.get("counts") or {}), "plan_ts": str(plan.get("ts") or ""),
             "mode": str(plan.get("mode") or ""),
             "decisions": list(plan.get("decisions") or []),
-            "replays": [{"task": r.get("task"), "action": r.get("action"), "rc": r.get("rc"),
-                         "duration_s": r.get("duration_s")} for r in replays]}
+            "replays": [_slim(r) for r in task_rows if str(r.get("action") or "") not in DEFERRED_ACTIONS],
+            "deferred": [_slim(r) for r in task_rows if str(r.get("action") or "") in DEFERRED_ACTIONS]}
 
 
 def format_plan(decisions: list[Decision]) -> str:
