@@ -1133,3 +1133,208 @@ class TestCarveOutBreachAlarm:
         import re as _re
         hh = _re.search(r'\$HourMin\s*=\s*"(\d\d:\d\d)"', ps1).group(1)
         assert hh in doc, f"docstring does not mention the registered time {hh}"
+
+
+# ── presumed-unconvened bucket (Code #13 slice 4, cq-8c4f2f4e73fc) ───────────
+# The 2026-09-07 (Labor Day) audit posted "5 scheduled, 0 captured, 5 missed" --
+# and every one of the five was a recurring block organised by a Google GROUP
+# calendar that nobody joined. There is no Meet/Zoom audit-log read available
+# (no admin.reports scope, no Zoom API), so the classifier is structural and the
+# bucket is labelled a PRESUMPTION everywhere it surfaces. Fixture text is
+# synthetic (D-145/D-256): random-word titles, no real people, no client content.
+
+_GROUP_CAL = "c_quartz7lantern@group.calendar.google.com"
+
+
+def _labor_day_events() -> list[dict]:
+    """The frozen 9/7 shape: five group-calendar recurring instances at 09:30,
+    09:30, 10:00, 10:00, 17:00 with distinct links; two carry the legacy notetaker
+    bot as an attendee (a bot was dispatched and still recorded nothing)."""
+    spec = [
+        ("gc-1_20260826T163000Z", "Velvet Otter Cadence", 9, 30, "https://meet.google.com/vot-cade-nce", True),
+        ("gc-2_20260826T163000Z", "Brass Kite Ledger", 9, 30, "https://meet.google.com/bra-kite-ldg", False),
+        ("gc-3_20260826T170000Z", "Marble Fern Relay", 10, 0, "https://meet.google.com/mar-fern-rly", True),
+        ("gc-4_20260826T170000Z", "Copper Lantern Drift", 10, 0, "https://meet.google.com/cop-lant-drf", False),
+        ("gc-5_20260827T000000Z", "Pewter Comet Ledger", 17, 0, "https://meet.google.com/pew-come-ldg", False),
+    ]
+    out = []
+    for eid, title, hh, mm, link, with_bot in spec:
+        attendees = ["harrison@hjrglobal.com", "pal@example.test"]
+        if with_bot:
+            attendees.append(mc.LEGACY_NOTETAKER)
+        ev = _ev(eid, summary=title, hh=hh, mm=mm, link=link,
+                 organizer=_GROUP_CAL, attendees=attendees)
+        ev["recurringEventId"] = eid.split("_", 1)[0]
+        out.append(ev)
+    return out
+
+
+class TestPresumedUnconvened:
+    def test_labor_day_shape_is_unconvened_not_missed(self):
+        """The 9/7 audit accused the capture lane of five misses that were five
+        standing group-calendar blocks nobody joined. Prevents: a holiday of
+        placeholders rendering as a capture-lane failure."""
+        r = _audit({"harrison@hjrglobal.com": _labor_day_events()}, [])
+        assert r.scheduled == 5
+        assert r.captured == 0
+        assert r.misses == []
+        assert len(r.unconvened) == 5
+
+    def test_unconvened_meetings_carry_their_basis(self):
+        """Every re-bucketing carries its reason (the qualify_event doctrine), so a
+        reader of the report or ledger can see WHY it was not called a miss."""
+        r = _audit({"harrison@hjrglobal.com": _labor_day_events()}, [])
+        assert {m.unconvened_basis for m in r.unconvened} == {mc.UNCONVENED_BASIS_GROUP_CALENDAR}
+
+    def test_human_organised_meeting_with_no_transcript_is_still_a_miss(self):
+        """The split must not widen: a meeting a PERSON called and nobody captured
+        is exactly the gap the auditor exists to report."""
+        r = _audit({"harrison@hjrglobal.com": [_ev("evt-1", organizer="harrison@hjrglobal.com")]}, [])
+        assert len(r.misses) == 1 and r.unconvened == []
+        assert r.misses[0].unconvened_basis == ""
+
+    def test_group_calendar_meeting_with_a_transcript_is_captured_never_unconvened(self):
+        """Measured live 2026-09-08: a group-calendar block WAS convened and
+        captured. The presumption must never suppress a real capture, and the
+        ensure/RSVP lanes may start capturing these series at any time."""
+        ev = _ev("gc-1", summary="Velvet Otter Cadence", organizer=_GROUP_CAL,
+                 link="https://meet.google.com/vot-cade-nce")
+        r = _audit({"harrison@hjrglobal.com": [ev]}, [_t("t1", cal_id="gc-1")])
+        assert r.captured == 1
+        assert r.unconvened == [] and r.misses == []
+
+    def test_organizer_suffix_match_is_case_insensitive_and_exact(self):
+        """A mixed-case organiser address is still a group calendar; a look-alike
+        human address that merely CONTAINS the suffix is not."""
+        assert mc.presumed_unconvened_basis(
+            {"organizer": {"email": "C_ABC@Group.Calendar.Google.Com"}}
+        ) == mc.UNCONVENED_BASIS_GROUP_CALENDAR
+        assert mc.presumed_unconvened_basis(
+            {"organizer": {"email": "group.calendar.google.com@example.test"}}
+        ) == ""
+        assert mc.presumed_unconvened_basis({"organizer": "not-a-dict"}) == ""
+        assert mc.presumed_unconvened_basis({}) == ""
+
+    def test_render_counts_line_names_all_buckets(self):
+        """The counts line is what the ops channel reads first. Prevents: the
+        unconvened count silently vanishing from the headline."""
+        r = _audit({"harrison@hjrglobal.com": _labor_day_events()}, [])
+        out = mc.render_report(r)
+        assert "5 scheduled, 0 captured, 0 missed, 5 presumed unconvened, 0 duplicated" in out
+
+    def test_render_has_unconvened_section_and_no_not_captured_section(self):
+        r = _audit({"harrison@hjrglobal.com": _labor_day_events()}, [])
+        out = mc.render_report(r)
+        assert "*:white_circle: Presumed unconvened (5)*" in out
+        assert "group-calendar blocks, no join evidence" in out
+        assert ":red_circle:" not in out
+        assert "Velvet Otter Cadence" in out and "Pewter Comet Ledger" in out
+
+    def test_render_clean_text_acknowledges_unconvened(self):
+        """'Every scheduled meeting captured exactly once' is FALSE on a day where
+        five scheduled meetings were not captured. The clean line must say what
+        was actually established."""
+        r = _audit({"harrison@hjrglobal.com": _labor_day_events()}, [])
+        out = mc.render_report(r)
+        assert "Every convened meeting captured exactly once (5 presumed unconvened)." in out
+        assert "Every scheduled meeting captured exactly once" not in out
+        assert "No qualifying roster meetings scheduled" not in out
+
+    def test_clean_text_unchanged_when_nothing_is_unconvened(self):
+        """The pre-existing clean line survives byte-for-byte on an ordinary day."""
+        r = _audit({"harrison@hjrglobal.com": [_ev("evt-1")]}, [_t("t1", cal_id="evt-1")])
+        assert "Every scheduled meeting captured exactly once." in mc.render_report(r)
+
+    def test_unconvened_does_not_mask_a_real_miss(self):
+        """The clean criterion excludes unconvened but KEEPS misses: one human-called
+        uncaptured meeting beside five placeholders is still a red day."""
+        events = _labor_day_events() + [
+            _ev("human-1", summary="Amber Heron Compass", hh=13,
+                link="https://meet.google.com/amb-hero-cmp", organizer="harrison@hjrglobal.com"),
+        ]
+        r = _audit({"harrison@hjrglobal.com": events}, [])
+        out = mc.render_report(r)
+        assert len(r.misses) == 1 and len(r.unconvened) == 5
+        assert "*:red_circle: Not captured (1)*" in out
+        assert "captured exactly once" not in out
+
+    def test_unconvened_does_not_mask_a_duplicate(self):
+        """A duplicated capture beside a placeholder is still a duplicate day."""
+        events = [_labor_day_events()[0], _ev("dup-1", link="https://meet.google.com/dup-dup-dup")]
+        r = _audit({"harrison@hjrglobal.com": events},
+                   [_t("t1", cal_id="dup-1"), _t("t2", cal_id="dup-1")])
+        out = mc.render_report(r)
+        assert len(r.duplicates) == 1 and len(r.unconvened) == 1
+        assert "captured exactly once" not in out
+
+    def test_lex_signal_group_calendar_event_renders_redacted(self):
+        """The LEX rail applies to the new section exactly as to misses: a group
+        calendar hosting a client-programme block must render as its shape, with
+        the organiser withheld and no agency domain on the line."""
+        ev = _ev("gc-lex", summary="Quiet Harbor Intake Review", hh=11,
+                 link="https://meet.google.com/qui-harb-int", organizer=_GROUP_CAL,
+                 attendees=["shaun@lexingtonservices.com", "vreese@azdes.gov"])
+        r = _audit({"harrison@hjrglobal.com": [ev]}, [])
+        assert len(r.unconvened) == 1
+        out = mc.render_report(r)
+        assert "Presumed unconvened (1)" in out
+        assert "LEX/PHI meeting" in out
+        assert "Quiet Harbor" not in out and "intake" not in out.lower()
+        assert "withheld" in out
+        assert "azdes.gov" not in out and _GROUP_CAL not in out
+
+    def test_unconvened_are_listed_chronologically(self):
+        r = _audit({"harrison@hjrglobal.com": _labor_day_events()}, [])
+        out = mc.render_report(r)
+        assert out.index("09:30") < out.index("10:00") < out.index("17:00")
+
+    def test_audit_ledger_records_unconvened_ids_never_titles(self):
+        """The ledger row gains the count + ids only; the existing ids-never-titles
+        pin (test_audit_ledger_records_ids_never_titles) must keep holding."""
+        text = (_REPO_ROOT / "scripts" / "run_meeting_capture_audit.py").read_text(encoding="utf-8")
+        assert "unconvened_event_ids" in text
+        assert '"unconvened": len(report.unconvened)' in text
+        assert "m.title" not in text and "\"title\"" not in text
+
+    def test_audit_log_line_carries_the_unconvened_count(self):
+        text = (_REPO_ROOT / "scripts" / "run_meeting_capture_audit.py").read_text(encoding="utf-8")
+        assert "unconvened=%d" in text
+
+    def test_run_marker_outputs_count_unconvened_and_ledger_row_is_ids_only(self, monkeypatch):
+        """Behavioural. The registry marks this lane expects_output, and
+        run_marker.evaluate WARNs 'FIRED BUT WROTE NOTHING' on outputs==0. Re-bucketing
+        the 9/7 five out of `misses` without counting them here would turn the
+        fixture day into that false alarm. Also pins the ledger row shape: counts +
+        event ids, no titles."""
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "_audit_script", _REPO_ROOT / "scripts" / "run_meeting_capture_audit.py"
+        )
+        mod = importlib.util.module_from_spec(spec)
+        monkeypatch.setattr(sys, "argv", ["run_meeting_capture_audit.py", "--day", DAY])
+        spec.loader.exec_module(mod)
+
+        report = _audit({"harrison@hjrglobal.com": _labor_day_events()}, [])
+        assert len(report.unconvened) == 5   # precondition
+
+        monkeypatch.setattr(mod.mc, "load_config", lambda: _cfg())
+        monkeypatch.setattr(mod.mc, "audit_day", lambda day, cfg: report)
+        markers: list[dict] = []
+        monkeypatch.setattr(mod.run_marker, "write",
+                            lambda task, **kw: markers.append(dict(task=task, **kw)))
+
+        assert mod.main() == 0
+
+        assert len(markers) == 1
+        assert markers[0]["outputs"] == 5, "unconvened findings must count as output"
+        assert markers[0]["detail"] == "scheduled=5 captured=0 missed=0 unconvened=5"
+
+        rows = [json.loads(l) for l in mc.ledger_path().read_text(encoding="utf-8").splitlines()]
+        row = [r for r in rows if r.get("lane") == "audit"][-1]
+        assert row["missed"] == 0 and row["unconvened"] == 5
+        assert sorted(row["unconvened_event_ids"]) == sorted(e["id"] for e in _labor_day_events())
+        assert row["missed_event_ids"] == []
+        flat = json.dumps(row)
+        for title in ("Velvet Otter", "Brass Kite", "Marble Fern", "Copper Lantern", "Pewter Comet"):
+            assert title not in flat

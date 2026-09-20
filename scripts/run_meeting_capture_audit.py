@@ -2,7 +2,10 @@
 """Daily meeting-capture auditor (cq-ffcf6e4ffe7c) -- READ-ONLY.
 
 Diffs yesterday's roster calendar events against Fireflies transcripts and posts
-misses / duplicates / unexpected captures to #founder-operations.
+misses / duplicates / unexpected captures to #founder-operations. A scheduled
+meeting with no transcript whose organiser is a Google GROUP calendar is reported
+as PRESUMED UNCONVENED (a standing placeholder nobody joined), not as a miss --
+see meeting_capture.presumed_unconvened_basis for why that is a presumption.
 
 WHY THIS IS LOAD-BEARING. Under the One Cora Notetaker architecture there is one
 capture seat and no per-seat fallback, so a meeting the ensure lane misses is
@@ -108,10 +111,10 @@ def main() -> int:
 
     print("\n" + text + "\n")
     log.info(
-        "audit %s: scheduled=%d captured=%d missed=%d dup=%d unmatched=%d "
+        "audit %s: scheduled=%d captured=%d missed=%d unconvened=%d dup=%d unmatched=%d "
         "skipped=%d failed_calendars=%d",
         day, report.scheduled, report.captured, len(report.misses),
-        len(report.duplicates), len(report.unmatched_transcripts),
+        len(report.unconvened), len(report.duplicates), len(report.unmatched_transcripts),
         len(report.skipped), len(report.failed_calendars),
     )
 
@@ -122,6 +125,11 @@ def main() -> int:
         "scheduled": report.scheduled,
         "captured": report.captured,
         "missed": len(report.misses),
+        # Presumed unconvened (group-calendar block, zero transcripts). Counted
+        # separately from `missed` so the ledger keeps the honest distinction the
+        # report draws; the ids below let a future audit-log read upgrade the
+        # presumption to evidence, or refute it.
+        "unconvened": len(report.unconvened),
         "duplicated": len(report.duplicates),
         "unmatched": len(report.unmatched_transcripts),
         "skipped": len(report.skipped),
@@ -134,6 +142,7 @@ def main() -> int:
         # Event ids only -- never titles. A LEX title must not reach an at-rest
         # log any more than it may reach the ops channel (D-082).
         "missed_event_ids": [m.event_id for m in report.misses],
+        "unconvened_event_ids": [m.event_id for m in report.unconvened],
         "duplicated_event_ids": [m.event_id for m in report.duplicates],
     }])
 
@@ -156,15 +165,23 @@ def main() -> int:
     # for the only daily expects_output lane. That is the "headline feature
     # shipped dead in prod" shape this whole session exists to retire, committed
     # inside the fix for it. The count is now derived from the AUDIT RESULT.
+    #
+    # Presumed-unconvened meetings COUNT here. They are reported lines (the run
+    # produced them), and the registry marks this lane expects_output -- so a day
+    # whose only findings are five re-bucketed group-calendar blocks (the 9/7
+    # Labor-Day shape) would otherwise read outputs=0 and trip the very
+    # FIRED-BUT-WROTE-NOTHING alarm this count exists to make honest.
     findings_count = (
-        len(report.misses) + len(report.duplicates)
+        len(report.misses) + len(report.unconvened) + len(report.duplicates)
         + len(report.carve_out_breaches) + len(report.unmatched_transcripts)
     )
     run_marker.write("cowork-cora-meeting-capture-audit",
                      script="run_meeting_capture_audit.py", ok=True,
                      outputs=findings_count,
                      outcome="posted" if args.post else "dry_run",
-                     detail="scheduled=%s captured=%s" % (report.scheduled, report.captured))
+                     detail="scheduled=%s captured=%s missed=%s unconvened=%s" % (
+                         report.scheduled, report.captured,
+                         len(report.misses), len(report.unconvened)))
     return 0
 
 

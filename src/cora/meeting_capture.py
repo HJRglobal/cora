@@ -872,6 +872,22 @@ def execute_ensure(
 _TRANSCRIPT_LOOKBACK_DAYS = 1
 _TRANSCRIPT_LOOKAHEAD_DAYS = 2
 
+#: Organiser address suffix of a Google GROUP calendar (a shared team calendar,
+#: not a person). A recurring block on such a calendar is a standing placeholder:
+#: it lands on every subscriber's calendar whether or not anyone actually joins.
+#: On the 2026-09-07 (Labor Day) audit ALL five "missed" meetings were of this
+#: shape -- nobody convened them, and reporting them as MISSED accused the capture
+#: lane of a gap it never had.
+GROUP_CALENDAR_ORGANIZER_SUFFIX = "@group.calendar.google.com"
+
+#: The basis string recorded on a presumed-unconvened meeting. There is no Meet /
+#: Zoom audit-log read available today (no admin.reports scope, no Zoom API), so
+#: the ONLY evidence is structural: a group-calendar organiser and zero transcripts.
+#: That is a PRESUMPTION, not proof (measured live 2026-09-08: one group-calendar
+#: block that day WAS convened and captured), which is why the bucket is labelled
+#: "presumed" everywhere it surfaces and why the ids stay in the ledger.
+UNCONVENED_BASIS_GROUP_CALENDAR = "group-calendar-organizer"
+
 
 @dataclass
 class AuditedMeeting:
@@ -886,6 +902,10 @@ class AuditedMeeting:
     #: organised meeting has a different id on each invitee's calendar, and a
     #: transcript's cal_id may name any one of them.
     event_ids: list[str] = field(default_factory=list)
+    #: Why this meeting was bucketed as presumed unconvened rather than missed
+    #: (see UNCONVENED_BASIS_GROUP_CALENDAR). Empty on every other meeting. Every
+    #: re-bucketing carries its reason, exactly as every qualify_event skip does.
+    unconvened_basis: str = ""
 
 
 @dataclass
@@ -894,6 +914,11 @@ class AuditReport:
     scheduled: int = 0
     captured: int = 0
     misses: list[AuditedMeeting] = field(default_factory=list)
+    #: Scheduled, zero transcripts, but PRESUMED never convened (a group-calendar
+    #: placeholder block with no join evidence). Kept apart from `misses` so a
+    #: holiday of standing team blocks does not read as five capture failures --
+    #: and kept OUT of the clean-day criterion's veto, because nothing was missed.
+    unconvened: list[AuditedMeeting] = field(default_factory=list)
     duplicates: list[AuditedMeeting] = field(default_factory=list)
     unmatched_transcripts: list[dict[str, Any]] = field(default_factory=list)
     skipped: list[tuple[str, str]] = field(default_factory=list)
@@ -919,6 +944,23 @@ def _transcript_ts(t: dict[str, Any]) -> int:
     from cora.connectors.fireflies_connector import _parse_date
 
     return _parse_date(t.get("date")) or 0
+
+
+def presumed_unconvened_basis(event: dict[str, Any]) -> str:
+    """Why a scheduled-but-transcript-less meeting is PRESUMED unconvened, or "".
+
+    Deterministic and network-free: the organiser address is the one structural
+    fact a calendar event carries about whether it is a standing placeholder (a
+    shared team calendar) or a meeting a person actually called. This is only ever
+    consulted for a meeting with ZERO transcripts -- a group-calendar block that
+    produced a transcript was convened by definition and is captured, never
+    unconvened. Returns the basis string so the report can say WHY.
+    """
+    organizer = event.get("organizer") if isinstance(event.get("organizer"), dict) else {}
+    addr = ((organizer or {}).get("email") or "").strip().lower()
+    if addr.endswith(GROUP_CALENDAR_ORGANIZER_SUFFIX):
+        return UNCONVENED_BASIS_GROUP_CALENDAR
+    return ""
 
 
 def audit_day(
@@ -1108,7 +1150,17 @@ def audit_day(
         hits = by_meeting.get(key) or []
         meeting.transcript_ids = [h.get("id") or "" for h in hits]
         if not hits:
-            report.misses.append(meeting)
+            # The ONLY place a miss is decided. Zero transcripts is either a
+            # capture failure (MISSED) or a placeholder nobody joined (presumed
+            # UNCONVENED); the split lives here so no other path can re-bucket a
+            # meeting. A group-calendar meeting WITH a transcript never reaches
+            # this branch, so it can never be called unconvened.
+            basis = presumed_unconvened_basis(raw_events[key])
+            if basis:
+                meeting.unconvened_basis = basis
+                report.unconvened.append(meeting)
+            else:
+                report.misses.append(meeting)
         else:
             report.captured += 1
             if len(hits) > 1:
@@ -1305,7 +1357,8 @@ def render_report(report: AuditReport) -> str:
 
     lines.append(
         f"{report.scheduled} scheduled, {report.captured} captured, "
-        f"{len(report.misses)} missed, {len(report.duplicates)} duplicated"
+        f"{len(report.misses)} missed, {len(report.unconvened)} presumed unconvened, "
+        f"{len(report.duplicates)} duplicated"
         + (" _(partial -- see above)_" if degraded else "")
     )
 
@@ -1353,15 +1406,39 @@ def render_report(report: AuditReport) -> str:
         if len(report.skipped) > 10:
             lines.append(f"  _...and {len(report.skipped) - 10} more_")
 
+    if report.unconvened:
+        # Informational, below every alarm. These are standing group-calendar
+        # blocks nobody joined -- a presumption (no Meet/Zoom audit-log read exists
+        # today), so the heading says so. Title + organiser go through the same
+        # LEX rail as a miss: display_title already redacted, and the organiser
+        # was set to "withheld" alongside it.
+        lines.append(
+            f"\n*:white_circle: Presumed unconvened ({len(report.unconvened)})* "
+            "-- group-calendar blocks, no join evidence"
+        )
+        for m in sorted(report.unconvened, key=lambda x: x.start_label)[:15]:
+            lines.append(f"  - {m.start_label}  {_esc(m.title)}  _(organizer {_esc(m.organizer)})_")
+        if len(report.unconvened) > 15:
+            lines.append(f"  _...and {len(report.unconvened) - 15} more_")
+
+    # CLEAN-DAY CRITERION. Unconvened is deliberately NOT in this veto: a presumed
+    # placeholder nobody joined is not a capture failure. Misses, duplicates,
+    # unmatched captures, carve-out breaches and a degraded read all still are.
     if not (report.misses or report.duplicates or report.unmatched_transcripts
             or report.carve_out_breaches) and not degraded:
         # A weekend has no meetings, and "captured exactly once" over a denominator
         # of zero reads as a success it did not earn. This report posts every day.
-        lines.append(
-            "\n:white_check_mark: No qualifying roster meetings scheduled."
-            if report.scheduled == 0
-            else "\n:white_check_mark: Every scheduled meeting captured exactly once."
-        )
+        if report.scheduled == 0:
+            lines.append("\n:white_check_mark: No qualifying roster meetings scheduled.")
+        elif report.unconvened:
+            # "Every scheduled meeting captured" would be false here -- some were
+            # scheduled and not captured. Say what was actually established.
+            lines.append(
+                f"\n:white_check_mark: Every convened meeting captured exactly once "
+                f"({len(report.unconvened)} presumed unconvened)."
+            )
+        else:
+            lines.append("\n:white_check_mark: Every scheduled meeting captured exactly once.")
 
     if report.seat_note:
         lines.append(f"\n_{report.seat_note}_")
