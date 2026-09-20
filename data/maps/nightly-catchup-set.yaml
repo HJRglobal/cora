@@ -1,0 +1,112 @@
+# The NIGHTLY INGEST SET the missed-start catch-up lane watches (Code #13 slice 2,
+# cq-fb50c9e6c911). Read by src/cora/nightly_catchup.py + scripts/check_missed_nightly.py.
+#
+# WHY: on 2026-09-09 the host was down 00:27-06:18 AZ; every task with a trigger in
+# 02:00-06:10 AZ was lost, Task Scheduler replayed NONE of them (all carried
+# StartWhenAvailable=true), and the 08:45 health check saw nothing. The 9/10 set ran
+# normally, so the loss was one night -- but the estate had no missed-start catch-up.
+#
+# ORDER = the registered trigger time, ascending (the ruled order: mirror -> static
+# -> capture -> sweep is a subsequence of it; commit a7cf77e pins static-before-
+# capture; setup-session-capture-task.ps1 pins capture-after-the-KB-syncs).
+#
+# EVIDENCE that a task fired in its window (any ONE suffices):
+#   * a run marker (logs/task-runs.jsonl) for the task inside the window;
+#   * a run_hidden header `=== run_hidden <slug> | <UTC> UTC | <AZ> AZ ===` in
+#     logs/tasks/<slug>-<UTC date>.log whose AZ stamp falls inside the window;
+#   * Task Scheduler's own LastRunTime inside the window.
+#   Only cowork-cora-session-capture writes a marker today, so the header line is
+#   the load-bearing evidence for the other twelve.
+#
+# `command` is the FALLBACK child command (from the 2026-09-02/03 task XML backups);
+# the lane prefers the LIVE registered action (Get-ScheduledTask ... Actions[0]) with
+# the run_hidden prefix stripped, so setup-script drift can never re-run a stale
+# command. `max_minutes` bounds the synchronous wait per replay.
+#
+# `enabled: false` rows are CANDIDATES the 9/9 outage also lost but the kickoff did
+# not name (reconciliation is registered as the 8th 'kb sync' task; qbo-token-refresh
+# missing a night is a token-expiry risk; gap-autofill / info-for-cora are gated
+# lanes). Harrison flips them with one edit (Code #13 report ask block).
+window:
+  start_az: "06:00"
+  end_az: "12:00"
+  default_grace_min: 150
+  imminent_min: 20
+
+tasks:
+  - name: cowork-cora-kb-sync-slack
+    trigger_az: "02:00"
+    max_minutes: 60
+    command: 'cmd.exe /c cd /d "C:\Users\Harri\code\cora" & "C:\Users\Harri\code\cora\.venv\Scripts\python.exe" "C:\Users\Harri\code\cora\scripts\incremental_sync_slack.py"'
+  - name: cowork-cora-qbo-token-refresh
+    trigger_az: "02:00"
+    max_minutes: 30
+    enabled: false
+    command: 'C:\Users\Harri\code\cora\.venv\Scripts\python.exe "C:\Users\Harri\code\cora\scripts\qbo_oauth_flow.py" --refresh-all'
+    notes: "candidate -- lost on 9/9 too; a missed refresh is a token-expiry risk; Harrison's call"
+  - name: cowork-cora-kb-sync-gmail
+    trigger_az: "02:30"
+    max_minutes: 180
+    command: 'cmd.exe /c cd /d "C:\Users\Harri\code\cora" & "C:\Users\Harri\code\cora\.venv\Scripts\python.exe" "C:\Users\Harri\code\cora\scripts\gmail_threaded_sweep.py"'
+  - name: cowork-cora-kb-sync-asana
+    trigger_az: "03:00"
+    max_minutes: 60
+    command: 'cmd.exe /c cd /d "C:\Users\Harri\code\cora" & "C:\Users\Harri\code\cora\.venv\Scripts\python.exe" "C:\Users\Harri\code\cora\scripts\incremental_sync_asana.py"'
+  - name: cowork-cora-kb-sync-fireflies
+    trigger_az: "03:30"
+    max_minutes: 60
+    command: 'cmd.exe /c cd /d "C:\Users\Harri\code\cora" & "C:\Users\Harri\code\cora\.venv\Scripts\python.exe" "C:\Users\Harri\code\cora\scripts\incremental_sync_fireflies.py"'
+  - name: cowork-cora-claude-mirror
+    trigger_az: "03:45"
+    max_minutes: 30
+    command: 'C:\Users\Harri\code\cora\.venv\Scripts\python.exe "C:\Users\Harri\code\cora\scripts\mirror_claude_workspace.py" --apply'
+    notes: "second daily trigger 12:15 -- the window rule excludes it"
+  - name: cowork-cora-kb-sync-static
+    trigger_az: "04:00"
+    max_minutes: 60
+    command: 'cmd.exe /c cd /d "C:\Users\Harri\code\cora" & "C:\Users\Harri\code\cora\.venv\Scripts\python.exe" "C:\Users\Harri\code\cora\scripts\incremental_sync_static.py"'
+    notes: "second daily trigger 12:20; a7cf77e pins static-before-capture"
+  - name: cowork-cora-kb-sync-drive
+    trigger_az: "04:30"
+    max_minutes: 60
+    command: 'cmd.exe /c cd /d "C:\Users\Harri\code\cora" & "C:\Users\Harri\code\cora\.venv\Scripts\python.exe" "C:\Users\Harri\code\cora\scripts\incremental_sync_drive.py"'
+  - name: Cora - LEX Dump Folder Sync
+    trigger_az: "04:45"
+    max_minutes: 120
+    command: 'C:\Users\Harri\code\cora\.venv\Scripts\python.exe "C:\Users\Harri\code\cora\scripts\run_lex_dump_folder_sync.py"'
+  - name: cowork-cora-kb-sync-notion
+    trigger_az: "05:00"
+    max_minutes: 60
+    command: 'cmd.exe /c cd /d "C:\Users\Harri\code\cora" & "C:\Users\Harri\code\cora\.venv\Scripts\python.exe" "C:\Users\Harri\code\cora\scripts\incremental_sync_notion.py"'
+  - name: cowork-cora-session-capture
+    trigger_az: "05:15"
+    max_minutes: 60
+    command: 'C:\Users\Harri\code\cora\.venv\Scripts\python.exe "C:\Users\Harri\code\cora\scripts\run_session_capture.py" --with-kb'
+    notes: "second daily trigger 12:30; the only nightly task that writes a run marker today"
+  - name: cowork-cora-reconciliation
+    trigger_az: "05:30"
+    max_minutes: 120
+    enabled: false
+    command: 'cmd.exe /c cd /d "C:\Users\Harri\code\cora" & "C:\Users\Harri\code\cora\.venv\Scripts\python.exe" "C:\Users\Harri\code\cora\scripts\run_reconciliation.py"'
+    notes: "candidate -- registered by setup-kb-sync-tasks.ps1 as the 8th kb-sync task; self-bounded at 50 min; Harrison's call"
+  - name: Cora - Drive Materialization
+    trigger_az: "05:45"
+    max_minutes: 30
+    command: 'C:\Users\Harri\code\cora\.venv\Scripts\python.exe "C:\Users\Harri\code\cora\scripts\run_drive_materialization.py"'
+  - name: Cora - Drive Sweep
+    trigger_az: "06:00"
+    max_minutes: 180
+    command: 'C:\Users\Harri\code\cora\.venv\Scripts\python.exe "C:\Users\Harri\code\cora\scripts\run_drive_sweep.py" --with-slack'
+    notes: "registered ExecutionTimeLimit is unlimited (PT0S); the replay is bounded here. --with-slack posts the sweep summary -- a replay posts too (Harrison confirms this is fine, Code #13 report ask block)"
+  - name: cowork-cora-info-for-cora-sweep
+    trigger_az: "06:05"
+    max_minutes: 20
+    enabled: false
+    command: 'C:\Users\Harri\code\cora\.venv\Scripts\python.exe "C:\Users\Harri\code\cora\scripts\run_info_for_cora_sweep.py"'
+    notes: "candidate -- gated lane; Harrison's call"
+  - name: cowork-cora-gap-autofill
+    trigger_az: "06:10"
+    max_minutes: 60
+    enabled: false
+    command: 'C:\Users\Harri\code\cora\.venv\Scripts\python.exe "C:\Users\Harri\code\cora\scripts\run_gap_autofill.py"'
+    notes: "candidate -- gated lane (proposals to the 07:00 review); Harrison's call"

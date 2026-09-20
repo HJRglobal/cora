@@ -149,3 +149,7 @@ run_markers:
     cadence_hours: 12         # 05:15 + 12:30 AZ (midday trigger since 2026-09-03)
     expects_output: false     # a window with no closed sessions legitimately writes 0 notes
     registered: 2026-09-08T00:00:00+00:00   # marker adopted by the ingest-integrity bundle (I2)
+  - name: Cora - Missed Nightly Catch-Up
+    cadence_hours: 24         # daily 08:30 AZ (Code #13 slice 2; deployment/setup-missed-nightly-catchup-task.ps1)
+    expects_output: false     # a night where every task fired legitimately replays 0 tasks
+    registered: 2026-09-19T00:00:00+00:00   # the marker WARNs 'never recorded' until Harrison registers the task -- that is the reminder

@@ -62,12 +62,17 @@ def write(
     outcome: str = "",
     detail: str = "",
     elapsed_s: float | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> bool:
     """Append one run marker. Returns True on success.
 
     `outputs` MUST be the count of things actually written or sent -- files
     created, messages posted, rows persisted. Passing a constant defeats the
     entire contract: the alarm this enables is "fired, exited 0, wrote nothing".
+
+    `extra` (Code #13 slice 2): additional JSON-safe fields merged AFTER the fixed
+    keys -- a fixed key is never overridden, so a caller cannot forge `ok` or
+    `outputs`. The catch-up lane rides `catch_up: true` + the window it covered.
 
     Never raises. A marker write must not be able to fail a real lane.
     """
@@ -86,6 +91,15 @@ def write(
             row["elapsed_s"] = round(float(elapsed_s), 2)
         except (TypeError, ValueError):
             pass
+    if isinstance(extra, dict):
+        for k, v in extra.items():
+            if k in row or not isinstance(k, str):
+                continue
+            try:
+                json.dumps(v)
+            except (TypeError, ValueError):
+                v = str(v)
+            row[k] = v
     path = ledger_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)

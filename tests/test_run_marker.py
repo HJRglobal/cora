@@ -187,6 +187,8 @@ class TestRegistryAndWiring:
             "Cora - F3E Blog Pipeline": "scripts/run_f3e_blog_pipeline.py",
             # ingest-integrity I2 (2026-09-08): the harvester adopted the marker
             "cowork-cora-session-capture": "scripts/run_session_capture.py",
+            # Code #13 slice 2: the missed-nightly catch-up lane
+            "Cora - Missed Nightly Catch-Up": "scripts/check_missed_nightly.py",
         }
         for entry in data.get("run_markers") or []:
             path = scripts.get(entry["name"])

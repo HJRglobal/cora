@@ -418,6 +418,9 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     # redirect in the SAME commit that introduces it, or the next suite run is
     # what discovers the omission -- by writing to it.
     monkeypatch.setenv("TASK_RUNS_LEDGER_PATH", str(tmp_path / "task-runs.jsonl"))
+    # Code #13 slice 2: the missed-nightly catch-up lane's own ledger (redirected
+    # in the SAME commit that introduced the writer, per the S4 doctrine above).
+    monkeypatch.setenv("NIGHTLY_CATCHUP_LEDGER_PATH", str(tmp_path / "nightly-catchup.jsonl"))
     # Found by WIDENING the isolation rail's suffix list to include *_LEDGER
     # (session #11 S4). Both were live, unredirected write paths that the
     # PATH/DIR/ROOT-only scanner could not see -- and decision_inbox has TWO env
@@ -575,6 +578,8 @@ _GUARDED_LEDGERS = (
     "data/state/code-queue-menu-runs.jsonl",
     "data/state/mechanical-batch-card.json",
     "data/state/egress-rails-armed.json",
+    # Code #13 slice 2: the missed-nightly catch-up ledger (writer: scripts/check_missed_nightly.py).
+    "logs/nightly-catchup.jsonl",
 )
 
 
