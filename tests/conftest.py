@@ -259,6 +259,15 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "MEETING_ASK_STATE_PATH", str(tmp_path / "meeting-ask-pending.json")
     )
+    # Code #13 slice 5 (cq-7a724ee43964): the meeting-recap card store (append-only
+    # events) + its send ledger. Both resolve per call; both born with their
+    # redirect in the same change, per the session-#11 S4 rule.
+    monkeypatch.setenv(
+        "MEETING_RECAP_PENDING_PATH", str(tmp_path / "meeting-recap-pending.jsonl")
+    )
+    monkeypatch.setenv(
+        "MEETING_RECAP_LEDGER_PATH", str(tmp_path / "meeting-recap-ledger.jsonl")
+    )
     # F3E blog publish lane (cq-2577936d2809). CORA_DRIVE_ROOT is the important
     # one and it is here because it ALREADY BIT: a publish-card tap advances the
     # human editorial backlog row on Drive, and a card test that set a
@@ -555,6 +564,9 @@ _GUARDED_LEDGERS = (
     "data/state/meeting_action_watermark.json",
     "data/state/meeting-ask-pending.json",
     "data/state/meeting-ask-watermark.json",
+    # Code #13 slice 5: the recap card store + its per-recipient send ledger.
+    "data/state/meeting-recap-pending.jsonl",
+    "logs/meeting-recap-ledger.jsonl",
     # One Cora capture lane (cq-ffcf6e4ffe7c). Both the ensure lane and the daily
     # auditor append here, so an unredirected test would write real rows.
     "logs/meeting-capture-ledger.jsonl",

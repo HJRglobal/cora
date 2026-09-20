@@ -628,12 +628,26 @@ def _s3_affordance_line() -> str:
         return ""
 
 
+def _recap_affordance_line() -> str:
+    """Code #13 slice 5: the meeting-recap card's footer, same registration
+    contract (and the same silent-failure cost) as `_s3_affordance_line`."""
+    try:
+        from .meeting_recap import AFFORDANCE_LINE  # noqa: PLC0415
+        return AFFORDANCE_LINE
+    except Exception:  # noqa: BLE001 -- a strip list must never fail to build
+        log.error("knowledge_review: recap affordance line unavailable -- resolved "
+                  "meeting-recap cards will keep advertising their buttons",
+                  exc_info=True)
+        return ""
+
+
 _CARD_AFFORDANCE_LINES = tuple(x for x in (
     "\U0001F44D Approve \u00b7 \U0001F44E Dismiss  (or tap a button below)",
     "\U0001F44D Accept \u00b7 \U0001F44E Dismiss  (or tap a button below)",
     _MECH_AFFORDANCE_DOES,
     _MECH_AFFORDANCE_HANDOFF,
     _s3_affordance_line(),
+    _recap_affordance_line(),
 ) if x)
 
 # D-051: THE FIRST CUT OF THIS STRIP WAS DEAD IN PRODUCTION.

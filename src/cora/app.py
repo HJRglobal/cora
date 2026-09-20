@@ -32,6 +32,7 @@ from . import feedback_log
 from . import help_responder
 from . import knowledge_review
 from . import meeting_asks
+from . import meeting_recap
 from . import missed_message_catchup as missed_catchup
 from .revops import cards as revops_cards
 from . import intent_classifier as ic
@@ -4845,6 +4846,86 @@ def handle_meeting_ask_accept(ack, body, client) -> None:
 def handle_meeting_ask_dismiss(ack, body, client) -> None:
     ack()
     _handle_meeting_ask_tap(body, client, accept=False)
+
+
+# ── Meeting recap cards (Code #13 slice 5, cq-7a724ee43964) ─────────────────
+#
+# One propose-only card to a captured meeting's ORGANIZER; the tap DMs the
+# recap to the INTERNAL attendees frozen into the record at card time. External
+# attendees are never recipients under any path, and a LEX card only ever names
+# PHI custodians (D-145). Authority is the addressee, decided in
+# `meeting_recap.claim_for_tap` -- the same "is this card addressed to you"
+# question the meeting-ask sibling answers, kept out of `review_lanes` so D-011
+# stays structurally untouched.
+
+def _handle_meeting_recap_tap(body: dict, client, *, share: bool) -> None:
+    try:
+        actions = body.get("actions") or []
+        recap_id = (actions[0].get("value") if actions else "") or ""
+        actor_id = (body.get("user") or {}).get("id", "")
+        channel_id = (body.get("channel") or {}).get("id", "")
+        message_ts = (body.get("message") or {}).get("ts", "")
+
+        if os.environ.get("CORA_EVAL_MODE") == "1":
+            return
+
+        # Atomic: the record comes back ALREADY CLAIMED, so a second fast tap
+        # cannot also fan out (two DMs per recipient from one card).
+        rec, refusal = meeting_recap.claim_for_tap(recap_id, actor_id)
+        if rec is None:
+            # Honest refusal in the thread, card untouched: it may be somebody
+            # else's, and rewriting it would tell them a stranger resolved it.
+            try:
+                client.chat_postMessage(channel=channel_id, thread_ts=message_ts,
+                                        text=refusal)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("meeting-recap refusal post failed: %s", exc)
+            return
+
+        if not share:
+            meeting_recap.mark_dismissed(rec)
+            outcome = meeting_recap.outcome_text(rec, sent=0, failed=0, dismissed=True)
+            resolved = True
+        else:
+            sent, failed, resolved = meeting_recap.process_share(rec, client)
+            outcome = meeting_recap.outcome_text(rec, sent=sent, failed=failed)
+
+        # A partial fan-out keeps its buttons: the row is back to PENDING with
+        # the delivered recipients recorded, so a retry reaches only the rest.
+        # The thread note narrates exactly what the ledger shows.
+        if not resolved:
+            try:
+                client.chat_postMessage(channel=channel_id, thread_ts=message_ts,
+                                        text=outcome)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("meeting-recap retry note failed: %s", exc)
+            return
+
+        # C4: strip the registered affordance, drop the buttons, append the
+        # outcome. Shared helper; the footer is registered in
+        # knowledge_review._CARD_AFFORDANCE_LINES or this strip is a no-op.
+        try:
+            orig = (body.get("message") or {}).get("blocks") or []
+            client.chat_update(
+                channel=channel_id, ts=message_ts, text=outcome,
+                blocks=knowledge_review.terminal_card_blocks(orig, outcome),
+            )
+        except Exception as exc:  # noqa: BLE001 -- cosmetic; the sends already happened
+            log.warning("meeting-recap card edit failed: %s", exc)
+    except Exception:  # noqa: BLE001 -- a handler error must never crash the bot
+        log.warning("meeting-recap tap handler error (non-fatal)", exc_info=True)
+
+
+@app.action(meeting_recap.ACTION_SHARE)
+def handle_meeting_recap_share(ack, body, client) -> None:
+    ack()
+    _handle_meeting_recap_tap(body, client, share=True)
+
+
+@app.action(meeting_recap.ACTION_DISMISS)
+def handle_meeting_recap_dismiss(ack, body, client) -> None:
+    ack()
+    _handle_meeting_recap_tap(body, client, share=False)
 
 
 @app.action(gap_autofill.ACTION_DECLINE_NOT_MINE)

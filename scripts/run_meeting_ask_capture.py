@@ -67,6 +67,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
 
 from cora import meeting_asks  # noqa: E402
+from cora import meeting_recap  # noqa: E402
 from cora.connectors import fireflies_connector as ffc  # noqa: E402
 from cora.connectors import fireflies_diarization as ffd  # noqa: E402
 
@@ -89,44 +90,59 @@ _DEFAULT_LOOKBACK_HOURS = 24
 #: about. Verified against the live schema by introspection: `Sentence` exposes
 #: index, speaker_name, speaker_id, raw_text, start_time, end_time, ai_filters,
 #: text.
-_ASK_QUERY = """
-query AskScan($limit: Int, $skip: Int, $fromDate: DateTime, $toDate: DateTime) {
-  transcripts(limit: $limit, skip: $skip, fromDate: $fromDate, toDate: $toDate) {
+#:
+#: The recap card (Code #13 slice 5) reads `transcript_url` and the `summary`
+#: block from THIS query -- every one of those field names is taken verbatim from
+#: `fireflies_connector._TRANSCRIPTS_QUERY`, which runs live nightly, and a test
+#: pins that containment. Nothing is guessed: one unknown field would take the S3
+#: ask lane dark along with the recap.
+_RECAP_FIELDS = """
+    transcript_url
+    summary {
+      overview
+      short_summary
+      gist
+      action_items
+    }"""
+
+_ASK_QUERY = f"""
+query AskScan($limit: Int, $skip: Int, $fromDate: DateTime, $toDate: DateTime) {{
+  transcripts(limit: $limit, skip: $skip, fromDate: $fromDate, toDate: $toDate) {{
     id
     title
     date
     duration
     organizer_email
     host_email
-    participants
-    sentences {
+    participants{_RECAP_FIELDS}
+    sentences {{
       index
       speaker_name
       text
       start_time
-    }
-    meeting_attendees {
+    }}
+    meeting_attendees {{
       displayName
       email
-    }
-  }
-}
+    }}
+  }}
+}}
 """
 
-_ASK_QUERY_BY_ID = """
-query AskScanOne($id: String!) {
-  transcript(id: $id) {
+_ASK_QUERY_BY_ID = f"""
+query AskScanOne($id: String!) {{
+  transcript(id: $id) {{
     id
     title
     date
     duration
     organizer_email
     host_email
-    participants
-    sentences { index speaker_name text start_time }
-    meeting_attendees { displayName email }
-  }
-}
+    participants{_RECAP_FIELDS}
+    sentences {{ index speaker_name text start_time }}
+    meeting_attendees {{ displayName email }}
+  }}
+}}
 """
 
 
@@ -463,6 +479,53 @@ def _post_card(client, slack_id: str, rec: dict, text: str) -> bool:
         return False
 
 
+def process_recap(transcript: dict, *, dry_run: bool,
+                  email_to_slack: dict[str, str], client=None) -> dict:
+    """Offer this transcript's recap to its organizer as ONE propose-only card
+    (Code #13 slice 5). Independent of the ask scan: a meeting with no spoken
+    ask still gets its recap card, and a meeting the ask lane excluded gets
+    nothing here either -- `_excluded` is re-run as a belt so this function is
+    safe to call alone.
+
+    Sends nothing to attendees. The organizer's tap (bot-side handler) does that,
+    to the recipient ids FROZEN into the record here.
+    """
+    out = {"carded": 0, "skipped": "", "excluded": ""}
+    reason = _excluded(transcript)
+    if reason:
+        out["excluded"] = reason
+        return out
+
+    entity = _entity_for(transcript)
+    health = ffd.assess(transcript)
+    rec, skip = meeting_recap.prepare_card(
+        transcript,
+        entity=entity,
+        email_to_slack=email_to_slack,
+        attribution_unreliable=bool(health.collapsed),
+        meeting_date=_meeting_date(transcript),
+    )
+    if rec is None:
+        out["skipped"] = skip
+        if skip and skip != "already carded":
+            print(f"  recap: SKIP ({skip})")
+        return out
+
+    if dry_run:
+        # Slack ids only in this print -- never an attendee address.
+        print(f"  recap: WOULD CARD -> {rec['addressee_id']} "
+              f"({len(rec['recipients'])} recipient(s), state={rec['state']})")
+        print("  " + meeting_recap.build_card_text(rec).replace("\n", "\n  "))
+        out["carded"] = 1
+        return out
+
+    if meeting_recap.post_card(client, rec):
+        out["carded"] = 1
+    else:
+        out["skipped"] = "organizer card post failed (will retry next run)"
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dry-run", action="store_true",
@@ -505,7 +568,7 @@ def main(argv: list[str] | None = None) -> int:
 
     email_to_slack = ffc._load_email_to_slack()
     totals = {"asks": 0, "carded": 0, "skipped_dup": 0, "no_recipient": 0,
-              "overflow": 0, "phi_skipped": 0, "excluded": 0}
+              "overflow": 0, "phi_skipped": 0, "excluded": 0, "recap_carded": 0}
     for t in transcripts:
         title = (t.get("title") or "").strip() or "(untitled)"
         print(f"- {title}")
@@ -514,6 +577,12 @@ def main(argv: list[str] | None = None) -> int:
         if res["excluded"]:
             print(f"  excluded: {res['excluded']}")
             totals["excluded"] += 1
+        else:
+            # The recap card rides the same poll and the same exclusions. An
+            # excluded meeting gets neither product.
+            rres = process_recap(t, dry_run=args.dry_run,
+                                 email_to_slack=email_to_slack, client=client)
+            totals["recap_carded"] += rres["carded"]
         for k in ("asks", "carded", "skipped_dup", "no_recipient", "overflow",
                   "phi_skipped"):
             totals[k] += res[k]
@@ -525,7 +594,8 @@ def main(argv: list[str] | None = None) -> int:
           f"{totals['skipped_dup']} already carded, "
           f"{totals['no_recipient']} unaddressable, "
           f"{totals['phi_skipped']} PHI-skipped, "
-          f"{totals['overflow']} over cap, {totals['excluded']} meeting(s) excluded")
+          f"{totals['overflow']} over cap, {totals['excluded']} meeting(s) excluded, "
+          f"{totals['recap_carded']} recap card(s)")
     return 0
 
 
