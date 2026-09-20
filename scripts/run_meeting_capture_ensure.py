@@ -68,13 +68,24 @@ _STRUCTURAL_SKIPS = ("not-a-meeting", "no-meeting-link", "cancelled",
 #: RSVP sub-step outcomes that earn an `rsvp-accept` ledger row. An accept is a
 #: real write; an error is a failure to diagnose; notetaker-present is the
 #: one-mechanism rule firing AFTER a guest-add (a second bot was averted). The
-#: rest -- already-accepted, lex-withheld, no-roster-copy -- are re-derived every
-#: 15 minutes and would be pure ledger growth.
+#: rest -- already-accepted, no-roster-copy -- are re-derived every 15 minutes
+#: and would be pure ledger growth.
 _RSVP_LEDGERED = ("accepted", "error", "skipped:notetaker-present")
+
+#: lex-withheld is the one skip that leaves cora@ GUEST-ADDED but never joining
+#: (R1 withhold on a LEX event). Invisible, that class reads as a clean guest-add
+#: and surfaces only as a next-day auditor miss (Code #13 review, C2-1). It is
+#: ledgered ONCE -- on the run whose guest-add landed (`applied`), the write whose
+#: consequence it is -- not on the `none` row that re-derives it every cycle
+#: afterwards (that would be the ~96 rows/day growth the block above is costed
+#: against).
+_RSVP_LEDGERED_ONCE_ON_APPLY = ("skipped:lex-withheld",)
 
 
 def _rsvp_ledger_worthy(act: mc.EnsureAction) -> bool:
-    return act.rsvp in _RSVP_LEDGERED
+    if act.rsvp in _RSVP_LEDGERED:
+        return True
+    return act.rsvp in _RSVP_LEDGERED_ONCE_ON_APPLY and act.applied
 
 
 def _action_row_worthy(act: mc.EnsureAction) -> bool:

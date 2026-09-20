@@ -105,8 +105,26 @@ CAPTURE_IDENTITIES: frozenset[str] = frozenset({
 #: there is no background sweep because an untapped card costs nothing.
 TTL_DAYS = 7
 
+#: A CLAIMED row is a LEASE, not a lock. The claim is written before the fan-out
+#: and the final `_set_state` after it; a bot kill (a routine elevated restart) or
+#: a disk error in between leaves the row CLAIMED with nothing to move it on, and
+#: every later tap would be refused forever (D-051 review, Code #13 C-3). After
+#: this many seconds a CLAIMED row is reclaimable: the tap treats it as PENDING and
+#: records the reclaim as a `state` event so the fold stays honest. The retry is
+#: safe because idempotency is per recipient (`sent_to`), never per card.
+CLAIM_LEASE_SECONDS = 300
+
+#: Fireflies lists a transcript BEFORE its summary is generated, so an all-empty
+#: `summary` block at first sighting is usually "not yet", not "never". Recording
+#: NO_SUMMARY (terminal) and DMing the organizer on that first sighting loses the
+#: card for good once the summary lands (D-051 review, Code #13 C-4). A transcript
+#: younger than this, by its own Fireflies date, is left alone -- no ledger write,
+#: no DM -- so the next poll can card it.
+NO_SUMMARY_GRACE_SECONDS = 3600
+
 STATE_PENDING = "PENDING"
-#: Held between `claim_for_tap` and the fan-out result. NOT terminal.
+#: Held between `claim_for_tap` and the fan-out result. NOT terminal, and only a
+#: LEASE (see CLAIM_LEASE_SECONDS).
 STATE_CLAIMED = "CLAIMED"
 STATE_SHARED = "SHARED"
 STATE_DISMISSED = "DISMISSED"
@@ -140,6 +158,55 @@ _MAX_TITLE_CHARS = 200
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _slack_field(resp: Any, *keys: str) -> str:
+    """Read a nested field off a Slack API response WITHOUT a dict type guard.
+
+    A live `slack_sdk.WebClient` returns `SlackResponse`, which is NOT a dict
+    subclass but supports `.get` -- the `isinstance(x, dict)` guard this replaced
+    read every live response as empty, so both send paths raised
+    'conversations_open returned no channel id' forever while every test passed
+    on dict-shaped fakes (D-051 review, Code #13 C-1). Reads through `.get` on
+    whatever came back; anything unreadable is "".
+    """
+    cur: Any = resp
+    for key in keys:
+        if cur is None:
+            return ""
+        getter = getattr(cur, "get", None)
+        if not callable(getter):
+            return ""
+        try:
+            cur = getter(key)
+        except Exception:  # noqa: BLE001
+            return ""
+    if cur is None or isinstance(cur, (dict, list, tuple)):
+        return ""
+    return str(cur)
+
+
+def transcript_age_seconds(transcript: dict | None,
+                           now: datetime | None = None) -> float | None:
+    """Seconds since the transcript's own Fireflies `date` (Unix ms, Unix s, or
+    ISO string -- the connector's `_parse_date` shapes, re-read here so this
+    module does not import the network connector). None when the date is
+    missing or unreadable: the caller must treat "unknown age" as NOT old."""
+    raw = (transcript or {}).get("date")
+    ts: float | None = None
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        ts = float(raw)
+        if ts > 32503680000:          # past year 3000 in seconds -> milliseconds
+            ts = ts / 1000.0
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            ts = datetime.fromisoformat(raw.strip().replace("Z", "+00:00")).timestamp()
+        except Exception:  # noqa: BLE001
+            ts = None
+    if ts is None:
+        return None
+    now_dt = now or datetime.now(timezone.utc)
+    return now_dt.timestamp() - ts
 
 
 # ── Paths (resolved PER CALL -- a module constant reading os.environ is the
@@ -496,6 +563,18 @@ def expired(rec: dict, now: datetime | None = None) -> bool:
         return True
 
 
+def claim_lease_lapsed(rec: dict, now: datetime | None = None) -> bool:
+    """Has a CLAIMED row outlived CLAIM_LEASE_SECONDS since `claimed_at`? An
+    unparseable or missing stamp reads as LAPSED: a claim nobody can date is a
+    claim nobody is honouring, and the retry is per-recipient idempotent."""
+    now = now or datetime.now(timezone.utc)
+    try:
+        claimed = datetime.fromisoformat(str(rec.get("claimed_at") or ""))
+    except Exception:  # noqa: BLE001
+        return True
+    return (now - claimed) > timedelta(seconds=CLAIM_LEASE_SECONDS)
+
+
 def _set_state(recap_id: str, state: str, **fields) -> None:
     payload = {"state": state}
     payload.update(fields)
@@ -522,14 +601,26 @@ def claim_for_tap(recap_id: str, actor_id: str, *,
             return None, "There was no recap to share on this one -- nothing to do."
         if state in _TERMINAL:
             return None, f"Already handled ({state.lower()}) -- nothing more to do."
-        if state == STATE_CLAIMED:
-            return None, "I'm sending that one already -- give me a second."
+        # Expiry is checked BEFORE the CLAIMED refusal: a row wedged CLAIMED by a
+        # crash must still age out honestly rather than say "sending" for ever.
         if expired(rec, now):
             _set_state(rec["recap_id"], STATE_EXPIRED, resolved_at=_now_iso())
             _ledger(EVENT_EXPIRED, rec)
             return None, (f"This card aged out after {TTL_DAYS} days, so I didn't "
                           "send anything. Ask me for the meeting's summary if you "
                           "still want it.")
+        if state == STATE_CLAIMED:
+            if not claim_lease_lapsed(rec, now):
+                return None, "I'm sending that one already -- give me a second."
+            # The lease lapsed: the fan-out that held this claim died between the
+            # claim and its final state write. Reclaim it as PENDING -- written as
+            # a `state` event so the log shows the recovery -- and let THIS tap act.
+            # The per-recipient `sent_to` makes the retry reach only the remainder.
+            _set_state(rec["recap_id"], STATE_PENDING, reclaimed_at=_now_iso(),
+                       reclaimed_from=STATE_CLAIMED)
+            rec["state"] = STATE_PENDING
+            log.warning("meeting_recap: reclaimed a CLAIMED card past its %ss lease (%s)",
+                        CLAIM_LEASE_SECONDS, rec["recap_id"])
         addressee = str(rec.get("addressee_id") or "")
         if not addressee or (actor and actor != addressee):
             return None, ("This card was addressed to someone else, so I've left "
@@ -718,8 +809,8 @@ def process_share(rec: dict, client) -> tuple[int, int, bool]:
             continue
         try:
             opened = client.conversations_open(users=[sid])
-            channel = ((opened.get("channel") or {}).get("id") if isinstance(opened, dict)
-                       else "") or ""
+            # No dict type guard: a live WebClient returns SlackResponse (C-1).
+            channel = _slack_field(opened, "channel", "id")
             if not channel:
                 raise RuntimeError("conversations_open returned no channel id")
             resp = client.chat_postMessage(channel=channel, text=text, blocks=blocks,
@@ -727,7 +818,7 @@ def process_share(rec: dict, client) -> tuple[int, int, bool]:
             sent_to.add(sid)
             _append_event(recap_id, EVENT_SENT, {"sent_to": sorted(sent_to)})
             _ledger(EVENT_SENT, rec, recipient_id=sid,
-                    dm_message_ts=str((resp or {}).get("ts") or "") if isinstance(resp, dict) else "")
+                    dm_message_ts=_slack_field(resp, "ts"))
         except Exception as exc:  # noqa: BLE001
             failed += 1
             _ledger(EVENT_SEND_FAILED, rec, recipient_id=sid, error=str(exc)[:200])
@@ -752,20 +843,34 @@ def prepare_card(
     attribution_unreliable: bool,
     meeting_date: str,
     custodian_loader: Callable[[], frozenset[str]] | None = None,
+    now: datetime | None = None,
 ) -> tuple[dict | None, str]:
     """Decide whether this transcript gets a recap card and build its record.
     (record, skip_reason). PURE apart from roster/org-roles/custodian reads.
 
     Skips (no card, nothing persisted): already carded; LEX with an empty
     custodian set; no internal recipient AND a non-empty recap (a card with
-    nobody to share with is noise); a non-LEX body that trips the PHI screen.
-    A recap-less meeting still gets its "nothing to share" card once.
+    nobody to share with is noise); a non-LEX body that trips the PHI screen;
+    an EMPTY summary on a transcript younger than NO_SUMMARY_GRACE_SECONDS
+    ("summary pending" -- Fireflies lists a transcript before it summarises it,
+    and a terminal NO_SUMMARY written then would lose the card for good, C-4).
+    A recap-less meeting past that grace still gets its "nothing to share" card
+    once.
     """
     recap_id = str(transcript.get("id") or "")
     if not recap_id:
         return None, "no transcript id"
     if already_carded(recap_id):
         return None, "already carded"
+
+    recap = extract_recap(transcript)
+    if recap_is_empty(recap):
+        age = transcript_age_seconds(transcript, now)
+        # Unknown age reads as NOT old: the only irreversible act here is the
+        # terminal NO_SUMMARY write + organizer DM, so an undatable transcript
+        # stays "pending" rather than being declared summary-less.
+        if age is None or age < NO_SUMMARY_GRACE_SECONDS:
+            return None, "summary pending"
 
     is_lex = str(entity or "").upper().startswith("LEX")
     custodians: frozenset[str] | None = None
@@ -781,7 +886,6 @@ def prepare_card(
         if not custodians:
             return None, "LEX meeting with no PHI custodians configured -- no card"
 
-    recap = extract_recap(transcript)
     if not is_lex and not recap_is_empty(recap):
         if phi_flagged(f"{recap['overview']}\n{recap['action_items']}"):
             return None, "recap body tripped the PHI screen -- not carded"
@@ -809,14 +913,13 @@ def post_card(client, rec: dict) -> bool:
     fallback, blocks = build_card_blocks(rec)
     try:
         opened = client.conversations_open(users=[rec["addressee_id"]])
-        channel = ((opened.get("channel") or {}).get("id") if isinstance(opened, dict)
-                   else "") or ""
+        # No dict type guard: a live WebClient returns SlackResponse (C-1).
+        channel = _slack_field(opened, "channel", "id")
         if not channel:
             raise RuntimeError("conversations_open returned no channel id")
         resp = client.chat_postMessage(channel=channel, text=fallback, blocks=blocks,
                                        unfurl_links=False, unfurl_media=False)
-        record_card(rec, dm_channel_id=channel,
-                    card_message_ts=str((resp or {}).get("ts") or "") if isinstance(resp, dict) else "")
+        record_card(rec, dm_channel_id=channel, card_message_ts=_slack_field(resp, "ts"))
         return True
     except Exception as exc:  # noqa: BLE001
         log.warning("meeting_recap: organizer card to %s failed: %s", rec.get("addressee_id"), exc)

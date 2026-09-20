@@ -56,6 +56,7 @@ import argparse
 import dataclasses
 import inspect
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -217,6 +218,59 @@ def _slice5_present() -> str | None:
     rk = (_REPO_ROOT / "scripts" / "run_meeting_ask_capture.py").read_text(encoding="utf-8")
     if "def process_recap(" not in rk or "meeting_recap.prepare_card(" not in rk:
         return "slice 5 recap card not produced by the meeting-ask capture run"
+    # BEHAVIOUR (D-051 review C-1): a live WebClient returns SlackResponse, which is
+    # NOT a dict subclass. Every symbol above was present while the lane was dead in
+    # prod because post_card read a non-dict response as "no channel id". The card
+    # must POST and RECORD against a non-dict Mapping response. The probe redirects
+    # both card write paths to a throwaway dir -- it never touches the real store.
+    from collections.abc import Mapping
+
+    class _NonDictResponse(Mapping):
+        def __init__(self, data: dict):
+            self._d = dict(data)
+
+        def __getitem__(self, key):
+            return self._d[key]
+
+        def __iter__(self):
+            return iter(self._d)
+
+        def __len__(self):
+            return len(self._d)
+
+    class _ProbeClient:
+        def conversations_open(self, users):
+            return _NonDictResponse({"ok": True, "channel": {"id": "D-probe-slice5"}})
+
+        def chat_postMessage(self, **kw):
+            return _NonDictResponse({"ok": True, "ts": "1.1"})
+
+    probe_id = "probe-slice5-recap"
+    rec = {
+        "recap_id": probe_id, "transcript_id": probe_id,
+        "meeting_title": "probe", "meeting_date": "2026-01-01", "entity": "F3E",
+        "is_lex": False, "overview": "probe overview", "action_items": "",
+        "transcript_url": "", "recipients": ["U0PROBE00001"], "attendee_count": 2,
+        "addressee_id": "U0PROBE00000", "routing_reason": "",
+        "attribution_unreliable": False, "sent_to": [], "state": mr.STATE_PENDING,
+    }
+    keys = ("MEETING_RECAP_PENDING_PATH", "MEETING_RECAP_LEDGER_PATH")
+    saved = {k: os.environ.get(k) for k in keys}
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["MEETING_RECAP_PENDING_PATH"] = str(Path(td) / "pending.jsonl")
+        os.environ["MEETING_RECAP_LEDGER_PATH"] = str(Path(td) / "ledger.jsonl")
+        try:
+            posted = bool(mr.post_card(_ProbeClient(), rec))
+            stored = mr.get_record(probe_id) or {}
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+    if not posted or stored.get("dm_channel_id") != "D-probe-slice5" or stored.get("card_message_ts") != "1.1":
+        return ("slice 5 post_card does not deliver against a non-dict (SlackResponse-shaped) "
+                "client -- the dict type guard that killed the lane in prod is back")
     return None
 
 

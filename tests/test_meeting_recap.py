@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -839,3 +840,105 @@ def test_main_loop_calls_the_recap_hook_only_for_non_excluded_meetings():
     assert "process_recap(" in loop
     assert loop.index('if res["excluded"]:') < loop.index("process_recap(")
     assert "else:" in loop[loop.index('if res["excluded"]:'):loop.index("process_recap(")]
+
+
+# ── D-051 adversarial review (Code #13, group C) regression pins ────────────
+
+class _SlackResponseClient(_FakeClient):
+    """A client whose responses are REAL `slack_sdk` SlackResponse objects: NOT a
+    dict subclass, but `.get`-readable -- the exact live shape the removed
+    `isinstance(x, dict)` guard read as empty (C-1)."""
+
+    def _wrap(self, data: dict):
+        from slack_sdk.web.slack_response import SlackResponse
+        return SlackResponse(client=None, http_verb="POST", api_url="https://slack.test/api",
+                             req_args={}, data=data, headers={}, status_code=200)
+
+    def conversations_open(self, users):
+        return self._wrap(super().conversations_open(users))
+
+    def chat_postMessage(self, **kw):
+        return self._wrap(super().chat_postMessage(**kw))
+
+
+def test_c1_post_card_and_share_deliver_against_a_real_slack_response():
+    """C-1: `WebClient.conversations_open` returns SlackResponse, not a dict. With
+    the dict guard the channel read as "" and BOTH send paths raised forever
+    ('organizer card post failed (will retry next run)' every 15 minutes). The
+    card must post and record channel + ts, and the share must fan out."""
+    client = _SlackResponseClient()
+    assert not isinstance(client.conversations_open([ORGANIZER_ID]), dict)
+    rec, skip = _prepare()
+    assert rec is not None, skip
+    assert mr.post_card(client, rec) is True
+    stored = mr.get_record(rec["recap_id"])
+    assert stored["state"] == mr.STATE_PENDING
+    assert stored["dm_channel_id"] == f"D-{ORGANIZER_ID}"
+    assert stored["card_message_ts"] == "999.9"
+    claimed, refusal = mr.claim_for_tap(rec["recap_id"], ORGANIZER_ID)
+    assert claimed is not None, refusal
+    sent, failed, resolved = mr.process_share(claimed, client)
+    assert (sent, failed, resolved) == (1, 0, True)
+    assert mr.get_record(rec["recap_id"])["state"] == mr.STATE_SHARED
+    assert '"dm_message_ts": "999.9"' in _ledger_text()
+    assert "no channel id" not in _ledger_text()
+
+
+def test_c3_a_claim_wedged_past_its_lease_is_reclaimed_and_the_tap_acts():
+    """C-3: a bot kill between the claim and the final state write left the row
+    CLAIMED with nothing to move it on, so every later tap -- even 30 days
+    later -- got 'sending already'. Inside the lease the double-tap refusal
+    still holds; past it the tap reclaims (a `state` event) and acts; and an
+    expired-but-wedged row still ages out (expiry is checked before CLAIMED)."""
+    rec = _carded()
+    first, _ = mr.claim_for_tap(rec["recap_id"], ORGANIZER_ID)
+    assert first is not None and first["state"] == mr.STATE_CLAIMED
+    # (process_share never runs: the crash)
+    soon = datetime.now(timezone.utc) + timedelta(seconds=mr.CLAIM_LEASE_SECONDS - 60)
+    again, refusal = mr.claim_for_tap(rec["recap_id"], ORGANIZER_ID, now=soon)
+    assert again is None and "already" in refusal.lower()
+    later = datetime.now(timezone.utc) + timedelta(seconds=mr.CLAIM_LEASE_SECONDS + 60)
+    reclaimed, refusal = mr.claim_for_tap(rec["recap_id"], ORGANIZER_ID, now=later)
+    assert reclaimed is not None, refusal
+    assert reclaimed["state"] == mr.STATE_CLAIMED
+    events = [json.loads(line) for line in _store_text().splitlines() if line.strip()]
+    assert any(e.get("event") == "state" and e.get("state") == mr.STATE_PENDING
+               and e.get("reclaimed_from") == mr.STATE_CLAIMED for e in events)
+    sent, failed, resolved = mr.process_share(reclaimed, _FakeClient())
+    assert (sent, failed, resolved) == (1, 0, True)
+    # The review's exact input: a tap 30 days after the wedge. Expiry wins.
+    wedged = _carded(_transcript(id="T-wedged-30d"))
+    mr.claim_for_tap(wedged["recap_id"], ORGANIZER_ID)
+    month = datetime.now(timezone.utc) + timedelta(days=30)
+    got, refusal = mr.claim_for_tap(wedged["recap_id"], ORGANIZER_ID, now=month)
+    assert got is None and "aged out" in refusal
+    assert mr.get_record(wedged["recap_id"])["state"] == mr.STATE_EXPIRED
+
+
+def test_c4_an_empty_summary_on_a_fresh_transcript_is_pending_not_terminal():
+    """C-4: Fireflies lists a transcript before it summarises it. An all-empty
+    summary inside the grace window writes NOTHING (no terminal NO_SUMMARY, no
+    organizer DM) and the populated summary on the next poll IS carded; past the
+    grace the silence is recorded once, as before; an undatable transcript
+    reads as not old (the only irreversible act is the terminal write)."""
+    fresh_ms = int(time.time() * 1000) - 5 * 60 * 1000
+    fresh = _transcript(date=fresh_ms, summary={})
+    rec, skip = _prepare(fresh)
+    assert rec is None and skip == "summary pending"
+    assert not mr.pending_path().exists() and not mr.ledger_path().exists()
+    assert not mr.already_carded(fresh["id"])
+    # next poll: same transcript, summary now populated
+    rec, skip = _prepare(_transcript(date=fresh_ms))
+    assert rec is not None, skip
+    assert rec["state"] == mr.STATE_PENDING
+    # past the grace window the silence is a real NO_SUMMARY card
+    old = _transcript(id="T-old-silence", summary={},
+                      date=int(time.time() * 1000) - (mr.NO_SUMMARY_GRACE_SECONDS + 600) * 1000)
+    rec, skip = _prepare(old)
+    assert rec is not None and rec["state"] == mr.STATE_NO_SUMMARY
+    # ISO-string dates are read too; an undatable one stays pending
+    iso_fresh = _transcript(id="T-iso-fresh", summary={},
+                            date=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
+    assert _prepare(iso_fresh) == (None, "summary pending")
+    assert _prepare(_transcript(id="T-undated", date=None, summary={})) == (None, "summary pending")
+    assert _prepare(_transcript(id="T-garbage", date="not-a-date", summary={})) == (None, "summary pending")

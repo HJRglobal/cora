@@ -585,7 +585,7 @@ RSVP_OUTCOMES: frozenset[str] = frozenset({
     "accepted",                  # cora@'s own entry set to accepted, read back verified
     "already-accepted",          # no API write
     "skipped:notetaker-present", # one mechanism per event -- a bot is already invited
-    "skipped:lex-withheld",      # never RSVP a LEX/PHI-redacted (organizer-withheld) event
+    "skipped:lex-withheld",      # never RSVP a LEX event (is_lex_event, R1) -- NOT the display redaction
     "skipped:no-roster-copy",    # sweep found cora@ invited but no roster copy to veto-check
     "error",                     # fetch/patch/read-back failed; rsvp_error carries why
 })
@@ -663,16 +663,25 @@ def own_response_status(event: dict[str, Any], identity: str) -> str:
     return ""
 
 
-def _plan_rsvp(own_event: dict[str, Any], safe_title: str) -> tuple[str, bool]:
-    """Decide the RSVP sub-step for one event on the capture identity's calendar.
+def _plan_rsvp(event: dict[str, Any]) -> tuple[str, bool]:
+    """Decide the RSVP sub-step for one event (cora@'s own copy, or -- for a
+    guest-add not yet applied -- the roster copy cora@ is about to be added to).
 
     Returns (rsvp, planned): a terminal skip reason with planned=False, or ("", True)
     when the execute step should accept. Order mirrors the execute-time re-check in
     `_rsvp_accept` so plan mode shows what live mode would do.
+
+    The LEX withhold is keyed on `is_lex_event` -- the ONE LEX detector, i.e. the
+    R1 predicate ("never RSVP a LEX-organizer-withheld event") -- and deliberately
+    NOT on the redacted display title. `display_title` redacts on a STRICTER screen
+    (any client-agency attendee, any PHI-shaped title) because over-redacting an
+    ops line costs nothing; keying the withhold on it silently withheld the RSVP on
+    every non-LEX meeting with a city/county/state attendee (F3E/UFL/HJRP), leaving
+    cora@ guest-added but never joining (Code #13 review, C2-1).
     """
-    if LEGACY_NOTETAKER in event_emails(own_event):
+    if LEGACY_NOTETAKER in event_emails(event):
         return "skipped:notetaker-present", False
-    if safe_title.startswith("LEX/PHI"):
+    if is_lex_event(event):
         return "skipped:lex-withheld", False
     return "", True
 
@@ -816,7 +825,7 @@ def plan_ensure(
             # THIS row rather than a second one so the meeting is counted once.
             own = needs_action.pop(key, None)
             if own is not None:
-                row.rsvp, row.rsvp_planned = _plan_rsvp(own, safe)
+                row.rsvp, row.rsvp_planned = _plan_rsvp(own)
                 row.rsvp_event_id = (own.get("id") or "").strip()
                 if row.rsvp_planned:
                     row.reason = f"{covered_reason}; capture identity RSVP pending -> accept"
@@ -839,14 +848,17 @@ def plan_ensure(
         # Claim the meeting immediately so it cannot be planned twice in one run.
         covered_meetings.add(meeting_key(ev))
 
+        # A guest-add is followed by an RSVP-accept as cora@ (R1). A copy is
+        # organised BY cora@ and has no invite to answer. The guest-add runs the
+        # same planner as the sweep (against the roster copy -- cora@ has no copy
+        # yet) so plan mode shows the withhold live mode would apply.
+        rsvp, rsvp_planned = _plan_rsvp(ev) if action == "guest-add" else ("", False)
         result.actions.append(EnsureAction(
             member=member.name, calendar_email=member.calendar_email, event_id=eid,
             title=safe, start_label=event_time_label(ev),
             action=action, reason=reason, meeting_link=link,
             meeting_start_ts=event_start_ts(ev),
-            # A guest-add is followed by an RSVP-accept as cora@ (R1). A copy is
-            # organised BY cora@ and has no invite to answer.
-            rsvp_planned=(action == "guest-add"),
+            rsvp=rsvp, rsvp_planned=rsvp_planned,
         ))
 
     # RSVP SWEEP REMAINDER. Unanswered invites on cora@'s calendar with NO qualifying
@@ -946,6 +958,7 @@ def execute_ensure(
                     act.action = "copy"
                     act.reason = f"guest-add refused ({str(exc)[:80]}) -> copy"
                     act.rsvp_planned = False   # cora@ organises the copy; nothing to accept
+                    act.rsvp = ""              # drop any plan-time withhold: no invite exists
 
             src = source_events.get(act.event_id)
             if src is None:
@@ -986,17 +999,19 @@ def _rsvp_accept(act: EnsureAction, cfg: CaptureConfig, cc: Any, *, event_id: st
     copy first so the checks run against the event AS IT IS NOW, not as it was at
     plan time -- design v1 s4a's case is a notetaker@ added AFTER the lane's
     guest-add, which must turn the accept into a skip (one mechanism per event).
-    The LEX/PHI rule is keyed on the action's display title exactly as the rest of
-    the lane keys its redaction: a withheld organiser is never RSVP'd (R1 as
-    written; the D-247 capture-yes tension is carried to Harrison, not resolved
-    here). Every failure is RECORDED, never raised -- the lane's other actions and
-    its ledger must complete.
+    The LEX withhold is keyed on `is_lex_event(own)` -- the R1 predicate ("never
+    RSVP a LEX-organizer-withheld event"), re-derived against the fresh copy -- and
+    NOT on the redacted display title, whose stricter screen (any .gov attendee,
+    any PHI-shaped title) would withhold the accept on every non-LEX civic meeting
+    (see `_plan_rsvp`). The D-247 capture-yes tension is carried to Harrison, not
+    resolved here. Every failure is RECORDED, never raised -- the lane's other
+    actions and its ledger must complete.
     """
     try:
         own = cc.get_event(user_email=cfg.capture_identity, event_id=event_id)
         if LEGACY_NOTETAKER in event_emails(own):
             return "skipped:notetaker-present"
-        if (act.title or "").startswith("LEX/PHI"):
+        if is_lex_event(own):
             return "skipped:lex-withheld"
         changed, outcome = cc.set_own_response(
             user_email=cfg.capture_identity, event_id=event_id,
@@ -1105,21 +1120,67 @@ def _transcript_ts(t: dict[str, Any]) -> int:
     return _parse_date(t.get("date")) or 0
 
 
-def presumed_unconvened_basis(event: dict[str, Any]) -> str:
+def roster_attendee_accepted(
+    copies: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None,
+    roster_emails: frozenset[str] | set[str],
+) -> bool:
+    """Did any ROSTER human RSVP `accepted` on any copy of this meeting?
+
+    The second structural signal behind the unconvened presumption. A roster
+    member's own attendee row is either flagged `self` (the copy came off their
+    calendar) or carries their roster address; `accepted` on it means a person
+    said they would be in the room, which is join evidence the organiser address
+    alone cannot carry. A bot or external accepting counts for nothing here.
+    """
+    wanted = {str(e or "").strip().lower() for e in (roster_emails or ()) if e}
+    for ev in (copies or ()):
+        if not isinstance(ev, dict):
+            continue
+        for att in (ev.get("attendees") or []):
+            if not isinstance(att, dict):
+                continue
+            addr = (att.get("email") or "").strip().lower()
+            is_roster = bool(att.get("self")) or (addr in wanted)
+            if is_roster and (att.get("responseStatus") or "").strip().lower() == "accepted":
+                return True
+    return False
+
+
+def presumed_unconvened_basis(
+    event: dict[str, Any],
+    *,
+    copies: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+    roster_emails: frozenset[str] | set[str] = frozenset(),
+) -> str:
     """Why a scheduled-but-transcript-less meeting is PRESUMED unconvened, or "".
 
-    Deterministic and network-free: the organiser address is the one structural
-    fact a calendar event carries about whether it is a standing placeholder (a
-    shared team calendar) or a meeting a person actually called. This is only ever
-    consulted for a meeting with ZERO transcripts -- a group-calendar block that
-    produced a transcript was convened by definition and is captured, never
-    unconvened. Returns the basis string so the report can say WHY.
+    Deterministic and network-free. TWO structural signals must agree before a
+    zero-transcript meeting is re-bucketed out of the misses:
+
+      1. the organiser is a Google GROUP calendar (a standing placeholder, not a
+         meeting a person called) -- the organiser address is the one structural
+         fact the event itself carries; AND
+      2. NO roster human RSVP'd `accepted` on any copy of it (`copies`, every
+         roster calendar's instance of the same meeting; `roster_emails`, the
+         active roster). A group-calendar block that people accepted and the bot
+         then failed to join is a genuine capture failure and must stay a MISS
+         above the alarms, not sink below them as "presumed unconvened" while
+         the clean-day line prints (D-051 review, Code #13 C-2).
+
+    This is only ever consulted for a meeting with ZERO transcripts -- a
+    group-calendar block that produced a transcript was convened by definition
+    and is captured, never unconvened. Returns the basis string so the report can
+    say WHY. Called with the event alone (no copies, no roster) rule 2 sees only
+    that copy and only its `self`-flagged attendee rows, so the one-argument
+    unit pins keep their pre-C-2 answers.
     """
     organizer = event.get("organizer") if isinstance(event.get("organizer"), dict) else {}
     addr = ((organizer or {}).get("email") or "").strip().lower()
-    if addr.endswith(GROUP_CALENDAR_ORGANIZER_SUFFIX):
-        return UNCONVENED_BASIS_GROUP_CALENDAR
-    return ""
+    if not addr.endswith(GROUP_CALENDAR_ORGANIZER_SUFFIX):
+        return ""
+    if roster_attendee_accepted(copies if copies is not None else [event], roster_emails):
+        return ""
+    return UNCONVENED_BASIS_GROUP_CALENDAR
 
 
 def audit_day(
@@ -1173,6 +1234,13 @@ def audit_day(
 
     meetings: dict[tuple, AuditedMeeting] = {}
     raw_events: dict[tuple, dict[str, Any]] = {}
+    #: EVERY qualifying copy of each meeting (one per roster calendar it landed
+    #: on), so the unconvened presumption can read an `accepted` RSVP off any
+    #: copy, not just the representative one (C-2).
+    raw_copies: dict[tuple, list[dict[str, Any]]] = {}
+    roster_emails = frozenset(
+        (m.calendar_email or "").strip().lower() for m in cfg.active_members if m.calendar_email
+    )
     #: meetings a carve-out removed from scope, kept so we can still notice if one
     #: of them was recorded anyway.
     carved: dict[tuple, tuple[dict[str, Any], str]] = {}
@@ -1220,6 +1288,7 @@ def audit_day(
             event_ids=[(e.get("id") or "").strip() for _m, e in qualifying],
         )
         raw_events[key] = ev
+        raw_copies[key] = [e for _m, e in qualifying]
 
     report.scheduled = len(meetings)
     #: every calendar event id belonging to a meeting, so a transcript whose cal_id
@@ -1313,8 +1382,13 @@ def audit_day(
             # capture failure (MISSED) or a placeholder nobody joined (presumed
             # UNCONVENED); the split lives here so no other path can re-bucket a
             # meeting. A group-calendar meeting WITH a transcript never reaches
-            # this branch, so it can never be called unconvened.
-            basis = presumed_unconvened_basis(raw_events[key])
+            # this branch, so it can never be called unconvened -- and one a
+            # roster human RSVP'd `accepted` on (any copy) stays a MISS (C-2).
+            basis = presumed_unconvened_basis(
+                raw_events[key],
+                copies=raw_copies.get(key) or [raw_events[key]],
+                roster_emails=roster_emails,
+            )
             if basis:
                 meeting.unconvened_basis = basis
                 report.unconvened.append(meeting)
@@ -1590,11 +1664,13 @@ def render_report(report: AuditReport) -> str:
         if report.scheduled == 0:
             lines.append("\n:white_check_mark: No qualifying roster meetings scheduled.")
         elif report.unconvened:
-            # "Every scheduled meeting captured" would be false here -- some were
-            # scheduled and not captured. Say what was actually established.
+            # NO checkmark here. "Every convened meeting captured" is a claim the
+            # auditor cannot prove: unconvened is a PRESUMPTION (no Meet/Zoom audit
+            # log exists), so a day carrying one is reported as unverified, never
+            # as clean (D-051 review, Code #13 C-2).
             lines.append(
-                f"\n:white_check_mark: Every convened meeting captured exactly once "
-                f"({len(report.unconvened)} presumed unconvened)."
+                f"\n:white_circle: {len(report.unconvened)} presumed unconvened -- not "
+                "verified. Nothing else scheduled was missed or duplicated."
             )
         else:
             lines.append("\n:white_check_mark: Every scheduled meeting captured exactly once.")

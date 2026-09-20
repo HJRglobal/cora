@@ -170,6 +170,28 @@ def test_a_raising_precondition_blocks_instead_of_aborting(capsys, monkeypatch):
     assert "would mark SHIPPED  cq-70d7b203f7ad" in out  # the loop continued
 
 
+def test_the_slice5_precondition_is_behavioural_against_a_non_dict_slack_response(monkeypatch):
+    """C-1 (D-051 review): the recap lane was dead in prod -- post_card read a
+    SlackResponse (not a dict) as 'no channel id' -- while every symbol the old
+    precondition grepped for was present. The check must POST against a non-dict
+    Mapping response, write only to its own throwaway store, and BLOCK a tree
+    whose post_card carries the dict guard again."""
+    mod = _load()
+    from cora import meeting_recap as mr
+    assert mod._slice5_present() is None
+    # the probe never reached the (conftest-redirected) real store
+    assert not mr.already_carded("probe-slice5-recap")
+
+    def _dict_guarded_post_card(client, rec):
+        opened = client.conversations_open(users=[rec["addressee_id"]])
+        channel = ((opened.get("channel") or {}).get("id") if isinstance(opened, dict) else "") or ""
+        return bool(channel)
+
+    monkeypatch.setattr(mr, "post_card", _dict_guarded_post_card)
+    blocker = mod._slice5_present()
+    assert blocker and "non-dict" in blocker
+
+
 def test_the_honesty_rail_precondition_is_behavioural_not_a_grep(monkeypatch):
     """A tree where the screen exists but never WARNs must be BLOCKED."""
     mod = _load()
