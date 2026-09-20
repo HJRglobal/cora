@@ -1725,6 +1725,7 @@ Remaining: Windows Defender real-time protection was disabled (Asana task create
 ```
 HJR Slack workspace
   Harrison (founder):       U02P3D6AT2C
+  NOTE 2026-09-19 (Code #13 RIDER 1 S-C): the id above is UNDER VERIFICATION -- code uniformly uses U0B2RM2JYJ1 (tool_dispatch.py _FOUNDER_SLACK_ID l.1106 / HARRISON_SLACK_USER_ID default l.7040 / _HARRISON_SLACK_ID l.8205; user_access.py:39; review_lanes.py:63; send-trust.yaml:25) and the live queue ledger records Harrison's taps under U0B2RM2JYJ1. The staged read-only probe scripts/probe_slack_user_ids.py (users.info on BOTH ids) decides; strike the loser with a dated note. Do not edit the id until then.
   Alex Cordova (F3E ops):   U0B3VGWJTMJ
   #f3-athletes channel:     C0B6GT3117Y
   #f3e-sales channel:       (name: f3e-sales)

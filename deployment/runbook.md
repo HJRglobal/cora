@@ -485,6 +485,239 @@ Most likely failure: token mis-pasted into `.env` (missing leading prefix, trail
 
 ---
 
+## Identity inventory
+
+Built 2026-09-19 (Code #13 RIDER 1, slice S-C; canon D-307 / D-308, ruled 2026-09-11).
+This is the inventory D-308 names: every system Cora touches, WHO she is there,
+which `.env` KEY holds the credential (key NAMES only -- a value never appears in
+this file), how her actions appear to staff, whether the identity is admin-level,
+and the CODE rail that bounds it.
+
+**Doctrine (D-308):** admin-level only where the platform's API model requires it
+for a locked lane (Fireflies precedent), credential inside the code seam,
+Harrison-provisioned, listed here. Cora holds NO admin-level and NO human-style
+account in Google Workspace, Slack, Asana or HubSpot (D-307). Never a UI/browser
+admin, never a human-shaped seat, never for testing convenience.
+
+**How to read the table.** "present"/"ABSENT" = whether the live `.env` carried a
+`KEY=` line on 2026-09-19, checked by count only
+(`Select-String .env -Pattern "^KEY="`), never by value. A credential key that is
+in `.env.example` but not in this table is a drift the test
+`tests/test_identity_docs.py` fails on: add the row when you add the key.
+
+| System | Identity (who Cora is there) | Credential KEY NAME (.env) | Appears as | Admin? | Rail (code) |
+|---|---|---|---|---|---|
+| Slack | Bot user of the "Cora" app, Socket Mode | `SLACK_BOT_TOKEN` (xoxb, present), `SLACK_APP_TOKEN` (xapp, present), `SLACK_SIGNING_SECRET` (present) | "Cora" (bot) | no -- 15 scopes, no `admin.*`, no `as_user` | `slack_egress.sanitize_text` (class-level WebClient patch + `tests/test_no_raw_slack_post.py`); staged-write gate; `data/maps/send-trust.yaml` approver ids |
+| Slack (user token) | Would be Harrison's owner-level token | `SLACK_USER_TOKEN` (xoxp) -- documented (`.env.example` lines 31-33), **ABSENT from the live `.env`** (count 0; R5 closed 2026-09-11) | Harrison | owner-level if it existed | Script-only: `scripts/archive_sprawl_channels.py` reads it and FALLS BACK to `SLACK_BOT_TOKEN` when it is absent (lines 260-264) -- the script does not fail without it; a Slack scope error would surface only at the `--apply` archive call. Do NOT add the key anywhere. |
+| Slack (founder id) | The single approver / founder identity in code | `HARRISON_SLACK_USER_ID`, `CORA_FOUNDER_SLACK_ID` (both optional overrides, ABSENT; code default `U0B2RM2JYJ1`) | n/a | n/a | `tool_dispatch.py` `_FOUNDER_SLACK_ID` / `_HARRISON_SLACK_ID`, `user_access.py`, `review_lanes.py`, `send-trust.yaml`. Repo `CLAUDE.md` KEY IDS still lists `U02P3D6AT2C` -- UNDER VERIFICATION by `scripts/probe_slack_user_ids.py` (read-only `users.info` on both ids). |
+| Anthropic | API key (model vendor; no identity surface) | `ANTHROPIC_API_KEY` (present) | n/a | n/a | `claude_client` token-budget guard (D-084); model never holds a credential |
+| OpenAI | API key (KB embeddings only) | `OPENAI_API_KEY` (present) | n/a | n/a | embeddings batching cap (`knowledge_base/embeddings.py`) |
+| Google Workspace (service account) | SA `cora-calendar@cora-calendar-readonly.iam.gserviceaccount.com` impersonating roster mailboxes via domain-wide delegation | `GOOGLE_SERVICE_ACCOUNT_JSON` (PATH to the key file under gitignored `.credentials/`; present). The DWD client id is the `client_id` field INSIDE that file -- never copied into a doc. `CORA_DRIVE_IMPERSONATE` (ABSENT; code default `harrison@hjrglobal.com`) | the impersonated user (a draft lands in that user's Drafts; reads run as that user) | no admin ROLE; the granted scope STRINGS are the guarantee (see Provisioning: Google service account + DWD) | scope strings matched character-for-character; `gmail.send` + `spreadsheets` write WITHHELD; Tier-1 header strip (`historical_access`); D-145 at ingest |
+| Google Workspace (cora@hjrglobal.com) | Workspace USER: Tier-0 intake mailbox (S-A), Fireflies capture identity, Cora-voice send mailbox (R4, drafts only today) | none -- no password or per-user credential in `.env` or the repo; reached only through the SA + DWD like every roster mailbox | cora@hjrglobal.com | no admin role (D-307) | see Provisioning: cora@hjrglobal.com |
+| Fireflies | "Cora Global" seat on cora@hjrglobal.com (bot named "Cora NoteTaker") | `FIREFLIES_API_KEY` (present); fallback names `FIREFLIES_API_TOKEN`, `FIREFLIES_TOKEN` (ABSENT) | Cora Global / Cora NoteTaker | **YES -- the ONE admin-level Cora identity.** The platform's API model requires it: the workspace-wide `users` query (`fireflies_connector.list_team_members`, admin-only, verified 2026-06-08) and org-wide capture. This is the D-308 precedent, not a template. | credential inside the code seam; `capture_identity` in `data/maps/meeting-capture-roster.yaml`; LEX recaps -> custodians only (`meeting_recap`); coverage nudges roster-scoped (`fireflies_seat` flag) |
+| Asana | TODAY: Harrison's personal PAT ("Cora Email Watch") -- every Cora write is attributed to Harrison. AFTER the S-B flip: cora@hjrglobal.com MEMBER seat (13 named teams, never Harrison Private) | `ASANA_PAT` (Harrison's; present), `ASANA_PAT_CORA` (Cora's; present since 2026-09-11), selector `CORA_ASANA_IDENTITY` (ABSENT = `harrison`; the key lands with S-B) | Harrison today; Cora after the flip | today: inherits Harrison's privileges (a human credential in Cora's keyring); after: Member, never admin (R2) | staged-write gate on every Asana write tool; `pm_metrics` ledger = the Cora-side attribution ground truth; see Rotation: Asana PAT (Cora) |
+| HubSpot | Private app on portal 246351746 | `HUBSPOT_PRIVATE_APP_TOKEN` (present), `HUBSPOT_PORTAL_ID` | the private app; every deal carries a HUMAN `hubspot_owner_id` | no seat, no admin (R7) | portal guard (D-029); staged-write gate; no Cora owner id exists |
+| QuickBooks Online | Intuit OAuth app authorized by Harrison's Intuit login; per-realm refresh tokens in `data/qbo-tokens.json` (untracked) | `QBO_CLIENT_ID`, `QBO_CLIENT_SECRET`, `QBO_REDIRECT_URI`, `QBO_ENVIRONMENT` (all present) | the authorizing Intuit user | company-admin-authorized grant; code is READ-ONLY (`qbo_client.py` has 0 POST sites) | D-026; finance tool gate + egress (D-074); daily `qbo_token_status --alert` monitor |
+| Shopify | F3E custom app (offline access token) | `SHOPIFY_F3E_STORE`, `SHOPIFY_F3E_ACCESS_TOKEN`, `SHOPIFY_F3E_API_KEY`, `SHOPIFY_F3E_API_SECRET` (all present) | the app | app-scoped, no human seat | inventory staged-write with floor-guarded delta; identity bound SERVER-SIDE, never an LLM echo |
+| Deposco | Integration user, V1 GET-only | `DEPOSCO_PROD_USER` / `DEPOSCO_PROD_PASS` (present), `DEPOSCO_UA_USER` / `DEPOSCO_UA_PASS` (present), `DEPOSCO_TENANT`, `DEPOSCO_BU` | the integration user | no | write-impossibility invariant (`deposco_client` exposes `_get` only) |
+| Klaviyo | Private API key | `KLAVIYO_API_KEY` (present) | n/a | no | read-only audit figures |
+| Instagram / Meta | Long-lived user access tokens for the F3E / F3MOOD / F3PURE IG Business accounts; Meta app | `INSTAGRAM_F3E_ACCESS_TOKEN`, `INSTAGRAM_F3MOOD_ACCESS_TOKEN`, `INSTAGRAM_F3PURE_ACCESS_TOKEN` (+ the `*_USER_ID` ids), `META_APP_ID`, `META_APP_SECRET` (all present) | the brand account | account-scoped | read-only monitoring (influencer scan); credit rule D-025 |
+| Notion | Internal integration token | `NOTION_API_KEY` (present) | the integration | no | read lane (press sweep, KB sync); `notion_connector.py` also carries 2 POST/PATCH sites -- NOT audited in this inventory |
+| Airtable | API key (read) + a separate WRITE key | `AIRTABLE_API_KEY` (present), `AIRTABLE_WRITE_API_KEY` (ABSENT = the org-tracker write lane is dark) | the token owner | no | `airtable_org_tracker` refuses to write without the WRITE key |
+| MCP local-HTTP bridge (SHELVED) | Loopback bridge for Claude Code; the plugin won | `CORA_MCP_HTTP_TOKEN`, `CORA_MCP_HTTP_CERT`, `CORA_MCP_HTTP_KEY`, `CORA_MCP_HTTP_PORT` (all documented, unused) | n/a | n/a | 127.0.0.1 bind + Host allowlist; mode=ro |
+| Other API keys (no identity surface) | vendor keys | `POLAR_API_KEY` / `POLAR_CLIENT_ID` / `POLAR_CLIENT_SECRET`, `PHOTOROOM_API_KEY`, `MAKE_SALES_DECK_WEBHOOK_URL`, `PERPLEXITY_API_KEY`, `GEMINI_API_KEY`, `OTTERLY_API_KEY` (present); `APOLLO_API_KEY` (LEGACY -- not read by current code) | n/a | n/a | per-connector caps and fail-soft |
+
+Bootstrap cross-reference: `deployment/bootstrap-new-machine.md` regenerates ONLY
+the 4 Slack/Anthropic secrets; every other row above is a Harrison-provisioned
+credential that a new machine restores from the encrypted secrets bundle
+(`backup_logs.py` / `restore_secrets.py`), not by regeneration.
+
+---
+
+## Rotation: Asana PAT (Cora)
+
+Two Asana tokens exist; the bot and the scripts load exactly ONE of them, chosen by
+`CORA_ASANA_IDENTITY` (slice S-B of Code #13 RIDER 1 introduces the selector;
+until it lands, `ASANA_PAT` is the only token read):
+
+- `ASANA_PAT` -- Harrison's personal token ("Cora Email Watch"). Every Cora write
+  made with it is attributed to Harrison in Asana.
+- `ASANA_PAT_CORA` -- the token of the cora@hjrglobal.com MEMBER seat (13 named
+  teams, never Harrison Private). Present in `.env` since 2026-09-11. The first
+  token issued for the seat was exposed in a chat and DELETED in Asana; the one in
+  `.env` is the re-issued token. Never paste a PAT into a chat, a doc or a commit.
+- `CORA_ASANA_IDENTITY` -- `harrison` (default when absent = today's behaviour) or
+  `cora`. `cora` with `ASANA_PAT_CORA` missing is a HARD FAIL at first use, never a
+  silent fallback to Harrison's token.
+
+The token is read via `os.environ` at call time in three seams
+(`asana_client`, `asana_connector`, `lex_client`) plus four scripts; `load_dotenv`
+populates the environment once at process start, so a `.env` change is BOT-LOADED:
+the bot picks it up only at the next restart, scripts at their next fire.
+
+### The flip (Harrison's hand, after reading the visibility diff)
+
+1. Run the READ-ONLY diff (S-B): `.venv\Scripts\python.exe scripts\asana_visibility_diff.py`
+   -- per-query counts under both tokens and the set difference of task/project
+   gids (names only). Any project Cora would LOSE is a line for Harrison to add the
+   cora@ seat to in Asana, never a code workaround. A lost catch-all
+   `Operations -- General` project is a STOP.
+2. Post the announce line in #info-for-cora: "Heads up: Cora's Asana tasks and
+   comments now show as Cora, not Harrison. Nothing else changes."
+3. Edit `.env`: set `CORA_ASANA_IDENTITY=cora`. Verify exactly ONE line:
+   `Select-String .env -Pattern "^CORA_ASANA_IDENTITY="` (dotenv takes the LAST
+   duplicate -- the 2026-06-11 HEALTH_PING_URL incident).
+4. Restart from ELEVATED PowerShell: `deployment\restart-cora.ps1`. Proof of the
+   restart = a NEW pid row in `logs/cora-instances.jsonl`, never the script's exit
+   code.
+5. Smoke: one hygiene-nudge `--dry-run` shows author = Cora; a `users/me` probe
+   under the active token returns the cora@ user, not Harrison.
+
+### Rotating `ASANA_PAT_CORA` itself
+
+1. Sign in to Asana AS cora@hjrglobal.com (Harrison, via the Google account
+   switcher -- see Provisioning: cora@hjrglobal.com). Open
+   https://app.asana.com/0/my-apps -> Personal access tokens -> Create new token.
+2. Paste the value into `.env` after `ASANA_PAT_CORA=` (Notepad; one line; no
+   trailing whitespace). Verify exactly one `^ASANA_PAT_CORA=` line.
+3. Restart (step 4 above). Smoke (step 5 above).
+4. ONLY THEN revoke the old token in the same Asana page.
+
+### 14-day retention of Harrison's PAT, then removal
+
+Harrison's `ASANA_PAT` stays in `.env` (loaded only while
+`CORA_ASANA_IDENTITY=harrison`) for 14 clean days after the flip -- the rollback
+path. On day 14 Harrison removes the `ASANA_PAT=` line from `.env` and revokes the
+"Cora Email Watch" token in Asana. Two guards before removal:
+
+- `scripts/nightly_health_check.py` is identity-aware since S-B (same rider): it
+  no longer reads `ASANA_PAT` directly -- it asks `cora.asana_identity` for the
+  ACTIVE identity's key, so after the flip it requires `ASANA_PAT_CORA` and stays
+  green when Harrison's key is removed. Before the flip (selector absent) it still
+  requires `ASANA_PAT`: do NOT remove the key while the selector is unset, or the
+  health check alarms every night.
+- Queue row `cq-40baab26d7f3` (Asana identity flip + Harrison PAT retirement) closes
+  at the removal, via `process_queue_action`, never by hand-editing the ledger.
+
+Removal record (a runbook line, not a code step -- fill in by hand):
+
+    ASANA_PAT (Harrison, "Cora Email Watch") removed from .env and revoked in Asana on: ____-__-__
+
+---
+
+## Provisioning: cora@hjrglobal.com
+
+cora@hjrglobal.com is a Google Workspace USER with NO admin role (D-307). It exists
+for three roles, each bounded by a code rail; it is never operated as a human-style
+Cora account.
+
+1. **Tier-0 intake mailbox (slice S-A).** A row in
+   `data/maps/monitored-email-accounts.yaml`: `entity_default: FNDR` (system
+   mailbox), `fireflies_seat: false`, `thread_sweep: false`,
+   `attachment_filer: false`, `drive_sweep: false`, and the S-A key
+   `intake_route: knowledge_review`. Inbound mail becomes PROPOSALS in the
+   Harrison-gated knowledge-review queue (D-143 / D-144: pending is not published;
+   approval verified at the consumer), LEX/PHI content refused at ingest and again
+   at apply (D-145), never autowritten (`CORA_AUTOWRITE_LIVE` tiers do not apply --
+   Tier-0 by construction). Same code path as #info-for-cora (`info_intake.ingest`),
+   never a second copy.
+2. **Fireflies capture identity.** `data/maps/meeting-capture-roster.yaml`
+   `capture_identity: "cora@hjrglobal.com"` -- the ONE Fireflies seat ("Cora
+   Global", ACTIVE + ADMIN since 2026-08-28; bot "Cora NoteTaker") whose connected
+   calendar auto-joins meetings. The DWD roster row keeps `fireflies_seat: false`:
+   the seat is tracked in the capture roster and is never double-flagged, so
+   `load_dwd_humans()` (the weekly coverage monitor) never nudges cora@.
+3. **Cora-voice send mailbox (R4).** Today T0: Cora drafts into cora@'s Drafts and a
+   human taps Send. T1 (send-trust ladder with mailbox = cora@) waits for the
+   October external-WRITE gate; `gmail.send` stays out of the DWD grant until then.
+
+**Human operator = Harrison, via the Google account switcher.** Two Workspace
+accounts live in one browser profile, so any Chrome-driven session that touches
+Gmail / Calendar / Drive reads the ACTIVE account before acting.
+**NO Gmail delegates on cora@** (amended 2026-09-11); the Admin-console "allow
+mail delegation" toggle is NOT needed and stays off.
+
+**Access path.** Cora reaches cora@ exactly as she reaches every roster mailbox:
+the service account impersonates it under domain-wide delegation. No password and
+no per-user credential for cora@ exists in `.env`, the repo or the secrets bundle.
+
+**Staged READ-ONLY smoke (Harrison's say-so before it runs; ids only in output):**
+
+- Gmail: `gmail_reader._build_service("cora@hjrglobal.com")` ->
+  `users().messages().list(userId="me", maxResults=1)` -- scope `gmail.modify`.
+- Calendar: `calendar_client._build_service("cora@hjrglobal.com", write=True)` ->
+  `events().list(calendarId="primary", maxResults=1)` -- scope `calendar.events`.
+  The `write=False` build uses `calendar.freebusy`, under which `events.list`
+  returns 403 (2026-06-11 finding) -- a spurious "DWD error" if you use it.
+
+**Checklist.** Workspace user exists, no admin role | DWD roster row present with
+the flags above | `capture_identity` matches | no Gmail delegates | no Slack seat
+(R5) | no HubSpot seat (R7) | Asana: the MEMBER seat only (R2).
+
+---
+
+## Provisioning: Google service account + DWD
+
+**Service account:** `cora-calendar@cora-calendar-readonly.iam.gserviceaccount.com`
+(identity, not a credential; recorded in `.env.example` and decisions.md
+2026-08-26). The key file lives under the gitignored `.credentials/` folder and
+`GOOGLE_SERVICE_ACCOUNT_JSON` holds its PATH. The OAuth client id that the
+domain-wide delegation grant is keyed on is the `client_id` field INSIDE that JSON:
+read it from the file when you need it, never copy it into a doc, ticket or chat.
+
+**Where the grant lives:** admin.google.com -> Security -> Access and data control
+-> API controls -> Manage Domain Wide Delegation -> the SA's client id -> the scope
+list. The grant covers the domains listed in the header of
+`data/maps/monitored-email-accounts.yaml` (hjrglobal.com, f3energy.com,
+lexingtonservices.com, unitedfightleague.com, bigd.media); personal Gmail is never
+eligible.
+
+**The character-for-character rule (decisions.md, 2026-08-26 entry, filed with
+D-245 / D-246):** Google matches the REQUESTED scope string against the GRANTED list
+literally. A broader granted scope does NOT satisfy a request for a narrower one:
+the SA held `gmail.modify` and `https://mail.google.com/` and the draft path still
+failed `unauthorized_client` because it requested `gmail.compose`, which was absent.
+When a code path adds a scope, add that EXACT string to the grant.
+
+**Scopes the CODE requests** (each builder verified at repo tip `7193b21`; keep this
+list in step with `grep -rn "googleapis.com/auth/" src/ scripts/`):
+
+| Scope (suffix of `https://www.googleapis.com/auth/`) | Builder(s) | Lane |
+|---|---|---|
+| `gmail.modify` | `src/cora/connectors/gmail_reader.py:36` | thread sweep, attachment filer, intake |
+| `gmail.compose` | `src/cora/tools/gmail_client.py:42` | draft-only lane (`gmail.send` is NOT requested and NOT granted) |
+| `calendar.events` | `src/cora/tools/calendar_client.py:54`, `src/cora/tools/tool_dispatch.py:6989` | `events.list` + event create |
+| `calendar.freebusy` | `src/cora/tools/calendar_client.py:53` | `freebusy.query` only (`events.list` 403s under it) |
+| `drive.readonly` | `src/cora/connectors/drive_sweep.py:474`, `scripts/run_drive_sweep.py:27`, `scripts/backfill_drive_assets.py:22`, `scripts/run_lex_dump_folder_sync.py:115` | Drive sweeps |
+| `drive` (full) | `src/cora/connectors/drive_connector.py:46`, `scripts/run_retroactive_hashtag_scan.py:153` | attachment filer upload, finance-receipt filing |
+| `spreadsheets.readonly` | `src/cora/connectors/drive_sweep.py:475`, `src/cora/connectors/gsheets_financials.py:50`, `src/cora/tools/fighter_tracker_client.py:43` | oversized-sheet fallback, cash sheet reads, fighter roster |
+
+**Granted but not requested by code** (as recorded 2026-08-26 on Harrison's "more
+capability" ruling): `gmail.readonly`, `https://mail.google.com/`, `calendar`
+(full), `documents`, `admin.directory.user.readonly`. Reconcile against the Admin
+console before pruning any of them -- this document is not the console.
+
+**Deliberately WITHHELD:** `gmail.send` (a posture change gated on the October
+external-WRITE seam, R4) and `spreadsheets` (write) -- "Cora cannot write the
+Standing ACTUALS sheet" is guaranteed by the SCOPE today; granting write would
+downgrade that guarantee to policy. The 13WCF worksheet writes use direct SA auth on
+directly-shared files, outside DWD entirely.
+
+**Impersonation default:** `CORA_DRIVE_IMPERSONATE` (default `harrison@hjrglobal.com`
+in `drive_connector.py:52` and `gsheets_financials.py:52`); per-mailbox sweeps pass
+the roster email explicitly.
+
+**Rotating the SA key:** Google Cloud console -> IAM & Admin -> Service accounts ->
+the SA -> Keys -> Add key (JSON) -> save the file under `.credentials/` -> point
+`GOOGLE_SERVICE_ACCOUNT_JSON` at the new path -> restart (elevated
+`deployment\restart-cora.ps1`; new pid in `logs/cora-instances.jsonl`) -> run one
+nightly sweep or a read-only DWD smoke -> delete the OLD key in the console. The DWD
+grant is keyed on the client id, not the key, so no Admin-console change is needed.
+The encrypted secrets bundle (`backup_logs.py`) picks up the new file at its next
+run; verify `Offsite verify: PASS` afterwards.
+
+---
+
 ## Updating Channel Routing
 
 `design/channel-routing.yaml` is the source of truth.
