@@ -159,6 +159,139 @@ Start-ScheduledTask -TaskName "cowork-cora-service"
 
 ---
 
+## Allowlist migration -- the ONE stop window (Code #13 slice 8)
+
+D-303 (ruled 2026-09-10): the flat per-user Drive sweep of harrison@hjrglobal.com
+runs in ALLOWLIST-BY-FOLDER mode (`drive_sweep_mode: allowlist` +
+`drive_sweep_allowlist` on the PRIMARY row in `data/maps/monitored-email-accounts.yaml`;
+v1 = the HJR-Founder-OS root only). The mode is SCRIPT-SIDE: `Cora - Drive Sweep`
+reads the working tree at its next fire, so no restart is needed for the mode
+itself. The migration -- purging the out-of-allowlist rows the denylist era
+already ingested -- is what needs the ONE stop window below, because the KB
+reclaim needs exclusive access to `data/cora_kb.db`.
+
+**NOTE -- the "Stop (hard kill)" block under "Operating Cora" above is STALE and
+is NOT the amended stop window.** It filters on `cora.exe` (no such process since
+the service action became `-m cora.main`, see doctrine 5), it does not park the
+watchdog or DISABLE the service task, and it does not kill the `pythonw.exe`
+`run_hidden.py` launcher. Use the block in this section for any window that needs
+Cora down for more than a moment. (The stale block is left in place deliberately;
+this section supersedes it for stop windows.)
+
+### Before the window -- NORMAL PowerShell, Cora running (read-only)
+
+1. Build the manifest (read-only: SELECT on the KB + `files.get` under DWD as the
+   account; writes only under `--out-dir`):
+   ```powershell
+   .venv\Scripts\python.exe scripts\drive_sweep_allowlist_manifest.py --db data\cora_kb.db --out-dir logs\drive-sweep-allowlist
+   ```
+   Re-runs are cheap: the folder cache persists at
+   `logs\drive-sweep-allowlist\drive-sweep-allowlist-folder-cache.json` (override with `--cache`).
+   `--limit N` previews the N largest files; `--account` defaults to harrison@hjrglobal.com.
+2. EYEBALL the manifest (`logs\drive-sweep-allowlist\drive-sweep-allowlist-manifest-<date>.txt`):
+   - `CANDIDATES TO ADD TO THE ALLOWLIST`: every out-of-tree TOP-LEVEL folder that
+     holds KB rows. The kickoff rule: a tree-adjacent BUSINESS folder is ADDED to
+     `drive_sweep_allowlist` in the yaml (the manifest prints the yaml line), never
+     purged. Re-run step 1 after editing the yaml; the folder moves to IN-allowlist.
+   - `UNRESOLVED / STALE KB ROWS` (404 / trashed / API error): NEVER in a purge set
+     here; they are stale rows for the monthly kb-hygiene sweep.
+   - `PURGE LINES`: one ready-to-run `purge_cora_internal_kb.py --folder-id <id>
+     --expect-leaf <name> --impersonate harrison@hjrglobal.com` line per purgeable
+     folder, through the UNCHANGED positive-leaf gate (one folder per --apply,
+     --expect-leaf must equal the resolved leaf, chain depth >= 3, complete
+     enumeration, reviewed dry-run manifest). The gate REFUSES depth-2 folders
+     (a folder directly under My Drive) and cannot reach loose files directly
+     under My Drive -- the manifest flags both `unreachable by the gate -- move in
+     Drive first` (the 9/9 precedent: pin the parent, purge per CHILD). Move those
+     files/folders under a sub-folder in Drive, re-run step 1, and the lines appear.
+3. Run every PURGE LINE WITHOUT `--apply` in normal PS (Cora running is fine --
+   dry-run). Each writes its own reviewed manifest at
+   `logs\purge-cora-internal-folder-<id>.txt`; eyeball the file list and totals.
+   Note the expected `Deleted:` totals per folder for step 4e.
+
+### The window -- ELEVATED PowerShell (amended 4c -> 4f, copied from the 9/9 _notes runbook)
+
+The block below is the AMENDED stop window from
+`_shared/projects/cora/_notes/2026-09-09_fndr_RUNBOOK-post-smoke-remaining-items.md`
+(the 4c/4f text as executed 2026-09-10), transliterated to ASCII (D-016) and with
+the #12-specific purge list replaced by the manifest's PURGE LINES. Steps 4a/4b/4g
+of that note (the #12 merge, its 7.5 reconcile, its pin script) do not apply here.
+
+```powershell
+# 4c. Park the watchdog AND the service task, then stop Cora.
+#     AMENDED 2026-09-10 (Harrison, ask H RULED): the service task is DISABLED for the window, not just stopped.
+#     `Stop-ScheduledTask` alone does not hold Cora down -- on 9/8 and again on 9/10 (pid 7048 at 08:45:06, ~11 min after
+#     the stop) the task re-launched Cora mid-window and held the DB against reclaim. Disable first, re-enable at 4f.
+Disable-ScheduledTask -TaskName "cora-watchdog"
+Disable-ScheduledTask -TaskName "cowork-cora-service"
+Stop-ScheduledTask -TaskName "cowork-cora-service" -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='cora.exe'" |
+    Where-Object { $_.CommandLine -like "*\Scripts\cora.exe*" -or $_.CommandLine -like "*cora.main*" } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
+    Where-Object { $_.CommandLine -like "*run_hidden.py*" -and ($_.CommandLine -like "*cora.main*" -or $_.CommandLine -like "*\Scripts\cora.exe*") } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Start-Sleep 3
+Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='cora.exe' OR Name='pythonw.exe'" |
+    Where-Object { $_.CommandLine -like "*cora.main*" -or $_.CommandLine -like "*\Scripts\cora.exe*" } |
+    Select-Object ProcessId, Name
+# Must print NOTHING. If a row prints, STOP.
+
+# 4c-wait. The heartbeat wait (>= 300 s): Cora is only proven DOWN when the heartbeat file has NOT advanced for a full
+#     watchdog period. Record it, wait, compare -- identical = down. If it moved, something relaunched Cora: go back to 4c.
+$hb0 = (Get-Item data\health\heartbeat.txt).LastWriteTime
+Start-Sleep 310
+(Get-Item data\health\heartbeat.txt).LastWriteTime -eq $hb0
+# Must print True.
+
+# 4d. OPTIONAL full KB snapshot (10-20 min) if the last one is older than you like.
+# .venv\Scripts\python.exe scripts\backup_logs.py --include-kb
+
+# 4e. The purges: the per-folder --apply loop, one folder per --apply (a depth-2 parent is refused by the depth floor;
+#     the PIN is on the parent, the PURGE is per child). Populate $kids from the manifest's PURGE LINES section (step 2):
+#     one row per emitted line, id + expect-leaf name EXACTLY as printed. Each REFUSES (nothing deleted) if its step-3
+#     dry-run manifest is missing, does not cover every selected file (files added since -> re-run step 3 first, or add
+#     --accept-delta only if you accept them), or --expect-leaf mismatches. A folder whose dry-run showed 0 chunks deletes nothing.
+$env:PYTHONIOENCODING = 'utf-8'   # silences the cosmetic middle-dot logging error seen on 9/10
+$kids = @(
+  @{id='<folder id from PURGE LINES>'; name='<expect-leaf name from PURGE LINES>'}
+  # ... one row per PURGE LINE
+)
+foreach ($k in $kids) {
+  "=== APPLY $($k.name) ==="
+  .venv\Scripts\python.exe scripts\purge_cora_internal_kb.py --folder-id $k.id --impersonate harrison@hjrglobal.com --expect-leaf $k.name --apply 2>&1 |
+    Select-String -Pattern "Deleted:|Applied|REFUSED|ERROR"
+}
+# Each folder with chunks: "Selected-rows intent written" -> "Deleted: {...}" -> "Applied record written" -> "Applied folder record written".
+# Expect each Deleted total to equal that folder's step-3 dry-run count across each of the vec-cascade tables.
+# If files landed in a folder since its dry-run the apply REFUSES it -> re-run its step-3 dry-run, eyeball, re-apply.
+
+# 4f. Reclaim + re-enable the service task + THE ONE RESTART, then watchdog on.
+#     AMENDED 2026-09-10 (ask H RULED): Enable-ScheduledTask for cowork-cora-service goes BEFORE restart-cora.ps1 -- Cora runs as
+#     that task's instance (cora_health lists it "Running"), and a disabled task cannot be started. Reclaim runs while it is still disabled.
+.venv\Scripts\python.exe scripts\reclaim_kb_space.py
+Enable-ScheduledTask -TaskName "cowork-cora-service"
+.\deployment\restart-cora.ps1
+Enable-ScheduledTask -TaskName "cora-watchdog"
+Get-Content logs\cora-instances.jsonl -Tail 1
+# Proof of LIVE = a NEW pid in the instances tail (not the pid Cora had before 4c). A restart script's exit code is
+# never the proof; the instances ledger is (doctrine 5).
+```
+
+### After the window
+
+- The next `Cora - Drive Sweep` fire (06:00 AZ) logs `harrison@hjrglobal.com done -- mode=allowlist ...
+  skipped_outside_allowlist=N` and run_sweep's `COMPLETE -- ... skipped_outside_allowlist=N`; the
+  `Drive sweep DONE` line and the `--with-slack` summary carry the same counters.
+- Re-run step 1: the OUTSIDE buckets you purged should now be empty; anything that
+  re-appears was re-ingested by a DENYLIST account that can also see it (cross-user
+  dedup deliberately does not let an allowlist skip poison other accounts) -- that is
+  the other account's row to decide, not a sweep bug.
+- `cora_self_inventory` in a founder channel lists the mode + allowlisted folder
+  under `DRIVE SWEEP MODES`.
+
+---
+
 ## Logs
 
 **Location:** `C:\Users\Harri\code\cora\logs\cora-YYYY-MM-DD.log`

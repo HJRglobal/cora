@@ -644,17 +644,27 @@ def _is_markdown(mime_type: str | None, filename: str | None) -> bool:
     return (mime_type or "").lower() == "text/markdown" or (filename or "").lower().endswith(".md")
 
 
-def _file_disposition(
+def _file_disposition_ex(
     service: Any, parents: list[str] | None, expanded: frozenset[str],
     complete: bool, cache: dict, *, mime_type: str = "", filename: str = "",
-) -> str | None:
-    """Why a flat-sweep file must be SKIPPED, or None to ingest it.
+    allowlist: frozenset[str] | None = None,
+) -> tuple[str | None, frozenset[str]]:
+    """``(disposition, chain_ids)`` -- why a flat-sweep file must be SKIPPED (or
+    None to ingest it) plus the resolved ancestor folder ids, so ONE cached walk
+    serves both the exclusion belt and the per-account allowlist check (Code #13
+    slice 8, D-303). ``chain_ids`` is empty when no walk ran or it failed.
 
     ``"excluded"``        a parent is in the expanded exclusion set (fast path), or
                           an ancestor is any pinned id -- incl. the parentless
                           Computers backup roots, which only the walk can see;
     ``"unresolved"``      the ancestry could not be resolved this run (fail-closed;
                           the caller HOLDS the watermark so the file is retried);
+    ``"outside_allowlist"`` (allowlist mode only) the resolved ancestry does not
+                          touch any allowlisted folder -- incl. a file with NO
+                          parents (shared-with-me / orphaned: nothing to
+                          intersect). SKIPPED and COUNTED, never held: the file
+                          is not the sweep's to ingest, so there is nothing to
+                          retry;
     ``"static_md_owned"`` a MARKDOWN file inside the HJR-Founder-OS tree. The
                           static_md sync ingests every .md under the tree with the
                           FOLDER-deterministic entity and its own exclusions
@@ -676,23 +686,95 @@ def _file_disposition(
     The walk runs whenever expansion was incomplete OR walk-only roots are pinned
     (always, in production) -- the expanded set is the fast path, no longer the
     authority. Cached per folder, so the cost is one lookup per distinct folder.
+
+    ALLOWLIST MODE (``allowlist`` is a non-empty frozenset of folder ids; D-303,
+    ruled 2026-09-10): the BELT runs first and WINS even inside the allowlist (a
+    pinned folder under the allowlisted tree is still ``excluded``); a parentless
+    file is ``outside_allowlist``; the walk is FORCED (the legacy "expanded set is
+    authoritative" early return never applies -- membership needs the chain);
+    ``unresolved`` still HOLDS; then the pinned-ancestor belt; then the in-tree
+    markdown rule (static_md owns it whether or not the tree is allowlisted); then
+    ``outside_allowlist`` when the chain touches no allowlisted id; else ingest.
     """
     parents = parents or []
+    allow = frozenset(allowlist) if allowlist else None
     if any(p in expanded for p in parents):
-        return "excluded"
+        return "excluded", frozenset()
     if not parents:
-        return None
-    if complete and not KB_EXCLUDED_WALK_ONLY_IDS:
-        return None  # the expanded set is authoritative (legacy shape, no walk-only roots)
+        return ("outside_allowlist" if allow else None), frozenset()
+    if allow is None and complete and not KB_EXCLUDED_WALK_ONLY_IDS:
+        return None, frozenset()  # the expanded set is authoritative (legacy shape, no walk-only roots)
     chain, ok = _ancestor_chain(service, parents, cache)
+    ids = frozenset(fid for fid, _name in chain)
     if not ok:
-        return "unresolved"
-    ids = {fid for fid, _name in chain}
+        return "unresolved", ids
     if ids & KB_EXCLUDED_FOLDER_IDS:
-        return "excluded"
+        return "excluded", ids
     if FOUNDERS_OS_ROOT_ID in ids and _is_markdown(mime_type, filename):
-        return "static_md_owned"
-    return None
+        return "static_md_owned", ids
+    if allow is not None and not (ids & allow):
+        return "outside_allowlist", ids
+    return None, ids
+
+
+def _file_disposition(
+    service: Any, parents: list[str] | None, expanded: frozenset[str],
+    complete: bool, cache: dict, *, mime_type: str = "", filename: str = "",
+    allowlist: frozenset[str] | None = None,
+) -> str | None:
+    """Disposition only (see _file_disposition_ex) -- the shape every existing
+    call site and test uses."""
+    return _file_disposition_ex(
+        service, parents, expanded, complete, cache,
+        mime_type=mime_type, filename=filename, allowlist=allowlist,
+    )[0]
+
+
+# ── Per-account sweep MODE (Code #13 slice 8, D-303) ──────────────────────────
+#
+# monitored-email-accounts.yaml may pin ONE account row to ALLOWLIST-BY-FOLDER
+# mode: only files whose resolved ancestry touches an allowlisted folder id are
+# ingested; everything else is skipped and COUNTED (skipped_outside_allowlist),
+# never held. Absent key = DENYLIST (today's behaviour, every other account).
+# v1 = the founder's primary mailbox with the HJR-Founder-OS root as the only
+# allowlisted folder. The key family is drive_sweep_* on purpose: it sits beside
+# the existing drive_sweep flag and cannot be confused with kb_exclusions'
+# basename allowlist (_KB_ALLOWLIST_BASENAMES), a different concept.
+DRIVE_SWEEP_MODE_DENYLIST = "denylist"
+DRIVE_SWEEP_MODE_ALLOWLIST = "allowlist"
+_DRIVE_SWEEP_MODES = frozenset({DRIVE_SWEEP_MODE_DENYLIST, DRIVE_SWEEP_MODE_ALLOWLIST})
+DRIVE_SWEEP_MODE_KEY = "drive_sweep_mode"
+DRIVE_SWEEP_ALLOWLIST_KEY = "drive_sweep_allowlist"
+
+
+def resolve_sweep_mode(user: dict) -> tuple[str, frozenset[str], str | None]:
+    """``(mode, allowlist, error)`` for one account row.
+
+    ``error`` is a human line when the row is NOT sweepable as configured --
+    allowlist mode with an EMPTY (or missing) list, or an unknown mode string.
+    Both are refused by the caller rather than defaulted: an empty allowlist
+    would silently ingest nothing forever, and a typo'd mode falling back to
+    denylist would silently ingest EVERYTHING (fail-open) -- so unknown is an
+    error, not denylist. Absent key = denylist."""
+    raw_mode = user.get(DRIVE_SWEEP_MODE_KEY)
+    mode = str(raw_mode or DRIVE_SWEEP_MODE_DENYLIST).strip().lower()
+    if mode not in _DRIVE_SWEEP_MODES:
+        return mode, frozenset(), (
+            f"unknown {DRIVE_SWEEP_MODE_KEY}={raw_mode!r} (expected one of "
+            f"{sorted(_DRIVE_SWEEP_MODES)}) -- account NOT swept"
+        )
+    raw_list = user.get(DRIVE_SWEEP_ALLOWLIST_KEY) or []
+    if isinstance(raw_list, str):
+        raw_list = [raw_list]
+    allowlist = frozenset(str(x).strip() for x in raw_list if str(x or "").strip())
+    if mode == DRIVE_SWEEP_MODE_ALLOWLIST and not allowlist:
+        return mode, allowlist, (
+            f"{DRIVE_SWEEP_MODE_KEY}=allowlist with an EMPTY {DRIVE_SWEEP_ALLOWLIST_KEY} "
+            f"-- REFUSED (an empty allowlist would ingest nothing forever); account NOT swept"
+        )
+    if mode == DRIVE_SWEEP_MODE_DENYLIST:
+        allowlist = frozenset()
+    return mode, allowlist, None
 
 
 def _file_under_excluded_folder(
@@ -760,6 +842,20 @@ def sweep_user(
     stats = {"files_enumerated": 0, "files_extracted": 0,
              "chunks_ingested": 0, "phi_skipped": 0, "noise_filtered": 0,
              "dedup_skipped": 0}
+
+    # Per-account sweep MODE (D-303). Resolved BEFORE any service is built or any
+    # KB state is read: a refused row returns the zero stats untouched -- no
+    # watermark advance, no checkpoint clear, no Drive call.
+    sweep_mode, sweep_allowlist, mode_error = resolve_sweep_mode(user)
+    if mode_error:
+        log.error("drive_sweep: %s -- %s", email, mode_error)
+        return stats
+    allowlist_arg: frozenset[str] | None = (
+        sweep_allowlist if sweep_mode == DRIVE_SWEEP_MODE_ALLOWLIST else None
+    )
+    if allowlist_arg is not None:
+        log.info("drive_sweep: %s mode=allowlist folders=%s (everything outside is skipped + counted; "
+                 "unresolved ancestry still holds the watermark)", email, sorted(allowlist_arg))
 
     # Watermark for incremental sync
     watermark_key = f"drive_sweep_{email}"
@@ -896,10 +992,22 @@ def sweep_user(
                 service, file_meta.get("parents"), excluded_folders,
                 _excl_complete, _folder_parent_cache,
                 mime_type=file_meta.get("mimeType", ""), filename=filename,
+                allowlist=allowlist_arg,
             )
             if disposition == "excluded":
                 stats.setdefault("dashboard_excluded_skipped", 0)
                 stats["dashboard_excluded_skipped"] += 1
+                continue
+            if disposition == "outside_allowlist":
+                # D-303: not this account's to ingest -- skipped and COUNTED, never
+                # held (nothing to retry). The cross-user dedup mark is WITHDRAWN so
+                # a shared out-of-tree file this account skips stays ingestable by a
+                # later DENYLIST account (ruling (c): an outside-allowlist skip must
+                # not poison other accounts' enumeration). Every other skip keeps
+                # today's mark-before-disposition semantics byte-for-byte.
+                seen_file_ids.discard(file_id)
+                stats.setdefault("skipped_outside_allowlist", 0)
+                stats["skipped_outside_allowlist"] += 1
                 continue
             if disposition == "unresolved":
                 # Fail-closed for THIS run, and the watermark is HELD below so the
@@ -1020,14 +1128,15 @@ def sweep_user(
             log.warning("drive_sweep: could not clear checkpoint for %s: %s", email, exc)
 
     log.info(
-        "drive_sweep: %s done -- enumerated=%d extracted=%d ingested=%d "
+        "drive_sweep: %s done -- mode=%s enumerated=%d extracted=%d ingested=%d "
         "phi_skipped=%d noise=%d dedup=%d excluded_folder=%d static_md_owned=%d "
-        "ancestry_unresolved=%d cora_internal=%d",
-        email,
+        "ancestry_unresolved=%d skipped_outside_allowlist=%d cora_internal=%d",
+        email, sweep_mode,
         stats["files_enumerated"], stats["files_extracted"], stats["chunks_ingested"],
         stats["phi_skipped"], stats["noise_filtered"], stats["dedup_skipped"],
         stats.get("dashboard_excluded_skipped", 0), stats.get("static_md_owned_skipped", 0),
-        stats.get("ancestry_unresolved_skipped", 0), stats.get("cora_internal_skipped", 0),
+        stats.get("ancestry_unresolved_skipped", 0), stats.get("skipped_outside_allowlist", 0),
+        stats.get("cora_internal_skipped", 0),
     )
     return stats
 
@@ -1077,28 +1186,45 @@ def run_sweep(
             seen_file_ids=seen_file_ids,
         )
         aggregate["accounts_swept"] += 1
-        for k in ("files_enumerated", "files_extracted", "chunks_ingested",
-                  "phi_skipped", "noise_filtered", "dedup_skipped",
-                  "dashboard_excluded_skipped", "static_md_owned_skipped",
-                  "ancestry_unresolved_skipped"):
+        for k in AGGREGATE_COUNTER_KEYS:
             aggregate[k] = aggregate.get(k, 0) + stats.get(k, 0)
 
     log.info(
         "drive_sweep: COMPLETE -- accounts=%d enumerated=%d extracted=%d "
         "ingested=%d phi_skipped=%d noise=%d dedup=%d excluded_folder=%d "
-        "static_md_owned=%d ancestry_unresolved=%d",
+        "static_md_owned=%d ancestry_unresolved=%d skipped_outside_allowlist=%d",
         aggregate["accounts_swept"], aggregate["files_enumerated"],
         aggregate["files_extracted"], aggregate["chunks_ingested"],
         aggregate["phi_skipped"], aggregate["noise_filtered"],
         aggregate["dedup_skipped"], aggregate.get("dashboard_excluded_skipped", 0),
         aggregate.get("static_md_owned_skipped", 0), aggregate.get("ancestry_unresolved_skipped", 0),
+        aggregate.get("skipped_outside_allowlist", 0),
     )
     return aggregate
+
+
+# Every per-account counter run_sweep folds into the aggregate. ONE list, so a
+# counter added to sweep_user cannot be forgotten here and never reach the
+# COMPLETE line (the 9/8 counters had been missing from run_drive_sweep.py's
+# DONE line + Slack summary for the same reason -- both now read this list too).
+AGGREGATE_COUNTER_KEYS: tuple[str, ...] = (
+    "files_enumerated", "files_extracted", "chunks_ingested",
+    "phi_skipped", "noise_filtered", "dedup_skipped",
+    "dashboard_excluded_skipped", "static_md_owned_skipped",
+    "ancestry_unresolved_skipped", "skipped_outside_allowlist",
+)
 
 
 # ── HJR-Founder-OS shared folder sweep ────────────────────────────────────────
 
 FOUNDERS_OS_ROOT_ID = "1TfxuKxzXz0-NipAFYqbK5AxowAy-LIPG"
+
+# Human labels for folder ids that may appear in a per-account drive_sweep_allowlist
+# (D-303). The self-inventory tool and the migration manifest render an allowlisted
+# id by name, never as an opaque id alone. v1 has exactly one.
+ALLOWLIST_FOLDER_LABELS: dict[str, str] = {
+    FOUNDERS_OS_ROOT_ID: "HJR-Founder-OS (the Founder-OS tree root)",
+}
 
 _FOUNDERS_OS_ENTITY_MAP: dict[str, str] = {
     "00-founder":            "FNDR",

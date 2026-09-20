@@ -70,22 +70,50 @@ def _post_slack_summary(stats: dict, dry_run: bool, channel: str) -> None:
         if not token:
             return
         client = WebClient(token=token)
-        mode = " *(dry-run)*" if dry_run else ""
-        text = (
-            f":file_folder: *Drive Sweep complete{mode}*\n"
-            f"Accounts swept: {stats['accounts_swept']}\n"
-            f"Files enumerated: {stats['files_enumerated']}\n"
-            f"Files extracted: {stats['files_extracted']}\n"
-            f"KB chunks ingested: {stats['chunks_ingested']}\n"
-            f"PHI-guarded (Lex): {stats['phi_skipped']}\n"
-            f"Noise-filtered: {stats['noise_filtered']}\n"
-            f"Cross-user dedup skipped: {stats['dedup_skipped']}"
-        )
-        client.chat_postMessage(channel=channel, text=text)
+        client.chat_postMessage(channel=channel, text=_format_slack_summary(stats, dry_run))
     except Exception as exc:
         logging.getLogger("run_drive_sweep").warning(
             "Could not post Slack summary: %s", exc
         )
+
+
+def _format_slack_summary(stats: dict, dry_run: bool) -> str:
+    """The --with-slack text. Carries EVERY aggregate counter, incl. the 9/8
+    disposition counters (excluded folder / static_md-owned / ancestry unresolved)
+    and the D-303 skipped_outside_allowlist -- both surfaces here had shown only
+    the legacy seven (Code #13 slice 8 brought them up to date)."""
+    mode = " *(dry-run)*" if dry_run else ""
+    return (
+        f":file_folder: *Drive Sweep complete{mode}*\n"
+        f"Accounts swept: {stats.get('accounts_swept', 0)}\n"
+        f"Files enumerated: {stats.get('files_enumerated', 0)}\n"
+        f"Files extracted: {stats.get('files_extracted', 0)}\n"
+        f"KB chunks ingested: {stats.get('chunks_ingested', 0)}\n"
+        f"PHI-guarded (Lex): {stats.get('phi_skipped', 0)}\n"
+        f"Noise-filtered: {stats.get('noise_filtered', 0)}\n"
+        f"Cross-user dedup skipped: {stats.get('dedup_skipped', 0)}\n"
+        f"Excluded-folder skipped: {stats.get('dashboard_excluded_skipped', 0)}\n"
+        f"static_md-owned (in-tree .md) skipped: {stats.get('static_md_owned_skipped', 0)}\n"
+        f"Ancestry unresolved (held): {stats.get('ancestry_unresolved_skipped', 0)}\n"
+        f"Outside allowlist skipped (D-303): {stats.get('skipped_outside_allowlist', 0)}"
+    )
+
+
+def _format_done_line(stats: dict) -> str:
+    """The final 'Drive sweep DONE' log line -- same counter set as run_sweep's
+    COMPLETE line, so the two never disagree about what a run did."""
+    return (
+        "Drive sweep DONE -- accounts=%d enumerated=%d extracted=%d "
+        "ingested=%d phi=%d noise=%d dedup=%d excluded_folder=%d "
+        "static_md_owned=%d ancestry_unresolved=%d skipped_outside_allowlist=%d" % (
+            stats.get("accounts_swept", 0), stats.get("files_enumerated", 0),
+            stats.get("files_extracted", 0), stats.get("chunks_ingested", 0),
+            stats.get("phi_skipped", 0), stats.get("noise_filtered", 0),
+            stats.get("dedup_skipped", 0), stats.get("dashboard_excluded_skipped", 0),
+            stats.get("static_md_owned_skipped", 0), stats.get("ancestry_unresolved_skipped", 0),
+            stats.get("skipped_outside_allowlist", 0),
+        )
+    )
 
 
 def main() -> int:
@@ -194,13 +222,7 @@ def main() -> int:
         except Exception:
             pass
 
-    log.info(
-        "Drive sweep DONE -- accounts=%d enumerated=%d extracted=%d "
-        "ingested=%d phi=%d noise=%d dedup=%d",
-        stats["accounts_swept"], stats["files_enumerated"],
-        stats["files_extracted"], stats["chunks_ingested"],
-        stats["phi_skipped"], stats["noise_filtered"], stats["dedup_skipped"],
-    )
+    log.info(_format_done_line(stats))
 
     if args.with_slack and not args.dry_run:
         channel = os.environ.get("DRIVE_SWEEP_NOTIFY_CHANNEL", "cora-drive-sweep")

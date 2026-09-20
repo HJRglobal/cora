@@ -464,7 +464,10 @@ def live_tool_families(entity: str | None) -> list[str]:
 # ── inventory build ──────────────────────────────────────────────────────────
 _SOURCE_DOOR_NOTES: dict[str, str] = {
     "static_md": "nightly 04:00 + midday 12:20 AZ walk of the Founder OS tree (.md + bootstrap.txt), entity by folder",
-    "drive_sweep": "Drive files -- founders_os tree (entity by folder) + per-user flat sweeps (markdown inside the Founder OS tree left to static_md)",
+    "drive_sweep": ("Drive files -- founders_os tree (entity by folder) + per-user flat sweeps (markdown inside the "
+                    "Founder OS tree left to static_md); an account may be pinned to ALLOWLIST-BY-FOLDER mode "
+                    "(D-303: only its allowlisted tree is ingested, everything else skipped + counted; see the "
+                    "drive-sweep modes line)"),
     "drive_asset": "Drive file stubs (name/path/owner) for non-text files",
     "gmail": ("per-mailbox threaded sweep (roster in monitored-email-accounts.yaml); watermarks live in "
               "data/cache/gmail-thread-watermarks.json (listed below), not in the KB"),
@@ -528,6 +531,7 @@ def build_inventory(
     gmail_reader: Callable[[], dict[str, Any]] | None = None,
     parity_reader: Callable[[], dict[str, Any]] | None = None,
     connectors_reader: Callable[[str | None], list[str]] | None = None,
+    sweep_modes_reader: Callable[[], list[dict[str, Any]]] | None = None,
     now: float | None = None,
 ) -> dict[str, Any]:
     """Assemble the inventory from live signals. Every section fail-soft.
@@ -542,6 +546,7 @@ def build_inventory(
     gmail_reader = gmail_reader or read_gmail_watermarks
     parity_reader = parity_reader or read_parity_report
     connectors_reader = connectors_reader or live_tool_families
+    sweep_modes_reader = sweep_modes_reader or read_drive_sweep_modes
     now = time.time() if now is None else now
     inv: dict[str, Any] = {"detail": detail, "entity": (entity or "").upper() or None,
                            "generated_at": datetime.fromtimestamp(now, tz=timezone.utc).isoformat()}
@@ -639,6 +644,13 @@ def build_inventory(
          "kind": "computers-backup root (ancestry walk)" if fid in walk_only else "pinned folder (subtree pruned)"}
         for fid in sorted(kb_exclusions.KB_EXCLUDED_FOLDER_IDS, key=lambda f: labels.get(f, f))
     ]
+    # D-303 (Code #13 slice 8): per-account Drive sweep MODE beside the pinned
+    # exclusions -- "do you ingest my Downloads" is answered from a listing.
+    try:
+        inv["drive_sweep_modes"] = list(sweep_modes_reader() or [])
+    except Exception as exc:  # noqa: BLE001
+        inv["drive_sweep_modes"] = []
+        inv["drive_sweep_modes_error"] = str(exc)
     inv["excluded_path_segments"] = {
         "dashboard stores": sorted(kb_exclusions._DASHBOARD_STORE_SEGMENTS),
         "finance working stores": sorted(kb_exclusions._FINANCE_WORKSHEET_SEGMENTS),
@@ -686,6 +698,43 @@ def _drive_skip_names() -> frozenset[str]:
         return frozenset(drive_sweep._FOUNDERS_OS_SKIP_FOLDERS)
     except Exception:  # noqa: BLE001
         return frozenset()
+
+
+ACCOUNTS_YAML_PATH = _REPO_ROOT / "data" / "maps" / "monitored-email-accounts.yaml"
+
+
+def read_drive_sweep_modes(path: Path | None = None) -> list[dict[str, Any]]:
+    """Per-account Drive sweep MODES from the roster (D-303, Code #13 slice 8):
+    one row per account that carries a ``drive_sweep_mode`` key, with its
+    allowlisted folders rendered by LABEL (drive_sweep.ALLOWLIST_FOLDER_LABELS)
+    and any config error the sweep would refuse on. Read-only; fail-soft (an
+    unreadable roster -> []). Accounts without the key are denylist and are not
+    listed -- the renderer says so in one line."""
+    import yaml  # lazy: not a module-level dependency of the inventory
+    from cora.connectors import drive_sweep  # lazy: the same bot-loaded reader as _drive_skip_names
+    p = Path(path) if path else ACCOUNTS_YAML_PATH
+    try:
+        cfg = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("self_inventory: drive sweep modes unreadable (%s)", exc)
+        return []
+    out: list[dict[str, Any]] = []
+    for row in cfg.get("accounts") or []:
+        if not isinstance(row, dict) or drive_sweep.DRIVE_SWEEP_MODE_KEY not in row:
+            continue
+        mode, allow, err = drive_sweep.resolve_sweep_mode(row)
+        out.append({
+            "email": str(row.get("email") or ""),
+            "mode": mode,
+            "swept": bool(row.get("enabled", True)) and bool(row.get("dwd_eligible", False))
+                     and bool(row.get("drive_sweep", False)),
+            "allowlist": [
+                {"id": fid, "label": drive_sweep.ALLOWLIST_FOLDER_LABELS.get(fid, "(unlabelled folder)")}
+                for fid in sorted(allow)
+            ],
+            "error": err,
+        })
+    return out
 
 
 # ── rendering ────────────────────────────────────────────────────────────────
@@ -760,6 +809,28 @@ def render_inventory(inv: dict[str, Any]) -> str:
                      f"confidential stores, an NDA project, finance working stores, the Cora build workspace, "
                      f"{n_roots} PC backup roots) plus the static-tree skips (_brain/swept, _delegated-work, "
                      f"_archive, PHI segments). Folder names and ids are founder-level.")
+    # D-303: per-account Drive sweep MODE, beside the pinned exclusions. A
+    # non-founder channel learns THAT allowlist mode exists and how many accounts
+    # run it -- never which mailbox or which folder ids.
+    modes = inv.get("drive_sweep_modes", []) or []
+    n_allow = sum(1 for m in modes if m.get("mode") == "allowlist")
+    if detail:
+        if modes:
+            lines.append("DRIVE SWEEP MODES (D-303; per account in monitored-email-accounts.yaml -- every account "
+                         "not listed here is denylist; mailbox | mode | allowlisted folders):")
+            for m in modes:
+                folders = ", ".join(f"{a.get('label')} [{a.get('id')}]" for a in m.get("allowlist") or []) or "(none)"
+                flag = f" | CONFIG ERROR (row not swept): {m.get('error')}" if m.get("error") else ""
+                swept = "" if m.get("swept", True) else " | not currently swept (enabled/dwd/drive_sweep off)"
+                lines.append(f"- {m.get('email')} | {m.get('mode')} | {folders}{flag}{swept}")
+        else:
+            err = inv.get("drive_sweep_modes_error")
+            lines.append("DRIVE SWEEP MODES: no account pinned to allowlist mode (every flat sweep is denylist)"
+                         + (f" -- roster unreadable this turn: {err}" if err else ""))
+    else:
+        lines.append(f"Drive sweep modes: {n_allow} account(s) run in ALLOWLIST-BY-FOLDER mode (only the allowlisted "
+                     f"tree is ingested from that Drive; everything else is skipped and counted, never held); all "
+                     f"other accounts are denylist. Mailboxes and folder ids are founder-level.")
     lines.append("Drive subtree names skipped in the Founder-OS walk: " + ", ".join(inv.get("drive_skip_folder_names", [])))
     belts = inv.get("title_belts_founder" if detail else "title_belts", inv.get("title_belts", []))
     lines.append("Title belts: " + " | ".join(belts))
