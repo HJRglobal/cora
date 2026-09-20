@@ -30,6 +30,7 @@ State model (append-only event ledger, state derived by fold):
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import logging
 import os
@@ -2167,7 +2168,7 @@ def process_queue_action(action_id: str, cq_id: str, actor_id: str, *,
         # ensure_kickoff_staged so EVERY approval path shares one implementation and
         # one loud-failure contract.
         if is_priority_severity(rec.get("severity")):
-            outcome, detail = ensure_kickoff_staged(cq_id)
+            outcome, detail = ensure_kickoff_staged(cq_id, via="approve_auto")
             if outcome == "staged":
                 msg = f"✅ Queued + prompt staged: `{detail}`"
             elif outcome == "inflight":
@@ -2215,7 +2216,7 @@ def process_queue_action(action_id: str, cq_id: str, actor_id: str, *,
         # guard is what keeps a re-tap from a second Sonnet call / second `staged`
         # event (defect #3 TOCTOU class), and its terminal guard is what keeps a
         # stale Slack button from resurrecting a SHIPPED row (lens-4 HIGH).
-        outcome, detail = ensure_kickoff_staged(cq_id)
+        outcome, detail = ensure_kickoff_staged(cq_id, via="button")
         if outcome == "staged":
             return "staged", f"📝 Prompt staged: `{detail}`"
         if outcome == "noop":
@@ -2327,9 +2328,17 @@ def process_queue_action(action_id: str, cq_id: str, actor_id: str, *,
 _TERMINAL_STATUSES = frozenset({"SHIPPED", "DISMISSED", "SUPERSEDED"})
 
 
-def ensure_kickoff_staged(cq_id: str, *, override_evidence_floor: bool = False) -> tuple[str, str]:
+def ensure_kickoff_staged(cq_id: str, *, override_evidence_floor: bool = False,
+                          via: str = "") -> tuple[str, str]:
     """Generate + ledger-record a kickoff prompt for one item. The single
     implementation every approval path shares.
+
+    ``via`` (Code #13 slice 1, kickoff section 9 ask 7): the door this staging
+    came through -- 'typed_verb' | 'button' | 'approve_auto' | 'seed' | 'script'
+    -- recorded on the `staged` event beside `override: true` when the floor was
+    bypassed. The 9/14 forensics could not tell a Stage-button stage from a typed
+    override on the ledger (the event carried only {event, ts, id, prompt_path,
+    bundle_id}); D-314 says verify on the LEDGER, so the ledger must say.
 
     Returns (outcome, detail):
       "staged"   -> detail is the prompt path
@@ -2392,6 +2401,10 @@ def ensure_kickoff_staged(cq_id: str, *, override_evidence_floor: bool = False) 
         # Mark-shipped tap on this row has a reference and the gate can pass it.
         ev = {"event": "staged", "ts": _now_iso(), "id": cq_id, "prompt_path": path,
               "bundle_id": solo_bundle_id(cq_id)}
+        if via:
+            ev["via"] = str(via)
+        if override_evidence_floor:
+            ev["override"] = True   # the founder's typed verb bypassed the C1 floor
         if meta.get("mis_homed"):
             ev["mis_homed"] = True
         _append_event(ev)
@@ -2918,7 +2931,7 @@ def stage_by_id(cq_id: str, actor_id: str) -> tuple[str, str]:
                 f"I can't find `{cid or '(no id)'}` in the queue. If you have the "
                 f"card, tap its \u201cStage prompt\u201d button -- that is the same "
                 f"path and it always resolves the right item.")
-    return ensure_kickoff_staged(cid, override_evidence_floor=True)
+    return ensure_kickoff_staged(cid, override_evidence_floor=True, via="typed_verb")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2959,6 +2972,64 @@ def match_queue_verb(text: str) -> tuple[str, ...] | None:
     if m:
         return "ship", m.group(1).lower(), m.group(2)
     return None
+
+
+# ── RIDER 2 (Code #13 section 10, cq-70d7b203f7ad): decorated / malformed verbs ──
+# 2026-09-15 21:17:48 AZ: Harrison's DM `• <@U0B44MDGC5R> \`stage cq-a24f9d2210fc\``
+# -- a bullet, a bot mention and backticks, i.e. the shape of a capture's paste-
+# ready block -- did NOT match the grammar above (the DM mention strip only removes
+# a LEADING token), fell through to dm_qa -> haiku, and the model replied "staged"
+# with zero tool_use. The 9/10 09:35:53 / 09:36:42 phantoms were the same class
+# (`ship cq-<STAGED id you are happy to close>` typed literally; `ship cq-cq-...`).
+# Three incidents, one mechanism: a decorated or malformed queue verb reaches the
+# model, which narrates a write.
+#
+# Two rails, both deterministic, both BEFORE the grammar's callers:
+#   1. normalize_verb_text -- strips ONE leading list marker, Cora's OWN mention
+#      token (never another user's: an unknown mention is ambiguity, and ambiguity
+#      refuses), backticks / fences, HTML entities and surrounding whitespace, and
+#      lower-cases the verb token only. Anything else (extra words, two ids, a
+#      second line) still fails the grammar. The grammar itself is UNCHANGED
+#      (1hhhhhhhhh: typed verb = deterministic, the ONLY evidence-floor override).
+#   2. looks_like_queue_verb_attempt -- a verb token followed by anything cq-shaped
+#      or a `<placeholder>` that FAILED the grammar is a PARSE FAILURE to refuse
+#      from code (PARSE_REFUSED_REPLY), never a question for the model (D-316).
+#      The refusal carries ZERO write-claim lexicon (test-pinned against S2').
+_VERB_LIST_MARKER_RE = re.compile(r"^\s*(?:[•◦‣⁃·\-\*\+]|\d{1,2}[.)])\s+")
+_VERB_CODE_TICKS_RE = re.compile(r"`{1,3}")
+_QUEUE_VERBS: tuple[str, ...] = ("stage", "approve", "dismiss", "ship")
+# `<@U..>` / `<#C..>` / `<!here>` / `<http...>` are Slack tokens, not placeholders --
+# a verb followed by one of those is NOT a queue-verb attempt (a DM "dismiss <@U1>'s
+# concern" is ordinary prose and stays with the model).
+_VERB_ATTEMPT_RE = re.compile(
+    r"\b(stage|approve|dismiss|ship)\b\s*[`'\"]*\s*(?:cq-\S*|<(?![@#!]|https?:)[^>\n]{0,80}>)",
+    re.IGNORECASE)
+PARSE_REFUSED_REPLY = ("I see a queue verb but couldn't parse it. Nothing was changed. "
+                       "Send exactly `stage cq-<12 hex>` on its own line.")
+
+
+def normalize_verb_text(text: str, *, bot_user_id: str | None = None) -> str:
+    """The verb-matching view of a DM: decorations a paste carries are removed; the
+    words are not. Only Cora's OWN mention (``bot_user_id``) is stripped -- with no
+    id known, a mention stays and the grammar fails (refusal, never execution)."""
+    t = html.unescape(str(text or ""))
+    t = _VERB_LIST_MARKER_RE.sub("", t, count=1)
+    if isinstance(bot_user_id, str) and bot_user_id:
+        t = re.sub(rf"<@{re.escape(bot_user_id)}(?:\|[^>\n]{{0,40}})?>", " ", t)
+    t = _VERB_CODE_TICKS_RE.sub("", t)
+    t = t.strip()
+    m = re.match(r"(\S+)(.*)", t, re.DOTALL)
+    if m and m.group(1).lower() in _QUEUE_VERBS:
+        t = m.group(1).lower() + m.group(2)
+    return t
+
+
+def looks_like_queue_verb_attempt(text: str) -> str | None:
+    """The verb when *text* carries a queue verb followed by something cq-shaped or
+    a `<placeholder>` (a paste that failed the grammar); else None. Callers run this
+    ONLY after match_queue_verb returned None."""
+    m = _VERB_ATTEMPT_RE.search(str(text or ""))
+    return m.group(1).lower() if m else None
 
 
 def apply_queue_verb(verb: str, cq_id: str, actor_id: str, arg: str = "") -> tuple[str, str]:

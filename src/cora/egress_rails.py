@@ -48,7 +48,15 @@ from pathlib import Path
 
 RAIL_SENTINEL = "sentinel-egress-leak"
 RAIL_PHANTOM = "phantom-write-claim"
-RAIL_KEYS: tuple[str, ...] = (RAIL_SENTINEL, RAIL_PHANTOM)
+# Code #13 slice 1 (cq-2a88e32a75ea): the THIRD seam rail -- a capability denial
+# about something the bot has, or an internal tool name on a non-developer
+# surface (slack_egress.screen_capability_claims). Same flag, same ritual.
+RAIL_CAPABILITY = "phantom-capability-claim"
+RAIL_KEYS: tuple[str, ...] = (RAIL_SENTINEL, RAIL_PHANTOM, RAIL_CAPABILITY)
+#: The two Code #12 keys -- the S2' observe-week pair whose clock started
+#: 2026-09-10 08:45:06. Rendered side by side with the full set so the 9/25
+#: criterion read stays COMPARABLE after the third key joined (kickoff section 3).
+S2_PAIR: tuple[str, ...] = (RAIL_SENTINEL, RAIL_PHANTOM)
 
 ENFORCE_ENV = "CORA_SENTINEL_ENFORCE"
 WINDOW_DAYS = 7
@@ -65,6 +73,7 @@ log = logging.getLogger(__name__)
 _FIRING_RE = {
     RAIL_SENTINEL: re.compile(r"sentinel-egress-leak\s+mode="),
     RAIL_PHANTOM: re.compile(r"phantom-write-claim\s+kind="),
+    RAIL_CAPABILITY: re.compile(r"phantom-capability-claim\s+kind="),
 }
 
 # The bot's log format (main._setup_logging): "%(asctime)s %(levelname)s
@@ -146,20 +155,35 @@ def armed_state(path: Path | None = None) -> dict | None:
 
 def record_armed(*, path: Path | None = None, now: datetime | None = None,
                  rails: tuple[str, ...] = RAIL_KEYS, log_to=None) -> dict:
-    """Record that ``rails`` are armed in THIS process. ``first_armed_at`` is kept
-    across restarts while the rail set is unchanged (a restart does not un-observe
-    the days already counted); it resets when the set changes, because a new rail's
-    observe week starts when IT first runs. Atomic write; fail-soft (returns the
-    record it tried to write)."""
+    """Record that ``rails`` are armed in THIS process.
+
+    PER-KEY ``first_armed`` (Code #13 slice 1; kickoff section 3): every rail keeps
+    ITS OWN first-armed stamp across restarts, and a NEW rail joining the set starts
+    its own clock WITHOUT resetting the others' -- the Code #12 rule ("keep while the
+    set is unchanged, else reset") would have wiped the S2' pair's 2026-09-10
+    08:45:06 clock the first time the capability rail booted. Top-level
+    ``first_armed_at`` = the earliest surviving key (so the legacy field still reads
+    2026-09-10 for the pair). A key REMOVED from the set drops its stamp. A record
+    written by the Code #12 shape (no ``first_armed`` map) is migrated: each prior
+    key inherits the record's ``first_armed_at``. Atomic write; fail-soft (returns
+    the record it tried to write)."""
     p = Path(path) if path is not None else ARMED_STATE_PATH
     now = now or datetime.now()
+    now_iso = now.isoformat(timespec="seconds")
     prior = armed_state(p)
     rail_list = sorted(rails)
-    first = now.isoformat(timespec="seconds")
-    if prior and sorted(prior.get("rails") or []) == rail_list and prior.get("first_armed_at"):
-        first = str(prior["first_armed_at"])
-    rec = {"rails": rail_list, "first_armed_at": first,
-           "last_armed_at": now.isoformat(timespec="seconds"), "pid": os.getpid()}
+    first_by_key: dict[str, str] = {}
+    if prior:
+        prior_keys = set(prior.get("rails") or [])
+        prior_map = prior.get("first_armed") if isinstance(prior.get("first_armed"), dict) else {}
+        for k in rail_list:
+            if k in prior_keys:
+                first_by_key[k] = str(prior_map.get(k) or prior.get("first_armed_at") or now_iso)
+    for k in rail_list:
+        first_by_key.setdefault(k, now_iso)
+    first = min(first_by_key.values()) if first_by_key else now_iso
+    rec = {"rails": rail_list, "first_armed_at": first, "first_armed": first_by_key,
+           "last_armed_at": now_iso, "pid": os.getpid()}
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(".tmp")
@@ -167,25 +191,44 @@ def record_armed(*, path: Path | None = None, now: datetime | None = None,
         tmp.replace(p)
     except Exception:  # noqa: BLE001 -- a breadcrumb must never block startup
         (log_to or log).warning("egress-rails: armed record write failed (non-fatal)", exc_info=True)
-    (log_to or log).info("egress-rails armed: %s (first armed %s)", ", ".join(rail_list), first)
+    later = [f"{k} since {v}" for k, v in first_by_key.items() if v != first]
+    (log_to or log).info("egress-rails armed: %s (first armed %s%s)", ", ".join(rail_list), first,
+                         ("; " + "; ".join(later)) if later else "")
     return rec
+
+
+def first_armed_by_key(st: dict | None) -> dict[str, datetime]:
+    """{rail: first-armed stamp} from an armed record -- per-key when the record has
+    the map, else every listed rail inherits the record's ``first_armed_at``
+    (the Code #12 shape). Unparseable stamps are dropped (never read as covered)."""
+    out: dict[str, datetime] = {}
+    if not st:
+        return out
+    m = st.get("first_armed") if isinstance(st.get("first_armed"), dict) else {}
+    for k in (st.get("rails") or []):
+        raw = m.get(k) or st.get("first_armed_at")
+        try:
+            out[str(k)] = datetime.fromisoformat(str(raw))
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def _coverage(now: datetime, scan7: dict, armed_path: Path | None) -> dict:
     st = armed_state(armed_path)
-    first: datetime | None = None
-    if st:
-        try:
-            first = datetime.fromisoformat(str(st.get("first_armed_at")))
-        except ValueError:
-            first = None
+    by_key = first_armed_by_key(st)
+    first = min(by_key.values()) if by_key else None
     window_start = now - timedelta(days=WINDOW_DAYS)
-    armed_for_window = first is not None and first <= window_start
+    covers_by_key = {k: (k in by_key and by_key[k] <= window_start) for k in RAIL_KEYS}
     return {
         "armed": st is not None,
         "first_armed_at": first.isoformat(timespec="seconds") if first else "",
         "armed_days": (now - first).days if first else 0,
-        "covers_window": armed_for_window,
+        "first_armed": {k: v.isoformat(timespec="seconds") for k, v in by_key.items()},
+        "armed_days_by_key": {k: (now - v).days for k, v in by_key.items()},
+        "covers_window": all(covers_by_key.values()),
+        "covers_window_by_key": covers_by_key,
+        "uncovered": [k for k in RAIL_KEYS if not covers_by_key[k]],
         "files_scanned": int(scan7.get("files_scanned") or 0),
         "bot_lines_in_window": int(scan7.get("bot_lines_in_window") or 0),
     }
@@ -210,24 +253,37 @@ def observe_week_read(now: datetime | None = None, *, log_dir: Path | None = Non
     zero = all(v == 0 for v in c7.values())
     covered = cov["covers_window"] and cov["files_scanned"] > 0
     clean = zero and covered
+    # The Code #12 pair on its own (S2' clock 2026-09-10): rendered beside the full
+    # set so adding the third key never makes the 9/25 read incomparable.
+    pair_zero = all(c7.get(k, 0) == 0 for k in S2_PAIR)
+    pair_covered = all(cov["covers_window_by_key"].get(k) for k in S2_PAIR) and cov["files_scanned"] > 0
+    clean_pair = pair_zero and pair_covered
+    hits_txt = " + ".join(f"{k} {c7[k]}" for k in RAIL_KEYS)
     if mode == "enforce":
         crit = ("ENFORCE is on: every hit is an ERROR-level correction; "
                 f"{sum(c7.values())} correction(s) in 7d")
     elif not zero:
-        crit = (f"observe week NOT clean: {RAIL_SENTINEL} {c7[RAIL_SENTINEL]} + "
-                f"{RAIL_PHANTOM} {c7[RAIL_PHANTOM]} in 7d -- the enforce flip stays "
-                "gated until BOTH read 0 for a full armed week")
+        crit = (f"observe week NOT clean: {hits_txt} in 7d -- the enforce flip stays "
+                "gated until ALL rails read 0 for a full armed week")
     elif not covered:
-        why = ("the rails were never armed in a running bot (no armed record)" if not cov["armed"]
-               else f"the rails have been armed only since {cov['first_armed_at'][:10]} "
-                    f"({cov['armed_days']}d, window is {WINDOW_DAYS}d)")
+        if not cov["armed"]:
+            why = "the rails were never armed in a running bot (no armed record)"
+        else:
+            parts = []
+            for k in cov["uncovered"]:
+                fa = (cov["first_armed"] or {}).get(k)
+                parts.append(f"{k} {'armed only since ' + fa[:10] + ' (' + str(cov['armed_days_by_key'].get(k, 0)) + 'd)' if fa else 'NOT yet armed in a running bot'}")
+            why = "; ".join(parts) + f" (window is {WINDOW_DAYS}d)"
+            if clean_pair:
+                why += (f"; the S2' pair ({' + '.join(S2_PAIR)}) IS clean and covered since "
+                        f"{cov['first_armed'].get(RAIL_PHANTOM, '')[:10]}")
         if cov["files_scanned"] == 0:
             why += " and no bot log file fell inside the window"
         crit = (f"NOT a clean read: {why} -- zero firings is silence, not safety; the "
-                "CORA_SENTINEL_ENFORCE flip stays gated until both rails read 0 across a "
+                "CORA_SENTINEL_ENFORCE flip stays gated until every rail reads 0 across a "
                 "FULL armed week")
     else:
-        crit = ("both rails clean over 7d with the rails armed for the whole window -- the "
+        crit = (f"all {len(RAIL_KEYS)} rails clean over 7d with the rails armed for the whole window -- the "
                 "CORA_SENTINEL_ENFORCE flip criterion is MET (Harrison's call; the bot reads the "
                 "flag at startup, so a flip = .env edit + restart)")
     return {
@@ -236,19 +292,28 @@ def observe_week_read(now: datetime | None = None, *, log_dir: Path | None = Non
         "counts_7d": c7,
         "coverage": cov,
         "clean_7d": clean,
+        "clean_7d_s2_pair": clean_pair,
         "flip_criterion": crit,
     }
 
 
 def format_line(read: dict) -> str:
-    """One ASCII line for a digest: counts for both rails, 24h and 7d, mode, coverage."""
+    """One ASCII line for a digest: counts for EVERY rail key, 24h and 7d, mode,
+    coverage (per-key first-armed when a key's clock differs from the earliest)."""
     c24 = read.get("counts_24h") or {}
     c7 = read.get("counts_7d") or {}
     cov = read.get("coverage") or {}
     if cov.get("armed"):
-        armed = f"armed since {str(cov.get('first_armed_at', ''))[:10]} ({cov.get('armed_days', '?')}d)"
+        first = str(cov.get("first_armed_at", ""))
+        armed = f"armed since {first[:10]} ({cov.get('armed_days', '?')}d)"
+        later = [f"{k} since {str(v)[:10]}" for k, v in (cov.get("first_armed") or {}).items()
+                 if str(v) != first]
+        missing = [k for k in RAIL_KEYS if k not in (cov.get("first_armed") or {})]
+        extra = later + [f"{k} NOT armed" for k in missing]
+        if extra:
+            armed += " (" + "; ".join(extra) + ")"
     else:
         armed = "rails NOT armed (no record)"
-    return (f"mode={read.get('mode', '?')} | {RAIL_SENTINEL} {c24.get(RAIL_SENTINEL, '?')} (24h) / "
-            f"{c7.get(RAIL_SENTINEL, '?')} (7d) | {RAIL_PHANTOM} {c24.get(RAIL_PHANTOM, '?')} (24h) / "
-            f"{c7.get(RAIL_PHANTOM, '?')} (7d) | {armed}, {cov.get('files_scanned', '?')} bot log(s) scanned")
+    counts = " | ".join(f"{k} {c24.get(k, '?')} (24h) / {c7.get(k, '?')} (7d)" for k in RAIL_KEYS)
+    return (f"mode={read.get('mode', '?')} | {counts} | {armed}, "
+            f"{cov.get('files_scanned', '?')} bot log(s) scanned")

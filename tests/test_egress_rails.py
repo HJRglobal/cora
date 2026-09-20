@@ -99,15 +99,15 @@ class TestCount:
     def test_24h_and_7d_windows_count_bot_firing_lines_only(self, logs):
         now = datetime.now()
         c24 = er.count_rail_hits(now - timedelta(hours=26), log_dir=logs)
-        assert c24 == {er.RAIL_SENTINEL: 1, er.RAIL_PHANTOM: 2}
+        assert c24 == {er.RAIL_SENTINEL: 1, er.RAIL_PHANTOM: 2, er.RAIL_CAPABILITY: 0}
         c7 = er.count_rail_hits(now - timedelta(days=7), log_dir=logs)
-        assert c7 == {er.RAIL_SENTINEL: 2, er.RAIL_PHANTOM: 3}
+        assert c7 == {er.RAIL_SENTINEL: 2, er.RAIL_PHANTOM: 3, er.RAIL_CAPABILITY: 0}
         scan = er.scan_rail_hits(now - timedelta(days=7), log_dir=logs)
         assert scan["files_scanned"] == 2 and scan["bot_lines_in_window"] == 5
 
     def test_missing_log_dir_counts_zero_and_scans_nothing(self, tmp_path):
         assert er.count_rail_hits(datetime.now(), log_dir=tmp_path / "nope") == {
-            er.RAIL_SENTINEL: 0, er.RAIL_PHANTOM: 0}
+            er.RAIL_SENTINEL: 0, er.RAIL_PHANTOM: 0, er.RAIL_CAPABILITY: 0}
         assert er.scan_rail_hits(datetime.now(), log_dir=tmp_path / "nope")["files_scanned"] == 0
 
     def test_observe_week_read_not_clean(self, logs, monkeypatch):
@@ -164,17 +164,65 @@ class TestCoverage:
         assert "MET" in read["flip_criterion"] and "armed for the whole window" in read["flip_criterion"]
         assert "restart" in read["flip_criterion"]  # a flip is .env + restart, said plainly
 
-    def test_record_armed_keeps_first_armed_at_across_restarts_and_resets_on_a_new_rail(self, tmp_path):
+    def test_record_armed_keeps_first_armed_at_across_restarts_and_a_new_rail_starts_its_own_clock(self, tmp_path):
+        """Code #13 slice 1 (kickoff section 3): per-key first_armed. A NEW rail
+        joining the set starts ITS clock without resetting the others' -- the Code
+        #12 rule reset the whole record on any set change, which would have wiped
+        the S2' 2026-09-10 clock the first time the capability rail booted."""
         p = tmp_path / "armed.json"
         t0 = datetime(2026, 9, 1, 8, 0, 0)
         rec1 = er.record_armed(path=p, now=t0)
         assert rec1["first_armed_at"] == rec1["last_armed_at"] == t0.isoformat(timespec="seconds")
+        assert set(rec1["first_armed"]) == set(er.RAIL_KEYS)
         rec2 = er.record_armed(path=p, now=t0 + timedelta(days=3))
         assert rec2["first_armed_at"] == t0.isoformat(timespec="seconds")          # kept
         assert rec2["last_armed_at"] == (t0 + timedelta(days=3)).isoformat(timespec="seconds")
         assert json.loads(p.read_text(encoding="utf-8"))["first_armed_at"] == rec2["first_armed_at"]
-        rec3 = er.record_armed(path=p, now=t0 + timedelta(days=4), rails=er.RAIL_KEYS + ("new-rail",))
-        assert rec3["first_armed_at"] == (t0 + timedelta(days=4)).isoformat(timespec="seconds")  # reset
+        t4 = t0 + timedelta(days=4)
+        rec3 = er.record_armed(path=p, now=t4, rails=er.RAIL_KEYS + ("new-rail",))
+        assert rec3["first_armed_at"] == t0.isoformat(timespec="seconds")          # NOT reset
+        for k in er.RAIL_KEYS:
+            assert rec3["first_armed"][k] == t0.isoformat(timespec="seconds")
+        assert rec3["first_armed"]["new-rail"] == t4.isoformat(timespec="seconds")  # its own clock
+        # a key REMOVED from the set drops its stamp; the survivors keep theirs
+        rec4 = er.record_armed(path=p, now=t4 + timedelta(days=1), rails=er.RAIL_KEYS)
+        assert "new-rail" not in rec4["first_armed"] and rec4["first_armed_at"] == t0.isoformat(timespec="seconds")
+
+    def test_live_code12_record_migrates_without_resetting_the_s2_clock(self, tmp_path):
+        """The exact live shape of data/state/egress-rails-armed.json at fire time
+        (two keys, no per-key map, first_armed_at 2026-09-10T08:45:06): the first
+        Code #13 boot must keep that stamp for the pair and start the third key."""
+        p = tmp_path / "armed.json"
+        p.write_text(json.dumps({"rails": ["phantom-write-claim", "sentinel-egress-leak"],
+                                 "first_armed_at": "2026-09-10T08:45:06",
+                                 "last_armed_at": "2026-09-19T16:22:42", "pid": 1992}), encoding="utf-8")
+        boot = datetime(2026, 9, 22, 9, 0, 0)
+        rec = er.record_armed(path=p, now=boot)
+        assert rec["first_armed_at"] == "2026-09-10T08:45:06"
+        assert rec["first_armed"][er.RAIL_PHANTOM] == "2026-09-10T08:45:06"
+        assert rec["first_armed"][er.RAIL_SENTINEL] == "2026-09-10T08:45:06"
+        assert rec["first_armed"][er.RAIL_CAPABILITY] == boot.isoformat(timespec="seconds")
+        assert sorted(rec["rails"]) == sorted(er.RAIL_KEYS)
+        # and the coverage read names the third key as the blocker, not the pair
+        _quiet_bot_log(tmp_path)
+        read = er.observe_week_read(now=boot + timedelta(days=1), log_dir=tmp_path, armed_path=p)
+        assert read["clean_7d"] is False and read["clean_7d_s2_pair"] is True
+        assert er.RAIL_CAPABILITY in read["flip_criterion"] and "S2' pair" in read["flip_criterion"]
+        assert read["coverage"]["uncovered"] == [er.RAIL_CAPABILITY]
+
+    def test_third_key_is_counted_beside_the_two(self, tmp_path):
+        now = datetime.now()
+        (tmp_path / "cora-2026-09-20.log").write_text("\n".join([
+            _bot(now - timedelta(hours=1), "WARNING",
+                 "phantom-capability-claim kind=denial phrase='I don't have visibility' term='code queue' mode=observe channel=#dm user=U1"),
+            _bot(now - timedelta(hours=2), "WARNING",
+                 "phantom-capability-claim kind=toolname symbol=cora_queue_code_session mode=observe channel=#dm user=U1 tool_use=0"),
+            _bot(now - timedelta(hours=3), "INFO", "the phantom-capability-claim screen is a sibling", logger="cora.tools"),
+        ]) + "\n", encoding="utf-8")
+        counts = er.count_rail_hits(now - timedelta(days=7), log_dir=tmp_path)
+        assert counts[er.RAIL_CAPABILITY] == 2 and counts[er.RAIL_PHANTOM] == 0 and counts[er.RAIL_SENTINEL] == 0
+        line = er.format_line(er.observe_week_read(now=now, log_dir=tmp_path, armed_path=_armed(tmp_path, days_ago=8)))
+        assert "phantom-capability-claim 2 (24h) / 2 (7d)" in line and "sentinel-egress-leak 0 (24h)" in line
 
     def test_unreadable_armed_record_reads_as_not_armed(self, tmp_path):
         p = tmp_path / "armed.json"

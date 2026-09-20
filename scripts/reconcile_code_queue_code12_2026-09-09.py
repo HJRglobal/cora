@@ -83,10 +83,13 @@ def _s1_present() -> str | None:
         return "S1' match_queue_verb matches a citation sentence (must be exact-match only)"
     from cora import app
     src = inspect.getsource(app.handle_message_event)
-    if "code_queue.match_queue_verb(text)" not in src or "code_queue.apply_queue_verb(" not in src:
+    # Code #13 RIDER 2 renamed the matched variable (the grammar now reads a
+    # NORMALIZED view, `_qtext`); the invariant this precondition guards is the
+    # CALL, not the argument name.
+    if "code_queue.match_queue_verb(" not in src or "code_queue.apply_queue_verb(" not in src:
         return "S1' interceptor not wired in app.handle_message_event"
     if ("gap_autofill.match_pending_ask" in src
-            and src.index("code_queue.match_queue_verb(text)") > src.index("gap_autofill.match_pending_ask")):
+            and src.index("code_queue.match_queue_verb(") > src.index("gap_autofill.match_pending_ask")):
         return "S1' interceptor sits below the gap-ask capture (a pending ask could swallow the verb)"
     return None
 
@@ -130,7 +133,9 @@ def _s3_present() -> str | None:
         read = egress_rails.observe_week_read(log_dir=empty, armed_path=empty / "armed.json")
     finally:
         shutil.rmtree(empty, ignore_errors=True)
-    if set(read.get("counts_7d") or {}) != {"sentinel-egress-leak", "phantom-write-claim"}:
+    # Code #13 slice 1 added a THIRD rail key; the invariant is that BOTH Code #12
+    # keys are counted (superset), not that they are the only two.
+    if not {"sentinel-egress-leak", "phantom-write-claim"} <= set(read.get("counts_7d") or {}):
         return "S3' observe_week_read does not count BOTH rails"
     if read.get("clean_7d") is not False:
         return "S3' an unarmed, empty window reads as clean"

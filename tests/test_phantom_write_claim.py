@@ -364,7 +364,9 @@ class TestSeamPlacement:
         assert len(stores) == len(guards) == len(cards) == 2
         for scr, store, guard, card in zip(finals, stores, guards, cards):
             assert scr < store < guard < card, (scr, store, guard, card)
-        assert src.count("tool_use_count=_turn_tool_use_count(gen_meta)") == 2
+        # 2 S2' sites + 2 Code #13 slice-1 capability-screen sites (the sibling
+        # rail reads the SAME measured ledger at the same seam)
+        assert src.count("tool_use_count=_turn_tool_use_count(gen_meta)") == 4
 
     def test_turn_tool_use_count_adds_server_web_tools(self):
         """D-051 lens A MED #5: a web-search turn ran zero client tools."""

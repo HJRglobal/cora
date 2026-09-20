@@ -232,9 +232,40 @@ _IMPERATIVE_WRITE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Code #13 slice 1, routing half (cq-2e02f1fd0f65; ruled 2026-09-10): "can you
+# access / see / reach / read <connector | tool | file | folder>" JOINS the force.
+# This REVERSES the lens-E #2 choice above ("the model has those tools in its list
+# and answers 'can you access HubSpot' from it"): the 9/10 founder-DM transcript
+# shows the model DENYING capabilities it had, so the answer is now inventory-
+# derived -- the tool renders live connectors as NOT-sources and names the door.
+# Deliberately NO specifier-tail guard here: "QBO for OSN" is an entity qualifier
+# on a connector, not a content object. The imperative-write exclusion still runs
+# first, so "send the Shopify file to Larry" is never hijacked.
+_CONNECTOR_NOUN = (
+    r"(?:hubspot|asana|quickbooks(?:\s+online)?|qbo|shopify|(?:google\s+)?calendar|deposco|klaviyo|"
+    r"make(?:\.com)?|notion|(?:the\s+)?web|web\s+search|(?:live\s+)?tools?|connectors?|integrations?|apis?|"
+    r"files?|folders?|documents?|docs|spreadsheets?|sheets?|(?:google\s+)?drive)"
+)
+_P_CAN_ACCESS_CONNECTOR = re.compile(
+    _LEAD + r"(?:can|could|do|did|don't|dont|do\s+not|can't|cant|will|would)\s+" + _YOU + r"\s+" + _ADV
+    + r"(?:have\s+access\s+to|access|see|reach|read|use|connect\s+to|talk\s+to|pull\s+from|query|"
+    r"get\s+(?:to|into|at)|log\s+into|hit|open|touch|work\s+with)\s+"
+    r"(?:the\s+|our\s+|my\s+|your\s+|any\s+|all\s+(?:the\s+)?|those\s+|these\s+|that\s+)?"
+    + _CONNECTOR_NOUN + r"\b",
+    re.IGNORECASE,
+)
+_P_ABLE_TO_ACCESS_CONNECTOR = re.compile(
+    _LEAD + r"are\s+" + _YOU + r"\s+" + _ADV
+    + r"(?:able\s+to|allowed\s+to|permitted\s+to|set\s+up\s+to|wired\s+(?:up\s+)?to|connected\s+to|"
+    r"hooked\s+up\s+to|plugged\s+into|integrated\s+with)\s+(?:(?:access|see|reach|read|use|query)\s+)?"
+    r"(?:the\s+|our\s+|my\s+)?" + _CONNECTOR_NOUN + r"\b",
+    re.IGNORECASE,
+)
+
 _INTENT_PATTERNS = (
     _P_HAVE_KNOW, _P_ARE_YOU, _P_WHAT_SOURCES, _P_YOUR_SOURCES, _P_IN_YOUR, _P_YOUR_KNOWLEDGE_INCLUDES,
     _P_AVAILABLE_TO_YOU, _P_HAVE_YOU, _P_ACCESS_TO, _P_TAG, _P_WHICH_OF,
+    _P_CAN_ACCESS_CONNECTOR, _P_ABLE_TO_ACCESS_CONNECTOR,
 )
 
 

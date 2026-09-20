@@ -66,6 +66,19 @@ POSITIVE = [
     "Cora, quick question: do you have the cowork cascade knowledge?",
     "hey cora, quick q: do you have the cowork cascade knowledge?",
     "is the Q3 P&L in your knowledge base?",           # FINANCIAL-classified meta-question still routes
+    # Code #13 slice 1 routing half (cq-2e02f1fd0f65; ruled 2026-09-10): live
+    # connectors / tools / files JOIN the force -- REVERSES the lens-E #2 choice
+    # (the 9/10 transcript shows the model denying tools it had). The inventory
+    # renders them as live connectors, NOT sources, and names the door.
+    "do you have access to HubSpot?",
+    "can you access HubSpot?",
+    "do you have access to Asana?",
+    "do you have access to QBO for OSN?",
+    "do you have access to the web?",
+    "can you see my calendar?",
+    "are you able to reach Shopify?",
+    "can you read the files in that folder?",
+    "Cora, can you connect to Deposco?",
 ]
 NEGATIVE = [
     # ordinary asks the first cut hijacked (27 of 50 realistic role-based asks)
@@ -83,14 +96,12 @@ NEGATIVE = [
     "do you have the EVV docs for live-in caregivers?",          # the D-046 LEX use case: retrieval
     "do you have the fireflies transcript from the Gotham call?",
     "do you have the slack thread where Matt approved the PO?",
-    # live systems are answered from the tool list, not the inventory (lens E #2)
-    "do you have access to HubSpot?",
-    "can you access HubSpot?",
-    "do you have access to Asana?",
-    "do you have access to QBO for OSN?",
+    # CONTENT questions about a live system stay with retrieval + the tool list
+    # (the Code #13 routing half admits "can you access <connector>", not this)
     "do you have Tommy's calendar for Friday?",
     "do you know the Shopify inventory for the 12-pack?",
-    "do you have access to the web?",
+    "what's in the Asana project for Pure Launch?",
+    "can you pull my HubSpot deals?",                    # an ASK for the tool, not a meta-question
     # imperative writes are never meta-questions (lens E #1)
     "Complete the 'send Larry the deck' task -- the deck is in your knowledge base right",
     "Mark the Sprouts task done since the appeal letter is in your memory now",

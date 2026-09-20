@@ -57,6 +57,9 @@ _DECLARED_UNREDIRECTED: dict[str, str] = {
     "STRATEGY_DECISIONS_PATH": "read-only: decisions-pending.md has NO writer in src/ "
                                "(decision_alerts/decision_lane both read it)",
     "KB_DECISION_LOG_PATH": "read-only: decision log scanned for gap detection",
+    "CORA_LADDER_REGISTRY_PATH": "read-only: data/ladder-registry.yaml has NO writer in src/ "
+                                 "(Code #13 slice 7: written only by a Code/Cowork commit; "
+                                 "the bot, the health check and the mirror only READ it)",
     # --- database handles: opened read-only or against a tmp db the test supplies ---
     "CORA_KB_DB_PATH": "db handle; tests pass their own path or use a tmp KB",
     "FRICTION_KB_DB_PATH": "db handle; friction mining tests supply a tmp db",

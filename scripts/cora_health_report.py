@@ -705,8 +705,11 @@ def threshold_alarms(report: dict) -> list[str]:
         alarms.append(
             f"EGRESS RAILS: observe week NOT clean -- sentinel-egress-leak "
             f"{c7.get('sentinel-egress-leak', '?')} | phantom-write-claim "
-            f"{c7.get('phantom-write-claim', '?')} in 7d; the CORA_SENTINEL_ENFORCE flip "
-            f"stays gated until both read 0 for a week."
+            f"{c7.get('phantom-write-claim', '?')} | phantom-capability-claim "
+            f"{c7.get('phantom-capability-claim', '?')} in 7d; the CORA_SENTINEL_ENFORCE flip "
+            f"stays gated until all three read 0 for a full armed week"
+            + (" (the S2' pair alone IS clean and covered)" if er.get("clean_7d_s2_pair") else "")
+            + "."
         )
     # Flywheel alarms come pre-evaluated by cora.flywheel_metrics (WS-2) so the
     # thresholds are single-sourced with the nightly health check.
@@ -813,10 +816,13 @@ def format_slack(report: dict) -> str:
         lines.append(
             f"*Egress rails* (mode={er.get('mode', '?')}): sentinel-egress-leak 7d "
             f"{c7.get('sentinel-egress-leak', '?')} | phantom-write-claim 7d "
-            f"{c7.get('phantom-write-claim', '?')} -- "
-            + ("flip criterion MET (both rails clean 7d)" if er.get("clean_7d")
+            f"{c7.get('phantom-write-claim', '?')} | phantom-capability-claim 7d "
+            f"{c7.get('phantom-capability-claim', '?')} -- "
+            + ("flip criterion MET (all rails clean 7d)" if er.get("clean_7d")
                else ("ENFORCE on" if er.get("mode") == "enforce"
-                     else "observe week NOT clean; flip stays gated"))
+                     else ("S2' pair clean; third rail not yet a full armed week"
+                           if er.get("clean_7d_s2_pair") else
+                           "observe week NOT clean; flip stays gated")))
         )
     cm = report.get("claude_mirror", {})
     if cm.get("available"):

@@ -333,6 +333,209 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
     return out
 
 
+# -- Capability-denial + internal-tool-name screen (Code #13 slice 1, cq-2a88e32a75ea) --
+# The 2026-09-10 09:16-10:30 AZ founder-DM replies to five unmatched verb-shaped
+# messages said "I don't have visibility into the code queue or staged items right
+# now ... use the Asana interface directly", "I don't have a way to ship code
+# sessions directly", "I don't have a tool to close code-queue items", "I don't
+# have tools to approve or stage code-queue items" -- six minutes after the same
+# bot STAGED a row on a typed verb -- and named `cora_queue_code_session` to the
+# founder. S2' above is blind to these BY DESIGN (they are not write claims), so
+# this is its SIBLING at the same seam: the model's FINAL reply text, the same
+# tool ledger, the same flag, the same observe -> enforce ritual.
+#
+# THE DISCRIMINATOR IS THE CAPABILITY SET, NOT THE PHRASE (charter section 1, the
+# honesty rail): "I don't have that document" and "I can't tell from here" are
+# honest sentences about things the bot lacks. A denial trips ONLY when the
+# sentence it sits in names something the bot HAS in that channel -- derived at
+# call time by cora.capability_set from the offered tool registry, the queue-verb
+# table and the ladder registry, never hand-listed here.
+#
+# Two kinds, one key (`phantom-capability-claim`, counted by cora.egress_rails as
+# the THIRD rail beside sentinel-egress-leak and phantom-write-claim):
+#   kind=denial   -- a capability-denial phrase in a zero-tool_use turn about a
+#                    capability the bot has. Enforce = PREPEND the honest template
+#                    with the exact verb / ask to try (D-282: never a sentence strip).
+#   kind=toolname -- an internal symbol (`cora_*`, `_dispatch_*`, any registry tool
+#                    name) spoken on a non-developer surface, regardless of tool
+#                    count (a leak is a leak). Enforce = the SYMBOL is replaced by
+#                    `[internal tool]`, the S2' fabricated-id precedent (a token
+#                    substitution, never a sentence strip); the prepend template
+#                    would be false on a turn that DID use the tool.
+# Developer surfaces (#cora-build / #cora-health / #cora-security / #cora-dev) are
+# exempt from the toolname half only -- a false denial is false anywhere.
+CAPABILITY_LOG_KEY = "phantom-capability-claim"
+CAPABILITY_HONEST_TEMPLATE = "I have tools for that; I did not use them this turn."
+INTERNAL_TOOL_REDACTION = "[internal tool]"
+
+# The ruled denial lexicon + synonyms (kickoff section 1 slice 1; named in the
+# Code #13 report). Bounded classes only; no nested quantifiers (ReDoS discipline).
+_CAP_NEG_HAVE = (
+    r"\bI\s+(?:don'?t|do\s+not|didn'?t|did\s+not|won'?t|will\s+not)\s+(?:currently\s+|actually\s+|really\s+)?have\s+"
+    r"(?:direct\s+|any\s+|the\s+|a\s+|an\s+)?(?:direct\s+)?"
+    r"(?:tools?|access|visibility|way|ability|permissions?|mechanism|integration|connector|means|"
+    r"capability|capabilities|hooks?|line|route|path|window)\b"
+)
+_CAP_NO_HAVE = (
+    r"\bI\s+have\s+no\s+(?:direct\s+)?(?:tools?|access|visibility|way|ability|permission|means|integration|"
+    r"connector|mechanism|hooks?)\b"
+    r"|\bI\s+lack\s+(?:the\s+|any\s+)?(?:tools?|access|visibility|ability|permission|means)\b"
+    r"|\bthere'?s?\s+(?:is\s+)?no\s+(?:tool|way|integration|connector|hook)\s+(?:for\s+me|I\s+(?:can|have))\b"
+)
+_CAP_CANT_VERB = (
+    r"\bI\s+(?:can'?t|cannot|can\s+not|am\s+not\s+able\s+to|'m\s+not\s+able\s+to|am\s+unable\s+to|"
+    r"'m\s+unable\s+to|won'?t\s+be\s+able\s+to|don'?t\s+have\s+the\s+ability\s+to|have\s+no\s+way\s+to)\s+"
+    r"(?:directly\s+|actually\s+|currently\s+|really\s+)?"
+    r"(?:access|see|reach|stage|ship|dismiss|close|approve|queue|read|pull(?:\s+up)?|check|view|open|query|"
+    r"use|touch|modify|update|create|send|post|run|execute|trigger|look\s+(?:at|into|up)|get\s+(?:to|into|at)|"
+    r"interact\s+with|connect\s+to|talk\s+to|search|retrieve|fetch|list|manage|edit|write\s+to|log\s+into|"
+    r"delete|complete|mark|schedule|draft|dm|message)\b"
+)
+_CAP_NOT_CONNECTED = (
+    r"\b(?:isn'?t|is\s+not|aren'?t|are\s+not|not)\s+(?:currently\s+|yet\s+)?"
+    r"(?:connected|available|accessible|exposed|wired(?:\s+up)?|hooked\s+up|integrated|enabled|set\s+up|"
+    r"provisioned|plugged\s+in)\b"
+    r"|\bnot\s+available\s+to\s+me\b"
+    r"|\b(?:outside|beyond)\s+(?:of\s+)?my\s+(?:reach|access|tools|toolset|capabilities|scope|purview)\b"
+    r"|\bI\s+(?:am|'m)\s+not\s+(?:connected|wired|hooked\s+up|integrated|plugged\s+in)\b"
+)
+_CAP_USE_INTERFACE = (
+    r"\b(?:use|check|open|go\s+to|try|log\s+into|do\s+(?:that|this|it)\s+(?:in|through|via))\s+"
+    r"(?:the\s+)?(?:asana|hubspot|quickbooks|qbo|shopify|gmail|calendar|slack|deposco|notion|klaviyo|"
+    r"make(?:\.com)?|google\s+calendar)\s+(?:interface|app|ui|dashboard|console|website|site|portal|web\s+app)\b"
+    r"|\b(?:do|handle|check|stage|approve|dismiss|close|ship|update|create|complete|mark|queue)\s+"
+    r"(?:that|this|it|those|these|them)\s+(?:manually|yourself|directly|by\s+hand)\b"
+    r"|\byou'?ll\s+(?:need|have)\s+to\s+(?:do|handle|check|stage|approve|dismiss|close|ship|update|create|queue)\s+"
+    r"(?:that|this|it|those|these|them\s+)?(?:manually|yourself|directly)\b"
+)
+_DENIAL_RE = re.compile(
+    "(?:" + _CAP_NEG_HAVE + "|" + _CAP_NO_HAVE + "|" + _CAP_CANT_VERB + "|" + _CAP_NOT_CONNECTED
+    + "|" + _CAP_USE_INTERFACE + ")",
+    re.IGNORECASE,
+)
+_DEVELOPER_SURFACE_RE = re.compile(r"(?:^|-)cora-(?:build|health|security|dev)\b", re.IGNORECASE)
+_INTERNAL_SYMBOL_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:cora_[a-z0-9]+(?:_[a-z0-9]+)+|_dispatch_[a-z0-9]+(?:_[a-z0-9]+)*)(?![A-Za-z0-9])")
+_SENTENCE_BREAK_RE = re.compile(r"[.!?;\n]")
+
+
+def is_developer_surface(channel_name: str) -> bool:
+    """#cora-build / #cora-health / #cora-security / #cora-dev (and their entity-prefixed
+    siblings such as #lex-cora-build): internal tool names are legitimate there."""
+    return bool(_DEVELOPER_SURFACE_RE.search(str(channel_name or "")))
+
+
+def _denial_window(text: str, start: int, end: int) -> str:
+    """The sentence the denial sits in (bounded 160 chars back / 220 ahead), so the
+    capability term is looked for where the denial's OBJECT lives -- after it
+    ("...visibility into the code queue") or before it ("HubSpot isn't connected")."""
+    lo = max(0, start - 160)
+    hi = min(len(text), end + 220)
+    before = text[lo:start]
+    brk = list(_SENTENCE_BREAK_RE.finditer(before))
+    if brk:
+        before = before[brk[-1].end():]
+    after = text[end:hi]
+    m = _SENTENCE_BREAK_RE.search(after)
+    if m:
+        after = after[:m.start()]
+    return before + text[start:end] + after
+
+
+def _prepend_capability_line(text: str, hint: str) -> str:
+    """ENFORCE for kind=denial: the honest template + the exact verb / ask to try
+    becomes the FIRST line; the body is kept byte-identical (D-282). Idempotent."""
+    body = text.lstrip()
+    if body.startswith(CAPABILITY_HONEST_TEMPLATE):
+        return text
+    return f"{CAPABILITY_HONEST_TEMPLATE} Try: {hint}\n\n{body}"
+
+
+def _capability_terms(entity: str, cross_entity: bool, founder: bool) -> dict[str, str]:
+    from .capability_set import capability_terms  # lazy: pulls tool_dispatch
+    return capability_terms(entity, cross_entity=cross_entity, founder=founder)
+
+
+def _registry_symbols() -> frozenset[str]:
+    from .capability_set import registry_tool_names  # lazy
+    return registry_tool_names()
+
+
+def screen_capability_claims(text, *, tool_use_count, channel_name: str = "", user_id: str = "",
+                             entity: str = "", cross_entity: bool = False, founder: bool = False):
+    """Screen ONE model reply for (1) a capability denial about a capability the bot
+    HAS in this channel, in a zero-tool_use turn, and (2) an internal tool symbol
+    spoken on a non-developer surface.
+
+    Observe mode (default): every hit is a WARNING keyed ``phantom-capability-claim``
+    (``kind=denial`` names the phrase and the matched term; ``kind=toolname`` names
+    the symbol) and the text is returned BYTE-IDENTICAL. Enforce mode: a denial
+    gets the honest template + `Try:` hint PREPENDED (body byte-identical); a symbol
+    is replaced by ``[internal tool]``; both at ERROR.
+
+    ``tool_use_count`` None = unknown -> the denial half is skipped (never assume
+    zero); the toolname half runs regardless of the count. A capability set that
+    cannot be derived (registry import failure) is EMPTY -> no denial can trip
+    (fail-open on the reference set, never on the claim), logged once per turn.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    try:
+        count = None if tool_use_count is None else int(tool_use_count)
+    except (TypeError, ValueError):
+        count = None
+    mode = _sentinel_mode()
+    emit = log.error if mode == "enforce" else log.warning
+    out = text
+
+    # (2) internal tool symbols -- any count, non-developer surfaces only
+    if not is_developer_surface(channel_name):
+        symbols = {m.group(0) for m in _INTERNAL_SYMBOL_RE.finditer(out)}
+        try:
+            registry = _registry_symbols()
+        except Exception:  # noqa: BLE001 -- an unreadable registry never redacts prose
+            registry = frozenset()
+        for name in registry:
+            if name and re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", out):
+                symbols.add(name)
+        for sym in sorted(symbols):
+            emit("%s kind=toolname symbol=%s mode=%s channel=#%s user=%s tool_use=%s -- an "
+                 "internal tool name reached a non-developer surface",
+                 CAPABILITY_LOG_KEY, sym, mode, channel_name or "?", user_id or "?",
+                 "?" if count is None else count)
+            if mode == "enforce":
+                out = re.sub(rf"(?<![A-Za-z0-9_]){re.escape(sym)}(?![A-Za-z0-9_])",
+                             INTERNAL_TOOL_REDACTION, out)
+
+    # (1) capability denial -- zero-tool_use turns only, about something the bot HAS
+    if count == 0:
+        masked = _LINK_TOKEN_RE.sub(" ", out)
+        try:
+            terms = _capability_terms(entity, cross_entity, founder)
+        except Exception:  # noqa: BLE001 -- no capability set = no denial can be judged false
+            # NOT a firing line (no ` kind=` after the key): the health count must
+            # never read a counting failure as a phantom claim.
+            log.warning("%s capability set UNAVAILABLE -- denial half skipped this turn",
+                        CAPABILITY_LOG_KEY, exc_info=True)
+            terms = {}
+        if terms:
+            from .capability_set import find_capability_term  # lazy
+            for m in _DENIAL_RE.finditer(masked):
+                window = _denial_window(masked, m.start(), m.end())
+                hit = find_capability_term(window, terms)
+                if hit is None:
+                    continue
+                term, hint = hit
+                emit("%s kind=denial phrase=%r term=%r mode=%s channel=#%s user=%s -- a capability "
+                     "denial with zero tool_use about a capability the bot has in this channel",
+                     CAPABILITY_LOG_KEY, m.group(0).strip(), term, mode, channel_name or "?",
+                     user_id or "?")
+                if mode == "enforce":
+                    out = _prepend_capability_line(out, hint)
+                break  # one WARN per reply, like the S2' lexicon half (keeps the count per turn)
+    return out
+
+
 # ── The single sanitizer ──────────────────────────────────────────────────────
 def sanitize_text(text):
     """Universal SAFETY transforms applied to EVERY outbound Slack message body.

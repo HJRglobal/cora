@@ -1474,6 +1474,13 @@ def _dispatch_qa(
                     cached_response, tool_use_count=None,
                     channel_name=channel_name, user_id=user_id or "",
                 )
+                # Code #13 slice 1 (cq-2a88e32a75ea): the sibling screen -- a cached
+                # reply has no ledger so only the toolname half runs (count=None).
+                cached_response = slack_egress.screen_capability_claims(
+                    cached_response, tool_use_count=None,
+                    channel_name=channel_name, user_id=user_id or "",
+                    entity=entity, cross_entity=is_founder, founder=is_founder,
+                )
                 say(
                     text=_guard_content(cached_response),
                     thread_ts=reply_thread_ts,
@@ -2007,6 +2014,15 @@ def _dispatch_qa(
             response_text, tool_use_count=_turn_tool_use_count(gen_meta),
             channel_name=channel_name, user_id=user_id or "",
         )
+        # Code #13 slice 1 (cq-2a88e32a75ea): the honesty rail's sibling screen --
+        # a capability DENIAL about something the bot has in this channel (zero
+        # tool_use) or an internal tool NAME on a non-developer surface. Same seam,
+        # same ledger, same flag; observe WARNs `phantom-capability-claim`.
+        response_text = slack_egress.screen_capability_claims(
+            response_text, tool_use_count=_turn_tool_use_count(gen_meta),
+            channel_name=channel_name, user_id=user_id or "",
+            entity=entity, cross_entity=is_founder, founder=is_founder,
+        )
         if cache_storable and not is_structured_table:
             _try_cache_store(entity, user_message, question_embedding, response_text, hints)
         response_text = _guard_content(response_text)
@@ -2141,6 +2157,13 @@ def _dispatch_qa(
     response_text = slack_egress.screen_phantom_write_claims(
         response_text, tool_use_count=_turn_tool_use_count(gen_meta),
         channel_name=channel_name, user_id=user_id or "",
+    )
+    # Code #13 slice 1 (cq-2a88e32a75ea): the sibling capability screen (see the
+    # non-streaming site above for the contract).
+    response_text = slack_egress.screen_capability_claims(
+        response_text, tool_use_count=_turn_tool_use_count(gen_meta),
+        channel_name=channel_name, user_id=user_id or "",
+        entity=entity, cross_entity=is_founder, founder=is_founder,
     )
     if cache_storable and not is_structured_table:
         _try_cache_store(entity, user_message, question_embedding, response_text, hints)
@@ -3242,7 +3265,17 @@ def handle_message_event(event: dict, client) -> None:
             # gets its not_authorized text, an unknown id its not-found text.
             # Exact match only; a sentence that merely cites an id still routes
             # to the model like any other DM.
-            _qverb = code_queue.match_queue_verb(text)
+            #
+            # RIDER 2 (Code #13 section 10, cq-70d7b203f7ad): the grammar reads a
+            # NORMALIZED view of the DM -- one leading list marker, Cora's own
+            # mention token (resolved only when the text carries a mention),
+            # backticks and HTML entities removed -- because the 9/15 21:17 paste
+            # `• <@BOT> \`stage cq-...\`` carried all three, missed the grammar,
+            # reached haiku and came back as a phantom "staged". Every consumer
+            # BELOW still sees the un-normalized `text`.
+            _qtext = code_queue.normalize_verb_text(
+                text, bot_user_id=(_resolve_bot_user_id(client) if "<@" in text else None))
+            _qverb = code_queue.match_queue_verb(_qtext)
             if _qverb is not None:
                 try:
                     _outcome, _qmsg = code_queue.apply_queue_verb(
@@ -3262,6 +3295,24 @@ def handle_message_event(event: dict, client) -> None:
                     )
                 except Exception as exc:  # noqa: BLE001
                     log.warning("founder-dm queue verb ack post failed: %s", exc)
+                return
+            # RIDER 2, rail 2: a queue verb followed by anything cq-shaped or a
+            # `<placeholder>` that still FAILED the grammar is a parse failure --
+            # refused from code with the exact grammar to retype, never handed to
+            # the model (D-316; the 9/10 09:35 / 09:36 and 9/15 21:17 phantoms).
+            # Nothing is written; the reply carries no write-claim lexicon.
+            _qattempt = code_queue.looks_like_queue_verb_attempt(_qtext)
+            if _qattempt is not None:
+                log.info("founder-dm queue verb=%s user=%s outcome=parse_refused text=%r",
+                         _qattempt, user_id, _qtext[:200])
+                try:
+                    client.chat_postMessage(
+                        channel=event.get("channel", user_id), text=code_queue.PARSE_REFUSED_REPLY,
+                        thread_ts=event.get("thread_ts"),
+                        unfurl_links=False, unfurl_media=False,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("founder-dm queue verb refusal post failed: %s", exc)
                 return
             # Gap autofill Stage 2: if this user has a pending knowledge-gap
             # ask, treat the reply as the answer. Threaded replies to the ask
@@ -5288,6 +5339,11 @@ def _handle_code_queue_button(body: dict, client, action_id: str) -> None:
             outcome, msg = code_queue.stage_bundle(value, actor_id)
         else:
             outcome, msg = code_queue.process_queue_action(action_id, value, actor_id)
+        # Code #13 slice 1 (kickoff section 9 ask 7): parity with the typed-verb log
+        # line -- until now a button tap logged NOTHING on success, so the 9/14
+        # forensics could not see WHO staged 13 rows or through which door.
+        log.info("code-queue button action=%s value=%s user=%s outcome=%s",
+                 action_id, value, actor_id, outcome)
         if outcome == "not_authorized":
             try:
                 client.chat_postEphemeral(channel=channel_id, user=actor_id, text=msg)
