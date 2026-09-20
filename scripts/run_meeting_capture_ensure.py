@@ -20,6 +20,11 @@ HYBRID MECHANIC (plan of record, Option A + B):
                   own updates and cancellations flow to the capture identity.
   * event copy -- for externally-organised events we cannot guest-add to. The copy
                   carries the ORIGINAL Meet link, never a new one.
+  * rsvp-accept -- after every guest-add (and for any unanswered invite already
+                  sitting on cora@'s calendar with a qualifying roster copy) the
+                  lane ACCEPTS the invite AS cora@ (R1, 2026-09-08). Same dual
+                  gate; read back before it counts; ledgered as action
+                  `rsvp-accept` keyed on (meeting_link, start_ts), never a title.
 
 Run:  python scripts/run_meeting_capture_ensure.py [--day YYYY-MM-DD] [--apply]
       (default day: today AND tomorrow, matching the T+0/T+1 sweep)
@@ -57,16 +62,49 @@ _AZ = timezone(timedelta(hours=-7))
 #: Structural skips -- an out-of-office block, a focus-time hold, a link-less
 #: reminder. Re-derived identically on every run and never interesting after the
 #: fact, so they are counted but not stored.
-_STRUCTURAL_SKIPS = ("not-a-meeting", "no-meeting-link", "cancelled")
+_STRUCTURAL_SKIPS = ("not-a-meeting", "no-meeting-link", "cancelled",
+                     mc.RSVP_NO_ROSTER_COPY_REASON)
+
+#: RSVP sub-step outcomes that earn an `rsvp-accept` ledger row. An accept is a
+#: real write; an error is a failure to diagnose; notetaker-present is the
+#: one-mechanism rule firing AFTER a guest-add (a second bot was averted). The
+#: rest -- already-accepted, lex-withheld, no-roster-copy -- are re-derived every
+#: 15 minutes and would be pure ledger growth.
+_RSVP_LEDGERED = ("accepted", "error", "skipped:notetaker-present")
 
 
-def _ledger_worthy(act: mc.EnsureAction) -> bool:
+def _rsvp_ledger_worthy(act: mc.EnsureAction) -> bool:
+    return act.rsvp in _RSVP_LEDGERED
+
+
+def _action_row_worthy(act: mc.EnsureAction) -> bool:
     """Keep what changed, what failed, and what a consent carve-out blocked."""
     if act.applied or act.error:
         return True
     if act.action == "skip":
         return not act.reason.startswith(_STRUCTURAL_SKIPS)
     return act.action in ("guest-add", "copy")   # planned-but-not-applied
+
+
+def _ledger_worthy(act: mc.EnsureAction) -> bool:
+    """Does this action put ANY row in the ledger (its own row, an rsvp row, or both)?"""
+    return _action_row_worthy(act) or _rsvp_ledger_worthy(act)
+
+
+def _rsvp_row(act: mc.EnsureAction, cfg, base: dict) -> dict:
+    """The rsvp-accept ledger row. Identity is (meeting_link, start_ts) -- D-254 --
+    plus the event id as the address acted on. NEVER a title (D-082); the
+    calendar is the capture identity's, which is where the patch landed."""
+    return {
+        **base,
+        "action": "rsvp-accept",
+        "outcome": act.rsvp,
+        "event_id": act.rsvp_event_id or act.event_id,
+        "calendar": cfg.capture_identity,
+        "meeting_link": act.meeting_link,
+        "start_ts": act.meeting_start_ts,
+        "error": act.rsvp_error,
+    }
 
 
 def _run_day(day: str, cfg, *, apply: bool) -> mc.EnsureResult:
@@ -83,9 +121,16 @@ def _run_day(day: str, cfg, *, apply: bool) -> mc.EnsureResult:
             mark = "skipped"
         elif act.action == "none":
             mark = "ok"
-        print(f"  [{mark:8s}] {act.start_label}  {act.action:9s}  {act.title[:52]:54s} {act.reason[:60]}")
+        rsvp = ""
+        if act.rsvp:
+            rsvp = f"  rsvp={act.rsvp}"
+        elif act.rsvp_planned:
+            rsvp = "  rsvp=planned"
+        print(f"  [{mark:8s}] {act.start_label}  {act.action:9s}  {act.title[:52]:54s} {act.reason[:60]}{rsvp}")
         if act.error:
             print(f"             error: {act.error[:120]}")
+        if act.rsvp_error:
+            print(f"             rsvp error: {act.rsvp_error[:120]}")
 
     # HONEST DEGRADE: N qualifying, M ensured, K skipped -- and never a clean-looking
     # summary when a calendar could not be read.
@@ -102,19 +147,27 @@ def _run_day(day: str, cfg, *, apply: bool) -> mc.EnsureResult:
     # times a day. What is worth keeping is what CHANGED, what FAILED, and what a
     # consent carve-out BLOCKED; everything else is re-derivable from the calendar.
     now = datetime.now(timezone.utc).isoformat()
-    rows = [{
+    base = {
         "ts": now,
         "lane": "ensure",
         "day": day,
         "mode": result.mode,
         "applied": result.applied,
+    }
+    rows = [{
+        **base,
         "action": a.action,
         "reason": a.reason,
         "event_id": a.event_id,       # ids only, never titles (D-082)
         "calendar": a.calendar_email,
         "was_applied": a.applied,
         "error": a.error,
-    } for a in result.actions if _ledger_worthy(a)]
+    } for a in result.actions if _action_row_worthy(a)]
+
+    # One rsvp-accept row per RSVP sub-step worth keeping (see _RSVP_LEDGERED).
+    # already-accepted earns nothing: that is what makes the second run of two
+    # consecutive cycles leave the ledger untouched (idempotency, R1).
+    rows += [_rsvp_row(a, cfg, base) for a in result.actions if _rsvp_ledger_worthy(a)]
 
     rows.append({
         "ts": now,

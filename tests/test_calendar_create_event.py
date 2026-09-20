@@ -199,6 +199,155 @@ class TestDeleteEvent:
 
 
 # ---------------------------------------------------------------------------
+# calendar_client.set_own_response() -- RSVP as the impersonated user
+# (Code #13 slice 3, cq-19b0298cf5be, R1 2026-09-08)
+# ---------------------------------------------------------------------------
+
+_CORA = "cora@hjrglobal.com"
+
+
+def _guests(cora_status="needsAction", cora_self=True, cora_email=_CORA):
+    """A POPULATED guest list (>= 3 others) -- the D-253 case where a one-element
+    patch would silently drop everyone else."""
+    entry = {"email": cora_email, "responseStatus": cora_status}
+    if cora_self:
+        entry["self"] = True
+    return [
+        {"email": "organizer@hjrglobal.com", "organizer": True, "responseStatus": "accepted"},
+        {"email": "guest-one@hjrglobal.com", "responseStatus": "accepted"},
+        {"email": "guest-two@vendor.example", "responseStatus": "tentative", "optional": True},
+        entry,
+    ]
+
+
+def _event(attendees, **extra):
+    return {"id": "evt-rsvp-1", "summary": "Amber Falcon Sync", "attendees": attendees, **extra}
+
+
+class TestSetOwnResponse:
+    def _svc(self, gets, patch_side_effect=None):
+        svc = MagicMock()
+        svc.events.return_value.get.return_value.execute.side_effect = list(gets)
+        req = MagicMock()
+        if patch_side_effect is not None:
+            req.execute.side_effect = patch_side_effect
+        else:
+            req.execute.return_value = {}
+        svc.events.return_value.patch.return_value = req
+        return svc
+
+    def test_patch_carries_every_attendee_and_changes_only_own_status(self):
+        """Google's events.patch REPLACES the attendees array. A patch that carried
+        only cora@'s entry would delete three real guests from a real meeting;
+        a probe against a guest-less event would pass either way (D-253)."""
+        before = _event(_guests("needsAction"))
+        after = _event(_guests("accepted"))
+        svc = self._svc([before, after])
+        with patch("cora.tools.calendar_client._build_service", return_value=svc):
+            changed, outcome = cal.set_own_response(user_email=_CORA, event_id="evt-rsvp-1")
+        assert (changed, outcome) == (True, "accepted")
+        patch_call = svc.events.return_value.patch
+        patch_call.assert_called_once()
+        kw = patch_call.call_args.kwargs
+        assert kw["calendarId"] == "primary" and kw["eventId"] == "evt-rsvp-1"
+        assert kw["sendUpdates"] == "none"
+        sent = kw["body"]["attendees"]
+        assert len(sent) == 4 and len(sent) >= 3
+        others_before = [a for a in before["attendees"] if a["email"] != _CORA]
+        others_sent = [a for a in sent if a["email"] != _CORA]
+        assert others_sent == others_before                     # untouched, in order
+        own = [a for a in sent if a["email"] == _CORA][0]
+        assert own["responseStatus"] == "accepted" and own.get("self") is True
+        # the source event was not mutated in place
+        assert [a for a in before["attendees"] if a["email"] == _CORA][0]["responseStatus"] == "needsAction"
+
+    def test_already_accepted_makes_no_write(self):
+        """Idempotency for the 15-minute lane: no patch, no read-back, no error."""
+        svc = self._svc([_event(_guests("accepted"))])
+        with patch("cora.tools.calendar_client._build_service", return_value=svc):
+            assert cal.set_own_response(user_email=_CORA, event_id="evt-rsvp-1") == (False, "already-accepted")
+        svc.events.return_value.patch.assert_not_called()
+        assert svc.events.return_value.get.return_value.execute.call_count == 1
+
+    def test_attendees_omitted_refuses_without_patch(self):
+        """An incomplete read written back deletes every guest it left out."""
+        svc = self._svc([_event(_guests("needsAction"), attendeesOmitted=True)])
+        with patch("cora.tools.calendar_client._build_service", return_value=svc):
+            with pytest.raises(cal.CalendarClientError, match="attendeesOmitted"):
+                cal.set_own_response(user_email=_CORA, event_id="evt-rsvp-1")
+        svc.events.return_value.patch.assert_not_called()
+
+    def test_not_on_the_guest_list_raises_without_patch(self):
+        """cora@ absent means the guest-add never landed (or the id is another
+        calendar's copy); inventing an entry would be a guest-add by side door."""
+        guests = [a for a in _guests() if a["email"] != _CORA]
+        svc = self._svc([_event(guests)])
+        with patch("cora.tools.calendar_client._build_service", return_value=svc):
+            with pytest.raises(cal.CalendarClientError, match="not on the guest list"):
+                cal.set_own_response(user_email=_CORA, event_id="evt-rsvp-1")
+        svc.events.return_value.patch.assert_not_called()
+
+    def test_read_back_mismatch_raises(self):
+        """A 200 on the patch is not proof the status took."""
+        svc = self._svc([_event(_guests("needsAction")), _event(_guests("needsAction"))])
+        with patch("cora.tools.calendar_client._build_service", return_value=svc):
+            with pytest.raises(cal.CalendarClientError, match="read-back"):
+                cal.set_own_response(user_email=_CORA, event_id="evt-rsvp-1")
+        svc.events.return_value.patch.assert_called_once()
+
+    def test_http_error_on_patch_becomes_calendar_client_error(self):
+        from googleapiclient.errors import HttpError
+        resp = MagicMock()
+        resp.status = 403
+        svc = self._svc([_event(_guests("needsAction"))], patch_side_effect=HttpError(resp, b"forbidden"))
+        with patch("cora.tools.calendar_client._build_service", return_value=svc):
+            with pytest.raises(cal.CalendarClientError, match="HTTP 403"):
+                cal.set_own_response(user_email=_CORA, event_id="evt-rsvp-1")
+
+    def test_self_flag_locates_the_entry_when_the_email_is_an_alias(self):
+        """Google marks the owner's entry self:true; an alias address on that entry
+        must not read as 'not on the guest list'."""
+        before = _event(_guests("needsAction", cora_email="cora-alias@hjrglobal.com"))
+        after = _event(_guests("accepted", cora_email="cora-alias@hjrglobal.com"))
+        svc = self._svc([before, after])
+        with patch("cora.tools.calendar_client._build_service", return_value=svc):
+            assert cal.set_own_response(user_email=_CORA, event_id="evt-rsvp-1") == (True, "accepted")
+        sent = svc.events.return_value.patch.call_args.kwargs["body"]["attendees"]
+        assert [a for a in sent if a.get("self")][0]["responseStatus"] == "accepted"
+
+    def test_email_match_locates_the_entry_without_a_self_flag(self):
+        before = _event(_guests("needsAction", cora_self=False))
+        after = _event(_guests("accepted", cora_self=False))
+        svc = self._svc([before, after])
+        with patch("cora.tools.calendar_client._build_service", return_value=svc):
+            assert cal.set_own_response(user_email=_CORA, event_id="evt-rsvp-1") == (True, "accepted")
+
+    def test_impersonates_the_rsvp_user_for_every_call(self):
+        """The patch must land on cora@'s OWN calendar (the invitee's entry), never
+        the organizer's; a wrong subject here is a silent write to someone else."""
+        svc = self._svc([_event(_guests("needsAction")), _event(_guests("accepted"))])
+        with patch("cora.tools.calendar_client._build_service", return_value=svc) as bs:
+            cal.set_own_response(user_email=_CORA, event_id="evt-rsvp-1")
+        assert bs.call_count == 3                       # get, patch, read-back
+        assert all(c.args[0] == _CORA for c in bs.call_args_list)
+
+    @pytest.mark.parametrize("bad", ["", "not-an-email"])
+    def test_bad_user_email_rejected_before_any_read(self, bad):
+        svc = self._svc([])
+        with patch("cora.tools.calendar_client._build_service", return_value=svc):
+            with pytest.raises(cal.CalendarClientError, match="real email"):
+                cal.set_own_response(user_email=bad, event_id="evt-rsvp-1")
+        svc.events.assert_not_called()
+
+    def test_unsupported_response_rejected(self):
+        svc = self._svc([])
+        with patch("cora.tools.calendar_client._build_service", return_value=svc):
+            with pytest.raises(cal.CalendarClientError, match="unsupported response"):
+                cal.set_own_response(user_email=_CORA, event_id="evt-rsvp-1", response="maybe")
+        svc.events.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # tool_dispatch calendar write tools -- server-side pending store (F-05 / F-06)
 # ---------------------------------------------------------------------------
 

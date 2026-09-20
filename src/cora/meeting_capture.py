@@ -576,6 +576,25 @@ def write_ledger(rows: list[dict[str, Any]]) -> None:
 
 # ── the ensure lane ──────────────────────────────────────────────────────────
 
+#: RSVP sub-step outcomes (cq-19b0298cf5be, R1 2026-09-08). A SUB-STEP on an
+#: action row, deliberately NOT a fifth `action` value: EnsureResult's counts and
+#: the script's `_ledger_worthy` key on the four-word action vocabulary, and a new
+#: word there would silently fall out of every count.
+RSVP_OUTCOMES: frozenset[str] = frozenset({
+    "",                          # no RSVP step (or not yet executed)
+    "accepted",                  # cora@'s own entry set to accepted, read back verified
+    "already-accepted",          # no API write
+    "skipped:notetaker-present", # one mechanism per event -- a bot is already invited
+    "skipped:lex-withheld",      # never RSVP a LEX/PHI-redacted (organizer-withheld) event
+    "skipped:no-roster-copy",    # sweep found cora@ invited but no roster copy to veto-check
+    "error",                     # fetch/patch/read-back failed; rsvp_error carries why
+})
+
+#: Reason prefix on the sweep's no-roster-copy skip row. The script treats it as
+#: structural (re-derived every run, never interesting afterwards).
+RSVP_NO_ROSTER_COPY_REASON = "no-roster-copy"
+
+
 @dataclass
 class EnsureAction:
     member: str
@@ -588,6 +607,16 @@ class EnsureAction:
     meeting_link: str = ""
     applied: bool = False
     error: str = ""
+    #: UTC epoch start -- with meeting_link this is the D-254 (link, start) identity
+    #: the rsvp ledger row carries; the id is only the ADDRESS acted on.
+    meeting_start_ts: int = 0
+    #: RSVP sub-step (see RSVP_OUTCOMES). rsvp_planned marks a row the execute step
+    #: should RSVP on; rsvp_event_id is the id on cora@'s OWN calendar when it differs
+    #: from event_id (an externally-organised meeting has a different id per invitee).
+    rsvp: str = ""
+    rsvp_planned: bool = False
+    rsvp_event_id: str = ""
+    rsvp_error: str = ""
 
 
 @dataclass
@@ -615,6 +644,37 @@ class EnsureResult:
 
 def _is_dwd_domain(email: str) -> bool:
     return email.rsplit("@", 1)[-1].strip().lower() in DWD_DOMAINS if "@" in email else False
+
+
+def own_response_status(event: dict[str, Any], identity: str) -> str:
+    """responseStatus of `identity`'s own attendee entry on an event from ITS calendar.
+
+    Google flags the calendar owner's entry `self: true`; the email match is the
+    belt for an entry that arrives without the flag. "" when the identity is not
+    on the guest list at all (e.g. it is the organiser of a link-less hold).
+    """
+    ident = (identity or "").strip().lower()
+    for att in (event.get("attendees") or []):
+        if not isinstance(att, dict):
+            continue
+        addr = (att.get("email") or "").strip().lower()
+        if att.get("self") is True or (addr and addr == ident):
+            return (att.get("responseStatus") or "").strip()
+    return ""
+
+
+def _plan_rsvp(own_event: dict[str, Any], safe_title: str) -> tuple[str, bool]:
+    """Decide the RSVP sub-step for one event on the capture identity's calendar.
+
+    Returns (rsvp, planned): a terminal skip reason with planned=False, or ("", True)
+    when the execute step should accept. Order mirrors the execute-time re-check in
+    `_rsvp_accept` so plan mode shows what live mode would do.
+    """
+    if LEGACY_NOTETAKER in event_emails(own_event):
+        return "skipped:notetaker-present", False
+    if safe_title.startswith("LEX/PHI"):
+        return "skipped:lex-withheld", False
+    return "", True
 
 
 def plan_ensure(
@@ -663,6 +723,21 @@ def plan_ensure(
         log.error("ensure: cannot read the capture identity's calendar (%s) -- planning nothing", exc)
         return result
 
+    # RSVP SWEEP SOURCE. Invites sitting on cora@'s own calendar at needsAction: a
+    # guest-add whose accept failed last cycle, or a meeting a human invited cora@
+    # to by hand. Lane-made copies are excluded (cora@ ORGANISES those -- there is
+    # no invite to accept). Keyed like everything else so the roster copy, whose
+    # qualification decides whether we may act, can be found.
+    needs_action: dict[tuple, dict[str, Any]] = {}
+    for ev in capture_events:
+        if not extract_meeting_link(ev) or not starts_on_day(ev, day):
+            continue
+        if CAPTURE_COPY_MARKER in (ev.get("description") or ""):
+            continue
+        if own_response_status(ev, cfg.capture_identity) != "needsAction":
+            continue
+        needs_action.setdefault(meeting_key(ev), ev)
+
     # Collect first, decide second. One meeting can surface as several calendar
     # events (see meeting_key), and we must act on it exactly once.
     #
@@ -701,9 +776,10 @@ def plan_ensure(
             member=member.name, calendar_email=member.calendar_email,
             event_id=(ev.get("id") or ""), title=display_title(ev),
             start_label=event_time_label(ev), action="skip", reason=reason,
+            meeting_start_ts=event_start_ts(ev),
         ))
 
-    for _key, entries in candidates.items():
+    for key, entries in candidates.items():
         # Prefer to act through a copy whose organiser we can impersonate -- that is
         # the guest-add path, which is transparent to the room and rides the
         # organiser's own updates. Otherwise any copy will do; it becomes an
@@ -728,11 +804,23 @@ def plan_ensure(
         else:
             covered_reason = ""
         if covered_reason:
-            result.actions.append(EnsureAction(
+            row = EnsureAction(
                 member=member.name, calendar_email=member.calendar_email, event_id=eid,
                 title=safe, start_label=event_time_label(ev),
                 action="none", reason=covered_reason, meeting_link=link,
-            ))
+                meeting_start_ts=event_start_ts(ev),
+            )
+            # Covered, but is cora@'s own invite still unanswered? This roster copy
+            # is the visible, already-qualified copy that lets us act (a veto on any
+            # copy already removed the key from `candidates`). The RSVP hangs off
+            # THIS row rather than a second one so the meeting is counted once.
+            own = needs_action.pop(key, None)
+            if own is not None:
+                row.rsvp, row.rsvp_planned = _plan_rsvp(own, safe)
+                row.rsvp_event_id = (own.get("id") or "").strip()
+                if row.rsvp_planned:
+                    row.reason = f"{covered_reason}; capture identity RSVP pending -> accept"
+            result.actions.append(row)
             continue
 
         organizer = (ev.get("organizer") or {}) if isinstance(ev.get("organizer"), dict) else {}
@@ -755,6 +843,29 @@ def plan_ensure(
             member=member.name, calendar_email=member.calendar_email, event_id=eid,
             title=safe, start_label=event_time_label(ev),
             action=action, reason=reason, meeting_link=link,
+            meeting_start_ts=event_start_ts(ev),
+            # A guest-add is followed by an RSVP-accept as cora@ (R1). A copy is
+            # organised BY cora@ and has no invite to answer.
+            rsvp_planned=(action == "guest-add"),
+        ))
+
+    # RSVP SWEEP REMAINDER. Unanswered invites on cora@'s calendar with NO qualifying
+    # roster copy. A vetoed meeting is left alone silently -- its skip row above
+    # already says why, and accepting would record a meeting somebody opted out of.
+    # Anything else has no roster copy through which the veto set can be evaluated,
+    # so the safe default is to skip it and say so (never accept blind).
+    for key, own in needs_action.items():
+        if key in vetoed:
+            continue
+        result.actions.append(EnsureAction(
+            member="capture identity", calendar_email=cfg.capture_identity,
+            event_id=(own.get("id") or "").strip(), title=display_title(own),
+            start_label=event_time_label(own), action="skip",
+            reason=f"{RSVP_NO_ROSTER_COPY_REASON}: capture identity invited but no roster "
+                   "copy visible -- veto set cannot be evaluated",
+            meeting_link=extract_meeting_link(own).strip().lower(),
+            meeting_start_ts=event_start_ts(own),
+            rsvp="skipped:no-roster-copy", rsvp_event_id=(own.get("id") or "").strip(),
         ))
 
     # RECONCILE OUR OWN COPIES. A copy is a snapshot: when the source meeting is
@@ -822,12 +933,19 @@ def execute_ensure(
                     )
                     act.applied = True
                     act.reason = f"{act.reason} -> {why}" if changed else "already-present"
+                    # THE R1 STEP: accept the invite AS cora@. Runs whether the
+                    # guest-add just happened or was already in place -- gated on
+                    # the read-back status inside set_own_response, not on whether
+                    # add_attendee changed anything, so a failed accept is retried
+                    # next cycle and a completed one is a no-op.
+                    act.rsvp = _rsvp_accept(act, cfg, cc, event_id=act.event_id)
                     continue
                 except Exception as exc:  # noqa: BLE001
                     log.info("ensure: guest-add failed for %s (%s) -- falling back to copy",
                              act.event_id, str(exc)[:160])
                     act.action = "copy"
                     act.reason = f"guest-add refused ({str(exc)[:80]}) -> copy"
+                    act.rsvp_planned = False   # cora@ organises the copy; nothing to accept
 
             src = source_events.get(act.event_id)
             if src is None:
@@ -837,6 +955,15 @@ def execute_ensure(
         except Exception as exc:  # noqa: BLE001
             act.error = str(exc)[:200]
             log.error("ensure: %s failed for event %s: %s", act.action, act.event_id, exc)
+
+    # RSVP SWEEP: covered meetings whose invite on cora@'s calendar is still
+    # unanswered. Same dual gate (we are past `if not writing: return`), same
+    # helper, same skip order as the guest-add path. Only 'none' rows carry a
+    # planned sweep RSVP -- a guest-add row handled its own above, and a row that
+    # errored before cora@ ever reached the guest list must not be accepted on.
+    for act in result.actions:
+        if act.action == "none" and act.rsvp_planned and not act.rsvp:
+            act.rsvp = _rsvp_accept(act, cfg, cc, event_id=act.rsvp_event_id or act.event_id)
 
     # Remove ghosts, under the same gates as every other write. Deleting only ever
     # touches an event on the capture identity's OWN calendar that carries this
@@ -850,6 +977,38 @@ def execute_ensure(
             log.error("ensure: could not remove stale capture copy %s: %s", event_id, exc)
 
     return result
+
+
+def _rsvp_accept(act: EnsureAction, cfg: CaptureConfig, cc: Any, *, event_id: str) -> str:
+    """Accept cora@'s own invite on one event. Returns an RSVP_OUTCOMES value.
+
+    Called ONLY from execute_ensure past its dual write gate. Re-fetches cora@'s
+    copy first so the checks run against the event AS IT IS NOW, not as it was at
+    plan time -- design v1 s4a's case is a notetaker@ added AFTER the lane's
+    guest-add, which must turn the accept into a skip (one mechanism per event).
+    The LEX/PHI rule is keyed on the action's display title exactly as the rest of
+    the lane keys its redaction: a withheld organiser is never RSVP'd (R1 as
+    written; the D-247 capture-yes tension is carried to Harrison, not resolved
+    here). Every failure is RECORDED, never raised -- the lane's other actions and
+    its ledger must complete.
+    """
+    try:
+        own = cc.get_event(user_email=cfg.capture_identity, event_id=event_id)
+        if LEGACY_NOTETAKER in event_emails(own):
+            return "skipped:notetaker-present"
+        if (act.title or "").startswith("LEX/PHI"):
+            return "skipped:lex-withheld"
+        changed, outcome = cc.set_own_response(
+            user_email=cfg.capture_identity, event_id=event_id,
+        )
+        if changed:
+            log.info("rsvp_accepted event_id=%s link=%s start_ts=%s",
+                     event_id, act.meeting_link, act.meeting_start_ts)
+        return outcome
+    except Exception as exc:  # noqa: BLE001
+        act.rsvp_error = str(exc)[:200]
+        log.error("ensure: rsvp-accept failed for event %s: %s", event_id, exc)
+        return "error"
 
 
 # ── the daily auditor (READ-ONLY, ships live) ────────────────────────────────

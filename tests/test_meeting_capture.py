@@ -725,7 +725,7 @@ class TestScriptsAndDeployment:
         future edit reaches for one, this fails before it reaches production."""
         text = (_REPO_ROOT / "scripts" / "run_meeting_capture_audit.py").read_text(encoding="utf-8")
         for forbidden in ("insert_event_copy", "add_attendee", "create_event",
-                          "delete_event", "upsert_documents"):
+                          "delete_event", "upsert_documents", "set_own_response"):
             assert forbidden not in text, f"auditor must not reference {forbidden}"
 
     def test_audit_ledger_records_ids_never_titles(self):
@@ -800,6 +800,19 @@ class TestScriptsAndDeployment:
         assert mod._ledger_worthy(act(action="guest-add", reason="x"))
         assert mod._ledger_worthy(act(action="none", reason="already-covered", applied=True))
         assert mod._ledger_worthy(act(action="copy", reason="x", error="boom"))
+        # RSVP sub-step (cq-19b0298cf5be): kept = a real accept, a failure, the
+        # one-mechanism rule firing after a guest-add; dropped = re-derived noise
+        assert mod._ledger_worthy(act(action="none", reason="already-covered", rsvp="accepted"))
+        assert mod._ledger_worthy(act(action="none", reason="already-covered", rsvp="error"))
+        assert mod._ledger_worthy(act(action="none", reason="already-covered",
+                                      rsvp="skipped:notetaker-present"))
+        assert not mod._ledger_worthy(act(action="none", reason="already-covered",
+                                          rsvp="already-accepted"))
+        assert not mod._ledger_worthy(act(action="none", reason="already-covered",
+                                          rsvp="skipped:lex-withheld"))
+        assert not mod._ledger_worthy(act(
+            action="skip", reason=f"{mc.RSVP_NO_ROSTER_COPY_REASON}: no roster copy visible",
+            rsvp="skipped:no-roster-copy"))
 
     def test_slack_post_goes_through_the_egress_boundary(self):
         """B1 doctrine. The CI guard is only an either/or tripwire, so pin the
@@ -1338,3 +1351,441 @@ class TestPresumedUnconvened:
         flat = json.dumps(row)
         for title in ("Velvet Otter", "Brass Kite", "Marble Fern", "Copper Lantern", "Pewter Comet"):
             assert title not in flat
+# ── RSVP-accept as cora@ (Code #13 slice 3, cq-19b0298cf5be, R1 2026-09-08) ──
+#
+# The capture identity is guest-added onto a meeting and its invite then sits at
+# needsAction forever; nothing in the lane ever answered it. These tests pin the
+# accept step on BOTH halves (after every guest-add; a sweep of cora@'s own
+# unanswered invites) under the same dual write gate as every other write.
+
+CORA = "cora@hjrglobal.com"
+LINK = "https://meet.google.com/rsvp-test-aaa"
+
+
+def _own(eid, *, status="needsAction", link=LINK, hh=10, extra=(), summary="Weekly Sync",
+         organizer="harrison@hjrglobal.com", description=None):
+    """cora@'s OWN copy of an event: carries its self-attendee + responseStatus."""
+    ev = _ev(eid, link=link, hh=hh, summary=summary, organizer=organizer, description=description)
+    ev["attendees"] = (
+        [{"email": organizer}]
+        + [{"email": e} for e in extra]
+        + [{"email": CORA, "responseStatus": status, "self": True}]
+    )
+    return ev
+
+
+def _lex_kwargs():
+    """An in-domain (guest-addable) organiser plus a client-agency attendee, so the
+    display rail redacts deterministically without depending on the classifier."""
+    return dict(organizer="ops@lexingtonservices.com",
+                attendees=["ops@lexingtonservices.com", "intake@county.gov"])
+
+
+class _Cal:
+    """Stub calendar client surface: records writes, serves cora@'s copy."""
+
+    def __init__(self, monkeypatch, *, own=None, add=(True, "added"), rsvp=(True, "accepted")):
+        from cora.tools import calendar_client as cc
+        self.cc = cc
+        self.adds: list[dict] = []
+        self.rsvps: list[dict] = []
+        self.copies: list[dict] = []
+        self.gets: list[dict] = []
+        own = own if own is not None else _own("e1")
+
+        def _add(**k):
+            self.adds.append(k)
+            if isinstance(add, Exception):
+                raise add
+            return add
+
+        def _rsvp(**k):
+            self.rsvps.append(k)
+            if isinstance(rsvp, Exception):
+                raise rsvp
+            return rsvp
+
+        def _get(**k):
+            self.gets.append(k)
+            if isinstance(own, Exception):
+                raise own
+            return own
+
+        monkeypatch.setattr(cc, "add_attendee", _add)
+        monkeypatch.setattr(cc, "set_own_response", _rsvp)
+        monkeypatch.setattr(cc, "get_event", _get)
+        monkeypatch.setattr(cc, "insert_event_copy", lambda **k: self.copies.append(k) or {"id": "c"})
+
+
+def _guest_add_plan(**ev_over):
+    kw = {"link": LINK, "organizer": "harrison@hjrglobal.com", **ev_over}
+    return mc.plan_ensure(DAY, _cfg(), list_events=_lister({
+        CORA: [],
+        "harrison@hjrglobal.com": [_ev("e1", **kw)],
+    }))
+
+
+def _sweep_plan(own_ev, roster_ev=None, *, roster_events=None):
+    roster = roster_events if roster_events is not None else [roster_ev]
+    return mc.plan_ensure(DAY, _cfg(), list_events=_lister({
+        CORA: [own_ev],
+        "harrison@hjrglobal.com": roster,
+    }))
+
+
+class TestRsvpPlan:
+    def test_guest_add_rows_plan_an_rsvp_and_copy_rows_do_not(self):
+        """An RSVP is planned after every guest-add; a copy is ORGANISED by cora@
+        and has no invite to answer -- planning one would error every cycle."""
+        ga = _guest_add_plan()
+        assert [a.rsvp_planned for a in ga.actions if a.action == "guest-add"] == [True]
+        cp = mc.plan_ensure(DAY, _cfg(), list_events=_lister({
+            CORA: [], "harrison@hjrglobal.com": [_ev("e1", link=LINK, organizer="ext@vendor.com")],
+        }))
+        assert [a.rsvp_planned for a in cp.actions if a.action == "copy"] == [False]
+
+    def test_rows_carry_the_meeting_start_epoch(self):
+        """The rsvp ledger row's identity is (link, start) (D-254); without the
+        epoch on the action the row could only carry an HH:MM label."""
+        res = _guest_add_plan()
+        act = [a for a in res.actions if a.action == "guest-add"][0]
+        assert act.meeting_start_ts == mc.event_start_ts(_ev("e1", link=LINK)) > 0
+
+    def test_sweep_attaches_the_rsvp_to_the_covered_row_not_a_second_one(self):
+        """cora@ hand-invited, still at needsAction, roster copy visible. The RSVP
+        rides the meeting's existing 'none' row -- a second row would double the
+        qualifying count for one meeting -- and targets cora@'s OWN event id,
+        which differs from the roster id for externally-organised meetings."""
+        own = _own("_cora-copy", organizer="ext@vendor.com")
+        res = _sweep_plan(own, _ev("roster-copy", link=LINK, organizer="ext@vendor.com",
+                                   attendees=["harrison@hjrglobal.com", "ext@vendor.com", CORA]))
+        rows = [a for a in res.actions if a.action != "skip"]
+        assert len(rows) == 1 and res.qualifying == 1
+        assert rows[0].action == "none" and rows[0].rsvp_planned is True
+        assert rows[0].rsvp_event_id == "_cora-copy" and rows[0].rsvp == ""
+        assert rows[0].meeting_link == LINK.lower()
+
+    def test_sweep_ignores_an_already_answered_invite(self):
+        """Idempotency at plan time: an accepted (or declined) entry is never a
+        candidate, so a healthy calendar plans zero RSVP writes."""
+        for status in ("accepted", "declined", "tentative"):
+            res = _sweep_plan(_own("c1", status=status), _ev("r1", link=LINK))
+            assert not any(a.rsvp_planned or a.rsvp for a in res.actions), status
+
+    def test_sweep_ignores_lane_made_copies(self):
+        """A capture copy carries the lane's marker and cora@ ORGANISES it; even
+        if its self entry reads needsAction there is nothing to accept."""
+        from cora.tools.calendar_client import CAPTURE_COPY_MARKER
+
+        own = _own("copy", description=f"({CAPTURE_COPY_MARKER}) source_event_id: r1")
+        res = _sweep_plan(own, _ev("r1", link=LINK, organizer="ext@vendor.com"))
+        assert not any(a.rsvp_planned or a.rsvp for a in res.actions)
+
+    def test_sweep_without_a_roster_copy_skips_and_says_so(self):
+        """No roster copy means the veto set (carve-outs, declines, [no-bot])
+        cannot be evaluated; accepting blind could record a meeting somebody
+        opted out of. The safe default is a named skip, never a silent accept."""
+        res = _sweep_plan(_own("lonely"), roster_events=[])
+        skip = [a for a in res.actions if a.rsvp == "skipped:no-roster-copy"]
+        assert len(skip) == 1
+        assert skip[0].action == "skip" and skip[0].rsvp_planned is False
+        assert skip[0].reason.startswith(mc.RSVP_NO_ROSTER_COPY_REASON)
+        assert skip[0].event_id == "lonely" and skip[0].calendar_email == CORA
+
+    def test_sweep_respects_a_veto_on_the_roster_copy(self):
+        """CONSENT. Harrison's [no-bot] on his copy vetoes the meeting; cora@'s
+        unanswered invite to the same meeting must not be accepted through the
+        sweep door either. The veto row is the only row."""
+        res = _sweep_plan(_own("c1", summary="Weekly Sync"),
+                          _ev("r1", link=LINK, summary="[no-bot] Weekly Sync"))
+        assert [a.action for a in res.actions] == ["skip"]
+        assert res.actions[0].reason.startswith("title-marker")
+        assert not any(a.rsvp_planned or a.rsvp for a in res.actions)
+
+    def test_sweep_skips_when_a_notetaker_is_already_on_the_invite(self):
+        """One mechanism per event: accepting on top of an invited notetaker@
+        dispatches TWO bots -- the duplicate this build exists to remove."""
+        res = _sweep_plan(_own("c1", extra=(mc.LEGACY_NOTETAKER,)),
+                          _ev("r1", link=LINK, attendees=["harrison@hjrglobal.com", mc.LEGACY_NOTETAKER]))
+        rows = [a for a in res.actions if a.action == "none"]
+        assert len(rows) == 1
+        assert rows[0].rsvp == "skipped:notetaker-present" and rows[0].rsvp_planned is False
+
+    def test_sweep_withholds_a_lex_redacted_invite(self):
+        """R1 as written: a LEX/PHI-redacted (organizer-withheld) event is never
+        RSVP'd. The row still names no organiser and no title."""
+        own = _own("c1", **{"organizer": "ops@lexingtonservices.com",
+                             "extra": ("intake@county.gov",)})
+        res = _sweep_plan(own, _ev("r1", link=LINK, **_lex_kwargs()))
+        rows = [a for a in res.actions if a.action == "none"]
+        assert len(rows) == 1
+        assert rows[0].rsvp == "skipped:lex-withheld" and rows[0].rsvp_planned is False
+        assert rows[0].title.startswith("LEX/PHI") and "county.gov" not in rows[0].reason
+
+
+class TestRsvpExecute:
+    def test_no_rsvp_when_flag_off_even_with_apply(self, monkeypatch):
+        cal = _Cal(monkeypatch)
+        res = mc.execute_ensure(_guest_add_plan(), _cfg(), apply=True)
+        assert res.applied is False and cal.rsvps == [] and cal.adds == []
+
+    def test_no_rsvp_in_plan_mode_with_apply(self, monkeypatch):
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "plan")
+        cal = _Cal(monkeypatch)
+        res = mc.execute_ensure(_guest_add_plan(), _cfg(), apply=True)
+        assert res.applied is False and cal.rsvps == []
+
+    def test_no_rsvp_in_live_mode_without_apply(self, monkeypatch):
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        cal = _Cal(monkeypatch)
+        # both halves planned: a guest-add AND a sweep row
+        plan = mc.plan_ensure(DAY, _cfg(), list_events=_lister({
+            CORA: [_own("c2", link="https://meet.google.com/rsvp-test-bbb")],
+            "harrison@hjrglobal.com": [
+                _ev("e1", link=LINK),
+                _ev("r2", link="https://meet.google.com/rsvp-test-bbb"),
+            ],
+        }))
+        assert any(a.rsvp_planned for a in plan.actions if a.action == "none")
+        res = mc.execute_ensure(plan, _cfg(), apply=False)
+        assert res.applied is False and cal.rsvps == []
+        assert all(a.rsvp == "" for a in res.actions)
+
+    def test_guest_add_success_accepts_exactly_once_as_cora(self, monkeypatch):
+        """THE R1 STEP. After the guest-add lands, exactly one accept, impersonating
+        the capture identity, on the event that was just guest-added."""
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        cal = _Cal(monkeypatch)
+        res = mc.execute_ensure(_guest_add_plan(), _cfg(), apply=True)
+        assert len(cal.adds) == 1 and len(cal.rsvps) == 1
+        assert cal.rsvps[0] == {"user_email": CORA, "event_id": "e1"}
+        act = [a for a in res.actions if a.action == "guest-add"][0]
+        assert act.applied is True and act.rsvp == "accepted" and act.error == ""
+
+    def test_already_present_guest_add_still_accepts(self, monkeypatch):
+        """The accept is gated on the invite's read-back status, NOT on whether
+        add_attendee changed anything -- otherwise an accept that failed last
+        cycle is never retried (cora@ is present, so add_attendee is a no-op)."""
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        cal = _Cal(monkeypatch, add=(False, "already-present"))
+        res = mc.execute_ensure(_guest_add_plan(), _cfg(), apply=True)
+        assert len(cal.rsvps) == 1
+        assert [a.rsvp for a in res.actions if a.action == "guest-add"] == ["accepted"]
+
+    def test_guest_add_fallback_to_copy_never_rsvps(self, monkeypatch):
+        """A refused guest-add becomes a copy that cora@ ORGANISES. Accepting on
+        it would raise 'not on the guest list' every cycle."""
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        from cora.tools import calendar_client as cc
+        cal = _Cal(monkeypatch, add=cc.CalendarClientError("Calendar HTTP 403 forbiddenForNonOrganizer"))
+        res = mc.execute_ensure(_guest_add_plan(), _cfg(), apply=True)
+        act = [a for a in res.actions if a.action == "copy"][0]
+        assert act.applied is True and len(cal.copies) == 1
+        assert cal.rsvps == [] and act.rsvp == "" and act.rsvp_planned is False
+
+    def test_notetaker_present_at_accept_time_skips_without_write(self, monkeypatch):
+        """Design v1 s4a: notetaker@ added AFTER the lane's guest-add. The accept
+        re-fetches cora@'s copy and turns into a skip -- one mechanism per event."""
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        cal = _Cal(monkeypatch, own=_own("e1", extra=(mc.LEGACY_NOTETAKER,)))
+        res = mc.execute_ensure(_guest_add_plan(), _cfg(), apply=True)
+        assert cal.rsvps == []
+        assert [a.rsvp for a in res.actions if a.action == "guest-add"] == ["skipped:notetaker-present"]
+
+    def test_lex_redacted_event_is_withheld_without_write(self, monkeypatch):
+        """R1 as written: never RSVP a LEX-organizer-withheld event."""
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        cal = _Cal(monkeypatch, own=_own("e1", organizer="ops@lexingtonservices.com",
+                                         extra=("intake@county.gov",)))
+        res = mc.execute_ensure(_guest_add_plan(**_lex_kwargs()), _cfg(), apply=True)
+        act = [a for a in res.actions if a.action == "guest-add"][0]
+        assert act.title.startswith("LEX/PHI")
+        assert act.applied is True             # the guest-add itself still happened (D-247)
+        assert act.rsvp == "skipped:lex-withheld" and cal.rsvps == []
+
+    def test_no_bot_copy_is_vetoed_and_never_rsvpd(self, monkeypatch):
+        """Veto propagation into the RSVP step: a carve-out on one roster copy
+        removes the meeting before either half can act, so neither guest-add
+        nor accept ever fires -- even with both write gates open."""
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        cal = _Cal(monkeypatch)
+        plan = mc.plan_ensure(DAY, _cfg(), list_events=_lister({
+            CORA: [_own("c1")],
+            "harrison@hjrglobal.com": [_ev("mine", summary="[no-bot] private", link=LINK)],
+            "hannah@hjrglobal.com": [_ev("theirs", summary="Weekly Sync", link=LINK)],
+        }))
+        res = mc.execute_ensure(plan, _cfg(), apply=True)
+        assert res.applied is True
+        assert cal.adds == [] and cal.rsvps == [] and cal.copies == []
+        assert [a.action for a in res.actions] == ["skip"]
+
+    def test_already_accepted_makes_no_write_and_is_recorded_as_such(self, monkeypatch):
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        cal = _Cal(monkeypatch, add=(False, "already-present"), rsvp=(False, "already-accepted"))
+        res = mc.execute_ensure(_guest_add_plan(), _cfg(), apply=True)
+        assert len(cal.rsvps) == 1     # the read happened (inside set_own_response); no patch
+        assert [a.rsvp for a in res.actions if a.action == "guest-add"] == ["already-accepted"]
+
+    def test_read_back_mismatch_is_recorded_not_raised(self, monkeypatch):
+        """A patch that returns 200 but does not take must surface as an rsvp
+        error on the row -- never as an accept, and never as an exception that
+        stops the rest of the lane or its ledger."""
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        from cora.tools import calendar_client as cc
+        cal = _Cal(monkeypatch, rsvp=cc.CalendarClientError(
+            "set_own_response: read-back for e1 shows 'needsAction', expected 'accepted'"))
+        res = mc.execute_ensure(_guest_add_plan(), _cfg(), apply=True)
+        act = [a for a in res.actions if a.action == "guest-add"][0]
+        assert act.rsvp == "error" and "read-back" in act.rsvp_error
+        assert act.applied is True and act.error == ""     # the guest-add row itself is clean
+        assert len(cal.rsvps) == 1
+
+    def test_own_calendar_fetch_failure_is_an_rsvp_error_not_a_crash(self, monkeypatch):
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        from cora.tools import calendar_client as cc
+        cal = _Cal(monkeypatch, own=cc.CalendarClientError("Calendar HTTP 404 fetching event e1"))
+        res = mc.execute_ensure(_guest_add_plan(), _cfg(), apply=True)
+        act = [a for a in res.actions if a.action == "guest-add"][0]
+        assert act.rsvp == "error" and "404" in act.rsvp_error and cal.rsvps == []
+
+    def test_sweep_row_accepts_on_cora_own_event_id(self, monkeypatch):
+        """For an externally-organised meeting the id on cora@'s calendar is NOT
+        the roster id; accepting on the roster id would 404 (or worse, act on the
+        wrong calendar's copy)."""
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        own = _own("_cora-copy", organizer="ext@vendor.com")
+        cal = _Cal(monkeypatch, own=own)
+        plan = _sweep_plan(own, _ev("roster-copy", link=LINK, organizer="ext@vendor.com",
+                                    attendees=["harrison@hjrglobal.com", CORA]))
+        res = mc.execute_ensure(plan, _cfg(), apply=True)
+        assert cal.rsvps == [{"user_email": CORA, "event_id": "_cora-copy"}]
+        assert cal.adds == [] and cal.copies == []
+        assert [a.rsvp for a in res.actions if a.action == "none"] == ["accepted"]
+
+    def test_an_errored_guest_add_row_never_rsvps(self, monkeypatch):
+        """If cora@ never reached the guest list there is nothing to accept;
+        trying would add a second, misleading error to the same row."""
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        from cora.tools import calendar_client as cc
+        boom = cc.CalendarClientError("nope")
+        cal = _Cal(monkeypatch, add=boom, own=boom)
+        monkeypatch.setattr(cal.cc, "insert_event_copy", lambda **k: (_ for _ in ()).throw(boom))
+        res = mc.execute_ensure(_guest_add_plan(), _cfg(), apply=True)
+        assert any(a.error for a in res.actions) and cal.rsvps == []
+
+    def test_second_run_is_a_no_op_write(self, monkeypatch):
+        """Idempotent across two consecutive cycles: the second plan sees cora@ on
+        the roster copy (action 'none') and cora@'s own entry accepted (no sweep
+        candidate), so no accept is even attempted."""
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        cal = _Cal(monkeypatch)
+        mc.execute_ensure(_guest_add_plan(), _cfg(), apply=True)
+        assert len(cal.rsvps) == 1
+        second = mc.plan_ensure(DAY, _cfg(), list_events=_lister({
+            CORA: [_own("e1", status="accepted")],
+            "harrison@hjrglobal.com": [_ev("e1", link=LINK, attendees=["harrison@hjrglobal.com", CORA])],
+        }))
+        res = mc.execute_ensure(second, _cfg(), apply=True)
+        assert len(cal.rsvps) == 1 and len(cal.adds) == 1
+        assert [a.action for a in res.actions] == ["none"] and res.actions[0].rsvp == ""
+
+    def test_rsvp_log_line_carries_link_and_start(self):
+        """The kickoff's observability key: `rsvp_accepted` with the (link, start)
+        identity, so a fired-but-accepted-nothing run is distinguishable in logs."""
+        text = (_REPO_ROOT / "src" / "cora" / "meeting_capture.py").read_text(encoding="utf-8")
+        assert "rsvp_accepted event_id=%s link=%s start_ts=%s" in text
+
+
+class TestRsvpLedger:
+    def _load(self, monkeypatch, tmp_path):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "_ensure_script_rsvp", _REPO_ROOT / "scripts" / "run_meeting_capture_ensure.py"
+        )
+        mod = importlib.util.module_from_spec(spec)
+        monkeypatch.setattr(sys, "argv", ["run_meeting_capture_ensure.py", "--apply"])
+        spec.loader.exec_module(mod)
+        # AFTER exec_module: the script's load_dotenv(override=True) re-populates
+        # from .env (see test_ensure_script_does_nothing_at_all_when_the_flag_is_off).
+        ledger = tmp_path / "rsvp-ledger.jsonl"
+        monkeypatch.setenv("CORA_MEETING_CAPTURE_LEDGER", str(ledger))
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        return mod, ledger
+
+    @staticmethod
+    def _rows(ledger):
+        return [json.loads(l) for l in ledger.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+    def test_rsvp_ledger_row_carries_link_and_start_never_a_title(self, monkeypatch, tmp_path):
+        """D-254 identity + D-082: the row must let a human find the meeting by
+        (link, start) and must never carry the title."""
+        mod, ledger = self._load(monkeypatch, tmp_path)
+        cal = _Cal(monkeypatch)
+        title = "Vermilion Kestrel Planning"
+        plan = _guest_add_plan(summary=title)
+        monkeypatch.setattr(mc, "plan_ensure", lambda d, c: plan)
+        mod._run_day(DAY, _cfg(), apply=True)
+        assert len(cal.rsvps) == 1
+        rows = self._rows(ledger)
+        rsvp = [r for r in rows if r.get("action") == "rsvp-accept"]
+        assert len(rsvp) == 1
+        r = rsvp[0]
+        assert r["outcome"] == "accepted" and r["event_id"] == "e1" and r["calendar"] == CORA
+        assert r["meeting_link"] == LINK.lower() and r["start_ts"] == mc.event_start_ts(_ev("e1"))
+        assert r["lane"] == "ensure" and r["mode"] == "live" and r["applied"] is True
+        assert "title" not in r
+        assert title not in ledger.read_text(encoding="utf-8")
+        # the guest-add's own action row is still there, unchanged in shape
+        ga = [r for r in rows if r.get("action") == "guest-add"]
+        assert len(ga) == 1 and ga[0]["was_applied"] is True
+
+    def test_two_consecutive_runs_write_one_rsvp_row(self, monkeypatch, tmp_path):
+        """Idempotency the ledger can prove: run 2 finds the entry already accepted,
+        performs no write, and adds no rsvp-accept row."""
+        mod, ledger = self._load(monkeypatch, tmp_path)
+        outcomes = iter([(True, "accepted"), (False, "already-accepted")])
+        cal = _Cal(monkeypatch, add=(False, "already-present"))
+        monkeypatch.setattr(cal.cc, "set_own_response",
+                            lambda **k: cal.rsvps.append(k) or next(outcomes))
+        # build BOTH plans before patching the planner (the helper calls it)
+        plans = iter([_guest_add_plan(), _guest_add_plan()])
+        monkeypatch.setattr(mc, "plan_ensure", lambda d, c: next(plans))
+        mod._run_day(DAY, _cfg(), apply=True)
+        mod._run_day(DAY, _cfg(), apply=True)
+        assert len(cal.rsvps) == 2                    # read both times, wrote once
+        rows = self._rows(ledger)
+        assert len([r for r in rows if r.get("action") == "rsvp-accept"]) == 1
+        assert len([r for r in rows if r.get("row") == "summary"]) == 2
+
+    def test_notetaker_skip_and_error_are_ledgered_but_lex_and_no_roster_are_not(
+            self, monkeypatch, tmp_path):
+        mod, ledger = self._load(monkeypatch, tmp_path)
+        from cora.tools import calendar_client as cc
+        act = lambda **kw: mc.EnsureAction(**{**dict(member="M", calendar_email="m@hjrglobal.com",
+                                                     event_id="e", title="t", start_label="10:00",
+                                                     action="none", reason="already-covered"), **kw})
+        assert mod._rsvp_ledger_worthy(act(rsvp="skipped:notetaker-present"))
+        assert mod._rsvp_ledger_worthy(act(rsvp="error", rsvp_error="x"))
+        assert mod._rsvp_ledger_worthy(act(rsvp="accepted"))
+        assert not mod._rsvp_ledger_worthy(act(rsvp="skipped:lex-withheld"))
+        assert not mod._rsvp_ledger_worthy(act(rsvp="already-accepted"))
+        assert not mod._rsvp_ledger_worthy(act(rsvp="skipped:no-roster-copy"))
+        # and the no-roster-copy SKIP row is structural for the action-row predicate too
+        assert not mod._action_row_worthy(act(
+            action="skip", reason=f"{mc.RSVP_NO_ROSTER_COPY_REASON}: x", rsvp="skipped:no-roster-copy"))
+        assert cc is not None
+
+    def test_error_row_carries_the_rsvp_error_not_the_action_error(self, monkeypatch, tmp_path):
+        mod, ledger = self._load(monkeypatch, tmp_path)
+        from cora.tools import calendar_client as cc
+        _Cal(monkeypatch, rsvp=cc.CalendarClientError("read-back shows needsAction"))
+        plan = _guest_add_plan()
+        monkeypatch.setattr(mc, "plan_ensure", lambda d, c: plan)
+        mod._run_day(DAY, _cfg(), apply=True)
+        rows = self._rows(ledger)
+        rsvp = [r for r in rows if r.get("action") == "rsvp-accept"]
+        assert len(rsvp) == 1 and rsvp[0]["outcome"] == "error"
+        assert "read-back" in rsvp[0]["error"]
+        ga = [r for r in rows if r.get("action") == "guest-add"][0]
+        assert ga["error"] == "" and ga["was_applied"] is True

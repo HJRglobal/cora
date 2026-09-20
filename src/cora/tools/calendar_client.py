@@ -1099,6 +1099,108 @@ def add_attendee(
     return True, "added"
 
 
+#: The Google responseStatus values an attendee may set on their own entry.
+_RSVP_RESPONSES: frozenset[str] = frozenset({"accepted", "declined", "tentative", "needsAction"})
+
+
+def _find_own_attendee(attendees: list[dict[str, Any]], target: str) -> int:
+    """Index of the impersonated user's own entry, or -1.
+
+    Google marks the calendar owner's entry with `self: true`; the email match is
+    the belt for the case where the owner's entry arrives without that flag (an
+    alias address, or a copy imported from an external organiser).
+    """
+    for i, att in enumerate(attendees):
+        addr = (att.get("email") or "").strip().lower()
+        if att.get("self") is True or (addr and addr == target):
+            return i
+    return -1
+
+
+def set_own_response(
+    *,
+    user_email: str,
+    event_id: str,
+    response: str = "accepted",
+    send_updates: str = "none",
+) -> tuple[bool, str]:
+    """RSVP on user_email's OWN entry of an event it was invited to. Returns
+    (changed, outcome) where outcome is `response` or "already-<response>".
+
+    The One-Cora ensure lane guest-adds cora@ onto a meeting and then must accept
+    that invite AS cora@ (R1, 2026-09-08): an invite left at needsAction is the
+    suspected reason the seat's calendar-connected bot never joins. Impersonation
+    is the same DWD grant the lane already uses to read cora@'s calendar, insert
+    copies onto it and delete them.
+
+    READ-MODIFY-WRITE, exactly like add_attendee and for the same reason: Google's
+    events.patch REPLACES the `attendees` array. A one-element patch carrying only
+    cora@'s entry would silently remove every other guest from a real meeting, so
+    the full list is read, ONLY the impersonated user's own entry is changed, and
+    the full list is written back. attendeesOmitted (an incomplete read) refuses
+    outright (D-253) rather than patch a truncated list.
+
+    Idempotent: an entry already at `response` returns (False, "already-<response>")
+    with NO API write, which is what lets the 15-minute lane re-run safely.
+
+    The write is then READ BACK and the status verified before (True, response) is
+    returned -- a patch that returns 200 but does not take is recorded as an error
+    by the caller, never as an accept.
+    """
+    target = (user_email or "").strip().lower()
+    if not target or "@" not in target:
+        raise CalendarClientError(f"set_own_response needs a real email, got {user_email!r}")
+    if not (event_id or "").strip():
+        raise CalendarClientError("set_own_response needs an event_id")
+    if response not in _RSVP_RESPONSES:
+        raise CalendarClientError(f"set_own_response: unsupported response {response!r}")
+
+    event = get_event(user_email=user_email, event_id=event_id)
+    if event.get("attendeesOmitted"):
+        raise CalendarClientError(
+            f"set_own_response refused for {event_id}: Google reported attendeesOmitted, "
+            "so the guest list read back is incomplete and patching it would drop guests."
+        )
+
+    existing = [a for a in (event.get("attendees") or []) if isinstance(a, dict)]
+    idx = _find_own_attendee(existing, target)
+    if idx < 0:
+        raise CalendarClientError(
+            f"set_own_response: {target} is not on the guest list of {event_id}"
+        )
+    if (existing[idx].get("responseStatus") or "").strip() == response:
+        return False, f"already-{response}"
+
+    merged = [dict(a) for a in existing]
+    merged[idx]["responseStatus"] = response
+    try:
+        service = _build_service(user_email, write=True)
+        service.events().patch(
+            calendarId="primary",
+            eventId=event_id,
+            body={"attendees": merged},
+            sendUpdates=send_updates,
+        ).execute()
+    except HttpError as exc:
+        status = exc.resp.status if exc.resp else "?"
+        raise CalendarClientError(
+            f"Calendar HTTP {status} setting {target} to {response} on {event_id}: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise CalendarClientError(f"Calendar API error setting own response: {exc}") from exc
+
+    # Read back. A 200 on the patch is not proof the status took.
+    after = get_event(user_email=user_email, event_id=event_id)
+    after_att = [a for a in (after.get("attendees") or []) if isinstance(a, dict)]
+    j = _find_own_attendee(after_att, target)
+    got = (after_att[j].get("responseStatus") or "") if j >= 0 else "<absent>"
+    if got != response:
+        raise CalendarClientError(
+            f"set_own_response: read-back for {event_id} shows {got!r}, expected {response!r}"
+        )
+    return True, response
+
+
 #: Marker written into a copied event's description so the ensure-lane can
 #: recognise (and re-sync) the copies it owns without touching anything else on
 #: the capture identity's calendar.
