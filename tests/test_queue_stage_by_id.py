@@ -114,8 +114,10 @@ def test_stage_by_id_delegates_to_the_shared_kickoff_generator(qenv, monkeypatch
                         lambda c, **kw: (calls.append((c, kw)), ("staged", "/tmp/p.md"))[1])
     assert cq.stage_by_id(cid, HARRISON) == ("staged", "/tmp/p.md")
     # Code #12 C1: the typed founder verb is THE deliberate override of the
-    # evidence floor -- and the only caller that passes it.
-    assert calls == [(cid, {"override_evidence_floor": True})]
+    # evidence floor -- and the only caller that passes it. Code #13 slice 1
+    # (RIDER 2 / C1 option B): the staged event also names HOW it was staged, so
+    # the ledger can tell a typed verb from a button tap or the approve auto-stage.
+    assert calls == [(cid, {"override_evidence_floor": True, "via": "typed_verb"})]
 
 
 # ── (c1) the WRITE_CONFIRMED leak ───────────────────────────────────────────

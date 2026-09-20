@@ -342,7 +342,7 @@ lanes:
     promotion_criteria: "n/a -- an ingest lane; extending the allowlist to staff sweeps is a follow-up ruling after one clean week"
     demotion_triggers: "an out-of-allowlist file found ingested (the dry-run manifest is the detector) -> the sweep for that account falls back to hold-all until reviewed"
     evidence_monitor:
-      description: "the sweep line `skipped_outside_allowlist=N` + `held=N` per run; the --dry-run out-of-tree manifest; kb_exclusions belt tests"
+      description: "the sweep line `skipped_outside_allowlist=N` + `ancestry_unresolved=N` (the held count -- the pre-existing counter name) per run; the --dry-run out-of-tree manifest; kb_exclusions belt tests"
       failing_capable: true
     audit_surface: "logs/drive-sweep-<date>.log sweep line + the purge manifest (Harrison-run, stop window)"
     authority: Harrison
@@ -405,4 +405,4 @@ lanes:
       - ts: 2026-09-19
         event: seeded
         by: code-13
-        evidence: "cq-06045f418bd2; coverage measured 4 of 74 tasks on 9/8; a task that fires and writes nothing == one that never fired"
+        evidence: "cq-06045f418bd2; coverage re-measured 2026-09-19: 0 of 109 Cowork tasks write the contract (the 4 self-loggers write ad-hoc jsonl to three other Drive paths -- the 9/8 '4 of 74' read counted those); a task that fires and writes nothing == one that never fired"
