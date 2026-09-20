@@ -48,7 +48,9 @@ def test_unknown_channel_routes_to_fndr():
 
 
 def test_unknown_user_passes_access_check_for_fndr_blocked_for_entity():
-    # FNDR scope: allowed, no blocked topics for an unknown user.
+    # FNDR scope: allowed. Since D-301 (2026-09-10) an unknown user DOES carry the
+    # default sensitive-topic blocks everywhere; this text trips none of them, so
+    # it still passes (the blocked sibling lives in tests/test_inventory_guard_order.py).
     assert user_access.check_access(_UNKNOWN, "FNDR", "how is the portfolio doing?") is None
     # Entity scope they aren't authorized for: redirected (but the redirect must
     # NOT leak an internal entity code -- the 2026-06-01 #f3-events regression).

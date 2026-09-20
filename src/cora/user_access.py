@@ -324,17 +324,26 @@ def _load_permissions() -> dict[str, Any]:
         return {}
 
 
-# The sensitive-topic set an UNLISTED user carries when a structural grant (Code
-# #12 G1's in-channel inventory grant) stands in for roster authorization. Every
-# topic the roster can block -- `financials` stays tier-aware in check_access.
-_GRANT_DEFAULT_BLOCKED_TOPICS: tuple[str, ...] = ("financials", "hr", "legal", "phi", "cap_table")
+# The sensitive-topic set EVERY unlisted user carries, everywhere (Code #13
+# adjacency, cq-da5abb36df07, D-301 ruled 2026-09-10): any channel, any DM, with or
+# without the Code #12 G1 in-channel inventory grant. Code #12 first applied it only
+# UNDER the grant (an unlisted channel member's empty block list made check_access a
+# no-op for the grant's own target population); the ruling widened it to the
+# roster-absent population as a whole -- an unlisted user is FNDR/HJRG read-only AND
+# topic-screened. Every topic the roster can block; `financials` stays tier-aware in
+# check_access (TIER_1 permits finance talk by design). Harrison is exempt; a LISTED
+# user carries exactly their roster list (an explicit `[]` stays `[]`).
+_UNLISTED_DEFAULT_BLOCKED_TOPICS: tuple[str, ...] = ("financials", "hr", "legal", "phi", "cap_table")
+# Code #12 name, kept as an alias: the grant case is a subset of the unlisted case.
+_GRANT_DEFAULT_BLOCKED_TOPICS = _UNLISTED_DEFAULT_BLOCKED_TOPICS
 
 
 def is_authorized(user_id: str, entity: str) -> bool:
     """Return True if the user is allowed to receive answers about this entity.
 
     Harrison always returns True. Users not in the file default to FNDR-only
-    (cross-entity overview access, no sub-entity detail).
+    (cross-entity overview access, no sub-entity detail) -- and, in check_access,
+    carry the default sensitive-topic blocks (_UNLISTED_DEFAULT_BLOCKED_TOPICS).
     """
     if user_id == _HARRISON_ID:
         return True
@@ -446,15 +455,20 @@ def check_access(
 
     # Sensitive topic check
     blocked = blocked_topics(user_id)
-    if entity_grant and user_id != _HARRISON_ID and not _load_permissions().get(user_id):
-        # D-051 lens C F2 (2026-09-09): an UNLISTED user has an EMPTY block list, so
-        # for the grant's own target population (a channel member who is in no
-        # roster file) "every topic block still runs" was vacuously true -- the
-        # grant made check_access a total no-op. A grant is entity scope earned by
-        # a structural fact; it must never also mean "no topic is sensitive". The
-        # unlisted-user default outside a grant is unchanged here (a pre-existing
-        # posture, seeded for a Harrison ruling rather than widened mid-build).
-        blocked = list(_GRANT_DEFAULT_BLOCKED_TOPICS)
+    if user_id != _HARRISON_ID and not _load_permissions().get(user_id):
+        # An UNLISTED user (no entry in user-permissions.yaml) has an EMPTY roster
+        # block list, so without this default check_access is a total no-op for
+        # them wherever the entity gate passes: FNDR/HJRG-routed channels, every
+        # DM (an unknown DM asker resolves to FNDR), and the Code #12 G1 in-channel
+        # inventory grant. Code #12 (D-051 lens C F2, 2026-09-09) closed only the
+        # grant case and seeded the rest for a ruling; D-301 (2026-09-10, Code #13
+        # adjacency cq-da5abb36df07) ruled the default applies to every unlisted
+        # user EVERYWHERE -- so the `entity_grant` conjunct is gone. Note this
+        # deliberately reads the roster, not blocked_topics(): a LISTED user with
+        # an explicit empty list keeps it. The grant itself is unchanged (entity
+        # scope earned by a structural fact, never topic scope): an unlisted
+        # member's in-channel template still executes, with these blocks ON.
+        blocked = list(_UNLISTED_DEFAULT_BLOCKED_TOPICS)
     if not blocked:
         return None
 

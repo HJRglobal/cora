@@ -6,7 +6,10 @@
 #   2. User entity scope (this file)
 #
 # If a user is not listed here, they get FNDR-level read access (cross-entity
-# overview, no sensitive sub-entity detail).
+# overview, no sensitive sub-entity detail) AND the default sensitive-topic blocks
+# (financials / hr / legal / phi / cap_table) everywhere -- any channel, any DM
+# (D-301, 2026-09-10). List a user here to give them a specific block list; an
+# explicit empty list on a listed user means no topic blocks.
 #
 # sensitive_topics_blocked: topics Cora refuses for this user even in allowed entities.
 # Options: financials, hr, legal, phi, cap_table, cross_entity, marketing, events

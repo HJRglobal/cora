@@ -5587,17 +5587,18 @@ def _shopify_set_inventory_impl(slack_user_id: str, entity: str, _input: dict) -
     mis-narrating model can never claim a phantom write (HIGH-2).
 
     Scope: F3E channels + Harrison/FNDR/HJRG cross-entity. Source-opaque output.
+
+    Guard ORDER (Code #13 adjacency, cq-eebf2408f252): out-of-channel MEMBERSHIP
+    first, then the entity-scope guard. A non-member asking from a DM or another
+    channel is refused with the channel POINTER (the actionable copy: post it in
+    the inventory channel or get added), never the entity-scope text. Membership
+    does NOT widen the entity wall: a live member whose surface entity is not
+    F3E/FNDR/HJRG still meets the scope guard (D-051 lens C -- a channel roster is
+    not an entity grant).
     """
     input_data = _input or {}
     ent = (entity or "").upper()
     channel = str(input_data.get("_channel_name") or "")
-
-    # --- Scope guard (defense-in-depth; tools_for_entity already gates exposure) ---
-    is_founder = slack_user_id == _HARRISON_SLACK_ID or ent in ("FNDR", "HJRG")
-    if not (ent == "F3E" or is_founder):
-        return _shopify_write_blocked(
-            f"{_NOT_WRITTEN}\nDTC inventory updates are only available from F3E channels."
-        )
 
     # --- G1 (Code #12, cq-f23d6885dd1c + cq-28de84159c3f): HYBRID authorization ---
     # IN the configured write channel, membership is proven by the post itself
@@ -5607,6 +5608,8 @@ def _shopify_set_inventory_impl(slack_user_id: str, entity: str, _input: dict) -
     # request time (<= 5 min cache), no hand-maintained names. A lookup that fails
     # REFUSES (fail closed): "could not verify" must never read as "authorized".
     # Harrison is a member like anyone else -- no founder side-door.
+    # Runs BEFORE the scope guard below so a non-member's refusal carries the
+    # membership pointer regardless of which entity their DM/channel resolved to.
     from cora import guard_input, inventory_membership
     if not guard_input.is_inventory_write_channel(channel):
         # F3E's channel(s) only (D-051 lens C F4): this tool writes F3E inventory.
@@ -5616,6 +5619,14 @@ def _shopify_set_inventory_impl(slack_user_id: str, entity: str, _input: dict) -
                      slack_user_id, channel, why)
             return _shopify_write_blocked(
                 f"{_NOT_WRITTEN}\n{inventory_membership.refusal_text(why)}")
+
+    # --- Scope guard (defense-in-depth; tools_for_entity already gates exposure) ---
+    # Kept AFTER membership (ordering only): a member still needs F3E/founder scope.
+    is_founder = slack_user_id == _HARRISON_SLACK_ID or ent in ("FNDR", "HJRG")
+    if not (ent == "F3E" or is_founder):
+        return _shopify_write_blocked(
+            f"{_NOT_WRITTEN}\nDTC inventory updates are only available from F3E channels."
+        )
 
     confirmed = _confirmed_flag(input_data)
     items = input_data.get("items")
