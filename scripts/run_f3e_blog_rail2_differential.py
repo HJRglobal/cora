@@ -107,6 +107,12 @@ def main(argv: list[str] | None = None, *, fetch=None) -> int:
         lg = "TRIP" if not rh.legacy_preflight(s).passed else "pass"
         at = "TRIP" if not rh.new_preflight(s).passed else "pass"
         lines.append(f"{'fp_set':<30} {lg:<5} {at:<5} {s}")
+    lines.append("")
+    lines.append("== round-2 release probes (D-051; must pass the shipping rail) ==")
+    for s in rh.RELEASE_PROBES:
+        lg = "TRIP" if not rh.legacy_preflight(s).passed else "pass"
+        at = "TRIP" if not rh.new_preflight(s).passed else "pass"
+        lines.append(f"{'release':<30} {lg:<5} {at:<5} {s}")
 
     if args.live:
         if fetch is None:

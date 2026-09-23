@@ -1222,3 +1222,103 @@ class TestIdiomOverTripsAreFailClosed:
     @pytest.mark.parametrize("sentence", OVER_TRIPS + CLAIMS_A_REDACTION_WOULD_CLEAR)
     def test_both_the_idiom_and_its_claim_twin_trip(self, sentence):
         assert "R2" in _pf(sentence).tripped_rail_ids, sentence
+
+
+# ---------------------------------------------------------------------------
+# D-051 ROUND 2 (Code #14 re-review of the r143 remediation, bca189c). Each class
+# names the regression (F3-Rn) or the PARTIAL closure (r143-claims-n) it pins. A
+# must-PASS row was cleared by the pre-remediation rail and re-tripped by round 1;
+# a must-TRIP row trips the frozen legacy rail and passed round 1.
+# ---------------------------------------------------------------------------
+
+
+class TestRound2PhraseQuantities:
+    """F3-R2: the exact-phrase edge check read every digit-bearing token and every
+    "-ly" word as a degree modifier, so "120mg natural caffeine from green tea" and
+    "uses only natural caffeine ..." re-tripped the phrase ruled cleared on Energy
+    (D-329). r143-claims-2 PARTIAL: unlisted colloquial intensifiers still cleared."""
+
+    RELEASED = rh.RELEASE_PROBES[:7]
+    MUST_TRIP = (
+        "F3 Energy runs on way cleaner fuel.",
+        "F3 Energy runs on a way cleaner fuel source.",
+        "F3 Energy runs on miles cleaner fuel.",
+        "F3 Energy has next-level natural caffeine from green tea.",
+        "F3 Energy has straight-up natural caffeine from green tea.",
+        "F3 Energy has refreshingly natural caffeine from green tea.",   # unlisted -ly: fail closed
+        "F3 Energy has 2x cleaner fuel.",                                 # a multiplier is a degree
+        "F3 Energy delivers 120 natural caffeine from green tea.",        # a bare number still counts
+    )
+
+    @pytest.mark.parametrize("sentence", RELEASED)
+    def test_a_quantity_or_focus_particle_keeps_the_ruled_phrase_exact(self, sentence):
+        assert pf.rail2_attribution_hit(sentence) is None, sentence
+        r = _pf(sentence)
+        assert r.passed, r.render()
+        assert pf.rail2_legacy_hit(sentence) is not None   # the ruling, not legacy, releases it
+
+    @pytest.mark.parametrize("sentence", MUST_TRIP)
+    def test_an_intensifier_is_still_a_modifier(self, sentence):
+        assert pf.rail2_attribution_hit(sentence) is not None, sentence
+        assert "R2" in _pf(sentence).tripped_rail_ids, sentence
+
+    def test_the_intensifier_holes_are_in_the_gate(self):
+        probes = rh.CLAIMS_HOLE_PROBES["clean_natural_on_energy_mood"]
+        for s in self.MUST_TRIP[:7]:
+            assert s in probes, s
+
+    def test_the_release_probes_are_gated(self):
+        v = rh.evaluate()
+        assert v.release_tripping == [] and v.ship is True
+        assert "round-2 release probes (D-051): attribution trips 0/%d" % len(rh.RELEASE_PROBES) \
+            in v.summary_lines()
+
+    def test_a_release_probe_regression_closes_the_gate(self, monkeypatch):
+        monkeypatch.setattr(rh, "RELEASE_PROBES", rh.RELEASE_PROBES + ("F3 Energy is clean.",))
+        v = rh.evaluate()
+        assert v.ship is False and v.release_tripping == ["F3 Energy is clean."]
+
+    def test_modifier_classification(self):
+        for w in ("only", "solely", "exclusively", "daily", "120mg", "120-mg", "12oz", "12-pack",
+                  "71mg", "200mg"):
+            assert not pf._is_phrase_modifier(w), w
+        for w in ("refreshingly", "insanely", "2x", "100%", "100", "120", "way", "miles",
+                  "next-level", "straight-up", "100-percent", "purely", "totally"):
+            assert pf._is_phrase_modifier(w), w
+
+    def test_way_is_a_noun_only_after_a_definite_determiner(self):
+        assert pf.rail2_attribution_hit("F3 Energy changes the way natural caffeine from green tea hits.") is None
+        assert pf.rail2_attribution_hit("F3 Energy is one way natural caffeine from green tea fits a day.") is None
+        assert pf.rail2_attribution_hit("F3 Energy runs on a way cleaner fuel source.") is not None
+        assert pf.rail2_attribution_hit("F3 Energy runs on way cleaner fuel.") is not None
+
+    def test_the_pinned_edge_probes_still_trip(self):
+        for s in TestExactPhraseEdges.MUST_TRIP:
+            assert pf.rail2_attribution_hit(s) is not None, s
+
+    DEGENERATE = (
+        "9" * 40000,
+        "1" * 20000 + "mg",
+        "120mg " * 6600,
+        "the way " * 5000 + "natural caffeine from green tea",
+        "only " * 8000 + "natural caffeine from green tea",
+        "120mg natural caffeine from green tea " * 1050,
+    )
+
+    @pytest.mark.parametrize("text", DEGENERATE, ids=range(len(DEGENERATE)))
+    def test_d171_the_quantity_rule_is_fast_at_40k(self, text):
+        dt = _best_of_3(lambda: pf._PHRASE_QUANTITY_RE.match(text))
+        assert dt < 0.2, "%r...: %.3fs" % (text[:12], dt)
+        for pat, _ in pf._RAIL2_PHRASE_EXEMPTIONS:
+            dt = _best_of_3(lambda: pf._redact_exact_phrase(pat, text))
+            assert dt < 0.2, "%s on %r...: %.3fs" % (pat.pattern[:30], text[:12], dt)
+
+    @pytest.mark.parametrize("unit", ["120mg natural caffeine from green tea ",
+                                      "the way natural caffeine from green tea ",
+                                      "only natural caffeine from green tea "])
+    def test_d171_the_quantity_rule_scales_linearly(self, unit):
+        def run(n):
+            text = "F3 Energy " + unit * n
+            return _best_of_3(lambda: pf.rail2_attribution_hit(text))
+        base, dbl = run(1500), run(3000)
+        assert dbl < base * 2.6 + 0.05, "superlinear: %.4fs -> %.4fs" % (base, dbl)

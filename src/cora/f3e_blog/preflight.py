@@ -724,16 +724,41 @@ def _attribution_clean_hits(seg: str) -> set[str]:
 #: Words that, directly before a ruled phrase, MODIFY its clean word -- the phrase
 #: is then no longer the exact ruled phrase (D-051 r143-claims-2: "all natural
 #: caffeine from green tea", "the most natural ...", "a much cleaner fuel source"
-#: all cleared because the pattern matched the tail). Adverbs (any "-ly" word),
-#: numbers and percentages, and hyphen/slash-joined prefixes ("all-natural",
-#: "super-cleaner") are refused STRUCTURALLY in _phrase_is_modified; this set
-#: covers the degree words that are none of those.
+#: all cleared because the pattern matched the tail). Degree adverbs ("-ly" words,
+#: see _PHRASE_NON_DEGREE_LY), bare numbers, multipliers and percentages, and
+#: hyphen/slash-joined prefixes ("all-natural", "super-cleaner") are refused
+#: STRUCTURALLY in _is_phrase_modifier; this set covers the degree words that are
+#: none of those, including the colloquial intensifiers the first cut missed ("way
+#: cleaner fuel", "miles cleaner", "next-level natural caffeine": round-2 review).
 _PHRASE_MODIFIERS = frozenset({
     "all", "most", "more", "much", "very", "so", "super", "ultra", "extra", "pure", "real",
     "true", "genuine", "whole", "total", "complete", "entire", "full", "absolute",
     "authentic", "raw", "percent", "cent", "far", "even", "lot", "lots", "ever", "just",
     "100",
+    "way", "miles", "tons", "loads", "crazy", "mega", "hyper", "uber", "wicked", "hella",
+    "certified", "twice", "double", "triple", "next-level", "straight-up", "top-notch",
 })
+#: ...except "way" after a definite determiner, where it is a noun: "the way
+#: natural caffeine from green tea works" names a manner, not a degree. "a way
+#: cleaner fuel source" is still the degree ("a" is not in the set, fail closed).
+_PHRASE_MODIFIERS_NOUN_AFTER_DET = frozenset({"way"})
+_PHRASE_DETERMINERS = frozenset({"the", "this", "that", "which", "every", "any", "no", "one",
+                                 "each", "whatever"})
+#: "-ly" words that say nothing about the clean word's DEGREE (D-051 round-2 F3-R2):
+#: focus particles ("uses only natural caffeine from green tea" -- which caffeine,
+#: not how natural) and frequency words ("your daily natural caffeine ..."). Every
+#: other "-ly" word still counts, so an unlisted intensifier ("refreshingly natural
+#: caffeine from green tea") stays fail-closed. A CLOSED degree list would have
+#: released it -- a hole the round-1 structural rule did not have.
+_PHRASE_NON_DEGREE_LY = frozenset({
+    "only", "solely", "exclusively", "daily", "weekly", "monthly", "yearly", "nightly", "hourly",
+})
+#: A number fused to its unit ("120mg", "120-mg", "12oz", "12-pack") is a
+#: QUANTITY, i.e. a fact, not a degree (the house spelling "200mg natural caffeine",
+#: F3-R2). A bare number, a multiplier ("2x") or a percentage still counts.
+_PHRASE_QUANTITY_RE = re.compile(
+    r"^\d{1,6}(?:[.,]\d{1,3})?-?(?:mg|mcg|g|kg|ml|l|oz|fl|kcal|cal|calories|calorie|milligrams?|"
+    r"grams?|ounces?|cans?|packs?|servings?|count|ct)$")
 #: A coordinated modifier ("pure and natural caffeine from green tea") is checked
 #: through ONE coordinator.
 _PHRASE_COORDINATORS = frozenset({"and", "or", "plus", "nor"})
@@ -743,10 +768,14 @@ def _is_phrase_modifier(word: str) -> bool:
     w = word.lower().strip("'&/-")
     if not w:
         return False
-    if any(ch.isdigit() for ch in w) or (len(w) > 3 and w.endswith("ly")):
-        return True
     if w in _PHRASE_MODIFIERS or w in _ATTRIBUTION_CLEAN_TOKENS:
         return True
+    if "%" in w:
+        return True
+    if any(ch.isdigit() for ch in w):
+        return _PHRASE_QUANTITY_RE.match(w) is None
+    if len(w) > 3 and w.endswith("ly"):
+        return w not in _PHRASE_NON_DEGREE_LY
     return any(p in _PHRASE_MODIFIERS or p in _ATTRIBUTION_CLEAN_TOKENS
                for p in w.replace("/", "-").split("-") if p)
 
@@ -779,6 +808,10 @@ def _phrase_is_modified(text: str, start: int, end: int) -> bool:
         if word in _PHRASE_COORDINATORS:
             cut = tok.start()
             continue
+        if word in _PHRASE_MODIFIERS_NOUN_AFTER_DET and toks:
+            before = window[toks[-1].end():tok.start()].strip()
+            if not before and toks[-1].group(0).lower() in _PHRASE_DETERMINERS:
+                return False   # "the way natural caffeine ...": a noun
         return _is_phrase_modifier(word)
     return False
 

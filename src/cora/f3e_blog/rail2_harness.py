@@ -26,6 +26,9 @@ WHAT THIS MODULE HOLDS (data + pure functions; no network, no LLM):
                           CleanHub environmental sentences, the chemistry sentence,
                           the 9/14 green-tea jam and the Pure-launch "cleaner fuel
                           source" line) that the shipping rail must PASS;
+  * RELEASE_PROBES     -- D-051 round 2: copy the round-1 remediation re-tripped
+                          (F3-R2 quantities / focus particles, F3-R3 CSR tails); gated
+                          must-PASS, kept apart from the measured FP set;
   * UNDECIDED          -- the 9/1 Pure-attached tail (trips under fail-closed union
                           inheritance, D-051 EF-7): reported, never gated;
   * legacy_preflight() -- the FROZEN pre-R14-3 composition: run_preflight's non-R2
@@ -154,6 +157,16 @@ CLAIMS_HOLE_PROBES: dict[str, tuple[str, ...]] = {
         "F3 Energy is the super cleaner fuel.",
         "F3 Energy runs on a much cleaner fuel source.",
         "F3 Energy runs on cleaner fuel-like energy.",
+        # D-051 round-2 (r143-claims-2 PARTIAL): colloquial intensifiers the degree set
+        # did not list (legacy TRIP / round-1 PASS); an unlisted "-ly" intensifier
+        # stays fail-closed through the structural rule
+        "F3 Energy runs on way cleaner fuel.",
+        "F3 Energy runs on a way cleaner fuel source.",
+        "F3 Energy runs on miles cleaner fuel.",
+        "F3 Energy has next-level natural caffeine from green tea.",
+        "F3 Energy has straight-up natural caffeine from green tea.",
+        "F3 Energy has refreshingly natural caffeine from green tea.",
+        "F3 Energy has 2x cleaner fuel.",
         # R14-3 NEW HOLES the Code #13 environmental redaction opened (it cleared a
         # PREDICATE of the brand, not only an environmental object): legacy TRIP,
         # pre-R14-3 attribution PASS
@@ -246,6 +259,24 @@ FALSE_POSITIVE_SET: tuple[str, ...] = (
     "with a cleaner fuel source.",
 )
 
+# ── D-051 round 2: copy the round-1 remediation RE-TRIPPED (must PASS) ─────────
+#: Plain factual or CSR sentences that the pre-remediation rail cleared, that the
+#: round-1 remediation re-tripped, and that are no claim: gated like
+#: FALSE_POSITIVE_SET but kept apart from it, because that set is the MEASURED
+#: live FP rate (its "5/6" pin) and these are review probes. Legacy trips most of
+#: them; the ruling (D-329) is what releases them.
+RELEASE_PROBES: tuple[str, ...] = (
+    # F3-R2: a unit-fused quantity and a focus particle are not degree modifiers of
+    # the ruled phrase (the house spelling is "200mg natural caffeine")
+    "F3 Energy delivers 120mg natural caffeine from green tea.",
+    "Each can of F3 Energy packs 120mg natural caffeine from green tea.",
+    "F3 Energy has a 120-mg natural caffeine from green tea.",
+    "F3 Energy uses only natural caffeine from green tea.",
+    "F3 Energy uses exclusively natural caffeine from green tea.",
+    "F3 Energy: your daily natural caffeine from green tea.",
+    "F3 Energy changes the way natural caffeine from green tea hits.",
+)
+
 # ── reported, never gated: needs a Harrison ruling ──────────────────────────────
 UNDECIDED: tuple[str, ...] = (
     # (the 9/14 green-tea sentence moved to FALSE_POSITIVE_SET: ruled 2026-09-19)
@@ -300,6 +331,7 @@ class Verdict:
     fp_legacy_tripping: list[str] = field(default_factory=list)             # the measured FP rate
     pinned_missed: list[str] = field(default_factory=list)
     undecided: dict[str, dict[str, bool]] = field(default_factory=dict)
+    release_tripping: list[str] = field(default_factory=list)               # round-2 must-PASS rows
 
     def summary_lines(self) -> list[str]:
         out = [f"SHIP: {'YES' if self.ship else 'NO'}"]
@@ -327,6 +359,10 @@ class Verdict:
                    f"attribution trips {len(self.fp_still_tripping)}/{len(FALSE_POSITIVE_SET)}")
         for s in self.fp_still_tripping:
             out.append("  FP still tripping under attribution: " + s)
+        out.append(f"round-2 release probes (D-051): attribution trips "
+                   f"{len(self.release_tripping)}/{len(RELEASE_PROBES)}")
+        for s in self.release_tripping:
+            out.append("  release probe still tripping: " + s)
         for s, res in self.undecided.items():
             out.append(f"UNDECIDED (Harrison ruling): legacy={'TRIP' if res['legacy'] else 'pass'} "
                        f"attribution={'TRIP' if res['attribution'] else 'pass'} -- {s}")
@@ -348,11 +384,12 @@ def evaluate() -> Verdict:
     fp_legacy = [s for s in FALSE_POSITIVE_SET if not legacy_preflight(s).passed]
     undecided = {s: {"legacy": not legacy_preflight(s).passed, "attribution": not new_preflight(s).passed}
                  for s in UNDECIDED}
+    release = [s for s in RELEASE_PROBES if not new_preflight(s).passed]
     gated_uncaught = [s for cls, missed in uncaught.items() if cls not in RULED_OUT_CLASSES for s in missed]
-    ship = not pinned_missed and not gated_uncaught and not fp_new
+    ship = not pinned_missed and not gated_uncaught and not fp_new and not release
     return Verdict(ship=ship, uncaught_by_class=uncaught, uncaught_legacy_by_class=uncaught_legacy,
                    fp_still_tripping=fp_new, fp_legacy_tripping=fp_legacy,
-                   pinned_missed=pinned_missed, undecided=undecided)
+                   pinned_missed=pinned_missed, undecided=undecided, release_tripping=release)
 
 
 @dataclass
