@@ -367,9 +367,10 @@ class TestPredicate:
     ], ids=["spaces", "cards", "responded", "pronouns", "mixed", "id-status", "them-status",
             "those-landed", "any", "did-those-land", "did-any-register"])
     def test_predicate_is_fast_on_degenerate_input_at_the_gate(self, shape):
-        t0 = time.perf_counter()
-        cq.is_queue_status_question(shape, prior_user_texts=[shape, shape, shape])
-        assert time.perf_counter() - t0 < 0.1
+        # Best of 3 (D-051 integration-tests-6): one sample flakes under host load.
+        from _timing import best_of_3
+        assert best_of_3(cq.is_queue_status_question, shape,
+                         prior_user_texts=[shape, shape, shape]) < 0.1
 
     @pytest.mark.parametrize("shape", [
         " " * 40_000 + "x", "card " * 8_000, "responded to " * 3_000, "!" * 40_000,

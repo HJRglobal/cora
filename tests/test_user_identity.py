@@ -641,8 +641,9 @@ def test_resolve_opt_in_keeps_placeholder_words(monkeypatch):
 
 def test_resolve_opt_in_regex_is_linear_on_degenerate_input(monkeypatch):
     """D-171: 40k of each character the new pattern's quantifiers eat, plus a
-    growth-shape check (4x the input must not cost anywhere near 16x)."""
-    import time as _t
+    growth-shape check (4x the input must not cost anywhere near 16x). Best of 3
+    (D-051 integration-tests-6): one sample flakes under host load."""
+    from _timing import best_of_3
     _patch_roster(monkeypatch)
     from cora.tools.user_identity import resolve_slack_mentions
 
@@ -659,10 +660,12 @@ def test_resolve_opt_in_regex_is_linear_on_degenerate_input(monkeypatch):
         ]
 
     def cost(n):
-        t0 = _t.perf_counter()
-        for s in shapes(n):
-            resolve_slack_mentions(s, unknown_label="unknown user", known_apps=True)
-        return _t.perf_counter() - t0
+        batch = shapes(n)
+
+        def run():
+            for s in batch:
+                resolve_slack_mentions(s, unknown_label="unknown user", known_apps=True)
+        return best_of_3(run)
 
     small, big = cost(10_000), cost(40_000)
     assert big < 0.2, f"degenerate input took {big:.3f}s"

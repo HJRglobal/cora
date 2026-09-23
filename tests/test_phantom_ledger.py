@@ -466,6 +466,4 @@ class TestCode14OwnerPrivateTurns:
 
 def test_snippet_path_is_linear_on_a_200kb_adversarial_reply(ledger):
     text = ("I updated " + "Routing Number: 021000021 " * 2000 + "https://x.com/" + "a" * 40000 + " ") * 2
-    t0 = time.perf_counter()
-    _pw(text[:200_000])
-    assert time.perf_counter() - t0 < 2.0
+    assert _best_of_3(lambda: _pw(text[:200_000])) < 2.0

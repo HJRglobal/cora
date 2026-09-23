@@ -13,7 +13,6 @@ import importlib.util
 import logging
 import re
 import sys
-import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -176,12 +175,16 @@ def test_main_dry_run_with_slack_never_constructs_a_client(fake_slack, monkeypat
 
 @pytest.mark.parametrize("ch", [" ", "-", "C", "0", "A"])
 def test_channel_id_regex_linear_on_degenerate_input(ch):
-    """D-171 growth shape: 40k of each character the pattern could chew must stay fast."""
+    """D-171 growth shape: 40k of each character the pattern could chew must stay fast.
+    Best of 3 (D-051 integration-tests-6): one sample flakes under host load."""
+    from _timing import best_of_3
     mod = _load()
+    rx = mod._SLACK_CHANNEL_ID_RE
     for n in (10_000, 40_000):
         s = ch * n
-        t0 = time.perf_counter()
-        mod._SLACK_CHANNEL_ID_RE.fullmatch(s)
-        mod._SLACK_CHANNEL_ID_RE.fullmatch(s + "!")
-        mod._SLACK_CHANNEL_ID_RE.fullmatch("C" + s)
-        assert time.perf_counter() - t0 < 0.2
+
+        def run():
+            rx.fullmatch(s)
+            rx.fullmatch(s + "!")
+            rx.fullmatch("C" + s)
+        assert best_of_3(run) < 0.2

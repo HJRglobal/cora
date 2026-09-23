@@ -939,9 +939,9 @@ class TestAsOfModifiedTime:
     def test_regex_free_classification_is_linear_on_degenerate_input(self):
         # D-171 posture: no regex was added; the "insufficient authentication
         # scopes" check is a substring test. Pin it stays fast on 40k junk.
-        import time as _time
+        # Best of 3 (D-051 integration-tests-6): one sample flakes under host load.
+        from _timing import best_of_3
         big = ("x" * 40_000).encode()
         exc = _s5_http_error(403, b'{"error":{"code":403,"message":"' + big + b'"}}')
-        t0 = _time.perf_counter()
         assert _gf._classify_modified_time_failure(exc) == "forbidden"
-        assert _time.perf_counter() - t0 < 0.2
+        assert best_of_3(_gf._classify_modified_time_failure, exc) < 0.2

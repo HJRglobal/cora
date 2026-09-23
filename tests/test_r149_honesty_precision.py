@@ -609,6 +609,4 @@ class TestDenialPrecisionCode14:
         "I don\u2019" * 10000 + "t have access",
     ], ids=["direct", "outside", "a", "needs", "apostrophe"])
     def test_edited_denial_patterns_are_linear(self, shape):
-        t0 = time.perf_counter()
-        list(se._DENIAL_RE.finditer(shape))
-        assert time.perf_counter() - t0 < 0.2
+        assert _best_of_3(lambda: list(se._DENIAL_RE.finditer(shape))) < 0.2

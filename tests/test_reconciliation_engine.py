@@ -505,15 +505,17 @@ class TestPass3UncapturedDecisions:
         assert "U0ZZZZ99999" not in gaps[0].description
 
     def test_speaker_prefix_regex_is_linear_on_degenerate_input(self):
-        import time as _t
+        # Best of 3 (D-051 integration-tests-6): one sample flakes under host load.
+        from _timing import best_of_3
 
         def cost(n):
             shapes = ["[" * n, "[" + "x" * n, "[x]" + " " * n, "[x] <@U" + "A" * n,
                       ("[x] <U0B44MDGC5R>: a\n") * (n // 20), "\n" * n]
-            t0 = _t.perf_counter()
-            for s in shapes:
-                _re._sentences_not_by(s, "U0B44MDGC5R")
-            return _t.perf_counter() - t0
+
+            def run():
+                for s in shapes:
+                    _re._sentences_not_by(s, "U0B44MDGC5R")
+            return best_of_3(run)
 
         small, big = cost(10_000), cost(40_000)
         assert big < 0.2, f"degenerate input took {big:.3f}s"
