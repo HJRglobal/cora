@@ -137,7 +137,10 @@ class TestAttributionSibling:
 
     def test_environmental_redaction_is_narrow(self):
         assert pf.rail2_attribution_hit("F3 Energy is the clean choice for the planet.") is not None   # 'clean choice' is a product claim
-        assert pf.rail2_attribution_hit("F3 Energy helps clean up the beaches every spring.") is None   # 'clean up' is an activity
+        # 'clean up' is an activity to the attribution leg; the legacy union takes it
+        # back (D-051 round 3: a verb "clean up" is not one of the four release spans)
+        _union_verdict("F3 Energy helps clean up the beaches every spring.")
+        assert "F3 Energy helps clean up the beaches every spring." in rh.UNION_OVER_TRIPS
 
 
 class TestGate:
@@ -280,7 +283,10 @@ class TestFailClosedInheritance:
         names Pure ITSELF (own attribution wins over the union)."""
         s = "Explore the full stack in F3 Energy or the clean-sweetened version in F3 Pure."
         assert pf.rail2_attribution_hit(s) is None
-        assert pf.rail2_attribution_hit("F3 Pure is clean-sweetened; F3 Energy is the full stack.") is None
+        # D-051 round 3: same-sentence P1 attachment clears the attribution leg only;
+        # the legacy union trips it (a UNION_OVER_TRIPS row)
+        _union_verdict("F3 Pure is clean-sweetened; F3 Energy is the full stack.")
+        assert "F3 Pure is clean-sweetened; F3 Energy is the full stack." in rh.UNION_OVER_TRIPS
 
     def test_bare_brand_segment_detector(self):
         assert pf._bare_brand_segment(" F3 Energy.") and pf._bare_brand_segment(" and F3's Pure")
@@ -361,7 +367,7 @@ class TestScript:
         assert rc == 0   # DELIBERATE FLIP (R14-3): the gate is open
         assert "articles linked 2 | fetched 2" in out
         assert "rail-2 trips: legacy 2 | attribution 1" in out
-        assert "released by attribution scope" in out and out_path.exists()
+        assert "released by the shipping rail" in out and out_path.exists()
         assert all(u.startswith("https://f3energy.com/blogs/") for u in calls)
 
     def test_article_url_parser(self):
@@ -384,6 +390,20 @@ class TestScript:
 
 def _pf(sentence: str) -> pf.PreflightResult:
     return pf.run_preflight(title="Post", summary="", body_html="<p>%s</p>" % sentence)
+
+
+def _union_verdict(sentence: str) -> None:
+    """D-051 round 3 (the legacy union): a row of a round-1/2 must-PASS list still
+    passes the ATTRIBUTION leg. The shipping preflight passes it too -- unless the
+    row is one of rh.UNION_OVER_TRIPS, which trips through the strict legacy leg
+    (rail2_released_legacy_hit). TestRound3LegacyUnion pins that set exactly."""
+    assert pf.rail2_attribution_core(sentence) is None, sentence
+    r = _pf(sentence)
+    if sentence in rh.UNION_OVER_TRIPS:
+        assert "R2" in r.tripped_rail_ids, sentence
+        assert pf.rail2_released_legacy_hit(sentence) is not None, sentence
+    else:
+        assert r.passed, r.render()
 
 
 class TestExemptions:
@@ -485,7 +505,7 @@ class TestEnvironmentalRedactionIsPositionChecked:
 
     @pytest.mark.parametrize("sentence", RELEASED)
     def test_an_environmental_object_of_an_environmental_action_is_released(self, sentence):
-        assert pf.rail2_attribution_hit(sentence) is None, sentence
+        _union_verdict(sentence)
 
     def test_the_redaction_only_removes_the_phrase(self):
         """Anything clean OUTSIDE the redacted object still trips."""
@@ -512,8 +532,9 @@ class TestHyphenAndVerbForms:
 
     def test_pure_compounds_still_clear_in_a_pure_clause(self):
         assert pf.rail2_attribution_hit("F3 Pure is super-clean.") is None
-        assert pf.rail2_attribution_hit(
-            "F3 Energy carries the full stack; F3 Pure is the clean-sweetened version.") is None
+        # D-051 round 3: the Energy clause shares the SENTENCE, so the union trips it
+        _union_verdict("F3 Energy carries the full stack; F3 Pure is the clean-sweetened version.")
+        assert "F3 Energy carries the full stack; F3 Pure is the clean-sweetened version." in rh.UNION_OVER_TRIPS
 
     def test_the_legacy_token_set_is_untouched(self):
         assert "cleans" not in pf._CLEAN_TOKENS and "cleans" in pf._ATTRIBUTION_CLEAN_TOKENS
@@ -819,8 +840,7 @@ class TestEnvironmentalContinuationIsAllowlisted:
                              + TestEnvironmentalRedactionIsPositionChecked.RELEASED
                              + rh.FALSE_POSITIVE_SET[1:3])
     def test_an_environmental_object_of_an_environmental_action_is_still_released(self, sentence):
-        assert pf.rail2_attribution_hit(sentence) is None, sentence
-        assert _pf(sentence).passed, _pf(sentence).render()
+        _union_verdict(sentence)
 
     def test_the_event_noun_needs_a_reference_not_a_copula(self):
         def ref(s):
@@ -963,8 +983,7 @@ class TestPositivePureAttachment:
 
     @pytest.mark.parametrize("sentence", STILL_PASS)
     def test_positively_pure_attached_clean_words_still_clear(self, sentence):
-        assert pf.rail2_attribution_hit(sentence) is None, sentence
-        assert _pf(sentence).passed, _pf(sentence).render()
+        _union_verdict(sentence)   # D-051 round 3: the attribution leg; see UNION_OVER_TRIPS
 
     @pytest.mark.parametrize("sentence", ACCEPTED_TRIPS)
     def test_accepted_fail_closed_consequences_trip(self, sentence):
@@ -1168,8 +1187,7 @@ class TestRemediationSelfReview:
 
     @pytest.mark.parametrize("sentence", STILL_PASS)
     def test_the_parallel_disjunct_and_plain_lists_still_clear(self, sentence):
-        r = _pf(sentence)
-        assert r.passed, r.render()
+        _union_verdict(sentence)   # D-051 round 3: the leading mirror is a UNION_OVER_TRIPS row
 
     def test_the_other_disjunct_must_name_its_line_after_a_locative(self):
         assert pf._brand_after_locative(pf._words("Explore the full stack in F3 Energy"), "ENERGY")
@@ -1365,9 +1383,7 @@ class TestRound2EnvironmentalPunctuation:
 
     @pytest.mark.parametrize("sentence", RELEASED)
     def test_a_csr_continuation_after_punctuation_is_released(self, sentence):
-        assert pf.rail2_attribution_hit(sentence) is None, sentence
-        r = _pf(sentence)
-        assert r.passed, r.render()
+        _union_verdict(sentence)   # D-051 round 3: only the tiny exact tails release under the union
 
     @pytest.mark.parametrize("sentence", MUST_TRIP)
     def test_a_metaphor_tail_after_punctuation_trips(self, sentence):
@@ -1392,11 +1408,14 @@ class TestRound2EnvironmentalPunctuation:
     def test_the_person_guard_is_bounded_and_fails_closed(self):
         """A continuation whose sentence runs past the 300-character window is not
         cleared (fail closed), and a second person anywhere inside it blocks it."""
+        # the person guard is the ATTRIBUTION leg's (D-051 round 3: the union's legacy
+        # leg trips all three, the last being a UNION_OVER_TRIPS row)
         long_tail = "F3 Energy funds a cleaner planet, and fans " + "cheer " * 60 + "on."
-        assert pf.rail2_attribution_hit(long_tail) is not None
+        assert pf.rail2_attribution_core(long_tail) is not None
         near = "F3 Energy funds a cleaner planet, and fans cheer as you arrive."
-        assert pf.rail2_attribution_hit(near) is not None
-        assert pf.rail2_attribution_hit("F3 Energy funds a cleaner planet, and fans cheer on.") is None
+        assert pf.rail2_attribution_core(near) is not None
+        _union_verdict("F3 Energy funds a cleaner planet, and fans cheer on.")
+        assert "F3 Energy funds a cleaner planet, and fans cheer on." in rh.UNION_OVER_TRIPS
 
     DEGENERATE = (
         "fund a clean planet, and fans " * 1400,
@@ -1868,8 +1887,12 @@ class TestRound2PureAttachmentStandsAlone:
 
     @pytest.mark.parametrize("sentence", STILL_PASS + TestPositivePureAttachment.STILL_PASS)
     def test_a_self_contained_clause_beside_pure_still_clears(self, sentence):
-        r = _pf(sentence)
-        assert r.passed, r.render()
+        # D-051 round 3: a same-sentence Energy/Mood clause is a UNION_OVER_TRIPS row;
+        # the two-sentence (carried) rows still pass the shipping preflight
+        if ". " in sentence:
+            assert _pf(sentence).passed, _pf(sentence).render()
+        else:
+            _union_verdict(sentence)
 
     @pytest.mark.parametrize("sentence", ACCEPTED_TRIPS)
     def test_accepted_fail_closed_consequences_trip(self, sentence):
@@ -1949,8 +1972,15 @@ class TestRound2PureAttachmentStandsAlone:
         base, dbl = run(1200), run(2400)
         assert dbl < base * 2.6 + 0.05, "superlinear: %.4fs -> %.4fs" % (base, dbl)
 
+
 # ---------------------------------------------------------------------------
-# D-051 round 3 (Code #14 final check, scope B).
+# D-051 round 3 (Code #14 final check, scope B): THE LEGACY UNION. The shipping
+# rail trips when the attribution leg trips OR the frozen legacy rail trips on the
+# sentence after a strict redaction of ONLY the four ruled release spans, so its
+# failure mode is bounded by construction: an Energy/Mood sentence passes only when
+# every legacy clean token sits inside a pinned span. B6 (a product metaphor behind
+# an allowlisted CSR tail) is closed by the union; B5 (a quadratic in the stand-alone
+# check) by computing each clause's verdict once.
 # ---------------------------------------------------------------------------
 
 
@@ -1991,7 +2021,7 @@ class TestRound3StandAloneIsLinear:
     def test_the_hoisted_verdict_keeps_every_stand_alone_answer(self):
         """The round-2 per-clause loop's answers (pinned by its own tables) survive the
         hoist, with and without a carried context."""
-        core = pf.rail2_attribution_hit
+        core = pf.rail2_attribution_core   # the attribution leg (the union trips same-sentence rows)
         for s in (TestRound2PureAttachmentStandsAlone.CLAIMS_1 + TestRound2PureAttachmentStandsAlone.STILL_PASS
                   + TestRound2PureAttachmentStandsAlone.ACCEPTED_TRIPS):
             if ". " in s:
@@ -1999,3 +2029,192 @@ class TestRound3StandAloneIsLinear:
             for ctx in (frozenset(), frozenset({"MOOD"})):
                 got = core(s, context_lines=ctx)
                 assert (got is None) == (s in TestRound2PureAttachmentStandsAlone.STILL_PASS), (s, ctx, got)
+
+
+#: Must-PASS rows asserted inline in a test body rather than in a class table.
+_INLINE_RELEASE_ROWS = (
+    "F3 Energy helps clean up the beaches every spring.",
+    "F3 Pure is clean-sweetened; F3 Energy is the full stack.",
+    "F3 Energy carries the full stack; F3 Pure is the clean-sweetened version.",
+    "F3 Energy funds a cleaner planet, and fans cheer on.",
+    "F3 Pure is super-clean.",
+)
+
+
+def _must_pass_rows() -> set[str]:
+    """Every single-sentence must-PASS row of this module (the class STILL_PASS /
+    RELEASED / PASS tables, the inline rows) plus the harness's ruled sets."""
+    rows: set[str] = set(_INLINE_RELEASE_ROWS) | set(rh.FALSE_POSITIVE_SET) | set(rh.RELEASE_PROBES)
+    for obj in list(globals().values()):
+        if isinstance(obj, type) and obj.__module__ == __name__:
+            for attr in ("STILL_PASS", "RELEASED", "PASS"):
+                rows |= {s for s in obj.__dict__.get(attr, ()) if isinstance(s, str) and ". " not in s}
+    return rows
+
+
+class TestRound3LegacyUnion:
+    B6 = (
+        "F3 Mood builds a cleaner world, for the world inside you.",
+        "F3 Mood builds a cleaner world, for the world you carry inside.",
+        "F3 Mood supports a clean environment, for the environment of your mind.",
+        "F3 Energy builds a cleaner world, one can at a time, inside you.",
+        "F3 Energy builds a cleaner world, for future generations of your cells.",
+        "F3 Mood restores clean water, on Sundays, in every can.",
+        "F3 Mood supports a clean environment for the environment of your mind.",
+        # literal-noun twins: only the strict release's tail-to-the-end rule closes them
+        "F3 Mood funds a cleaner planet, for the oceans inside you.",
+        "F3 Energy funds a cleaner planet, one can at a time, inside you.",
+        "F3 Mood funds a cleaner planet with every case sold, in every sip.",
+        "F3 Mood funds a cleaner planet through CleanHub and through every calm sip of your evening.",
+        "F3 Energy funds a cleaner planet, for future generations of your cells.",
+    )
+    #: the round-2 exact-phrase residual the final check named: a stacked degree
+    #: behind a focus particle, and two transparent words stacked
+    STACKED = (
+        "F3 Energy uses truly only natural caffeine from green tea.",
+        "F3 Energy uses really only natural caffeine from green tea.",
+        "F3 Energy has daily 120mg natural caffeine from green tea.",
+    )
+
+    def test_the_shipping_rail_is_the_union(self):
+        src = inspect.getsource(pf.rail2_attribution_hit)
+        assert "rail2_attribution_core(" in src and "rail2_released_legacy_hit(" in src
+        assert "rail2_legacy_hit(rail2_strict_release_redact(" in inspect.getsource(pf.rail2_released_legacy_hit)
+        run = "\n".join(ln for ln in inspect.getsource(pf.run_preflight).splitlines()
+                        if not ln.strip().startswith("#"))
+        assert "rail2_attribution_hit(sent)" in run and "rail2_attribution_core" not in run
+
+    @pytest.mark.parametrize("sentence", B6 + STACKED)
+    def test_a_shape_only_the_legacy_leg_sees_trips(self, sentence):
+        """Each passes the attribution leg -- the round-2 hole -- so only the union
+        closes it; removing the legacy leg re-opens every row."""
+        assert pf.rail2_attribution_core(sentence) is None, sentence
+        assert pf.rail2_released_legacy_hit(sentence) is not None, sentence
+        assert pf.rail2_attribution_hit(sentence) is not None, sentence
+        assert "R2" in _pf(sentence).tripped_rail_ids, sentence
+        assert pf.rail2_legacy_hit(sentence) is not None   # main trips it too
+
+    def test_the_round_3_shapes_are_in_the_gate(self):
+        probes = rh.CLAIMS_HOLE_PROBES["clean_natural_on_energy_mood"]
+        for s in self.B6 + self.STACKED:
+            assert s in probes, s
+
+    def test_every_ruled_release_passes_both_legs(self):
+        for s in rh.FALSE_POSITIVE_SET + rh.RELEASE_PROBES:
+            assert pf.rail2_attribution_core(s) is None, s
+            assert pf.rail2_released_legacy_hit(s) is None, s
+            assert _pf(s).passed, _pf(s).render()
+        assert sum(pf.rail2_legacy_hit(s) is not None for s in rh.FALSE_POSITIVE_SET) == 5
+
+    def test_the_strict_redaction_blanks_only_the_four_spans(self):
+        red = pf.rail2_strict_release_redact
+        # (a) the ruled phrases: exact, brand-scoped
+        assert "natural" not in red("F3 Energy runs on natural caffeine from green tea.")
+        assert "natural" not in red("F3 Energy uses only natural caffeine from green tea.")
+        assert "cleaner" not in red("F3 Energy runs on a cleaner fuel source.")
+        assert "natural" in red("F3 Mood runs on natural caffeine from green tea.")
+        assert "cleaner" in red("F3 Mood runs on a cleaner fuel source.")
+        for s in self.STACKED + ("F3 Energy runs on a much cleaner fuel source.",
+                                 "F3 Energy has 100% only natural caffeine from green tea."):
+            assert "natural" in red(s) or "cleaner" in red(s), s
+        # (b) the CleanHub object: literal noun, action verb, a tiny exact tail to the end
+        for s in rh.FALSE_POSITIVE_SET[1:3] + rh.RELEASE_PROBES[7:9]:
+            assert "cleaner" not in red(s) and pf.rail2_legacy_hit(red(s)) is None, s
+        for s in ("F3 Energy funds a cleaner planet, one case at a time, for your body.",
+                  "F3 Energy funds a cleaner world with every case sold.",
+                  "F3 Energy funds a cleaner planet with every sip.",
+                  "F3 Energy funds a cleaner planet; fans love it.",
+                  "F3 Energy is a cleaner planet.",
+                  "F3 Energy funds the cleanest planet."):
+            assert red(s) == s and pf.rail2_legacy_hit(red(s)) is not None, s
+        # (d) the 8/26 disjunct, as the last words only
+        assert "clean-sweetened" not in red(rh.FALSE_POSITIVE_SET[0])
+        for s in ("Explore the clean-sweetened version in F3 Pure or the full stack in F3 Energy.",
+                  "Explore the full stack in F3 Energy or the clean-sweetened version in F3 Pure, also in 12-packs.",
+                  "Grab the clean-sweetened version in F3 Pure or the one in F3 Energy."):
+            assert "clean-sweetened" in red(s), s
+        # ...and nothing else
+        for s in ("F3 Energy is clean.", "F3 Pure is clean-sweetened.", ""):
+            assert red(s) == s
+
+    def test_a_blank_can_neither_be_a_token_nor_join_its_neighbours(self):
+        """A blank of plain spaces would make "present <phrase> naturally" read as the
+        natural-occurrence chemistry exemption once the phrase is gone."""
+        s = "F3 Energy is present cleaner fuel naturally."
+        assert "cleaner" not in pf.rail2_strict_release_redact(s)
+        assert pf.rail2_released_legacy_hit(s) == ("naturally", "ENERGY")
+        assert not pf._STRICT_BLANK.isspace() and not pf._WORD_RE.search(pf._STRICT_BLANK)
+
+    def test_a_released_span_never_holds_an_energy_mood_brand(self, monkeypatch):
+        import re
+        monkeypatch.setattr(pf, "_STRICT_ENV_OBJECT_RES", (re.compile(r"F3 Energy is clean"),))
+        assert pf.rail2_strict_release_redact("F3 Energy is clean.") == "F3 Energy is clean."
+        assert pf.rail2_released_legacy_hit("F3 Energy is clean.") is not None
+
+    def test_the_union_over_trips_are_exactly_the_must_pass_rows_that_trip(self):
+        rows = _must_pass_rows()
+        tripping = {s for s in rows if "R2" in _pf(s).tripped_rail_ids}
+        assert tripping == set(rh.UNION_OVER_TRIPS), sorted(tripping ^ set(rh.UNION_OVER_TRIPS))
+        assert len(rh.UNION_OVER_TRIPS) == len(set(rh.UNION_OVER_TRIPS)) == 32
+        for s in rh.UNION_OVER_TRIPS:
+            assert pf.rail2_attribution_core(s) is None, s          # round 2 released it
+            assert pf.rail2_released_legacy_hit(s) is not None, s   # the union takes it back
+            assert pf.rail2_legacy_hit(s) is not None, s            # ...as main does
+            assert s not in rh.FALSE_POSITIVE_SET and s not in rh.RELEASE_PROBES
+
+    def test_the_gate_measures_the_union(self):
+        v = rh.evaluate()
+        assert v.ship is True and v.union_violations == [] and v.over_trips_passing == []
+        assert v.union_checked == len(rh._union_items()) and v.union_legacy_trips > 0
+        lines = v.summary_lines()
+        assert ("rail-2 legacy union (D-051 round 3): the strict-redacted legacy leg trips %d of %d "
+                "probe(s); the shipping preflight passes 0 of them" % (v.union_legacy_trips, v.union_checked)
+                ) in lines
+        assert "union over-trips (round-2 releases taken back, a bounded revision each): 32/32 trip" in lines
+        assert "false positives: legacy trips 5/6, attribution trips 0/6" in lines
+
+    def test_shipping_the_attribution_leg_alone_closes_the_gate(self, monkeypatch):
+        monkeypatch.setattr(pf, "rail2_attribution_hit", pf.rail2_attribution_core)
+        v = rh.evaluate()
+        assert v.ship is False
+        assert set(self.B6 + self.STACKED) <= set(v.union_violations)
+        assert set(v.over_trips_passing) == set(rh.UNION_OVER_TRIPS)
+        assert any(ln.startswith("  UNION VIOLATION") for ln in v.summary_lines())
+
+    # ── D-171 / D-239: every new pattern on the input that reaches it ─────────────
+    DEGENERATE = (
+        " " * 40000,
+        "," * 40000,
+        "fund a clean planet " * 2000,
+        "fund a cleaner planet, " * 1750,
+        "fund a cleaner planet with every case " * 1100,
+        "fund a cleaner future for the " * 1350,
+        "fund a cleaner planet" + " " * 40000,
+        "fund a cleaner planet," + " " * 40000 + "x",
+        "or the clean-sweetened version in F3 Pure " * 950,
+        "or the " * 5700,
+        "only " * 8000 + "natural caffeine from green tea",
+        "natural caffeine from green tea " * 1300,
+        "120mg only " * 3700 + "natural caffeine from green tea",
+    )
+
+    @pytest.mark.parametrize("text", DEGENERATE, ids=range(len(DEGENERATE)))
+    def test_d171_the_strict_redaction_is_fast_at_40k(self, text):
+        for pat in pf._STRICT_ENV_OBJECT_RES + (pf._STRICT_PURE_DISJUNCT_RE,):
+            dt = _best_of_3(lambda: list(pat.finditer(text)))
+            assert dt < 0.2, "%s on %r...: %.3fs" % (pat.pattern[:30], text[:20], dt)
+        s = "F3 Energy " + text
+        dt = _best_of_3(lambda: pf.rail2_released_legacy_hit(s))
+        assert dt < 0.5, "%r...: %.3fs" % (text[:20], dt)
+        dt = _best_of_3(lambda: pf.rail2_attribution_hit(s))
+        assert dt < 1.0, "%r...: %.3fs" % (text[:20], dt)
+
+    @pytest.mark.parametrize("unit", ["fund a cleaner planet, ", "or the clean-sweetened version in F3 Pure ",
+                                      "uses only natural caffeine from green tea ", "a cleaner fuel source "])
+    def test_d171_the_strict_redaction_scales_linearly(self, unit):
+        def run(n):
+            s = "F3 Energy " + unit * n + "done."
+            return _best_of_3(lambda: pf.rail2_released_legacy_hit(s))
+        base, dbl = run(1200), run(2400)
+        assert dbl < base * 2.6 + 0.05, "superlinear: %.4fs -> %.4fs" % (base, dbl)
+

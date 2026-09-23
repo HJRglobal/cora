@@ -32,12 +32,18 @@ WHAT THIS MODULE HOLDS (data + pure functions; no network, no LLM):
   * CARRY_RELEASE_PROBES / CARRY_HOLE_PROBES -- D-051 round 2 (F3-R1): ARTICLE-level
                           must-PASS / must-TRIP probes for the cross-sentence carry
                           (title / summary / body fields, paragraphs), gated;
+  * UNION_OVER_TRIPS   -- D-051 round 3: round-1/2 synthetic release probes the
+                          LEGACY UNION takes back (each trips the frozen legacy rail
+                          after the strict release redaction): reported, never gated;
   * UNDECIDED          -- the 9/1 Pure-attached tail (trips under fail-closed union
                           inheritance, D-051 EF-7): reported, never gated;
   * legacy_preflight() -- the FROZEN pre-R14-3 composition: run_preflight's non-R2
                           trips + rail2_legacy_hit over the same fields;
   * new_preflight()    -- run_preflight itself: the gate measures the SHIPPING
                           function, never a composition of it;
+  * union_check()      -- D-051 round 3: the gate's proof that run_preflight ships
+                          the UNION -- wherever the strict-redacted legacy leg trips a
+                          probe sentence, the shipping preflight trips too (gated);
   * evaluate() / gate() -- the ship decision, and WHY;
   * differential()     -- legacy vs shipping rail 2 over any sentence corpus (the
                           live News/Learn read the differential script performs);
@@ -246,6 +252,29 @@ CLAIMS_HOLE_PROBES: dict[str, tuple[str, ...]] = {
         "F3 Mood supports a clean environment; your mind will thank you.",
         "F3 Energy builds a cleaner world, removing your stress.",
         "F3 Mood supports a clean environment, and we keep your mind calm.",
+        # D-051 round 3 (B6): round 2's punctuated CSR-tail allowlist checked nothing
+        # AFTER an allowlisted tail, so a product metaphor re-opened behind it (legacy
+        # TRIP / round-2 PASS; the comma-less twin passed both). The legacy union
+        # closes the class: the strict env release needs the tail to END the sentence
+        "F3 Mood builds a cleaner world, for the world inside you.",
+        "F3 Mood builds a cleaner world, for the world you carry inside.",
+        "F3 Mood supports a clean environment, for the environment of your mind.",
+        "F3 Energy builds a cleaner world, one can at a time, inside you.",
+        "F3 Energy builds a cleaner world, for future generations of your cells.",
+        "F3 Mood restores clean water, on Sundays, in every can.",
+        "F3 Mood supports a clean environment for the environment of your mind.",
+        # ...the same class with a LITERAL environmental noun (the strict release
+        # keeps "planet" / "oceans", so only its tail-to-the-end rule closes these)
+        "F3 Mood funds a cleaner planet, for the oceans inside you.",
+        "F3 Energy funds a cleaner planet, one can at a time, inside you.",
+        "F3 Mood funds a cleaner planet with every case sold, in every sip.",
+        "F3 Mood funds a cleaner planet through CleanHub and through every calm sip of your evening.",
+        "F3 Energy funds a cleaner planet, for future generations of your cells.",
+        # ...and the round-2 exact-phrase residual the same check named: a degree
+        # stacked behind a focus particle, or two transparent words stacked
+        "F3 Energy uses truly only natural caffeine from green tea.",
+        "F3 Energy uses really only natural caffeine from green tea.",
+        "F3 Energy has daily 120mg natural caffeine from green tea.",
         # D-051 r143-claims-6: the noun form after a copula, and a compound whose
         # first half is the clean-up object (these passed BOTH rails)
         "F3 Energy is the community clean-up crew for your afternoon slump.",
@@ -338,6 +367,55 @@ RELEASE_PROBES: tuple[str, ...] = (
     # F3-R3: the comma branch refused its own allowlisted CSR continuation
     "F3 Energy funds a cleaner planet, one case at a time.",
     "F3 Energy helps build a cleaner planet, one can at a time.",
+)
+
+# ── D-051 round 3: what the LEGACY UNION takes back (reported, never gated) ──────
+#: Synthetic review probes that round 1 or round 2 released and the union now
+#: trips. Each passes the attribution leg (rail2_attribution_core) and trips the
+#: frozen legacy rail after the strict release redaction -- i.e. main trips it too,
+#: and none is a sentence the rulings released: the rulings name the measured FP
+#: set, the two exact phrases and the release probes above, and all of those still
+#: pass. The cost of each is one bounded revision; the drafting prompt's "two
+#: sentences, one line each" style avoids every row. A test pins this set EXACTLY
+#: against the module's must-pass lists, so a row can neither silently start
+#: passing nor silently join.
+UNION_OVER_TRIPS: tuple[str, ...] = (
+    # same-sentence Pure attachment (P1 and the leading disjunct mirror): the clean
+    # word shares a sentence with Energy/Mood
+    "F3 Pure is clean-sweetened; F3 Energy is the full stack.",
+    "F3 Energy carries the full stack; F3 Pure is the clean-sweetened version.",
+    "Unlike F3 Energy, F3 Pure is clean-sweetened.",
+    "F3 Energy carries the stack, whereas F3 Pure is clean-sweetened.",
+    "F3 Energy carries the stack while F3 Pure is clean-sweetened.",
+    "F3 Energy is the full stack, and F3 Pure is clean-sweetened.",
+    "F3 Pure is clean-sweetened, and F3 Energy carries the stack.",
+    "If you like F3 Energy, F3 Pure is the clean-sweetened pick.",
+    "In the cooler, F3 Pure is the clean-sweetened pick; F3 Energy is the stack.",
+    "The F3 Pure line is clean-sweetened, while F3 Energy carries the stack.",
+    "F3 Energy has the full stack; F3 Pure is clean-sweetened, and both taste great.",
+    "F3 Pure is clean-sweetened, and F3 Energy is great.",
+    "F3 Pure is clean-sweetened, and F3 Energy carries the stack that athletes want.",
+    "F3 Pure is clean-sweetened, and F3 Energy has one goal.",
+    "F3 Pure is clean-sweetened, and F3 Energy is different.",
+    "F3 Pure is clean-sweetened, but F3 Energy is not.",
+    "F3 Pure is clean-sweetened, and F3 Energy carries that stack.",
+    "F3 Energy hits hard, while F3 Pure is the clean-sweetened pick.",
+    "F3 Pure is clean-sweetened; F3 Mood keeps you calm.",
+    "Explore the clean-sweetened version in F3 Pure or the full stack in F3 Energy.",
+    "Try the clean-sweetened version in F3 Pure or the full stack in F3 Energy.",
+    # CSR copy outside the strict (b) span: a verb "clean up", a metaphor-prone noun
+    # (water), or a continuation that is not one of the tiny exact tails
+    "F3 Energy supports clean water for the community.",
+    "F3 Energy funds cleaner oceans by removing plastic.",
+    "F3 Energy funds cleaner oceans, by removing plastic.",
+    "F3 Energy helps clean up the beaches every spring.",
+    "F3 Energy helps clean up the beaches, every spring.",
+    "F3 Energy volunteers helped clean up the beach, pulling 400 pounds of trash.",
+    "F3 Energy funds a cleaner planet, and fans love it.",
+    "F3 Energy funds a cleaner planet; fans love it.",
+    "F3 Energy funds a cleaner planet: every case sold plants a tree.",
+    "F3 Energy funds a cleaner planet, and our volunteers log every pound.",
+    "F3 Energy funds a cleaner planet, and fans cheer on.",
 )
 
 
@@ -533,9 +611,22 @@ class Verdict:
     release_tripping: list[str] = field(default_factory=list)               # round-2 must-PASS rows
     carry_release_tripping: list[str] = field(default_factory=list)         # article-level must-PASS
     carry_holes_missed: list[str] = field(default_factory=list)             # article-level must-TRIP
+    union_checked: int = 0                                                  # D-051 round 3: probes the
+    union_legacy_trips: int = 0                                             #   strict legacy leg read / tripped
+    union_violations: list[str] = field(default_factory=list)              # legacy leg trips, shipping PASSES
+    over_trips_passing: list[str] = field(default_factory=list)            # UNION_OVER_TRIPS rows that pass
 
     def summary_lines(self) -> list[str]:
         out = [f"SHIP: {'YES' if self.ship else 'NO'}"]
+        out.append(f"rail-2 legacy union (D-051 round 3): the strict-redacted legacy leg trips "
+                   f"{self.union_legacy_trips} of {self.union_checked} probe(s); the shipping preflight "
+                   f"passes {len(self.union_violations)} of them")
+        for s in self.union_violations:
+            out.append("  UNION VIOLATION (legacy leg trips, shipping passes): " + s)
+        out.append(f"union over-trips (round-2 releases taken back, a bounded revision each): "
+                   f"{len(UNION_OVER_TRIPS) - len(self.over_trips_passing)}/{len(UNION_OVER_TRIPS)} trip")
+        for s in self.over_trips_passing:
+            out.append("  over-trip row now PASSES the shipping preflight: " + s)
         if self.pinned_missed:
             out.append("pinned D-051 holes MISSED by the new preflight: " + " | ".join(self.pinned_missed))
         for cls, missed in sorted(self.uncaught_by_class.items()):
@@ -577,11 +668,43 @@ class Verdict:
         return out
 
 
+def _union_items() -> list[tuple[str, dict[str, str]]]:
+    """Every probe the gate reads, as (label, run_preflight fields): the sentence
+    sets (each wrapped as a one-paragraph body) and the article sets."""
+    sentences = list(PINNED_D051) + list(FALSE_POSITIVE_SET) + list(RELEASE_PROBES) + list(UNDECIDED)
+    for probes in CLAIMS_HOLE_PROBES.values():
+        sentences += list(probes)
+    sentences += list(UNION_OVER_TRIPS)
+    items = [(s, {"title": "Post", "summary": "", "body_html": _body(s)}) for s in dict.fromkeys(sentences)]
+    return items + [(label, kw) for label, kw in CARRY_RELEASE_PROBES + CARRY_HOLE_PROBES]
+
+
+def union_check() -> tuple[int, int, list[str]]:
+    """D-051 round 3: the union is what the gate measures. For every probe, read
+    each field sentence by sentence (run_preflight's own split) with the union's
+    LEGACY leg alone (rail2_released_legacy_hit); wherever that leg trips, the
+    shipping preflight must trip too. Returns (probes read, probes the leg trips,
+    probes it trips that the shipping preflight PASSES) -- the last is empty iff
+    run_preflight ships the union."""
+    tripped = 0
+    violations: list[str] = []
+    items = _union_items()
+    for label, kw in items:
+        if any(pf.rail2_released_legacy_hit(sent)
+               for _, text in pf.rail_fields(**kw) for sent in pf.sentences(text)):
+            tripped += 1
+            if pf.run_preflight(**kw).passed:
+                violations.append(label)
+    return len(items), tripped, violations
+
+
 def evaluate() -> Verdict:
     """Run every probe through BOTH preflights and decide the gate: ship iff every
     pinned hole and every claims-hole probe OUTSIDE RULED_OUT_CLASSES is caught by
-    the SHIPPING preflight AND every measured false-positive sentence PASSES it. The
-    ruled-out classes are still run and reported (uncaught_by_class), never hidden."""
+    the SHIPPING preflight AND every measured false-positive sentence PASSES it AND
+    (D-051 round 3) the shipping preflight trips wherever the union's strict legacy
+    leg trips. The ruled-out classes are still run and reported
+    (uncaught_by_class), never hidden; UNION_OVER_TRIPS is reported, never gated."""
     pinned_missed = [s for s in PINNED_D051 if new_preflight(s).passed]
     uncaught: dict[str, list[str]] = {}
     uncaught_legacy: dict[str, list[str]] = {}
@@ -596,12 +719,16 @@ def evaluate() -> Verdict:
     carry_release = [label for label, kw in CARRY_RELEASE_PROBES if not pf.run_preflight(**kw).passed]
     carry_missed = [label for label, kw in CARRY_HOLE_PROBES if pf.run_preflight(**kw).passed]
     gated_uncaught = [s for cls, missed in uncaught.items() if cls not in RULED_OUT_CLASSES for s in missed]
+    union_checked, union_tripped, union_bad = union_check()
+    over_passing = [s for s in UNION_OVER_TRIPS if new_preflight(s).passed]
     ship = (not pinned_missed and not gated_uncaught and not fp_new and not release
-            and not carry_release and not carry_missed)
+            and not carry_release and not carry_missed and not union_bad)
     return Verdict(ship=ship, uncaught_by_class=uncaught, uncaught_legacy_by_class=uncaught_legacy,
                    fp_still_tripping=fp_new, fp_legacy_tripping=fp_legacy,
                    pinned_missed=pinned_missed, undecided=undecided, release_tripping=release,
-                   carry_release_tripping=carry_release, carry_holes_missed=carry_missed)
+                   carry_release_tripping=carry_release, carry_holes_missed=carry_missed,
+                   union_checked=union_checked, union_legacy_trips=union_tripped,
+                   union_violations=union_bad, over_trips_passing=over_passing)
 
 
 @dataclass
@@ -618,7 +745,8 @@ class Differential:
         out = [
             f"sentences scanned: {self.sentences}",
             f"rail-2 trips: legacy {len(self.legacy_trips)} | attribution {len(self.attribution_trips)}",
-            f"released by attribution scope (legacy-only trips = the measured FP candidates): {len(self.only_legacy)}",
+            f"released by the shipping rail (since D-051 round 3 only the legacy union's strict "
+            f"release spans; legacy-only trips = the measured FP candidates): {len(self.only_legacy)}",
             f"caught only by the shipping rail (R14-3 hole closures: verb forms, hyphen compounds): "
             f"{len(self.only_attribution)}",
         ]
@@ -653,6 +781,8 @@ def rail2_article_walk(fields, *, first_per_field: bool = False) -> list[tuple[s
 
 def differential(sentences_iter, *, articles=None) -> Differential:
     """Frozen legacy vs SHIPPING rail-2 over any sentence corpus (pure; no other rail).
+    "attribution" is rail2_attribution_hit, i.e. the shipping UNION since D-051 round
+    3, so only_legacy is exactly what the strict release redaction releases.
 
     The sentence counts are sentence by sentence. D-051 round 2 (F3-R1): they
     cannot see the shipping rail's cross-sentence carry, so a carry false positive

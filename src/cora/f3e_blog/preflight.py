@@ -531,7 +531,12 @@ _NATURAL_OCCURRENCE_RES = (
 # own), ruled the two exact-phrase exemptions below (ESC 3(i)/(ii)), and the gate
 # now passes: run_preflight calls rail2_attribution_hit. rail2_legacy_hit stays
 # exported, byte-identical, as the FROZEN measurement baseline the harness and the
-# differential script compare against -- run_preflight never calls it.
+# differential script compare against -- run_preflight never calls it on a raw
+# sentence. D-051 round 3: rail2_attribution_hit is now the LEGACY UNION (see the
+# block above rail2_released_legacy_hit): this attribution scope is its first leg,
+# rail2_attribution_core, and the frozen legacy rail over a strictly redacted
+# sentence is its second. The exemptions described below release a sentence only
+# when the second leg releases it too.
 #
 # WHAT "ATTRIBUTION" MEANS HERE: the clean word is predicated OF the Energy or Mood
 # line. A clean token is exempt only in these positive, narrow shapes -- (1) it sits
@@ -925,6 +930,146 @@ def rail2_legacy_hit(sentence: str) -> tuple[str, str] | None:
     if not hit:
         return None
     return sorted(hit)[0], "/".join(sorted(lines & {"ENERGY", "MOOD"}))
+
+
+# ── rail 2, THE LEGACY UNION (D-051 round 3, the convergent design) ─────────────
+# Two review rounds found each enumerated heuristic of the attribution rail (Pure
+# attachment, the CSR continuation allowlist, the expletive list, the carry decay)
+# opening a laundering shape the frozen legacy rail still caught. So the shipping
+# rail (rail2_attribution_hit) is now a UNION: it trips when the attribution rail
+# (rail2_attribution_core) trips OR when the frozen legacy rail trips on the
+# sentence after a STRICT redaction of ONLY the ruled release spans
+# (rail2_released_legacy_hit). run_preflight still never calls rail2_legacy_hit on
+# a raw sentence. The failure mode is bounded BY CONSTRUCTION: a sentence that
+# names Energy or Mood passes only when every legacy clean token in it sits inside
+# one of four pinned spans --
+#   (a) a ruled exact phrase (D-329), brand-scoped as _RAIL2_PHRASE_EXEMPTIONS and
+#       exact at both edges (_strict_phrase_exact);
+#   (b) the CleanHub environmental object: a closed action verb + "clean"/"cleaner"
+#       + a literal environmental noun, followed to the END of the sentence by
+#       nothing but one tiny exact CSR tail (_STRICT_ENV_TAIL);
+#   (c) the natural-occurrence chemistry legacy already redacts itself;
+#   (d) the 8/26 Pure disjunct, "... or the clean-sweetened version in F3 Pure.",
+#       as the sentence's last words.
+# Every other heuristic may only ADD trips. What the union takes back from round 2
+# (same-sentence Pure attachment, the looser CSR tails, the metaphor-prone nouns
+# world / environment / air / water) is listed in rail2_harness.UNION_OVER_TRIPS:
+# a bounded revision, never a leak.
+
+#: (b) literal environmental nouns only. "world", "environment", "air" and "water"
+#: are left out: each is a product metaphor as often as a CSR object ("a cleaner
+#: world of flavor", "a clean environment for your mind", "clean air in a can").
+_STRICT_ENV_NOUNS = (r"(?:planet|earth|oceans?|beach(?:es)?|coast(?:line)?s?|rivers?|waterways?|"
+                     r"shorelines?)")
+#: ...and the only words that may follow the object, to the end of the sentence.
+_STRICT_ENV_TAIL = (
+    r"(?:with\s{1,3}(?:every|each)\s{1,3}(?:(?:case|can|pack)\s{1,3}(?:sold|purchased|bought)"
+    r"|purchase|order)"
+    r"|one\s{1,3}(?:case|can|purchase|order)\s{1,3}at\s{1,3}a\s{1,3}time"
+    r"|for\s{1,3}(?:future|next)\s{1,3}generations"
+    r"|for\s{1,3}(?:the|our)\s{1,3}" + _STRICT_ENV_NOUNS +
+    r"|(?:through|with|via)\s{1,3}CleanHub)"
+)
+_STRICT_SENTENCE_END = r"\s{0,3}[.!?]?[\"'”’)\]]{0,3}\s{0,3}$"
+_STRICT_ENV_TO_END = (r"(?=\s{0,3}(?:,\s{0,3})?(?:" + _STRICT_ENV_TAIL + r")?"
+                      + _STRICT_SENTENCE_END + r")")
+_STRICT_ENV_OBJECT_RES = (
+    # "fund a cleaner planet with every case sold."
+    re.compile(r"\b" + _ENV_ACTION_VERBS + r"\s{1,3}" + _ENV_DETERMINER + r"clean(?:er)?\s{1,3}"
+               + _STRICT_ENV_NOUNS + r"\b" + _STRICT_ENV_TO_END, re.IGNORECASE),
+    # "supports a cleaner future for the oceans."
+    re.compile(r"\b" + _ENV_ACTION_VERBS + r"\s{1,3}" + _ENV_DETERMINER
+               + r"clean(?:er)?\s{1,3}future\s{1,3}for\s{1,3}(?:(?:the|our)\s{1,3})?"
+               + _STRICT_ENV_NOUNS + r"\b" + _STRICT_ENV_TO_END, re.IGNORECASE),
+)
+#: (d) the 8/26 live rejection's disjunct, exactly, as the sentence's last words.
+#: The leading mirror is NOT released: "the clean-sweetened version in F3 Pure or
+#: the one in F3 Energy" hands the clean word to Energy through "the one".
+_STRICT_PURE_DISJUNCT_RE = re.compile(
+    r"\bor\s{1,3}the\s{1,3}clean-sweetened\s{1,3}(?:version|option|pick|can|one)\s{1,3}in\s{1,3}"
+    r"F3\s{1,3}Pure(?=" + _STRICT_SENTENCE_END + r")", re.IGNORECASE)
+#: What a released span is replaced with: no word, no whitespace, so the blank can
+#: neither be read as a token nor join its neighbours into a new match.
+_STRICT_BLANK = " \x00 "
+
+
+def _is_transparent_word(word: str, before: str) -> bool:
+    """A word _phrase_is_modified lets stand directly before a ruled phrase WITHOUT
+    judging it as a degree: a focus / frequency word ("only", "daily"), a
+    unit-fused quantity ("120mg"), a coordinator, or "way" after a determiner."""
+    w = word.lower().strip("'&/-")
+    if w in _PHRASE_NON_DEGREE_LY or w in _PHRASE_COORDINATORS:
+        return True
+    if any(ch.isdigit() for ch in w) and _PHRASE_QUANTITY_RE.match(w):
+        return True
+    return w in _PHRASE_MODIFIERS_NOUN_AFTER_DET and before.lower() in _PHRASE_DETERMINERS
+
+
+def _strict_phrase_exact(text: str, start: int, end: int) -> bool:
+    """(a): the ruled phrase at text[start:end] is EXACT for the union's legacy leg.
+    It must pass _phrase_is_modified, and a transparent word before it must itself
+    stand after an unmodified, non-transparent word: "truly only natural caffeine
+    from green tea" is a stacked degree, "uses only natural caffeine ..." is not.
+    Linear: it reads at most 120 characters back."""
+    if _phrase_is_modified(text, start, end):
+        return False
+    window = text[max(0, start - 120):start]
+    toks = list(_WORD_RE.finditer(window))
+    if not toks or window[toks[-1].end():].strip():
+        return True        # sentence start, or punctuation: _phrase_is_modified judged it
+    w1 = toks[-1]
+    before1 = toks[-2].group(0) if len(toks) > 1 else ""
+    if not _is_transparent_word(w1.group(0), before1):
+        return True        # an ordinary word, already judged by _phrase_is_modified
+    if len(toks) < 2:
+        return True        # "Only natural caffeine from green tea ..." opens the sentence
+    w2 = toks[-2]
+    gap = window[w2.end():w1.start()].strip()
+    if "%" in gap:
+        return False       # "100% only natural caffeine ..."
+    if gap and gap not in (",", "&", "+"):
+        return True        # other punctuation: a boundary
+    before2 = toks[-3].group(0) if len(toks) > 2 else ""
+    if _is_transparent_word(w2.group(0), before2):
+        return False       # two transparent words stacked: fail closed
+    return not _is_phrase_modifier(w2.group(0))
+
+
+def rail2_strict_release_redact(sentence: str) -> str:
+    """The sentence with ONLY the ruled release spans (a), (b), (d) blanked (see the
+    block comment above); (c) is legacy's own. Every span is found against the
+    ORIGINAL sentence, so no redaction can change the context another one reads,
+    and a span that would hold an Energy/Mood brand is never blanked. Linear: one
+    finditer pass per pattern."""
+    sent = sentence or ""
+    scoped = brand_lines_in(sent) & _RAIL2_EM
+    spans: list[tuple[int, int]] = []
+    for pat, allowed in _RAIL2_PHRASE_EXEMPTIONS:
+        if scoped <= allowed:
+            spans += [(m.start(), m.end()) for m in pat.finditer(sent)
+                      if _strict_phrase_exact(sent, m.start(), m.end())]
+    for pat in _STRICT_ENV_OBJECT_RES + (_STRICT_PURE_DISJUNCT_RE,):
+        spans += [(m.start(), m.end()) for m in pat.finditer(sent)]
+    spans = sorted((a, b) for a, b in spans if not (brand_lines_in(sent[a:b]) & _RAIL2_EM))
+    if not spans:
+        return sent
+    out: list[str] = []
+    pos = 0
+    for a, b in spans:
+        if b <= pos:
+            continue
+        out.append(sent[pos:max(a, pos)])
+        out.append(_STRICT_BLANK)
+        pos = b
+    out.append(sent[pos:])
+    return "".join(out)
+
+
+def rail2_released_legacy_hit(sentence: str) -> tuple[str, str] | None:
+    """The union's second leg: the FROZEN rail2_legacy_hit over the sentence after
+    rail2_strict_release_redact. It never reads the carried context -- a pronoun is
+    the attribution leg's job -- so it can only ADD trips to it."""
+    return rail2_legacy_hit(rail2_strict_release_redact(sentence))
 
 
 #: Words a clause segment may hold and still be a BARE brand mention ("or F3 Pure",
@@ -1588,7 +1733,19 @@ class Rail2Carry:
 
 def rail2_attribution_hit(sentence: str, *, context_lines: frozenset[str] = frozenset()
                           ) -> tuple[str, str] | None:
-    """The SHIPPING rail-2 test since R14-3 (see the block comment above): trips when
+    """The SHIPPING rail-2 test: THE UNION (D-051 round 3; see the legacy-union block
+    comment above rail2_released_legacy_hit). It trips when EITHER the attribution
+    rail (rail2_attribution_core, with the carried context) trips OR the frozen
+    legacy rail trips on the sentence after the strict release redaction. The
+    attribution result is returned first, so its excerpt names the carried lines."""
+    return (rail2_attribution_core(sentence, context_lines=context_lines)
+            or rail2_released_legacy_hit(sentence))
+
+
+def rail2_attribution_core(sentence: str, *, context_lines: frozenset[str] = frozenset()
+                           ) -> tuple[str, str] | None:
+    """The ATTRIBUTION leg of the shipping rail (the whole shipping rail from R14-3
+    to D-051 round 2; see the block comment above): trips when
     a clean token is predicated of Energy/Mood -- i.e. it is neither POSITIVELY
     Pure-attached, nor an environmental object of an environmental action, nor
     inside one of the two ruled exact phrases (redacted BEFORE clause segmentation,
@@ -2028,7 +2185,9 @@ def run_preflight(
     # round 2 (F3-R1): the carry DECAYS (Rail2Carry: the next sentence, or the one
     # after a single brand-less sentence in the same block; the title stays in view
     # for each later field's first sentence), and expletive / generic pronouns never
-    # carry ("it's worth noting that", "they say").
+    # carry ("it's worth noting that", "they say"). D-051 round 3: every call below
+    # is the LEGACY UNION -- the frozen legacy rail over the strictly redacted
+    # sentence trips it too, so only the four pinned release spans are released.
     carry = Rail2Carry()
     for name, text in fields:
         carry = carry.enter_field(name)

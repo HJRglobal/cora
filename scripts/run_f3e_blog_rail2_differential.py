@@ -2,7 +2,9 @@
 corpus (Code #13 slice 6; the R14-3 ship gate, cq-85b35413b020).
 
 Columns: "legacy" = the FROZEN pre-R14-3 same-sentence rail (rail2_legacy_hit, the
-measurement baseline); "attribution" = the SHIPPING rail (run_preflight since R14-3).
+measurement baseline); "attribution" = the SHIPPING rail (run_preflight since R14-3;
+since D-051 round 3 the legacy UNION: the attribution leg OR the frozen legacy rail
+over the strictly redacted sentence).
 Exit 0 when the gate passes (ship), 3 when it is closed -- a regression that re-opens
 a gated claims hole or re-trips a measured false positive turns this red again.
 
