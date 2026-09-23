@@ -964,6 +964,26 @@ def _self_inventory_force(text: str) -> str | None:
     return "cora_self_inventory" if self_inventory.is_self_inventory_question(text or "") else None
 
 
+def _queue_status_turn(user_id: str | None, channel_name: str, retrieval_grant: object,
+                       user_message: str, prior_messages: list[dict] | None) -> bool:
+    """R14-9(a): True when this turn is Harrison, in his DM, asking about the STATE
+    of his code-queue cards (code_queue.is_queue_status_question, Tier A, or a
+    follow-up to one in his last three turns). Never on a Tier-2 grant turn."""
+    # One combined guard (never a second `if retrieval_grant ...` line: a web_guard
+    # source pin locates _dispatch_qa's own grant branch by that exact text).
+    if (not user_id or user_id != code_queue.HARRISON_ID or channel_name != "dm"
+            or retrieval_grant is not None):
+        return False
+    priors = [m.get("content") for m in (prior_messages or [])
+              if isinstance(m, dict) and m.get("role") == "user"
+              and isinstance(m.get("content"), str)][-3:]
+    try:
+        return code_queue.is_queue_status_question(user_message, prior_user_texts=priors)
+    except Exception:  # noqa: BLE001 -- a detector error never steals a turn
+        log.warning("queue-status intent detector failed", exc_info=True)
+        return False
+
+
 def _staged_write_force_tool(text: str) -> str | None:
     """The staged-write tool to force for this message, or None.
 
@@ -1458,10 +1478,18 @@ def _dispatch_qa(
     # cache read, so the read is bypassed here on the same predicate. Never on a
     # Tier-2 grant turn (the grant owns that turn; lens E #9).
     inventory_turn = bool(user_id) and retrieval_grant is None and _self_inventory_force(user_message) is not None
+    # R14-9(a) (cq-323c8974fa02): a queue/card-STATUS question in Harrison's DM
+    # ("have my cards registered?", and its follow-ups) is answered from the
+    # ledger-read tool, forced below -- never a zero-tool reply, never a cached
+    # answer composed without the ledger. Founder + DM only (the read renders
+    # cross-entity build titles); the tool re-checks both.
+    queue_status_turn = _queue_status_turn(user_id, channel_name, retrieval_grant,
+                                           user_message, prior_messages)
     # Grant-path responses contain owner-private mail/file content — they must
     # never be served from (or stored into) the shared semantic cache, where a
     # different user's similar question would replay them.
-    if not hints.bypass_cache and retrieval_grant is None and not web_intent and not inventory_turn:
+    if (not hints.bypass_cache and retrieval_grant is None and not web_intent
+            and not inventory_turn and not queue_status_turn):
         try:
             question_embedding = kb_embeddings.embed_query(user_message)
             cached_response = sc.get_cache().lookup(entity, question_embedding)
@@ -1675,7 +1703,14 @@ def _dispatch_qa(
                          force_tool, channel_name, user_id)
             else:
                 force_tool = _asana_destructive_intent(user_message)
-                if force_tool is None and inventory_turn:
+                if force_tool is None and queue_status_turn:
+                    # R14-9(a): after every command / write force (a command
+                    # always wins), BEFORE the inventory force (a card-status
+                    # question is not a sources question).
+                    force_tool = "cora_queue_status"
+                    log.info("queue-status intent -> forcing tool channel=#%s user=%s",
+                             channel_name, user_id)
+                elif force_tool is None and inventory_turn:
                     # I4 (cq-3542e1b095b2): a question about Cora's OWN sources /
                     # doors / coverage is answered from the deterministic inventory,
                     # not from a semantic miss. Ordered LAST: an explicit command

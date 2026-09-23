@@ -3863,3 +3863,281 @@ def seed_item(*, kind: str, severity: str, title: str, summary: str, entity: str
                         "check will WARN after %dh (pass stage_now=True to generate "
                         "here)", cq_id, severity, PRIORITY_KICKOFF_GRACE_HOURS)
     return cq_id
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# R14-9(a) (cq-323c8974fa02): the founder-DM queue/card-STATUS read
+# ─────────────────────────────────────────────────────────────────────────────
+# 2026-09-21 08:44-08:47 AZ: Harrison asked three times whether his Monday-menu
+# card presses had registered and got three zero-tool answers ("I don't have
+# direct read access to the card ledger", "outside my current context scope",
+# "that needs a direct check of the ledger"). VERIFY-FIRST overturned the
+# premise that the read existed: the bot had NO tool that reads this ledger (only
+# the MCP cora_code_queue surface, which the bot model is never offered), so the
+# denials were TRUE for the bot as built. The truthful answer was on disk: 20 of
+# 21 carded rows carried a decision event after the menu ts; the 21st
+# (cq-f880ce946bb6) was an APPROVED row whose Stage press the evidence floor had
+# refused (outcome=no_evidence, which writes no event).
+#
+# This block is (1) a deterministic intent predicate the DM seam uses to FORCE the
+# new read tool before the model speaks, and (2) the read-only renderer the tool
+# returns. Pure reads: no _append_event, no file writes (test-pinned by bytes).
+_AZ = timezone(timedelta(hours=-7))          # Arizona: no DST
+_QS_MAX_CHARS = 500
+# A command, never a status question: the capture / verb / write paths own these.
+_QS_IMPERATIVE_RE = re.compile(
+    r"\A[^\w\n]{0,8}(?:(?:hey|hi|ok|okay)[,!]?[ \t]{1,3})?(?:@?cora[,:]?[ \t]{1,3})?"
+    r"(?:please[ \t]{1,3})?"
+    r"(?:stage|approve|dismiss|ship|queue|park|keep|mark|close|delegate|surface|resend|"
+    r"re-?post|send|file|log|create|press|tap|click|re-?stage|re-?queue|draft|dm|remember|"
+    r"do|go|make|add|fix|build|update|delete|remove|move|flag|give|show)\b",
+    re.IGNORECASE)
+_QS_REQUEST_RE = re.compile(
+    r"\?|\b(?:confirm|check|verify|tell[ \t]+me|let[ \t]+me[ \t]+know|show[ \t]+me|list)\b"
+    r"[^.\n]{0,20}?\b(?:if|whether|which|what|how[ \t]+many|that|any|all)\b",
+    re.IGNORECASE)
+_QS_OBJECT_RE = re.compile(
+    r"\b(?:(?:code[\s-]?(?:session[ \t]+)?|build[ \t]+|decision[ \t]+|queue[ \t]+|menu[ \t]+|"
+    r"monday[ \t]+)?cards?\b"
+    r"|(?:card|stage|keep|park|dismiss|queue|approve)[ \t]+(?:press(?:es)?|taps?|clicks?|buttons?)\b"
+    r"|monday[ \t]+menu\b"
+    r"|(?:my|the|your)[ \t]+(?:code[\s-]?(?:session[ \t]+)?)?queue\b"
+    r"|code[\s-]?(?:session[ \t]+)?queue\b"
+    r"|backlog\b"
+    r"|staged[ \t]+(?:items?|prompts?|kickoffs?|sessions?)\b"
+    r"|(?:kickoff|code[\s-]?session)[ \t]+prompts?\b"
+    r"|cq-[0-9a-f]{12}\b)",
+    re.IGNORECASE)
+# A 'card(s)' hit that is part of an everyday compound is NOT a queue card.
+_QS_CARD_BEFORE_RE = re.compile(
+    r"\b(?:credit|debit|gift|business|amex|visa|mastercard|corporate|company|bank|sim|report|"
+    r"rate|playing|trading|greeting|thank[\s-]you|birthday|loyalty|punch|fighter|id|key|wild|"
+    r"score|index|recipe|preview|rewards?|membership|insurance|health|sd|memory|graphics|"
+    r"tarot|flash|post|christmas|holiday|wedding)[ \t]+\Z", re.IGNORECASE)
+_QS_CARD_AFTER_RE = re.compile(
+    r"\A[ \t]*(?:payments?|statements?|balances?|charges?|numbers?|readers?|terminals?|fees?|"
+    r"limits?|transactions?|holders?|swipes?|processing|program|reader|slot)\b", re.IGNORECASE)
+_QS_STATUS_RE = re.compile(
+    r"\b(?:(?:been[ \t]+)?(?:responded|replied)[ \t]+to|unresponded|un-?answered|registered|"
+    r"register|recorded|landed|land|(?:go|went|gone)[ \t]+through|t(?:ake|ook)[ \t]+effect|"
+    r"stuck|stick|(?:un)?decided|actioned|acknowledged|missed|"
+    r"still[ \t]+(?:show(?:s|ing)?|pending|waiting|open|there|awaiting|unanswered|up)|"
+    r"show(?:s|ing)?[ \t]+as|awaiting(?:[ \t]+a)?[ \t]+decision|"
+    r"waiting[ \t]+on[ \t]+(?:me|a[ \t]+decision|my)|outstanding|"
+    r"left[ \t]+to[ \t]+(?:decide|review|respond|answer)|pending[ \t]+(?:a[ \t]+)?(?:decision|my))\b",
+    re.IGNORECASE)
+# Follow-up turns ("did they go through?") refer back; only valid when a recent
+# prior user turn was itself a card-status question (Tier A).
+_QS_PRONOUN_RE = re.compile(
+    r"\b(?:them|those|these|any|all|it|they|ones|each|(?:my|the|those|these)[ \t]+"
+    r"(?:press(?:es)?|taps?|clicks?)(?![ \t]+(?:release|releases|pipeline|coverage|hits?|kit|"
+    r"mentions?|pieces?|tour|list|conference|team|room))|pressed|tapped|clicked)\b",
+    re.IGNORECASE)
+_QS_CLAUSE_BREAK = re.compile(r"[.!?\n;]")
+_QS_PAIR_GAP = 60
+
+
+def _qs_card_hit_is_compound(text: str, m: re.Match) -> bool:
+    if not m.group(0).lower().rstrip("s").endswith("card"):
+        return False
+    before = text[max(0, m.start() - 25):m.start()]
+    after = text[m.end():m.end() + 20]
+    return bool(_QS_CARD_BEFORE_RE.search(before) or _QS_CARD_AFTER_RE.match(after))
+
+
+def _qs_paired(text: str, left: list[tuple[int, int]], right: list[tuple[int, int]]) -> bool:
+    """Any (left, right) span pair in the SAME clause, <= _QS_PAIR_GAP chars apart,
+    either order. Bounded: both lists are capped by the 500-char gate."""
+    for ls, le in left:
+        for rs, re_ in right:
+            lo, hi = (le, rs) if le <= rs else (re_, ls)
+            if hi - lo > _QS_PAIR_GAP:
+                continue
+            if lo < hi and _QS_CLAUSE_BREAK.search(text, lo, hi):
+                continue
+            return True
+    return False
+
+
+def _qs_tier_a(text: str) -> bool:
+    objs = [(m.start(), m.end()) for m in _QS_OBJECT_RE.finditer(text)
+            if not _qs_card_hit_is_compound(text, m)]
+    if not objs:
+        return False
+    stats = [(m.start(), m.end()) for m in _QS_STATUS_RE.finditer(text)]
+    return bool(stats) and _qs_paired(text, objs, stats)
+
+
+def _qs_gates(text: str) -> bool:
+    return (bool(text) and len(text) <= _QS_MAX_CHARS
+            and not _QS_IMPERATIVE_RE.match(text) and bool(_QS_REQUEST_RE.search(text)))
+
+
+def is_queue_status_question(text: str, *, prior_user_texts: Any = ()) -> bool:
+    """True when *text* asks about the STATE of Harrison's code-queue cards / presses
+    (Tier A: a queue-card object and a status term in one clause), or is a follow-up
+    ("did they go through?") to such a question in the last three user turns (Tier
+    B). Fail-closed: > 500 chars, an imperative / command opening, or no question /
+    request form -> False. The caller gates on founder + DM; this predicate reads
+    text only. Regex over bounded input plus plain span logic (D-171: re-timed,
+    tests pin the degenerate shapes)."""
+    t = html.unescape(str(text or "")).strip()
+    if not _qs_gates(t):
+        return False
+    if _qs_tier_a(t):
+        return True
+    pron = [(m.start(), m.end()) for m in _QS_PRONOUN_RE.finditer(t)]
+    stats = [(m.start(), m.end()) for m in _QS_STATUS_RE.finditer(t)]
+    if not (pron and stats and _qs_paired(t, pron, stats)):
+        return False
+    priors = [html.unescape(str(p or "")).strip() for p in list(prior_user_texts or ())[-3:]]
+    return any(p and len(p) <= _QS_MAX_CHARS and _qs_tier_a(p) for p in priors)
+
+
+_QS_DECISION_EVENTS = frozenset({
+    "approved", "dismissed", "snoozed", "staged", "shipped", "kept", "parked",
+    "superseded", "blocked",
+})
+# The Monday-menu rows that carry decision BUTTONS (the rest are listed as text).
+_QS_CARDED_KEYS = ("approved", "stale_actionable", "proposed_actionable", "parked_due",
+                   "expired_snoozed")
+_QS_CAPTURE_CARD_DAYS = 7
+_QS_TITLE_CHARS = 80
+QUEUE_STATUS_FOOTER = (
+    "The card's own text does NOT refresh after a press (known: cq-2d26f131091e), so a "
+    "card can read as unanswered after the press registered -- this ledger is the "
+    "source of truth. A repeat press is safe: Approve / Stage / Dismiss / Ship are "
+    "no-ops once recorded; a repeat Keep or Later records one more keep / snooze.")
+
+
+def _qs_az(ts: Any) -> str:
+    dt = _parse_ts(ts)
+    return dt.astimezone(_AZ).strftime("%a %m/%d %H:%M AZ") if dt else "time unknown"
+
+
+def _qs_title(it: dict[str, Any] | None) -> str:
+    """LEX-safe (the view is load_items'), PHI-screened, capped."""
+    if not it:
+        return ""
+    title = " ".join(str(it.get("title") or "").split())
+    if not title or phi_guard.is_any_phi(title):
+        return ""
+    return title if len(title) <= _QS_TITLE_CHARS else title[:_QS_TITLE_CHARS - 3] + "..."
+
+
+def latest_menu_run() -> dict[str, Any] | None:
+    """The most recent Monday-menu row that was actually SENT (read-only)."""
+    rows = [r for r in _read_jsonl(_MENU_RUNS_LEDGER) if r.get("sent")]
+    return rows[-1] if rows else None
+
+
+def _events_by_id() -> dict[str, list[dict[str, Any]]]:
+    out: dict[str, list[dict[str, Any]]] = {}
+    for ev in _read_jsonl(_EVENT_LEDGER):
+        cid = str(ev.get("id") or "").lower()
+        if cid:
+            out.setdefault(cid, []).append(ev)
+    return out
+
+
+def _first_decision_after(events: list[dict[str, Any]], after: datetime | None
+                          ) -> dict[str, Any] | None:
+    for ev in events:
+        if ev.get("event") not in _QS_DECISION_EVENTS:
+            continue
+        ts = _parse_ts(ev.get("ts"))
+        if after is None or (ts is not None and ts >= after):
+            return ev
+    return None
+
+
+def _qs_line(cid: str, safe: dict[str, Any] | None, raw: dict[str, Any] | None,
+             decision: dict[str, Any] | None) -> str:
+    title = _qs_title(safe)
+    head = f"`{cid}`" + (f" {title}" if title else "")
+    if decision is not None:
+        via = f", via {decision['via']}" if decision.get("via") else ""
+        return (f"- {head} -- {str(decision.get('event')).upper()} "
+                f"{_qs_az(decision.get('ts'))}{via}")
+    status = str((safe or {}).get("status") or "?")
+    line = f"- {head} -- no decision recorded (status {status})"
+    if raw is not None and status == "APPROVED" and not has_evidence(raw):
+        line += (" -- a Stage press on this card is refused by the evidence floor and "
+                 f"writes nothing; type `stage {cid}` to override")
+    return line
+
+
+def render_card_status(cq_ids: Any = None, *, now: datetime | None = None) -> str:
+    """Deterministic, read-only answer to "have my cards / presses registered?".
+
+    With *cq_ids*: one status line per id (status + its latest decision event).
+    Without: the latest SENT Monday menu's carded rows (which have a decision
+    event after the menu went out, which do not), plus capture cards DM'd in the
+    last 7 days still PROPOSED with no decision. Titles are LEX-safe (load_items),
+    PHI-screened and capped. Writes nothing."""
+    now = now or _now()
+    safe_by_id = {str(r.get("id") or "").lower(): r for r in load_items()}
+    raw_by_id = {str(k).lower(): v for k, v in _fold_items().items()}
+    events = _events_by_id()
+    lines: list[str] = []
+    ids = [str(x).strip().lower() for x in (cq_ids or []) if str(x).strip()]
+    if ids:
+        lines.append("*Code-queue status (from the ledger):*")
+        for cid in ids[:20]:
+            if cid not in raw_by_id:
+                lines.append(f"- `{cid}` -- not in the queue ledger")
+                continue
+            decisions = [e for e in events.get(cid, []) if e.get("event") in _QS_DECISION_EVENTS]
+            lines.append(_qs_line(cid, safe_by_id.get(cid), raw_by_id.get(cid),
+                                  decisions[-1] if decisions else None))
+        lines.append("")
+        lines.append(QUEUE_STATUS_FOOTER)
+        return "\n".join(lines)
+
+    menu = latest_menu_run()
+    if menu is None:
+        lines.append("No Monday menu has been sent yet (the menu-run ledger has no sent row).")
+    else:
+        menu_ts = _parse_ts(menu.get("ts"))
+        carded: list[str] = []
+        for key in _QS_CARDED_KEYS:
+            for cid in menu.get(key) or []:
+                cid = str(cid).lower()
+                if cid and cid not in carded:
+                    carded.append(cid)
+        decided, waiting = [], []
+        for cid in carded:
+            dec = _first_decision_after(events.get(cid, []), menu_ts)
+            (decided if dec is not None else waiting).append((cid, dec))
+        lines.append(f"*Monday menu sent {_qs_az(menu.get('ts'))}:* {len(carded)} card(s) with "
+                     f"decision buttons -- {len(decided)} decided since it went out, "
+                     f"{len(waiting)} with no decision recorded.")
+        if waiting:
+            lines.append("*No decision recorded:*")
+            for cid, _ in waiting:
+                lines.append(_qs_line(cid, safe_by_id.get(cid), raw_by_id.get(cid), None))
+        if decided:
+            lines.append("*Decided:*")
+            for cid, dec in decided:
+                lines.append(_qs_line(cid, safe_by_id.get(cid), raw_by_id.get(cid), dec))
+    cutoff = now - timedelta(days=_QS_CAPTURE_CARD_DAYS)
+    pending_capture: list[str] = []
+    for cid, evs in events.items():
+        sent = [e for e in evs if e.get("event") == "dm_sent"]
+        if not sent:
+            continue
+        sent_ts = _parse_ts(sent[-1].get("ts"))
+        if sent_ts is None or sent_ts < cutoff:
+            continue
+        safe = safe_by_id.get(cid)
+        if not safe or safe.get("status") != "PROPOSED":
+            continue
+        if _first_decision_after(evs, sent_ts) is None:
+            pending_capture.append(_qs_line(cid, safe, raw_by_id.get(cid), None))
+    if pending_capture:
+        lines.append(f"*Capture cards DM'd in the last {_QS_CAPTURE_CARD_DAYS} days, still "
+                     "undecided:*")
+        lines.extend(pending_capture[:20])
+    lines.append("")
+    lines.append(QUEUE_STATUS_FOOTER)
+    return "\n".join(lines)

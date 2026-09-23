@@ -547,11 +547,15 @@ class TestAppRoute:
         i_staged = body.index("force_tool = _staged_write_force_tool(user_message)")
         i_asana = body.index("force_tool = _asana_destructive_intent(user_message)")
         i_inv = body.index('force_tool = "cora_self_inventory"')
-        assert i_queue < i_deleg < i_staged < i_asana < i_inv
+        # R14-9(a): the queue-status force sits after Asana and before inventory
+        i_qs = body.index('force_tool = "cora_queue_status"')
+        assert i_queue < i_deleg < i_staged < i_asana < i_qs < i_inv
         # gated on the same predicate the cache-read bypass uses, and never on a grant turn
         assert "inventory_turn = bool(user_id) and retrieval_grant is None and _self_inventory_force(user_message) is not None" in body
-        assert "and not web_intent and not inventory_turn:" in body
-        assert "if force_tool is None and inventory_turn:" in body
+        # DELIBERATE re-pin (R14-9(a)): the cache-read guard now also bypasses a
+        # queue-status turn, so the old single-line substring ends differently
+        assert "and not inventory_turn and not queue_status_turn):" in body
+        assert "elif force_tool is None and inventory_turn:" in body
 
     def test_explicit_commands_win_and_writes_are_never_stolen(self, app):
         q = "queue a code session: do you have access to the Drive folder? the tool double-posts"

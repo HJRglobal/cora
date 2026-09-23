@@ -8517,6 +8517,41 @@ def _tool_cora_self_inventory(slack_user_id: str, entity: str, _input: dict) -> 
     return text
 
 
+_CQ_ID_RE = re.compile(r"\bcq-[0-9a-f]{12}\b", re.IGNORECASE)
+
+
+def _tool_cora_queue_status(slack_user_id: str, entity: str, _input: dict) -> str:
+    """READ-ONLY code-queue card / decision state for Harrison's DM (R14-9(a),
+    cq-323c8974fa02). The 9/21 08:44-08:47 incident: three "have my card presses
+    registered?" questions answered at zero tool_use with a capability denial --
+    true for the bot as built (it had no reader of this ledger). This is that
+    reader. Founder + DM only (the rendered queue carries cross-entity build titles;
+    a channel would be a D-145/D-034 surface), belt behind the app-side force gate.
+    Never raises; an unreadable ledger is said to be unreadable, never "nothing
+    registered"."""
+    from .. import code_queue
+
+    channel = str((_input or {}).get("_channel_name") or "")
+    if slack_user_id != code_queue.HARRISON_ID or channel != "dm":
+        log.info("cora_queue_status refused actor=%s channel=%s", slack_user_id, channel)
+        return ("The code-queue status read is Harrison's, in his DM with Cora only. "
+                "Nothing was read.")
+    ids: list[str] = []
+    raw_id = str((_input or {}).get("cq_id") or "").strip()
+    if raw_id:
+        ids = _CQ_ID_RE.findall(raw_id)
+    if not ids:
+        ids = _CQ_ID_RE.findall(str((_input or {}).get("_user_message") or ""))
+    try:
+        text = code_queue.render_card_status(ids or None)
+    except Exception as exc:  # noqa: BLE001 -- never a crash, never an improvised answer
+        log.warning("cora_queue_status failed: %s", exc)
+        text = ("Code-queue ledger UNAVAILABLE this turn (%s) -- this is NOT evidence that "
+                "nothing registered; say the ledger could not be read." % type(exc).__name__)
+    log.info("cora_queue_status actor=%s ids=%d", slack_user_id, len(ids))
+    return text
+
+
 def _tool_cora_person_dossier(slack_user_id: str, entity: str, _input: dict) -> str:
     """On-demand per-person involvement dossier (North Star pillar 4).
 
@@ -12047,6 +12082,28 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "cora_queue_status",
+        "description": (
+            "READ-ONLY: the code-queue card ledger -- the source of truth for Harrison's "
+            "code-session cards (the Monday menu and capture cards). Returns which carded "
+            "rows have a recorded decision (approved / staged / kept / parked / dismissed / "
+            "shipped, with the time and the door) and which have none, plus why a press "
+            "wrote nothing (the evidence floor). Call it for 'have my cards / presses "
+            "registered', 'which cards are still unresponded', 'did the stage press land', "
+            "or the status of a named cq- id. Relay the result; never say you lack access to "
+            "the card ledger or card state -- this tool IS that access. Harrison's DM only. "
+            "Changes nothing (to stage/approve/dismiss, Harrison types the verb)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cq_id": {"type": "string",
+                          "description": "Optional: one or more cq-<12 hex> ids to report on."},
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "cora_person_dossier",
         "description": (
             "Pull a teammate's recent WORK involvement -- a founder check-in or a "
@@ -13792,6 +13849,8 @@ _TOOL_FUNCTIONS: dict[str, Callable[[str, str, dict], str]] = {
     "cora_self_check": _tool_cora_self_check,
     # Deterministic self-inventory of doors / exclusions / cadence (I4, cq-3542e1b095b2)
     "cora_self_inventory": _tool_cora_self_inventory,
+    # Read-only code-queue card / decision state, founder DM only (R14-9(a))
+    "cora_queue_status": _tool_cora_queue_status,
     # Per-person involvement dossier (founder-or-self; North Star pillar 4)
     "cora_person_dossier": _tool_cora_person_dossier,
     # Meeting action items -- PULL flow (replaces the retired auto-create push)
@@ -13921,6 +13980,7 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     "cora_forget_note": 8,
     "cora_self_check": 8,
     "cora_self_inventory": 20,   # one schtasks query (<=12s, cached 10 min) + KB stat reads
+    "cora_queue_status": 8,      # two local jsonl reads + a fold (R14-9(a))
     # cq-7fb82054ee4a residual: the confirmed explicit path runs an OpenAI embed
     # (novel-request dedup), a G: backlog render (drive_io default timeout 10s),
     # and 2 synchronous Slack DM calls INLINE -- an 8s budget was smaller than a
