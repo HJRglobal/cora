@@ -836,6 +836,46 @@ capability" ruling): `gmail.readonly`, `https://mail.google.com/`, `calendar`
 (full), `documents`, `admin.directory.user.readonly`. Reconcile against the Admin
 console before pruning any of them -- this document is not the console.
 
+**Editing the grant: the Admin-console edit REPLACES the whole list.** The SA's
+Domain Wide Delegation entry holds ONE comma-separated scope string, and saving the
+edit replaces every scope the entry held with exactly what is in the field (the
+1ssssss lock). Typing only the new scope REVOKES all the others, and every DWD lane
+(gmail thread sweep, attachment filer, calendar ensure lane, drive sweeps, the draft
+lane) then fails `unauthorized_client`. Never edit the list in place:
+
+1. Read the console's CURRENT list first (the path under "Where the grant lives")
+   and diff it against the recorded grant below. If they differ, STOP: the console is
+   the truth. Rebuild the paste line from the console read-back plus the one new
+   string, and correct this section. (If the proposed tightening of the entry to the
+   7 code-requested strings has run, the console will NOT match this section.)
+2. Paste the WHOLE line below -- never a single scope -- and save.
+3. Read the console back and confirm it shows exactly these strings, no more, no
+   fewer.
+
+Recorded grant (12 scopes): the seven granted code-requested DWD scopes in the table
+(every row except the direct-SA `drive.metadata.readonly` and the not-yet-granted
+`admin.reports.audit.readonly`) plus the five granted-but-not-requested ones -- the
+2026-08-26 grant, confirmed verbatim by the
+live console read-backs of 2026-09-19 ~19:05 AZ and 2026-09-20 ~16:21 AZ
+(`00-Founder/projects/set-up-cora-calendar-meeting-notetaker/2026-09-19_fndr_fireflies-dwd-settings-audit.md`:
+one remaining entry, 12 scopes, "leave-at-12"). `drive.metadata.readonly` is NOT in
+it and never goes in it (a direct-SA credential, see the table).
+
+Source reconciliation: the 2026-09-19 fireflies rollout doc says the SA "holds
+.../auth/calendar" and that the domain-wide roster slice "needs"
+`admin.directory.user.readonly`. That doc was written BEFORE that evening's console
+read-back, which recorded `admin.directory.user.readonly` (and `calendar`) as already
+granted; this section trusts the dated console read-back over a planning doc's
+statement of need. The asymmetry makes that the safe side either way: pasting a scope
+that is already granted changes nothing, while omitting a live one revokes it.
+
+**Paste-ready FULL list** = the recorded grant + `admin.reports.audit.readonly`
+(Code #14 R14-8, the Meet join audit read; NOT YET GRANTED). Diff first (step 1):
+
+```text
+https://www.googleapis.com/auth/gmail.modify,https://www.googleapis.com/auth/gmail.readonly,https://mail.google.com/,https://www.googleapis.com/auth/gmail.compose,https://www.googleapis.com/auth/calendar,https://www.googleapis.com/auth/calendar.events,https://www.googleapis.com/auth/calendar.freebusy,https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/drive.readonly,https://www.googleapis.com/auth/spreadsheets.readonly,https://www.googleapis.com/auth/documents,https://www.googleapis.com/auth/admin.directory.user.readonly,https://www.googleapis.com/auth/admin.reports.audit.readonly
+```
+
 **Deliberately WITHHELD:** `gmail.send` (a posture change gated on the October
 external-WRITE seam, R4) and `spreadsheets` (write) -- "Cora cannot write the
 Standing ACTUALS sheet" is guaranteed by the SCOPE today; granting write would

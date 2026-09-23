@@ -411,6 +411,61 @@ def test_dwd_section_states_the_character_for_character_rule_and_the_withheld_sc
     assert "`GOOGLE_SERVICE_ACCOUNT_JSON`" in sec and "`client_id` field INSIDE" in sec
 
 
+# -- D-051 lex-phi-identity-3: the DWD edit REPLACES the list; paste the WHOLE line --
+
+_G = "https://www.googleapis.com/auth/"
+#: The ruled paste line (Code #14 kickoff R14-8 / ruling 9.6): the 2026-08-26 grant,
+#: confirmed verbatim by the 9/19 + 9/20 console read-backs, plus the Meet audit scope.
+_RULED_PASTE = [_G + "gmail.modify", _G + "gmail.readonly", "https://mail.google.com/",
+                _G + "gmail.compose", _G + "calendar", _G + "calendar.events",
+                _G + "calendar.freebusy", _G + "drive", _G + "drive.readonly",
+                _G + "spreadsheets.readonly", _G + "documents",
+                _G + "admin.directory.user.readonly", _G + "admin.reports.audit.readonly"]
+#: code-requested scopes that are NOT DWD (a direct service-account credential):
+#: they need no Admin-console grant and must never be pasted into the DWD list.
+_DIRECT_SA_ONLY = {"drive.metadata.readonly"}
+
+
+def _paste_line(sec: str) -> str:
+    marker = "**Paste-ready FULL list**"
+    assert sec.count(marker) == 1
+    tail = sec[sec.index(marker):]
+    start = tail.index("```text\n") + len("```text\n")
+    return tail[start:tail.index("\n```", start)].strip()
+
+
+def test_dwd_section_warns_the_edit_replaces_the_whole_list():
+    sec = _identity_sections()[SECTIONS[3]]
+    assert "REPLACES the whole list" in sec
+    assert "Read the console's CURRENT list first" in sec and "diff it" in sec
+    assert "Paste the WHOLE line" in sec and "Read the console back" in sec
+    assert "never a single scope" in sec
+
+
+def test_dwd_paste_line_is_exactly_the_ruled_full_list():
+    line = _paste_line(_identity_sections()[SECTIONS[3]])
+    assert "\n" not in line and " " not in line
+    parts = line.split(",")
+    assert parts == _RULED_PASTE
+    assert len(parts) == len(set(parts)) == 13
+
+
+def test_dwd_paste_line_covers_every_dwd_scope_the_code_requests():
+    """Drift guard: a new DWD scope in code must be added to the paste line too, or
+    the next console edit (which REPLACES the list) would drop it."""
+    parts = set(_paste_line(_identity_sections()[SECTIONS[3]]).split(","))
+    wanted = {_G + s for s in _code_scopes() - _DIRECT_SA_ONLY}
+    assert not sorted(wanted - parts), sorted(wanted - parts)
+    for never in _DIRECT_SA_ONLY | {"gmail.send", "spreadsheets"}:
+        assert _G + never not in parts, never
+
+
+def test_dwd_source_reconciliation_names_the_trusted_source():
+    sec = _identity_sections()[SECTIONS[3]]
+    assert "Source reconciliation" in sec
+    assert "2026-09-19 ~19:05 AZ" in sec and "trusts the dated console read-back" in sec
+
+
 # -- bootstrap pointer + CLAUDE.md note --
 
 def test_bootstrap_points_to_the_inventory_under_not_covered():
