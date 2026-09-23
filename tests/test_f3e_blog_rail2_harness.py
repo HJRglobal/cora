@@ -1624,19 +1624,15 @@ class TestRound2PronounResolution:
     NONREFERENTIAL = (
         "It's worth noting that natural caffeine is the same molecule",
         "it is worth knowing",
-        "It's time to reset",
         "It's no secret that caffeine works",
-        "It is important to hydrate",
+        "It is important that you hydrate",
         "It is true that caffeine is caffeine",
         "It turns out caffeine is caffeine",
         "it seems that",
         "It depends on your goals",
-        "It helps to hydrate",
-        "It makes sense",
+        "It makes sense that tea is smoother",
         "It goes without saying",
         "They say green tea is smoother",
-        "Rinse your shaker and clean it weekly",
-        "clean it after every session",
         "It’s worth noting that",                         # a curly apostrophe splits it + s
     )
     REFERENTIAL = (
@@ -1646,7 +1642,12 @@ class TestRound2PronounResolution:
         "It is natural to want more",                     # a clean word is never an extraposition adjective
         "It is easy to love",                             # tough-movement: the "it" IS the can
         "It is important to us",
-        "It helps to know it",                            # the second "it"
+        "It's time to go clean",                          # to-infinitive exhortations stay referential
+        "It is important to go natural",
+        "It helps to hydrate",
+        "It makes sense to go clean",
+        "It depends",
+        "It helps to know it",
         "It's time-tested",
         "It helps you unwind",
         "It seems natural",
@@ -1675,6 +1676,19 @@ class TestRound2PronounResolution:
     @pytest.mark.parametrize("clause", REFERENTIAL)
     def test_their_referential_twins_still_refer_back(self, clause):
         assert self._refs(clause), clause
+
+    def test_the_household_care_frame_needs_a_claim_free_sentence(self):
+        """The clean VERB's own object ("clean it weekly") is dropped only when the
+        sentence holds no other clean word: "We clean it weekly, all clean." is a
+        claim about the referent (found by the round-2 self-differential)."""
+        assert not any(pf._rail2_backref_flags("Rinse your shaker and clean it weekly."))
+        assert not any(pf._rail2_backref_flags("Clean it after every session."))
+        assert any(pf._rail2_backref_flags("We clean it weekly, all clean."))
+        assert any(pf._rail2_backref_flags("Clean it weekly and keep it natural."))
+        assert any(pf._rail2_backref_flags("We cleaned it up."))
+        assert self._refs("clean it weekly") == ["it"]                    # a bare clause is never enough
+        assert self._refs("clean it weekly", care_ok=True) == []
+        assert "R2" in _pf("F3 Energy is our can. We clean it weekly, all clean.").tripped_rail_ids
 
     def test_exclusion_is_per_occurrence(self):
         assert self._refs("It's worth noting it is all-natural") == ["it"]

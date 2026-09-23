@@ -1324,14 +1324,15 @@ _BACKREF_DEMONSTRATIVES = frozenset({"this", "that", "that's", "these", "those"}
 #: "That's it: all-natural.", "It is easy to love: all-natural." (tough-movement:
 #: the "it" IS the can), "It's worth trying: all-natural." Those stay referential
 #: (fail closed); an over-trip costs one bounded revision. What is excluded:
-#:   * expletive "it" ahead of a clause, never before a COLON (whatever follows a
+#:   * expletive "it" ahead of a CLAUSE, never before a COLON (whatever follows a
 #:     colon is the content of "it"): "it's worth noting / mentioning / knowing
-#:     ...", "it's time to", "it's no secret / wonder / surprise", "it is
-#:     <important / true / clear / likely / ...> that / whether / how / why / what
-#:     / if / when", "it is <important / essential / crucial / vital / necessary>
-#:     to <a verb>" (not "to us" / "to you"), "it turns out", "it seems / appears
-#:     that", "it depends", "it helps / pays to", "it makes sense", "it goes
-#:     without saying";
+#:     ...", "it's no secret / wonder / surprise", "it is <important / true / clear
+#:     / likely / ...> that / whether / how / why / what / if / when", "it turns
+#:     out", "it seems / appears that", "it depends on", "it makes sense that", "it
+#:     goes without saying". NOT the to-infinitive forms ("it's time to go clean",
+#:     "it is important to go natural", "it helps to"): right after a product
+#:     sentence they are an exhortation whose implied subject is the can, and no
+#:     reviewed false positive needed them;
 #:   * generic "they": "they say / said / call" (an "it" after it still counts);
 #:   * the object of a clean VERB in a household-care frame ("rinse your shaker
 #:     and clean it weekly"): followed by a closed list of frequency / manner words
@@ -1349,13 +1350,6 @@ _EXTRAPOSITION_THAT_ADJ = frozenset({
     "worth", "evident", "certain", "unclear",
 })
 _EXTRAPOSITION_THAT_COMP = frozenset({"that", "whether", "if", "when", "how", "why", "what"})
-_EXTRAPOSITION_TO_ADJ = frozenset({"important", "essential", "crucial", "vital", "necessary"})
-#: after "it is important to": a pronoun / determiner means "important TO someone"
-#: (referential: the can is important to us), not an infinitive.
-_NOT_AN_INFINITIVE = frozenset({
-    "us", "me", "you", "them", "him", "her", "our", "your", "their", "my", "his", "its", "the",
-    "a", "an", "everyone", "anyone", "everybody", "anybody", "people", "fans", "athletes",
-})
 _COPULA_AFTER_IT = frozenset({"is", "was", "s"})   # "it is", "it was", curly "it’s" -> it + s
 _CLEAN_VERB_FORMS = frozenset({"clean", "cleans", "cleaned", "cleaning", "cleanse", "cleanses",
                                "cleansed", "cleansing"})
@@ -1366,9 +1360,25 @@ _HOUSEHOLD_CARE_AFTER = frozenset({
 _BACKREF_COORDINATORS = frozenset({"and", "or", "nor", "plus", "&"})
 
 
-def _nonreferential_positions(t: list[str], *, colon_after: bool) -> set[int]:
+def _is_household_care(t: list[str], i: int) -> bool:
+    """t[i] == "it" is the object of a clean verb in a household-care frame."""
+    return (t[i] == "it" and i > 0 and t[i - 1] in _CLEAN_VERB_FORMS
+            and i + 1 < len(t) and t[i + 1] in _HOUSEHOLD_CARE_AFTER)
+
+
+def _only_care_verbs_are_clean(sentence: str) -> bool:
+    """True when every clean token in the sentence is the verb of a household-care
+    frame -- the only case where that frame's "it" may be dropped ("F3 Energy is our
+    can. We clean it weekly, all clean." still refers back: "all clean" is a claim)."""
+    t = _lower_tokens(_words(sentence))
+    care = {i - 1 for i in range(len(t)) if _is_household_care(t, i)}
+    return all(i in care for i, w in enumerate(t) if _is_clean_token(w))
+
+
+def _nonreferential_positions(t: list[str], *, colon_after: bool, care_ok: bool = False) -> set[int]:
     """Indices of pronoun tokens in `t` (lower-cased clause tokens) that refer to
-    nothing, per the list above. Linear: a constant look-around per token."""
+    nothing, per the list above. Linear: a constant look-around per token.
+    `care_ok`: the SENTENCE holds no clean word but household-care verbs."""
     n = len(t)
     out: set[int] = set()
     if colon_after:
@@ -1383,35 +1393,31 @@ def _nonreferential_positions(t: list[str], *, colon_after: bool) -> set[int]:
             if w == "it" and at(k) in _COPULA_AFTER_IT:
                 k += 1
             copula = w == "it's" or k == i + 2
-            nxt, nxt2, nxt3 = at(k), at(k + 1), at(k + 2)
+            nxt, nxt2 = at(k), at(k + 1)
             if copula and ((nxt == "worth" and nxt2 in _WORTH_INFO_VERBS)
-                           or (nxt == "time" and nxt2 == "to")
                            or (nxt == "no" and nxt2 in ("secret", "wonder", "surprise"))
-                           or (nxt in _EXTRAPOSITION_THAT_ADJ and nxt2 in _EXTRAPOSITION_THAT_COMP)
-                           or (nxt in _EXTRAPOSITION_TO_ADJ and nxt2 == "to" and nxt3
-                               and nxt3 not in _NOT_AN_INFINITIVE)):
+                           or (nxt in _EXTRAPOSITION_THAT_ADJ and nxt2 in _EXTRAPOSITION_THAT_COMP)):
                 out.add(i)
                 continue
             if w == "it" and ((at(i + 1) in ("turns", "turned") and at(i + 2) == "out")
                               or (at(i + 1) in ("seems", "seemed", "appears", "appeared")
                                   and at(i + 2) == "that")
-                              or at(i + 1) in ("depends", "depended")
-                              or (at(i + 1) in ("helps", "pays") and at(i + 2) == "to"
-                                  and at(i + 3) not in _NOT_AN_INFINITIVE)
-                              or (at(i + 1) in ("makes", "made") and at(i + 2) == "sense")
+                              or (at(i + 1) in ("depends", "depended") and at(i + 2) == "on")
+                              or (at(i + 1) in ("makes", "made") and at(i + 2) == "sense"
+                                  and at(i + 3) == "that")
                               or (at(i + 1) == "goes" and at(i + 2) == "without" and at(i + 3) == "saying")):
                 out.add(i)
                 continue
         if w == "they" and at(i + 1) in ("say", "said", "says", "call"):
             out.add(i)
             continue
-        if w == "it" and at(i - 1) in _CLEAN_VERB_FORMS and at(i + 1) in _HOUSEHOLD_CARE_AFTER:
+        if care_ok and _is_household_care(t, i):
             out.add(i)
     return out
 
 
 def _back_reference_tokens(words: list[str], *, coordinated_only: bool = False,
-                           colon_after: bool = False) -> list[str]:
+                           colon_after: bool = False, care_ok: bool = False) -> list[str]:
     """The back-referring tokens of one clause (see _BACKREF_PRONOUNS and the
     non-referential list above). With `coordinated_only` -- a clause that names an
     Energy/Mood line itself -- a pronoun counts only when it is COORDINATED with a
@@ -1420,7 +1426,7 @@ def _back_reference_tokens(words: list[str], *, coordinated_only: bool = False,
     r143-claims-5: the blanket exemption let "F3 Energy and it" launder the ruled
     phrase onto Mood)."""
     t = _lower_tokens(words)
-    skip = _nonreferential_positions(t, colon_after=colon_after)
+    skip = _nonreferential_positions(t, colon_after=colon_after, care_ok=care_ok)
     found: list[str] = []
     for i, w in enumerate(t):
         if i in skip or w not in _BACKREF_PRONOUNS:
@@ -1465,11 +1471,12 @@ def _rail2_backref_flags(sentence: str) -> list[bool]:
     two-sentence remedy for the 9/1 UNDECIDED shape."""
     segs = _clause_split(sentence or "")
     words = [_words(seg) for seg, _ in segs]
+    care_ok = _only_care_verbs_are_clean(sentence or "")
     toks: list[list[str]] = []
     for (seg, delim), w in zip(segs, words):
         em = bool(w) and bool(brand_lines_in(seg) & _RAIL2_EM)
-        toks.append(_back_reference_tokens(w, coordinated_only=em, colon_after=delim == ":")
-                    if w else [])
+        toks.append(_back_reference_tokens(w, coordinated_only=em, colon_after=delim == ":",
+                                           care_ok=care_ok) if w else [])
     flags = [bool(tk) for tk in toks]
     k = next((i for i, (seg, _) in enumerate(segs) if brand_lines_in(seg)), -1)
     if k >= 0 and not any(flags[:k]) and brand_lines_in(segs[k][0]) == {"PURE"} \
