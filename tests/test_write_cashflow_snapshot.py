@@ -89,6 +89,34 @@ def test_build_snapshot_is_source_opaque():
         assert forbidden not in blob
 
 
+def test_as_of_known_true_and_as_of_date_passthrough():
+    # Code #14 S5: ADDITIVE boolean; as_of_date itself is unchanged
+    snap = wcs.build_snapshot(_summary(), "2026-06-19T21:00:00+00:00")
+    assert snap["as_of_known"] is True
+    assert snap["as_of_date"] == "2026-06-16"
+
+
+def test_as_of_known_false_keeps_the_sentinel_string():
+    s = CashflowSummary(week_label="Week of 6/09/2026", as_of_date="unknown",
+                        closing_balance=100.0)
+    snap = wcs.build_snapshot(s, "2026-06-19T21:00:00+00:00")
+    assert snap["as_of_known"] is False
+    assert snap["as_of_date"] == "unknown"  # never nulled: the Cowork brief reads it
+
+
+def test_main_dry_run_with_unknown_as_of_writes_nothing(tmp_path, monkeypatch, capsys):
+    # D-290: the new field changes no write site -- --dry-run still writes nothing
+    s = CashflowSummary(week_label="Week of 6/09/2026", as_of_date="unknown",
+                        closing_balance=100.0)
+    monkeypatch.setattr(wcs.gf, "get_cashflow", lambda tab_name=None: s)
+    out = tmp_path / "cashflow-latest.json"
+    rc = wcs.main(["--out", str(out), "--dry-run"])
+    assert rc == 0
+    assert not out.exists()
+    assert list(tmp_path.iterdir()) == []
+    assert '"as_of_known": false' in capsys.readouterr().out
+
+
 def test_portfolio_ending_cash_mirrors_outlook_anchor():
     # D-051: headline must equal the outlook anchor (same actual-first precedence),
     # not the legacy forecast-first closing_balance, or the brief shows two numbers.

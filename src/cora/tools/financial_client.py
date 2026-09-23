@@ -26,6 +26,7 @@ from ..connectors.gsheets_financials import (
     CashflowSummary,
     EntityRow,
     GsheetsConnectorError,
+    as_of_label,
     entity_to_tab,
     get_cashflow,
 )
@@ -194,9 +195,9 @@ def _format_summary_full(
 
     lines: list[str] = []
     if is_portfolio:
-        lines.append(f"*Cash Flow -- {s.week_label}* (as of {s.as_of_date})")
+        lines.append(f"*Cash Flow -- {s.week_label}* ({as_of_label(s)})")
     else:
-        lines.append(f"*{label} Cash Flow -- {s.week_label}* (as of {s.as_of_date})")
+        lines.append(f"*{label} Cash Flow -- {s.week_label}* ({as_of_label(s)})")
     lines.append("")
 
     entities_to_show = s.entities
@@ -210,7 +211,7 @@ def _format_summary_full(
         if not entities_to_show:
             return (
                 f"No cash flow data found for *{entity_filter}* "
-                f"in {s.week_label} (as of {s.as_of_date}). "
+                f"in {s.week_label} ({as_of_label(s)}). "
                 "Ask Hayden or Justin to confirm the sheet has been updated."
             )
 
@@ -332,7 +333,7 @@ def get_osn_pulse_text(
         store_rows = summary.osn_entities()
 
         lines: list[str] = [
-            f"*OSN Financial Pulse -- {summary.week_label}* (as of {summary.as_of_date})",
+            f"*OSN Financial Pulse -- {summary.week_label}* ({as_of_label(summary)})",
             "",
         ]
 

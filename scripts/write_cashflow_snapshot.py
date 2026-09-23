@@ -108,6 +108,9 @@ def build_snapshot(
         "generated_at_utc": generated_at_iso,
         "week_label": summary.week_label,
         "as_of_date": summary.as_of_date,
+        # ADDITIVE (Code #14 S5): an explicit boolean so a reader never has to
+        # string-compare the "unknown" sentinel. as_of_date itself is unchanged.
+        "as_of_known": gf.as_of_label(summary) != "as of: unknown",
         # Fail-CLOSED freshness (D-051): an unparseable week label -> data_age_days is
         # None -> treat as STALE so the consumer shows "unavailable" rather than
         # presenting unknown-age cash as current.

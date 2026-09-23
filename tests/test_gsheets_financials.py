@@ -644,3 +644,304 @@ class TestRealSheetBalanceLabels:
         # near-miss. Assert we got the real ending cash, not the liquidity check row.
         summary = _parse_cashflow_csv(self._csv(), "2026-06-04")
         assert summary.closing_balance != 0.0
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Code #14 S5 -- sheet modifiedTime ("as of") on its own metadata-only direct-SA
+# credential; one Drive call per file per process; ONE source-opaque WARNING per
+# AZ day; the Sheets read can never be sunk by the Drive side.
+# ────────────────────────────────────────────────────────────────────────────
+
+import logging as _logging
+from datetime import datetime as _dt, timezone as _tz
+
+import httplib2 as _httplib2
+from googleapiclient.errors import HttpError as _HttpError
+
+import cora.connectors.gsheets_financials as _gf
+
+_S5_LOGGER = "cora.connectors.gsheets_financials"
+# Synthetic ids only -- the assertions prove neither reaches a log line.
+_S5_FID = "SYNTHFILEID0123456789abcdefXYZ"
+_S5_REAL_DEFAULT_FID_PREFIX = "1bkMFetsIW"
+_S5_TABS = [f"CF_T{i}" for i in range(9)]
+_S5_SCOPE_403 = (
+    b'{"error":{"code":403,"message":"Request had insufficient authentication scopes.",'
+    b'"errors":[{"message":"Insufficient Permission","domain":"global",'
+    b'"reason":"insufficientPermissions"}]}}'
+)
+
+
+def _s5_http_error(status: int, content: bytes) -> _HttpError:
+    return _HttpError(
+        _httplib2.Response({"status": status}),
+        content,
+        uri=f"https://www.googleapis.com/drive/v3/files/{_S5_FID}?fields=modifiedTime&alt=json",
+    )
+
+
+class _FakeDrive:
+    """files().get(**kw).execute(**kw) -- records calls, returns or raises."""
+
+    def __init__(self, result=None, exc=None):
+        self.result = result
+        self.exc = exc
+        self.get_calls: list[dict] = []
+        self.execute_calls: list[dict] = []
+
+    def files(self):
+        return self
+
+    def get(self, **kw):
+        self.get_calls.append(kw)
+        return self
+
+    def execute(self, **kw):
+        self.execute_calls.append(kw)
+        if self.exc is not None:
+            raise self.exc
+        return self.result
+
+
+def _s5_csv() -> str:
+    return _make_csv(
+        weeks=["9/11/2026"],
+        entities={"LBHS": {"9/11/2026": [10000, 9500, -500]}},
+    )
+
+
+def _s5_patches(fake_drive=None, meta_creds_exc=None, sheets_exc=None):
+    stack = ExitStack()
+    stack.enter_context(patch.object(_gf, "_build_direct_sa_creds", return_value=MagicMock()))
+    stack.enter_context(patch.object(_gf, "_build_sheets_service", return_value=MagicMock()))
+    if sheets_exc is not None:
+        stack.enter_context(patch.object(_gf, "_export_sheet_as_csv", side_effect=sheets_exc))
+    else:
+        stack.enter_context(patch.object(
+            _gf, "_export_sheet_as_csv",
+            side_effect=lambda service, file_id, sheet_name: _s5_csv(),
+        ))
+    if meta_creds_exc is not None:
+        stack.enter_context(patch.object(
+            _gf, "_build_direct_sa_drive_meta_creds", side_effect=meta_creds_exc,
+        ))
+    else:
+        stack.enter_context(patch.object(
+            _gf, "_build_direct_sa_drive_meta_creds", return_value=MagicMock(),
+        ))
+    stack.enter_context(patch.object(
+        _gf, "build", side_effect=lambda *a, **k: fake_drive,
+    ))
+    return stack
+
+
+def _s5_run_tabs(tabs=_S5_TABS):
+    return [get_cashflow(file_id=_S5_FID, tab_name=t) for t in tabs]
+
+
+def _s5_as_of_warnings(caplog) -> list:
+    return [
+        r for r in caplog.records
+        if r.name == _S5_LOGGER and r.levelno == _logging.WARNING
+        and "cashflow as_of unknown" in r.getMessage()
+    ]
+
+
+def _s5_pin_clock(monkeypatch, iso_utc: str) -> None:
+    fixed = _dt.fromisoformat(iso_utc).replace(tzinfo=_tz.utc)
+    monkeypatch.setattr(_gf, "_now", lambda: fixed)
+
+
+class TestAsOfModifiedTime:
+
+    @pytest.fixture(autouse=True)
+    def _fresh_data_cache(self):
+        # the (file_id, tab) DATA cache is process-global too; conftest resets
+        # the as_of memo + latch, this resets the summaries themselves
+        invalidate_cache()
+        yield
+        invalidate_cache()
+
+    # (a) least privilege, no impersonation
+    def test_drive_meta_creds_request_only_the_metadata_scope_and_never_impersonate(self):
+        fake_creds = MagicMock()
+        with patch.object(_gf, "_sa_path", return_value="C:/synthetic/sa.json"), \
+             patch.object(_gf.service_account.Credentials, "from_service_account_file",
+                          return_value=fake_creds) as mk:
+            creds = _gf._build_direct_sa_drive_meta_creds()
+        assert creds is fake_creds
+        assert mk.call_args.kwargs["scopes"] == [
+            "https://www.googleapis.com/auth/drive.metadata.readonly"
+        ]
+        fake_creds.with_subject.assert_not_called()
+
+    # (b) the Sheets credential's scope list is pinned (the 5/28 lesson)
+    def test_sheets_scope_list_unchanged_and_never_merged(self):
+        assert _gf._DRIVE_SCOPES == ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+        assert _gf._DRIVE_META_SCOPES == ["https://www.googleapis.com/auth/drive.metadata.readonly"]
+        assert not set(_gf._DRIVE_META_SCOPES) & set(_gf._DRIVE_SCOPES)
+
+    def test_sheets_read_credential_carries_no_drive_scope(self):
+        with patch.object(_gf, "_sa_path", return_value="C:/synthetic/sa.json"), \
+             patch.object(_gf.service_account.Credentials, "from_service_account_file",
+                          return_value=MagicMock()) as mk:
+            _gf._build_direct_sa_creds()
+        assert mk.call_args.kwargs["scopes"] == [
+            "https://www.googleapis.com/auth/spreadsheets.readonly"
+        ]
+
+    # (c) ONE Drive call for nine tabs; the date flows to every summary
+    def test_modified_time_fetched_once_for_many_tabs(self):
+        fake = _FakeDrive(result={"modifiedTime": "2026-09-18T14:23:11.000Z"})
+        with _s5_patches(fake_drive=fake):
+            summaries = _s5_run_tabs()
+        assert len(fake.get_calls) == 1
+        assert fake.get_calls[0] == {
+            "fileId": _S5_FID, "fields": "modifiedTime", "supportsAllDrives": True,
+        }
+        assert fake.execute_calls == [{"num_retries": 1}]
+        assert [s.as_of_date for s in summaries] == ["2026-09-18"] * len(_S5_TABS)
+
+    # (d) ONE warn per run, source-opaque
+    def test_one_warn_per_run_and_no_file_id(self, caplog):
+        caplog.set_level(_logging.DEBUG, logger=_S5_LOGGER)
+        fake = _FakeDrive(exc=_s5_http_error(403, _S5_SCOPE_403))
+        with _s5_patches(fake_drive=fake):
+            summaries = _s5_run_tabs()
+        warns = _s5_as_of_warnings(caplog)
+        assert len(warns) == 1
+        msg = warns[0].getMessage()
+        assert "sheet modified-time unavailable: scope" in msg
+        assert "is_stale" in msg and '"as of: unknown"' in msg
+        # memoized failure -> Drive asked ONCE, not once per tab
+        assert len(fake.get_calls) == 1
+        for r in caplog.records:
+            text = r.getMessage()
+            assert _S5_FID not in text
+            assert _S5_REAL_DEFAULT_FID_PREFIX not in text
+            assert "googleapis.com/drive" not in text
+            assert "insufficient authentication scopes" not in text.lower()
+        assert all(s.as_of_date == "unknown" for s in summaries)
+
+    # (e) honesty: C10b never reads as_of, so the WARN must not claim it
+    def test_warn_does_not_claim_c10b(self, caplog):
+        caplog.set_level(_logging.WARNING, logger=_S5_LOGGER)
+        with _s5_patches(fake_drive=_FakeDrive(exc=_s5_http_error(403, _S5_SCOPE_403))):
+            _s5_run_tabs(["CF_A"])
+        (w,) = _s5_as_of_warnings(caplog)
+        assert "C10b" not in w.getMessage()
+        assert "disabled" not in w.getMessage()
+
+    # (f) reason classes
+    @pytest.mark.parametrize("exc,reason", [
+        (_s5_http_error(403, _S5_SCOPE_403), "scope"),
+        (_s5_http_error(403, b'{"error":{"code":403,"message":"x","status":"PERMISSION_DENIED",'
+                              b'"errors":[{"reason":"ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]}}'), "scope"),
+        (_s5_http_error(404, b'{"error":{"code":404,"message":"File not found.",'
+                              b'"errors":[{"reason":"notFound"}]}}'), "not_found"),
+        (_s5_http_error(403, b'{"error":{"code":403,"message":"The caller does not have permission",'
+                              b'"errors":[{"reason":"forbidden"}]}}'), "forbidden"),
+        (_s5_http_error(403, b"not json"), "forbidden"),
+        (_s5_http_error(500, b'{"error":{"code":500,"message":"backend"}}'), "error"),
+        (TimeoutError("socket timed out"), "error"),
+        (ValueError("bad key file"), "error"),
+    ])
+    def test_reason_classes(self, exc, reason):
+        assert _gf._classify_modified_time_failure(exc) == reason
+
+    def test_credential_load_failure_is_reason_error(self, caplog):
+        caplog.set_level(_logging.WARNING, logger=_S5_LOGGER)
+        with _s5_patches(fake_drive=_FakeDrive(), meta_creds_exc=ValueError("bad key")):
+            _s5_run_tabs(["CF_A"])
+        (w,) = _s5_as_of_warnings(caplog)
+        assert "sheet modified-time unavailable: error" in w.getMessage()
+        assert "bad key" not in w.getMessage()
+
+    def test_200_without_modified_time_is_unknown(self, caplog):
+        caplog.set_level(_logging.WARNING, logger=_S5_LOGGER)
+        with _s5_patches(fake_drive=_FakeDrive(result={})):
+            (s,) = _s5_run_tabs(["CF_A"])
+        assert s.as_of_date == "unknown"
+        assert len(_s5_as_of_warnings(caplog)) == 1
+
+    def test_malformed_modified_time_is_unknown_not_a_label(self):
+        with _s5_patches(fake_drive=_FakeDrive(result={"modifiedTime": "20XX-99-99T00:00:00Z"})):
+            (s,) = _s5_run_tabs(["CF_A"])
+        assert s.as_of_date == "unknown"
+
+    # (g) the Drive side can NEVER sink the Sheets read
+    @pytest.mark.parametrize("kind", ["creds", "transport", "http"])
+    def test_sheets_read_survives_drive_meta_failure(self, kind):
+        if kind == "creds":
+            ctx = _s5_patches(fake_drive=_FakeDrive(),
+                              meta_creds_exc=GsheetsConnectorError("no key"))
+        elif kind == "transport":
+            ctx = _s5_patches(fake_drive=_FakeDrive(exc=ConnectionResetError("reset")))
+        else:
+            ctx = _s5_patches(fake_drive=_FakeDrive(exc=_s5_http_error(403, _S5_SCOPE_403)))
+        with ctx:
+            (s,) = _s5_run_tabs(["CF_A"])
+        assert s.as_of_date == "unknown"
+        assert "9/11/2026" in s.week_label
+        assert s.entities and s.entities[0].entity_code == "LEX-LBHS"
+
+    def test_sheets_failure_still_raises_and_never_asks_drive(self):
+        fake = _FakeDrive(result={"modifiedTime": "2026-09-18T00:00:00Z"})
+        with _s5_patches(fake_drive=fake, sheets_exc=GsheetsConnectorError("sheets down")):
+            with pytest.raises(GsheetsConnectorError):
+                get_cashflow(file_id=_S5_FID, tab_name="CF_A")
+        assert fake.get_calls == []
+
+    # (h) the latch is per AZ day (not UTC), and invalidate_cache does not re-arm it
+    def test_warn_resets_next_az_day(self, caplog, monkeypatch):
+        caplog.set_level(_logging.WARNING, logger=_S5_LOGGER)
+        fake = _FakeDrive(exc=_s5_http_error(403, _S5_SCOPE_403))
+        with _s5_patches(fake_drive=fake):
+            # 06:59Z = 23:59 AZ on 9/22
+            _s5_pin_clock(monkeypatch, "2026-09-23T06:59:00")
+            _s5_run_tabs(["CF_A", "CF_B"])
+            assert len(_s5_as_of_warnings(caplog)) == 1
+            # same AZ day, data cache + memo invalidated: Drive is asked again,
+            # but the day already carried its WARN
+            invalidate_cache()
+            _s5_pin_clock(monkeypatch, "2026-09-23T06:59:30")
+            _s5_run_tabs(["CF_A"])
+            assert len(fake.get_calls) == 2
+            assert len(_s5_as_of_warnings(caplog)) == 1
+            # 07:01Z = 00:01 AZ on 9/23 -> a new AZ day -> a second WARN
+            invalidate_cache()
+            _s5_pin_clock(monkeypatch, "2026-09-23T07:01:00")
+            _s5_run_tabs(["CF_A"])
+        assert len(_s5_as_of_warnings(caplog)) == 2
+
+    def test_memo_expires_after_ttl(self):
+        fake = _FakeDrive(result={"modifiedTime": "2026-09-18T00:00:00Z"})
+        with _s5_patches(fake_drive=fake):
+            _s5_run_tabs(["CF_A"])
+            ts, val = _gf._MODIFIED_TIME_MEMO[_S5_FID]
+            _gf._MODIFIED_TIME_MEMO[_S5_FID] = (ts - _gf._CACHE_TTL_SECONDS - 1, val)
+            _s5_run_tabs(["CF_B"])
+        assert len(fake.get_calls) == 2
+
+    # (i) the rendered label
+    @pytest.mark.parametrize("raw,label", [
+        ("2026-09-18", "as of 2026-09-18"),
+        ("unknown", "as of: unknown"),
+        ("", "as of: unknown"),
+        (None, "as of: unknown"),
+        ("2026-13-45", "as of: unknown"),
+        ("d", "as of: unknown"),
+    ])
+    def test_as_of_label(self, raw, label):
+        s = CashflowSummary(week_label="Week of 9-11", as_of_date=raw)
+        assert _gf.as_of_label(s) == label
+
+    def test_regex_free_classification_is_linear_on_degenerate_input(self):
+        # D-171 posture: no regex was added; the "insufficient authentication
+        # scopes" check is a substring test. Pin it stays fast on 40k junk.
+        import time as _time
+        big = ("x" * 40_000).encode()
+        exc = _s5_http_error(403, b'{"error":{"code":403,"message":"' + big + b'"}}')
+        t0 = _time.perf_counter()
+        assert _gf._classify_modified_time_failure(exc) == "forbidden"
+        assert _time.perf_counter() - t0 < 0.2

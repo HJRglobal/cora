@@ -826,7 +826,8 @@ list in step with `grep -rn "googleapis.com/auth/" src/ scripts/`):
 | `calendar.freebusy` | `src/cora/tools/calendar_client.py:53` | `freebusy.query` only (`events.list` 403s under it) |
 | `drive.readonly` | `src/cora/connectors/drive_sweep.py:474`, `scripts/run_drive_sweep.py:27`, `scripts/backfill_drive_assets.py:22`, `scripts/run_lex_dump_folder_sync.py:115` | Drive sweeps |
 | `drive` (full) | `src/cora/connectors/drive_connector.py:46`, `scripts/run_retroactive_hashtag_scan.py:153` | attachment filer upload, finance-receipt filing |
-| `spreadsheets.readonly` | `src/cora/connectors/drive_sweep.py:475`, `src/cora/connectors/gsheets_financials.py:50`, `src/cora/tools/fighter_tracker_client.py:43` | oversized-sheet fallback, cash sheet reads, fighter roster |
+| `spreadsheets.readonly` | `src/cora/connectors/drive_sweep.py:475`, `src/cora/tools/fighter_tracker_client.py:43` (DWD); `src/cora/connectors/gsheets_financials.py` (`_DRIVE_SCOPES`) requests it on a DIRECT service-account credential (no impersonation), NOT via DWD | oversized-sheet fallback, fighter roster; cash sheet reads (direct SA) |
+| `drive.metadata.readonly` | `src/cora/connectors/gsheets_financials.py` (`_DRIVE_META_SCOPES`) | DIRECT service-account credential (no impersonation) -- NOT a DWD scope, needs NO Admin-console grant, never paste it into the DWD list; cashflow sheet modifiedTime (the "as of" label) only (Code #14 S5) |
 
 **Granted but not requested by code** (as recorded 2026-08-26 on Harrison's "more
 capability" ruling): `gmail.readonly`, `https://mail.google.com/`, `calendar`
@@ -845,8 +846,10 @@ never cite its absence as the guarantee. The 13WCF worksheet writes use direct S
 directly-shared files, outside DWD entirely.
 
 **Impersonation default:** `CORA_DRIVE_IMPERSONATE` (default `harrison@hjrglobal.com`
-in `drive_connector.py:52` and `gsheets_financials.py:52`); per-mailbox sweeps pass
-the roster email explicitly.
+in `drive_connector.py:52`); per-mailbox sweeps pass the roster email explicitly.
+`gsheets_financials.py` also defines that default, but only its dead delegated
+path (`_build_delegated_creds`) reads it and no caller reaches that path: the cash
+sheet is read with direct service-account credentials.
 
 **Rotating the SA key:** Google Cloud console -> IAM & Admin -> Service accounts ->
 the SA -> Keys -> Add key (JSON) -> save the file under `.credentials/` -> point

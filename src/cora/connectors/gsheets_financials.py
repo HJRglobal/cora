@@ -6,10 +6,21 @@ Targets the CF_SUMMARY tab by name so the first/active tab does not matter.
 Returns a structured CashflowSummary with the most recent week that has
 actual data, all entity rows, and portfolio totals.
 
-Auth: reuses GOOGLE_SERVICE_ACCOUNT_JSON + CORA_DRIVE_IMPERSONATE from
-drive_connector.py. Requires spreadsheets.readonly scope only.
-(Drive scope removed 2026-05-28 — modifiedTime is non-critical and the
-two-scope combination triggered unauthorized_client on DWD token fetch.)
+Auth: DIRECT service-account credentials (GOOGLE_SERVICE_ACCOUNT_JSON, no
+impersonation, no domain-wide delegation) -- the sheet is shared with the SA
+email itself. The Sheets read requests spreadsheets.readonly only (_DRIVE_SCOPES).
+History: the Drive scope was dropped 2026-05-28 while this module still used DWD
+(the two-scope combination triggered unauthorized_client on the DWD token fetch);
+the same day the module moved to direct SA auth, and the Drive scope was never
+re-added, so modifiedTime 403'd (insufficientPermissions) on every read and every
+summary said as_of=unknown. Since Code #14 S5 the sheet's modifiedTime rides a
+SEPARATE direct-SA credential requesting ONLY drive.metadata.readonly
+(_DRIVE_META_SCOPES). A service account acting as itself needs NO Admin-console
+(DWD) grant for that scope. It is never merged into _DRIVE_SCOPES, so a
+Drive-side failure can never break the Sheets read: as_of degrades to "unknown"
+with ONE WARNING per process per AZ day (no file id, no URL, no exception text).
+The CORA_DRIVE_IMPERSONATE / _build_delegated_creds path below is DEAD (no src
+caller reaches it); it is left in place, unused.
 
 Behavioral contract (locked 2026-05-21):
   - Source-opaque: never log or surface file IDs, sheet names, or Drive links
@@ -21,7 +32,7 @@ Configuration:
   GSHEETS_CASHFLOW_FILE_ID   — Drive file ID for the Standing ACTUALS sheet
   GSHEETS_CASHFLOW_SHEET_NAME — Tab name to read (default: CF_SUMMARY)
   GOOGLE_SERVICE_ACCOUNT_JSON — path to service account JSON key file
-  CORA_DRIVE_IMPERSONATE     — email to impersonate (default harrison@hjrglobal.com)
+  CORA_DRIVE_IMPERSONATE     — (dead delegated path only; unreachable from get_cashflow)
 """
 
 from __future__ import annotations
@@ -31,8 +42,9 @@ import io
 import logging
 import os
 import re
+import threading
 import time
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -48,6 +60,14 @@ log = logging.getLogger(__name__)
 
 _DRIVE_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets.readonly",
+]
+# The sheet's modifiedTime (the rendered "as of" date) rides its OWN direct-SA
+# credential with ONLY this scope (Code #14 S5). NOT a DWD scope: a service
+# account acting as itself needs no Admin-console grant. NEVER merge it into
+# _DRIVE_SCOPES -- that list is also the dead delegated path's list, and the
+# 2026-05-28 two-scope DWD token fetch failed unauthorized_client.
+_DRIVE_META_SCOPES = [
+    "https://www.googleapis.com/auth/drive.metadata.readonly",
 ]
 _DEFAULT_IMPERSONATE = "harrison@hjrglobal.com"
 
@@ -322,13 +342,78 @@ def _cache_set(file_id: str, tab_name: str, summary: CashflowSummary) -> None:
 
 
 def invalidate_cache(file_id: Optional[str] = None) -> None:
-    """Force-expire cache for one file or all files. Useful for tests."""
+    """Force-expire cache for one file or all files. Useful for tests.
+
+    Also expires the modifiedTime memo (so the next read re-asks Drive), but
+    NOT the once-per-AZ-day WARN latch -- invalidating the data cache must not
+    re-arm a log line the day already carried.
+    """
     if file_id:
         stale_keys = [k for k in _CACHE if k[0] == file_id]
         for k in stale_keys:
             del _CACHE[k]
+        with _AS_OF_LOCK:
+            _MODIFIED_TIME_MEMO.pop(file_id, None)
     else:
         _CACHE.clear()
+        with _AS_OF_LOCK:
+            _MODIFIED_TIME_MEMO.clear()
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Sheet modifiedTime ("as of") -- memo + once-per-AZ-day WARN latch (S5)
+# ────────────────────────────────────────────────────────────────────────────
+
+# The sentinel every consumer already receives when the date is unavailable.
+AS_OF_UNKNOWN = "unknown"
+
+# {file_id: (fetched_at_monotonic, "YYYY-MM-DD" | "unknown")}. One Drive call per
+# file per _CACHE_TTL_SECONDS per process: a 9-tab run makes ONE call, and a
+# failing call is memoized too, so a Drive outage never re-hammers per tab.
+_MODIFIED_TIME_MEMO: dict[str, tuple[float, str]] = {}
+# {(file_id, az_date)}: the as_of-unknown WARNING fires once per process per AZ
+# day per file. The key never reaches a log line.
+_AS_OF_UNKNOWN_WARNED: set[tuple[str, str]] = set()
+_AS_OF_LOCK = threading.Lock()
+
+# America/Phoenix: UTC-7, no DST.
+_AZ_TZ = timezone(timedelta(hours=-7))
+
+
+def _now() -> datetime:
+    """Aware now(). A seam so tests pin the clock instead of formatting a live one."""
+    return datetime.now(timezone.utc)
+
+
+def _az_date() -> str:
+    return _now().astimezone(_AZ_TZ).date().isoformat()
+
+
+def _reset_as_of_state() -> None:
+    """Clear the modifiedTime memo AND the WARN latch. Tests only."""
+    with _AS_OF_LOCK:
+        _MODIFIED_TIME_MEMO.clear()
+        _AS_OF_UNKNOWN_WARNED.clear()
+
+
+def _warn_as_of_unknown_once(file_id: str, reason: str) -> None:
+    """Emit the ONE as_of-unknown WARNING for this file today (AZ).
+
+    Source-opaque (the module's behavioral contract): the text carries ONLY a reason
+    class -- never the file id, a Drive URL, or exception text. It also makes no
+    claim about the known-answer staleness rail (C10b never reads as_of); the
+    cash freshness gate is the week-label is_stale(), which this does not touch.
+    """
+    key = (file_id, _az_date())
+    with _AS_OF_LOCK:
+        if key in _AS_OF_UNKNOWN_WARNED:
+            return
+        _AS_OF_UNKNOWN_WARNED.add(key)
+    log.warning(
+        "cashflow as_of unknown (sheet modified-time unavailable: %s) -- as-of labels "
+        "read \"as of: unknown\" this run; week-label staleness (is_stale) is unaffected",
+        reason,
+    )
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -389,6 +474,27 @@ def _build_direct_sa_creds():
     return creds  # No .with_subject() — direct SA authentication
 
 
+def _build_direct_sa_drive_meta_creds():
+    """Direct SA credentials for the sheet's modifiedTime ONLY (Code #14 S5).
+
+    Requests _DRIVE_META_SCOPES (drive.metadata.readonly) and nothing else, with
+    no .with_subject(): the SA reads metadata of a file shared with it, acting as
+    itself, so no domain-wide delegation grant is involved or needed. Kept apart
+    from _build_direct_sa_creds so the Sheets read's token never carries (or
+    depends on) a Drive scope.
+    """
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            _sa_path(),
+            scopes=list(_DRIVE_META_SCOPES),
+        )
+    except Exception as exc:
+        raise GsheetsConnectorError(
+            f"Failed to load service account credentials: {exc}"
+        ) from exc
+    return creds  # No .with_subject() — direct SA authentication
+
+
 def _build_drive_service(delegated_creds=None):
     """Build a Drive v3 API service via service account DWD."""
     creds = delegated_creds or _build_delegated_creds()
@@ -405,18 +511,105 @@ def _build_sheets_service(delegated_creds=None):
 # Drive + Sheets API calls
 # ────────────────────────────────────────────────────────────────────────────
 
+_SCOPE_REASONS = frozenset({"insufficientPermissions", "ACCESS_TOKEN_SCOPE_INSUFFICIENT"})
+
+
+def _http_status(exc: BaseException) -> Optional[int]:
+    """The HTTP status of an HttpError, else None. Never raises."""
+    if not isinstance(exc, HttpError):
+        return None
+    try:
+        return int(getattr(exc, "status_code", None) or exc.resp.status)
+    except Exception:
+        return None
+
+
+def _classify_modified_time_failure(exc: BaseException) -> str:
+    """Reason class for a failed modifiedTime fetch: scope | not_found | forbidden | error.
+
+    Keys on the HTTP status and the structured error reason (no regex, no
+    exception text): 403 + insufficientPermissions (or the newer
+    ACCESS_TOKEN_SCOPE_INSUFFICIENT, or the "insufficient authentication scopes"
+    message) -> scope; 404 -> not_found; any other 403 -> forbidden; anything
+    else (transport, credential load, token refresh, a non-HTTP error) -> error.
+    """
+    status = _http_status(exc)
+    if status == 404:
+        return "not_found"
+    if status == 403:
+        details = getattr(exc, "error_details", None)
+        reasons: set[str] = set()
+        if isinstance(details, list):
+            for d in details:
+                if isinstance(d, dict):
+                    r = d.get("reason")
+                    if isinstance(r, str):
+                        reasons.add(r)
+        if reasons & _SCOPE_REASONS:
+            return "scope"
+        message = getattr(exc, "reason", "")
+        if isinstance(message, str) and "insufficient authentication scopes" in message.lower():
+            return "scope"
+        return "forbidden"
+    return "error"
+
+
 def _get_modified_time(drive_service, file_id: str) -> str:
-    """Return the modifiedTime field as an ISO date string (YYYY-MM-DD)."""
+    """Return the file's modifiedTime as an ISO date (YYYY-MM-DD), else "unknown".
+
+    Never raises: ANY failure (HTTP, transport, a malformed payload) degrades to
+    "unknown" plus the once-per-AZ-day WARNING, so the Drive metadata call can
+    never sink the Sheets read. The per-call DEBUG line carries the reason class
+    and HTTP status only -- never str(exc), which embeds the file-id URL.
+    """
     try:
         meta = drive_service.files().get(
             fileId=file_id,
             fields="modifiedTime",
-        ).execute()
-        raw = meta.get("modifiedTime", "")  # e.g. "2026-05-22T14:23:11.000Z"
-        return raw[:10] if raw else "unknown"
-    except HttpError as exc:
-        log.warning("Could not fetch modifiedTime for file: %s", exc)
-        return "unknown"
+            supportsAllDrives=True,
+        ).execute(num_retries=1)
+        raw = (meta or {}).get("modifiedTime", "")  # e.g. "2026-05-22T14:23:11.000Z"
+        if isinstance(raw, str) and len(raw) >= 10:
+            day = raw[:10]
+            date.fromisoformat(day)  # a malformed stamp is "unknown", not a label
+            return day
+        reason = "error"  # 200 with no usable modifiedTime
+    except Exception as exc:
+        reason = _classify_modified_time_failure(exc)
+        log.debug(
+            "cashflow sheet modifiedTime fetch failed: reason=%s status=%s type=%s",
+            reason, _http_status(exc), type(exc).__name__,
+        )
+    _warn_as_of_unknown_once(file_id, reason)
+    return AS_OF_UNKNOWN
+
+
+def _sheet_modified_date(file_id: str) -> str:
+    """The sheet's modifiedTime date, memoized per file for _CACHE_TTL_SECONDS.
+
+    Builds its OWN Drive client from the metadata-only direct-SA credential.
+    Credential load / client build failures are caught here (reason=error), so
+    nothing on the Drive side can raise into get_cashflow.
+    """
+    with _AS_OF_LOCK:
+        hit = _MODIFIED_TIME_MEMO.get(file_id)
+    if hit is not None and time.monotonic() - hit[0] <= _CACHE_TTL_SECONDS:
+        return hit[1]
+    try:
+        meta_creds = _build_direct_sa_drive_meta_creds()
+        drive_service = build("drive", "v3", credentials=meta_creds, cache_discovery=False)
+    except Exception as exc:
+        log.debug(
+            "cashflow sheet modifiedTime client unavailable: reason=error type=%s",
+            type(exc).__name__,
+        )
+        _warn_as_of_unknown_once(file_id, "error")
+        value = AS_OF_UNKNOWN
+    else:
+        value = _get_modified_time(drive_service, file_id)
+    with _AS_OF_LOCK:
+        _MODIFIED_TIME_MEMO[file_id] = (time.monotonic(), value)
+    return value
 
 
 def _cashflow_sheet_name() -> str:
@@ -1097,6 +1290,23 @@ def cashflow_file_id() -> str:
     return os.environ.get(_CASHFLOW_FILE_ID_ENV, _DEFAULT_CASHFLOW_FILE_ID)
 
 
+def as_of_label(summary: CashflowSummary) -> str:
+    """The rendered as-of label: "as of YYYY-MM-DD", or "as of: unknown" explicitly.
+
+    Anything that is not a real ISO date (the "unknown" sentinel, empty, None,
+    junk) renders the explicit unknown form -- a reader must never mistake a
+    missing date for one. Source-opaque: never says WHY it is unknown.
+    """
+    raw = getattr(summary, "as_of_date", None)
+    if isinstance(raw, str) and len(raw) == 10:
+        try:
+            date.fromisoformat(raw)
+            return f"as of {raw}"
+        except ValueError:
+            pass
+    return "as of: unknown"
+
+
 def get_cashflow(
     file_id: Optional[str] = None,
     tab_name: Optional[str] = None,
@@ -1126,13 +1336,19 @@ def get_cashflow(
         # direct SA creds sidestep that entirely.
         sa_creds = _build_direct_sa_creds()
         sheets_service = _build_sheets_service(sa_creds)
-        drive_service = build("drive", "v3", credentials=sa_creds, cache_discovery=False)
-        modified_date = _get_modified_time(drive_service, fid)
         csv_text = _export_sheet_as_csv(sheets_service, fid, tab)
     except GsheetsConnectorError:
         raise
     except Exception as exc:
         raise GsheetsConnectorError(f"Sheets API error: {exc}") from exc
+
+    # The "as of" date comes from Drive metadata on its OWN credential, AFTER the
+    # Sheets read succeeded, and can never raise into this read (S5): a missing
+    # scope / 404 / outage renders "as of: unknown", one WARNING per AZ day.
+    try:
+        modified_date = _sheet_modified_date(fid)
+    except Exception:  # belt: _sheet_modified_date is already total
+        modified_date = AS_OF_UNKNOWN
 
     summary = _parse_cashflow_csv(csv_text, modified_date)
 

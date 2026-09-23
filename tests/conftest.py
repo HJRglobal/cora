@@ -204,6 +204,24 @@ def _inventory_membership_default_member(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _reset_cashflow_as_of_state():
+    """Code #14 S5: gsheets_financials memoizes the sheet modifiedTime per file for
+    the cache TTL and latches its as_of-unknown WARNING once per AZ day. Both are
+    process-global, so a test that patches the date to "2026-05-22" would leak it
+    into a later test expecting "unknown" (and a latched WARN would hide the next
+    test's WARN). Reset both around every test -- only when the module is already
+    imported, so this costs nothing for the suites that never touch it."""
+    import sys as _sys
+    _gf = _sys.modules.get("cora.connectors.gsheets_financials")
+    if _gf is not None and hasattr(_gf, "_reset_as_of_state"):
+        _gf._reset_as_of_state()
+    yield
+    _gf = _sys.modules.get("cora.connectors.gsheets_financials")
+    if _gf is not None and hasattr(_gf, "_reset_as_of_state"):
+        _gf._reset_as_of_state()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     """Isolate module-global state that otherwise leaks between tests.
 

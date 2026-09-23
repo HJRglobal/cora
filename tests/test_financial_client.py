@@ -160,6 +160,24 @@ class TestFormatSummaryFull:
         assert "100,000" in result
         assert "95,000" in result
 
+    # Code #14 S5: an unknown sheet date renders EXPLICITLY, a known one unchanged
+    def test_known_as_of_renders_unchanged(self):
+        assert "(as of 2026-05-27)" in _format_summary_full(_summary())
+        assert "(as of 2026-05-27)" in _format_summary_full(_summary(), entity_label="OSN")
+
+    def test_unknown_as_of_portfolio_header_says_so(self):
+        result = _format_summary_full(_summary(as_of_date="unknown"))
+        assert "*Cash Flow -- W21* (as of: unknown)" in result
+        assert "(as of unknown)" not in result
+
+    def test_unknown_as_of_entity_header_says_so(self):
+        result = _format_summary_full(_summary(as_of_date="unknown"), entity_label="OSN")
+        assert "*OSN Cash Flow -- W21* (as of: unknown)" in result
+
+    def test_unknown_as_of_entity_filter_empty_message_says_so(self):
+        result = _format_summary_full(_summary(as_of_date="unknown"), entity_filter="MISSING")
+        assert "in W21 (as of: unknown)." in result
+
 
 # ── get_cashflow_text ─────────────────────────────────────────────────────────
 
@@ -239,6 +257,14 @@ class TestGetOsnPulseText:
         mock_get.return_value = self._osn_summary()
         result = get_osn_pulse_text()
         assert "8,000" in result or "7,500" in result
+
+    @patch("cora.tools.financial_client.get_cashflow")
+    def test_unknown_as_of_header_says_so(self, mock_get):
+        s = self._osn_summary()
+        s.as_of_date = "unknown"
+        mock_get.return_value = s
+        result = get_osn_pulse_text()
+        assert "*OSN Financial Pulse -- W21* (as of: unknown)" in result
 
     @patch("cora.tools.financial_client.get_cashflow",
            side_effect=GsheetsConnectorError("sheet gone"))

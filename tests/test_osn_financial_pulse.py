@@ -105,6 +105,15 @@ class TestGetOsnPulseTextHappyPath:
             result = get_osn_pulse_text()
         assert "2026-05-21" in result
 
+    def test_as_of_unknown_is_explicit(self):
+        # Code #14 S5: never "(as of unknown)" -- the unknown form is explicit
+        s = self._four_store_summary()
+        s.as_of_date = "unknown"
+        with patch(_GC_PATH, return_value=s), patch(_AUDIT_PATH):
+            result = get_osn_pulse_text()
+        assert "(as of: unknown)" in result
+        assert "(as of unknown)" not in result
+
     def test_store_breakdown_heading(self):
         with patch(_GC_PATH, return_value=self._four_store_summary()), \
              patch(_AUDIT_PATH):
