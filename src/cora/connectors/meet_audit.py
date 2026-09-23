@@ -39,21 +39,43 @@ scope-guarantee doctrine. A refused subject never reaches `with_subject`.
 
 D-145 / D-082. A Meet audit event carries participant emails (external and
 agency addresses on client meetings), display names, IPs and locations. They are
-DROPPED at parse: the only per-endpoint values that leave `_parse_event` are a
-12-hex SHA-256 prefix used to count distinct endpoints, a 12-hex PER-READ keyed
-hash of the participant's email identifier used to count distinct PEOPLE (D-051
-lex-phi-identity-2: one person on laptop + phone, or a drop-and-rejoin, is two
-endpoints but one person), plus an is-human flag decided in-function. The person
-hash is keyed with a random salt minted inside each read_call_ended call and never
-stored, so it cannot be linked across reads or reversed by hashing a known
-address; it lives only in memory, is never logged, and the audit ledger carries
-counts + event ids only. Nothing identifying is returned, logged or stored.
+DROPPED at parse. The only per-endpoint values that leave `_parse_event` are two
+12-hex counting keys and an is-human flag decided in-function:
 
-The parameter KEY NAMES the parser reads (meeting_code, calendar_event_id,
-conference_id, identifier, display_name, endpoint_id, duration_seconds,
-start_timestamp_seconds) are VERIFY-AT-BUILD against a live read -- the staged
-read-only `scripts/probe_meet_audit.py` prints the key names it observes (never
-their values). A missing key makes a join unusable; it never crashes the read.
+  * `endpoint_key` -- a SHA-256 prefix of the endpoint id (the identifier when
+    the event carries none), to count distinct ENDPOINTS;
+  * `person_key` -- a PER-READ keyed hash (HMAC-SHA-256) of the participant's
+    EMAIL identifier, to count distinct PEOPLE (D-051 lex-phi-identity-2: one
+    person on laptop + phone, or a drop-and-rejoin, is two endpoints but one
+    person). The HMAC key is 16 random bytes minted inside each read_call_ended
+    call and dropped when it returns, so a person_key cannot be linked across
+    reads or reversed by hashing a known address.
+
+Both keys live only in memory, inside the one read. Neither is ever stored,
+logged or printed: the staged probe prints only the COUNT of distinct keys, and
+the Meet fields of the 07:22 audit ledger row carry a state, a fixed reason class,
+counts and event ids only. No participant identifier is returned, logged or stored.
+
+The parameter KEY NAMES the parser reads (`PARSED_PARAM_KEYS`: meeting_code,
+calendar_event_id, conference_id, identifier, identifier_type, display_name,
+endpoint_id, duration_seconds, start_timestamp_seconds) are VERIFY-AT-BUILD
+against a live read. The staged read-only `scripts/probe_meet_audit.py` prints
+the key names it observes (never their values) and names any parser key the log
+did NOT carry. A missing key can make a join unusable (no meeting code or
+calendar id, no endpoint id or identifier) or less informative (for
+identifier_type, the identifier's own shape then decides); it never crashes the
+read.
+
+The key names alone cannot show a wrong identifier_type VALUE. Only "" (absent)
+and "email_address" (any case), on an identifier containing "@", make a
+person_key; any other value leaves it empty, and an empty person_key reads as
+"cannot tell who". If Google's real value differs, every human endpoint has an
+empty key, every multi-endpoint meeting reads "cannot tell", and the lane never
+records a MISS. That fails closed (no false MISS, nothing leaks), but the lane
+can then never tell two people from one. The probe's "distinct identified
+people" and "people check" lines show it: 0 identified people with >0 human
+endpoints means this has happened, unless every human that day joined by phone
+or anonymously.
 
 Not imported by the bot (cora.app never loads it): meeting_capture imports it
 lazily inside audit_day's default reader. Script-side, no restart.
@@ -111,6 +133,17 @@ _NOTETAKER_DOMAINS = ("@fireflies.ai",)
 _NOTETAKER_NAME_MARKERS = ("notetaker", "fireflies")
 
 _NON_CODE = re.compile(r"[^a-z0-9]")
+
+#: Every call_ended parameter KEY NAME `_parse_event` reads, VERIFY-AT-BUILD
+#: against a live read (the staged probe names any of them the log did not carry).
+#: tests/test_meet_audit.py pins this tuple to the keys `_parse_event` actually
+#: reads AND to the module docstring's list, so the operator-facing list cannot
+#: drift from the parser again (D-051 F4-R1: identifier_type was read but unlisted).
+PARSED_PARAM_KEYS: tuple[str, ...] = (
+    "meeting_code", "calendar_event_id", "conference_id", "identifier",
+    "identifier_type", "display_name", "endpoint_id", "duration_seconds",
+    "start_timestamp_seconds",
+)
 
 
 class MeetAuditDark(Exception):
@@ -328,7 +361,8 @@ def _parse_event(activity: dict[str, Any], event: dict[str, Any], *,
                  person_salt: bytes) -> MeetJoin | None:
     """One call_ended event -> a MeetJoin with every identifier DROPPED, or None
     when it cannot be joined to a meeting or counted as a distinct endpoint.
-    `person_salt` is the read's own random key for the person hash (never stored)."""
+    `person_salt` is the read's own random key for the person hash (never stored,
+    logged or printed)."""
     params = _param_map(event)
     code = normalize_meeting_code(str(params.get("meeting_code") or ""))
     cal_id = str(params.get("calendar_event_id") or "").strip()

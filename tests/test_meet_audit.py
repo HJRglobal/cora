@@ -485,3 +485,120 @@ def test_probe_source_is_read_only_ascii_and_calls_only_the_seam():
                       "open(", "write_text", "requests.", "_build_reports_service"):
         assert forbidden not in src, forbidden
     assert src.count("ma.read_call_ended(") == 1
+
+
+# -- D-051 F4-R1: the operator-facing key list + privacy text match the code --
+
+def _parse_event_param_keys() -> set[str]:
+    """Every literal key `_parse_event` reads off its param map (`params.get("k")`)."""
+    import ast
+    import textwrap
+    tree = ast.parse(textwrap.dedent(inspect.getsource(ma._parse_event)))
+    keys: set[str] = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get" and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "params" and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)):
+            keys.add(node.args[0].value)
+    return keys
+
+
+def test_parsed_param_keys_are_exactly_the_keys_the_parser_reads():
+    """The VERIFY-AT-BUILD list the probe checks against is the parser's own list:
+    add a params.get("k") to _parse_event and this fails until PARSED_PARAM_KEYS
+    (and so the probe and the docstring) names it too."""
+    reads = _parse_event_param_keys()
+    assert "identifier_type" in reads            # the key the person count depends on
+    assert set(ma.PARSED_PARAM_KEYS) == reads
+    assert len(ma.PARSED_PARAM_KEYS) == len(set(ma.PARSED_PARAM_KEYS))
+
+
+def test_the_module_docstring_lists_every_parsed_key_and_states_the_person_hash():
+    flat = " ".join(ma.__doc__.split())
+    listed = flat.split("(`PARSED_PARAM_KEYS`:", 1)[1].split(")", 1)[0]
+    assert {k.strip() for k in listed.split(",")} == set(ma.PARSED_PARAM_KEYS)
+    for phrase in ("PER-READ keyed hash (HMAC-SHA-256)", "Neither is ever stored, logged or printed",
+                   "counts and event ids only", "cannot show a wrong identifier_type VALUE",
+                   '"people check"'):
+        assert phrase in flat, phrase
+    assert "endpoint hash only" not in flat
+
+
+def _probe_over(monkeypatch, items):
+    mod = _load_probe()
+    real = ma.read_call_ended
+    monkeypatch.setattr(mod.ma, "read_call_ended",
+                        lambda s, e: real(s, e, service=_Svc([{"items": items}])))
+    return mod
+
+
+def test_probe_people_check_is_ok_and_no_parser_key_is_missing_on_a_normal_read(monkeypatch, capsys):
+    mod = _probe_over(monkeypatch, [_event(endpoint="ep-1"),
+                                    _event(endpoint="ep-2", ident="other@example.test")])
+    assert mod.main(["--day", "2026-08-26"]) == 0
+    out = capsys.readouterr().out
+    assert "people check: ok (2 distinct from 2 human endpoints)" in out
+    assert "parser keys not observed: none" in out
+
+
+def test_probe_people_check_warns_when_the_identifier_type_value_is_not_the_expected_one(
+        monkeypatch, capsys):
+    """F4-R1: key NAMES cannot show a wrong identifier_type VALUE. Two people whose
+    events carry an unexpected value -> both person keys empty -> the lane would
+    read the meeting 'cannot tell' forever. The probe must say so in its own line."""
+    evs = [_event(endpoint="ep-1"), _event(endpoint="ep-2", ident="other@example.test")]
+    for ev in evs:
+        for prm in ev["events"][0]["parameters"]:
+            if prm["name"] == "identifier_type":
+                prm["value"] = "account_email"
+    mod = _probe_over(monkeypatch, evs)
+    assert mod.main(["--day", "2026-08-26"]) == 0
+    out = capsys.readouterr().out
+    assert "distinct identified people: 0 (human endpoints without an email identity: 2)" in out
+    (line,) = [ln for ln in out.splitlines() if "people check:" in ln]
+    assert "people check: WARN" in line and "identifier_type" in line
+    assert "parser keys not observed: none" in out        # the NAMES were all there
+    for leak in ("pal@example.test", "other@example.test", "account_email", "ep-1", "ep-2"):
+        assert leak not in out, leak
+
+
+def test_probe_names_the_parser_keys_the_log_did_not_carry(monkeypatch, capsys):
+    ev = _event()
+    ev["events"][0]["parameters"] = [prm for prm in ev["events"][0]["parameters"]
+                                     if prm["name"] not in ("identifier_type", "start_timestamp_seconds")]
+    mod = _probe_over(monkeypatch, [ev])
+    assert mod.main(["--day", "2026-08-26"]) == 0
+    out = capsys.readouterr().out
+    assert "parser keys not observed: identifier_type, start_timestamp_seconds" in out
+
+
+def test_probe_dark_read_has_no_people_or_key_verdict(capsys):
+    mod = _load_probe()
+    assert mod.main(["--day", "2026-08-26"]) == 2
+    out = capsys.readouterr().out
+    assert "people check: n/a (no human endpoints)" in out
+    assert "parser keys not observed: n/a (no events)" in out
+
+
+def test_operator_docs_name_identifier_type_and_the_people_check():
+    """F4-R1: every operator-facing surface of the lane (module docstring, probe
+    docstring, the runbook's identity-inventory row, the ladder row) names the key
+    the person count depends on and the check that exposes a wrong VALUE, and none
+    still says the endpoint hash is the only value that leaves the parse."""
+    import yaml
+    runbook = (_REPO / "deployment" / "runbook.md").read_text(encoding="utf-8")
+    row = next(ln for ln in runbook.splitlines()
+               if ln.startswith("| Google Workspace (Meet join audit read) "))
+    reg = yaml.safe_load((_REPO / "data" / "ladder-registry.yaml").read_text(encoding="utf-8"))
+    lane = next(r for r in reg["lanes"] if r["lane"] == "meet-join-audit")
+    surfaces = {"module": ma.__doc__, "probe": _load_probe().__doc__, "runbook-row": row,
+                "ladder-promotion": lane["promotion_criteria"]}
+    for name, text in surfaces.items():
+        flat = " ".join(text.split())
+        assert "identifier_type" in flat, name
+        assert "people check" in flat, name
+        assert "endpoint hash only" not in flat, name
+    assert "stored, logged or printed" in row and "PER-READ HMAC" in row
+    assert "meet_undecided_event_ids" in lane["audit_surface"]
