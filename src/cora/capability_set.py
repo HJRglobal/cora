@@ -181,10 +181,18 @@ _TOKEN_ALIASES: dict[str, tuple[str, ...]] = {
     # "your live card-interaction history", "the live card state", "a direct check
     # of the ledger"). NEVER "reaction log" or bare "cards" (a Slack reaction log is
     # something the bot truly cannot read).
+    # Code #14 D-051 (honesty-rails-5 / redos-slack-surfaces-5 / integration-tests-2):
+    # ONLY names that can mean nothing but the code-queue card ledger. Dropped:
+    # 'card status' / 'card state(s)' (an Amex / Chase / Stripe card), 'button
+    # presses' (a storefront), 'decision cards' (an Asana board). 'the ledger' is
+    # the 08:46:52 verbatim object ("a direct check of the ledger, not another tap")
+    # and is KEPT, but only as an UNQUALIFIED reference (_UNQUALIFIED_ONLY_TERMS):
+    # "the ledger at Chase", "the ledger your bookkeeper keeps", "the ledger for
+    # OSN's gift cards" name some OTHER ledger and never count.
     "queue_ledger": ("card ledger", "queue ledger", "decision ledger", "code queue ledger",
-                     "card state", "card states", "card status", "card presses", "button presses",
+                     "live card state", "live card states", "card presses",
                      "card interaction", "card interactions", "card interaction history",
-                     "decision cards", "the ledger"),
+                     "the ledger"),
     "dashboards": ("dashboards", "dashboard", "cowork dashboards"),
     "lexicon": ("lexicon",),
     "action_items": ("action items", "meeting action items"),
@@ -225,6 +233,18 @@ _FAMILY_HINTS: dict[str, str] = {
     "plate": "ask 'what's on my plate'",
     "queue_ledger": "ask me 'which cards are still unresponded?' -- I read the card ledger",
 }
+
+#: Terms that count only as an UNQUALIFIED reference: the next thing after the
+#: term (normalized window) must be the end, punctuation, or one of the few
+#: adverbs a denial about THIS object carries ("the ledger here", "the ledger
+#: directly"). "the ledger at the bank" / "the ledger Justin keeps" / "the ledger
+#: for the gift cards" / "the ledger detail" name another ledger and never count.
+_UNQUALIFIED_ONLY_TERMS: frozenset[str] = frozenset({"the ledger"})
+# The window is _norm()ed (whitespace runs collapsed to ONE space), so the gap is at
+# most one space: a bounded ` ?`, never a run (D-171).
+_UNQUALIFIED_FOLLOW_RE = re.compile(
+    r" ?(?:$|[^\sa-z0-9'’]|(?:here|directly|itself|now|today|yet|either|from here|right now)"
+    r"(?![a-z0-9]))")
 
 _QUEUE_HINT_FOUNDER = ("`stage cq-<12 hex>` / `approve cq-<12 hex>` / `dismiss cq-<12 hex>` "
                        "-- one verb per message, on its own line")
@@ -302,12 +322,16 @@ def _ladder_terms() -> dict[str, str]:
 
 
 def capability_terms(entity: str | None, *, cross_entity: bool = False,
-                     founder: bool = False) -> dict[str, str]:
+                     founder: bool = False, dm: bool = False) -> dict[str, str]:
     """{normalized term: 'Try:' hint} for everything the bot HAS in this channel.
 
     Sources, in order: the offered tool registry (+ alias rows whose token is
     present), the queue-verb table (objects; the verbs themselves are hint text),
-    the ladder registry's explicit `capability_terms`. Deterministic; fail-soft."""
+    the ladder registry's explicit `capability_terms`. Deterministic; fail-soft.
+
+    ``dm`` = the surface is a DM. The queue_ledger family (cora_queue_status)
+    contributes only for the founder IN HIS DM -- the tool refuses every other
+    surface, so a denial there is honest (Code #14 D-051 honesty-rails-6)."""
     terms: dict[str, str] = {}
     names = _offered_tool_names(entity, cross_entity)
     present_tokens: set[str] = set()
@@ -335,8 +359,8 @@ def capability_terms(entity: str | None, *, cross_entity: bool = False,
     for tok in sorted(present_tokens):
         if tok == "queue":
             continue  # queue objects are added below with the founder-aware hint
-        if tok == "queue_ledger" and not founder:
-            continue  # R14-9(c): the read refuses non-founders -- their denial is honest
+        if tok == "queue_ledger" and not (founder and dm):
+            continue  # R14-9(c): the read answers the founder in his DM only -- elsewhere a denial is honest
         hint = _FAMILY_HINTS.get(tok, f"ask me directly -- I have {tok.replace('_', ' ')} tools in this channel")
         if "_" not in tok and tok not in _ALIAS_ONLY_TOKENS:
             terms.setdefault(_norm(tok), hint)   # a compound / alias-only key contributes ONLY its aliases
@@ -351,6 +375,24 @@ def capability_terms(entity: str | None, *, cross_entity: bool = False,
     return terms
 
 
+_TERM_RX_CACHE: dict[tuple[str, ...], list[tuple[str, re.Pattern[str]]]] = {}
+
+
+def _term_patterns(terms: dict[str, str]) -> list[tuple[str, re.Pattern[str]]]:
+    """Longest-first (term, compiled whole-phrase pattern) for a term set, compiled
+    ONCE per distinct set (the screen used to re-escape and re-look-up ~160 patterns
+    per denial match -- seconds on a denial-dense 40k reply, D-171)."""
+    key = tuple(terms)
+    pats = _TERM_RX_CACHE.get(key)
+    if pats is None:
+        pats = [(t, re.compile(rf"(?<![a-z0-9]){re.escape(t)}(?![a-z0-9])"))
+                for t in sorted(key, key=len, reverse=True) if t]
+        if len(_TERM_RX_CACHE) > 64:
+            _TERM_RX_CACHE.clear()
+        _TERM_RX_CACHE[key] = pats
+    return pats
+
+
 def find_capability_term(window: str, terms: dict[str, str]) -> tuple[str, str] | None:
     """(term, hint) for the LONGEST capability term present in *window* as a whole
     word/phrase (after normalization), or None. Longest-first so 'code queue'
@@ -358,10 +400,12 @@ def find_capability_term(window: str, terms: dict[str, str]) -> tuple[str, str] 
     if not window or not terms:
         return None
     w = " " + _norm(window) + " "
-    for term in sorted(terms, key=len, reverse=True):
-        if not term:
-            continue
-        if re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", w):
+    for term, rx in _term_patterns(terms):
+        if term not in w:
+            continue   # C-speed substring precheck: the screen calls this once per denial match
+        for m in rx.finditer(w):
+            if term in _UNQUALIFIED_ONLY_TERMS and not _UNQUALIFIED_FOLLOW_RE.match(w, m.end()):
+                continue   # a QUALIFIED reference names some other ledger
             return term, terms[term]
     return None
 

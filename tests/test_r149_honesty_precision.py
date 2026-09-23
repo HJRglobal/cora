@@ -498,9 +498,110 @@ class TestDenialRecall:
         assert _msgs(caplog, se.CAPABILITY_LOG_KEY, "denial") == []
 
     def test_reaction_log_and_bare_cards_are_never_terms(self):
-        terms = cs.capability_terms("FNDR", cross_entity=True, founder=True)
+        terms = cs.capability_terms("FNDR", cross_entity=True, founder=True, dm=True)
         assert "reaction log" not in terms and "cards" not in terms and "card" not in terms
-        assert "card ledger" in terms and "the ledger" in terms
+        assert "card ledger" in terms and "the ledger" in terms and "live card state" in terms
+        # Code #14 D-051: only names that can mean nothing but the code-queue card ledger
+        for gone in ("card status", "card state", "card states", "button presses", "decision cards"):
+            assert gone not in terms, gone
+
+    def test_the_card_ledger_is_a_capability_only_in_the_founder_dm(self):
+        """honesty-rails-6 / forcing-seams-4: cora_queue_status refuses every surface
+        but the founder's DM, so the family is contributed there alone."""
+        assert "card ledger" in cs.capability_terms("FNDR", cross_entity=True, founder=True, dm=True)
+        assert "card ledger" not in cs.capability_terms("FNDR", cross_entity=True, founder=True)
+        assert "card ledger" not in cs.capability_terms("FNDR", cross_entity=True, founder=False, dm=True)
+
+
+def _cap_ch(text, channel, entity):
+    return se.screen_capability_claims(text, tool_use_count=0, channel_name=channel, user_id=HARRISON,
+                                       entity=entity, cross_entity=True, founder=True)
+
+
+class TestDenialPrecisionCode14:
+    @pytest.mark.parametrize("text", [
+        # honesty-rails-5 / redos-slack-surfaces-5 / integration-tests-2: OTHER ledgers and cards
+        "I can't check the card status with Amex directly.",
+        "I don't have access to the ledger at Chase.",
+        "I can't see the ledger your bookkeeper keeps in Excel.",
+        "I don't have visibility into the card states on the Stripe side.",
+        "That needs a direct check of the ledger at the bank, not QBO.",
+        "I don't have access to the ledger your bookkeeper keeps for the Amex card.",
+        "I can't see the ledger for OSN's gift card balances from here.",
+        "I don't have visibility into the ledger that tracks Justin's credit card statements.",
+        "I don't have direct access to the card state on your Chase account.",
+        "I can't read the card status on your Amex.",
+        "I can't see the ledger Justin keeps in his notebook.",
+        "I don't have access to the ledger detail for that OSN account.",
+        # honesty-rails-7: every QBO tool is a READ -- a write-access denial is true
+        "I don't have write access to the QBO books; my QuickBooks tools are read-only.",
+        "I don't have write access to QuickBooks -- the QBO connector is read-only.",
+        "I don't have full access to the QuickBooks audit log.",
+    ])
+    def test_honest_founder_dm_denials_never_fire(self, caplog, text):
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        assert _cap(text) == text
+        assert _msgs(caplog, se.CAPABILITY_LOG_KEY, "denial") == [], text
+
+    @pytest.mark.parametrize("text", [
+        "I can't see the button presses on the Shopify storefront.",
+        "I don't have access to the decision cards Tessa is using in Asana.",
+    ])
+    def test_storefront_and_asana_card_denials_never_read_as_the_card_ledger(self, caplog, text):
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        _cap(text)
+        for m in _msgs(caplog, se.CAPABILITY_LOG_KEY, "denial"):
+            for gone in ("button presses", "decision cards", "card ledger", "the ledger"):
+                assert f"term='{gone}'" not in m, m
+
+    @pytest.mark.parametrize("channel,entity", [("fndr-leadership", "FNDR"), ("f3e-leadership", "F3E")])
+    @pytest.mark.parametrize("text", [
+        "I can't read the card ledger from this channel -- ask me in our DM.",
+        "I don't have access to the card ledger here; that read only works in your DM with me.",
+        "I can't read the card ledger outside your DM.",
+        "I can't read the card ledger here -- it's DM-only.",
+    ])
+    def test_the_founder_outside_his_dm_is_honest(self, caplog, channel, entity, text):
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        _cap_ch(text, channel, entity)
+        assert _msgs(caplog, se.CAPABILITY_LOG_KEY, "denial") == []
+
+    def test_the_same_denial_in_the_founder_dm_still_fires(self, caplog):
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        _cap("I can't read the card ledger here.")
+        _cap("I can't read the ledger here.")
+        hits = _msgs(caplog, se.CAPABILITY_LOG_KEY, "denial")
+        assert len(hits) == 2 and "term='card ledger'" in hits[0] and "term='the ledger'" in hits[1]
+
+    def test_a_member_qbo_write_access_denial_is_honest(self, caplog):
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        se.screen_capability_claims("I don't have write access to QuickBooks, so Justin will post that entry.",
+                                    tool_use_count=0, channel_name="hjrg-finance", user_id="U0B3AEJCYGP",
+                                    entity="HJRG", cross_entity=False, founder=False)
+        assert _msgs(caplog, se.CAPABILITY_LOG_KEY, "denial") == []
+
+    def test_the_deflection_object_not_the_sentence_carries_the_term(self, caplog):
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        _cap("That needs a direct check of the ledger at the bank, not QBO.")
+        assert _msgs(caplog, se.CAPABILITY_LOG_KEY, "denial") == []
+        _cap("That needs a direct check of the card ledger, not another tap.")
+        assert len(_msgs(caplog, se.CAPABILITY_LOG_KEY, "denial")) == 1
+
+    @pytest.mark.parametrize("shape", [
+        "the ledger" + " " * 40000 + "x", "the ledger at " * 3000, "check of the ledger " * 2000,
+        "that needs a direct check of" + " -" * 20000, "that needs a direct check of " * 1400,
+        "I don't have " + "write " * 20000 + "access",
+    ], ids=["ledger_sp", "ledger_rep", "check_rep", "clause_dash", "deflect_rep", "write_run"])
+    def test_code14_capability_patterns_are_linear(self, shape):
+        terms = cs.capability_terms("FNDR", cross_entity=True, founder=True, dm=True)
+
+        def run():
+            cs.find_capability_term(shape, terms)
+            list(cs._UNQUALIFIED_FOLLOW_RE.finditer(shape))
+            list(se._DENIAL_RE.finditer(shape))
+            list(se._CLAUSE_BREAK_RE.finditer(shape))
+            _cap(shape)
+        assert _best_of_3(run) < 0.5
 
     @pytest.mark.parametrize("shape", [
         "I don't have " + "direct " * 20000 + "x", "outside my " + "current " * 20000,

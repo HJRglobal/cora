@@ -825,9 +825,12 @@ INTERNAL_TOOL_REDACTION = "[internal tool]"
 
 # The ruled denial lexicon + synonyms (kickoff section 1 slice 1; named in the
 # Code #13 report). Bounded classes only; no nested quantifiers (ReDoS discipline).
+# Code #14 D-051 (honesty-rails-7): NO 'write' / 'full' modifier -- every QBO tool
+# the bot has is a READ, so "I don't have write access to QuickBooks" is TRUE; a
+# write-access denial about a read-only family must never count as a phantom.
 _CAP_NEG_HAVE = (
     r"\bI\s+(?:don['\u2019]?t|do\s+not|didn['\u2019]?t|did\s+not|won['\u2019]?t|will\s+not)\s+(?:currently\s+|actually\s+|really\s+)?have\s+"
-    r"(?:(?:direct|read|read-only|write|live|real[- ]?time|any|the|a|an|full|current)\s+){0,3}"
+    r"(?:(?:direct|read|read-only|live|real[- ]?time|any|the|a|an|current)\s+){0,3}"
     r"(?:tools?|access|visibility|way|ability|permissions?|mechanism|integration|connector|means|"
     r"capability|capabilities|hooks?|line|route|path|window)\b"
 )
@@ -880,16 +883,23 @@ _CAP_USE_INTERFACE = (
     r"(?:that|this|it|those|these|them)\s+(?:manually|yourself|directly|by\s+hand)\b"
     r"|\byou['\u2019]?ll\s+(?:need|have)\s+to\s+(?:do|handle|check|stage|approve|dismiss|close|ship|update|create|queue)\s+"
     r"(?:that|this|it|those|these|them\s+)?(?:manually|yourself|directly)\b"
-    # R14-9(c): a DEFLECTION -- the reply points at a check it will not run itself
-    # (9/21 08:46:52 "that needs a direct check of the ledger, not another tap").
-    # Trips only when the sentence names a capability the bot HAS (the term side).
-    r"|\b(?:that|this|it|which)\s+(?:needs|requires|would\s+need|would\s+require|takes|calls\s+for)\s+"
+)
+# R14-9(c): a DEFLECTION -- the reply points at a check it will not run itself
+# (9/21 08:46:52 "that needs a direct check of the ledger, not another tap").
+# Trips only when the deflection's OWN OBJECT (the phrase after "check of", up to
+# the next clause break) names a capability the bot HAS -- Code #14 D-051: the
+# whole sentence was searched, so "a direct check of the ledger at the bank, not
+# QBO" read the NEGATED 'QBO' as the object.
+_CAP_DEFLECT = (
+    r"\b(?:that|this|it|which)\s+(?:needs|requires|would\s+need|would\s+require|takes|calls\s+for)\s+"
     r"(?:a\s+)?(?:(?:direct|manual|live|separate|real)\s+){0,2}(?:check|look|query|read|lookup|pull)\s+"
     r"(?:of|at|on|in|into)\b"
 )
+_DEFLECT_RE = re.compile(_CAP_DEFLECT, re.IGNORECASE)
+_CLAUSE_BREAK_RE = re.compile(r"[,;:.!?\n()\u2014\u2013]|\s-{1,2}\s")
 _DENIAL_RE = re.compile(
     "(?:" + _CAP_NEG_HAVE + "|" + _CAP_NO_HAVE + "|" + _CAP_CANT_VERB + "|" + _CAP_NOT_CONNECTED
-    + "|" + _CAP_USE_INTERFACE + ")",
+    + "|" + _CAP_USE_INTERFACE + "|" + _CAP_DEFLECT + ")",
     re.IGNORECASE,
 )
 # RULED refusals the model is REQUIRED to voice are exempt BY SHAPE (D-051 Code #13
@@ -956,9 +966,10 @@ def _prepend_capability_line(text: str, hint: str) -> str:
     return f"{CAPABILITY_HONEST_TEMPLATE} Try: {hint}\n\n{body}"
 
 
-def _capability_terms(entity: str, cross_entity: bool, founder: bool) -> dict[str, str]:
+def _capability_terms(entity: str, cross_entity: bool, founder: bool,
+                      dm: bool = False) -> dict[str, str]:
     from .capability_set import capability_terms  # lazy: pulls tool_dispatch
-    return capability_terms(entity, cross_entity=cross_entity, founder=founder)
+    return capability_terms(entity, cross_entity=cross_entity, founder=founder, dm=dm)
 
 
 def _registry_symbols() -> frozenset[str]:
@@ -1029,7 +1040,12 @@ def screen_capability_claims(text, *, tool_use_count, channel_name: str = "", us
     if count == 0:
         masked = _LINK_TOKEN_RE.sub(" ", out)
         try:
-            terms = _capability_terms(entity, cross_entity, founder)
+            # Code #14 D-051 (honesty-rails-6 / forcing-seams-4): the card-ledger read
+            # answers ONLY in the founder's DM, so its family is a capability there
+            # alone -- the founder's honest "I can't read the card ledger from this
+            # channel" elsewhere is true (the tool refuses every non-DM surface).
+            terms = _capability_terms(entity, cross_entity, founder,
+                                      dm=str(channel_name or "").strip().lower() == "dm")
         except Exception:  # noqa: BLE001 -- no capability set = no denial can be judged false
             # NOT a firing line (no ` kind=` after the key): the health count must
             # never read a counting failure as a phantom claim.
@@ -1042,7 +1058,12 @@ def screen_capability_claims(text, *, tool_use_count, channel_name: str = "", us
                 window = _denial_window(masked, m.start(), m.end())
                 if _RULED_REFUSAL_RE.search(window):
                     continue   # AD-6: a tier / scope refusal the model must voice, not a denial
-                hit = find_capability_term(window, terms)
+                if _DEFLECT_RE.fullmatch(m.group(0)):
+                    obj = masked[m.end():m.end() + 160]
+                    brk = _CLAUSE_BREAK_RE.search(obj)
+                    hit = find_capability_term(obj[:brk.start()] if brk else obj, terms)
+                else:
+                    hit = find_capability_term(window, terms)
                 if hit is None:
                     continue
                 term, hint = hit
