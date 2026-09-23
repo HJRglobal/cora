@@ -64,7 +64,33 @@ MUST_FORCE = [
     "did the monday menu cards register?",
     "is the code backlog still stuck?",
     "have my presses registered?",
-    "did my button presses land?",
+    # D-051 F2-R4: a button press counts only with a card / verb / menu qualifier
+    # (the round-1 row was the bare "did my button presses land?")
+    "did my card button presses land?",
+    "did my Monday menu button presses land?",
+    "did the stage button presses land?",
+]
+
+# D-051 F2-R4: storefront / analytics / media questions. Every row forced the card
+# read at bca189c (the bare `button` press prefix and `my presses`), no prior needed.
+STOREFRONT_AND_MEDIA_PRESSES = [
+    "did the Buy Now button presses register in Shopify?",
+    "are the add-to-cart button clicks still showing in Shopify analytics?",
+    "did the button clicks on the F3 landing page register?",
+    "have the button taps on the new Klaviyo popup been recorded?",
+    "did the subscribe button presses land in Klaviyo?",
+    "is the checkout button click count still stuck at zero?",
+    "did the email button clicks register?",
+    "did my presses land in the Phoenix paper?",
+]
+# D-051 forcing-seams-1 residual (pre-existing, re-review evidence): a press-noun
+# follow-up about a storefront / web / media surface, with a card question in the
+# priors. SYNTHETIC_NEGATIVES pins the first two with NO prior only.
+TIER_B_SURFACE_FOLLOW_UPS = [
+    "did the press land in the Phoenix paper?",
+    "did the clicks land on the landing page?",
+    "did the taps register on the kiosk?",
+    "did my clicks register on the Amazon listing?",
 ]
 
 # D-051 forcing-seams-2: Tier A must name the CODE-QUEUE object. Every row forced
@@ -225,6 +251,27 @@ class TestPredicate:
         # and a card question in the priors does not rescue them
         assert cq.is_queue_status_question(text, prior_user_texts=[Q1]) is False
 
+    @pytest.mark.parametrize("text", STOREFRONT_AND_MEDIA_PRESSES)
+    def test_a_storefront_or_media_press_never_forces(self, text):
+        assert cq.is_queue_status_question(text) is False
+        assert cq.is_queue_status_question(text, prior_user_texts=[Q1]) is False
+        # and it never arms a follow-up as a card-question prior either
+        assert cq.is_queue_status_question("did those go through?", prior_user_texts=[text]) is False
+
+    @pytest.mark.parametrize("text", TIER_B_SURFACE_FOLLOW_UPS)
+    def test_a_surface_follow_up_never_forces_even_after_a_card_question(self, text):
+        for prior in ([Q1], ["have my cards registered?"], ["did the stage press land?"]):
+            assert cq.is_queue_status_question(text, prior_user_texts=prior) is False
+
+    def test_a_weak_press_object_is_vetoed_only_by_an_off_surface_word(self):
+        """`my presses` alone still forces; a card object is never vetoed by a
+        surface word (the veto is for press-only objects)."""
+        assert cq.is_queue_status_question("have my presses registered?") is True
+        assert cq.is_queue_status_question("have my presses registered in Shopify?") is False
+        assert cq.is_queue_status_question("have my presses registered in Asana?") is False
+        assert cq.is_queue_status_question(
+            "have my card presses registered? the Shopify ones can wait") is True
+
     @pytest.mark.parametrize("text", COMPOUND_VERB_AND_STATUS)
     def test_a_queue_verb_next_to_an_id_never_forces(self, text):
         assert cq.is_queue_status_question(text) is False
@@ -289,13 +336,18 @@ class TestPredicate:
         "those landed " * 3_000, "did any land " * 3_000, "any" + " " * 40_000 + "land",
         "those actually " * 3_000 + "register", "those take" + " " * 40_000 + "effect",
         "did any " * 5_000 + "x", "these -- " * 4_000,
+        # (F2-R4 surface / weak-object patterns)
+        "landing " * 5_000 + "x", "landing" + " " * 40_000 + "pages", "web" + " " * 40_000 + "x",
+        "pop-" * 10_000, "my presses " * 3_000, "my" + "\t" * 40_000 + "presses",
     ], ids=["spaces", "card", "responded", "bang", "still", "cq",
             "any", "those", "any-tabs", "stage-cq", "stage-spaces-cq", "restage-tick",
             "the-rest", "monday-menu", "monday-tabs", "catch-up", "knowledge-spaces",
             "show-me", "give-spaces", "code-backlog", "decision-cards", "button-presses",
             "id-status",
             "those-landed", "did-any-land", "any-spaces-land", "those-actually",
-            "those-take-spaces", "did-any", "these-dash"])
+            "those-take-spaces", "did-any", "these-dash",
+            "landing", "landing-spaces-pages", "web-spaces", "pop-dash", "my-presses",
+            "my-tabs-presses"])
     def test_raw_regexes_are_linear_past_the_gate(self, shape):
         """D-171: the 500-char gate runs first, but each compiled pattern must stand
         on its own at Slack's 40k cap too. Best of 3: measured ~14ms worst shape on
@@ -303,7 +355,8 @@ class TestPredicate:
         concurrent full suites -- the minimum is what the pattern costs."""
         rxs = (cq._QS_IMPERATIVE_RE, cq._QS_REQUEST_RE, cq._QS_OBJECT_RE,
                cq._QS_STATUS_RE, cq._QS_PRONOUN_RE, cq._QS_CARD_BEFORE_RE,
-               cq._QS_ID_STATUS_RE, cq._QS_VERB_ID_RE, cq._QS_FOREIGN_RE, cq._QS_CQ_ID_RE)
+               cq._QS_ID_STATUS_RE, cq._QS_VERB_ID_RE, cq._QS_FOREIGN_RE, cq._QS_CQ_ID_RE,
+               cq._QS_SURFACE_RE, cq._QS_WEAK_OBJECT_RE)
         best = float("inf")
         for _ in range(3):
             t0 = time.perf_counter()

@@ -3909,10 +3909,14 @@ _QS_REQUEST_RE = re.compile(
 # queue / build qualifier; a generic `cards` still counts (Q1 is "Have all cards
 # been responded to") unless _QS_CARD_BEFORE_RE names another card surface;
 # `menu cards` counts only as `monday menu cards`.
+# D-051 F2-R4: a bare `button` is NOT a press prefix -- "did the Buy Now button
+# presses register in Shopify?" / "is the checkout button click count still stuck?"
+# forced the card read. A button press counts only with a card / queue-verb / Monday
+# menu qualifier ("card button presses", "stage button", "monday menu button ...").
 _QS_OBJECT_RE = re.compile(
     r"\b(?:(?:code[\s-]?(?:session[ \t]+)?|build[ \t]+|queue[ \t]+|capture[ \t]+|"
     r"monday[ \t]+(?:menu[ \t]+)?)?cards?\b"
-    r"|(?:card|stage|keep|park|dismiss|queue|approve|button)[ \t]+"
+    r"|(?:card|stage|keep|park|dismiss|queue|approve)[ \t]+"
     r"(?:press(?:es)?|taps?|clicks?|buttons?)\b"
     r"|my[ \t]+presses\b"
     r"|monday[ \t]+menu\b"
@@ -4019,6 +4023,21 @@ _QS_FOREIGN_RE = re.compile(
     r"quickbooks|shopify|deposco|calendar|meetings?|invites?|transcripts?|receipts?|"
     r"statements?|sources|knowledge[ \t]+base|kb|mailboxes?|folders?|files?|docs?|documents?)\b",
     re.IGNORECASE)
+# D-051 F2-R4 / forcing-seams-1 residual: a press / click / tap that happened on a
+# STOREFRONT, web, ad or MEDIA surface is not a card press. The press nouns are
+# shared with ordinary marketing and press-coverage talk, so a Tier-B follow-up
+# ("did the clicks land on the landing page?", "did the press land in the Phoenix
+# paper?") and a Tier-A hit whose only object is the weak "my presses" ("did my
+# presses land in the Phoenix paper?") never force when the text names one.
+# Bare `page` / `site` are deliberately absent (a card lives on a Slack page too).
+_QS_SURFACE_RE = re.compile(
+    r"\b(?:shopify|klaviyo|amazon|landing[ \t]+pages?|web[ \t]?pages?|web[ \t]?sites?|"
+    r"storefronts?|checkout|pop-?ups?|listings?|analytics|kiosks?|ads?|campaigns?|"
+    r"newspapers?|paper|articles?|journal|magazines?|coverage|instagram|tiktok|facebook|"
+    r"linkedin|youtube|google)\b", re.IGNORECASE)
+# The Tier-A objects that name only a press, not a card or the queue: vetoed by a
+# foreign or surface object in the same message (strong objects never are).
+_QS_WEAK_OBJECT_RE = re.compile(r"my[ \t]+presses", re.IGNORECASE)
 _QS_CQ_ID_RE = re.compile(r"\bcq-[0-9a-f]{12}\b", re.IGNORECASE)
 _QS_CLAUSE_BREAK = re.compile(r"[.!?\n;]")
 _QS_PAIR_GAP = 60
@@ -4046,9 +4065,17 @@ def _qs_paired(text: str, left: list[tuple[int, int]], right: list[tuple[int, in
     return False
 
 
+def _qs_off_surface(text: str) -> bool:
+    """The message names a non-queue object or a storefront / web / media surface."""
+    return bool(_QS_FOREIGN_RE.search(text) or _QS_SURFACE_RE.search(text))
+
+
 def _qs_tier_a(text: str) -> bool:
-    objs = [(m.start(), m.end()) for m in _QS_OBJECT_RE.finditer(text)
-            if not _qs_card_hit_is_compound(text, m)]
+    hits = [m for m in _QS_OBJECT_RE.finditer(text) if not _qs_card_hit_is_compound(text, m)]
+    if hits and all(_QS_WEAK_OBJECT_RE.fullmatch(m.group(0)) for m in hits) \
+            and _qs_off_surface(text):
+        return False
+    objs = [(m.start(), m.end()) for m in hits]
     if not objs:
         return False
     stats = [(m.start(), m.end()) for m in _QS_STATUS_RE.finditer(text)]
@@ -4087,7 +4114,7 @@ def is_queue_status_question(text: str, *, prior_user_texts: Any = ()) -> bool:
     stats = [(m.start(), m.end()) for m in _QS_STATUS_RE.finditer(t)]
     if not (pron and stats and _qs_paired(t, pron, stats)):
         return False
-    if _QS_FOREIGN_RE.search(t):
+    if _qs_off_surface(t):
         return False
     priors = [html.unescape(str(p or "")).strip() for p in list(prior_user_texts or ())[-3:]]
     return any(p and len(p) <= _QS_MAX_CHARS and _qs_tier_a(p) for p in priors)
