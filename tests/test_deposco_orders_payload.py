@@ -157,6 +157,28 @@ class TestWholesalePayloadShape:
         assert order["orderTotal"] == "18054.40"
         assert order["orderSubTotal"] == "18054.40"
 
+    def test_order_total_is_decimal_exact_not_float_accumulated(self):
+        """D-051 review, 2026-09-23: sum(qty * float(price)) rounded once at
+        the end diverges from the exact decimal sum for ~4.9% of randomized
+        multi-line combinations. This spec (odd quantities, mixed cent-level
+        prices) is one of the reproducible cases against the OLD float code."""
+        odd_spec = spec_mod.OrderSpec(
+            channel="wholesale", buyer_or_fc_code="GOTHAM", reference="4473",
+            authored_by="Harrison",
+            lines=[
+                spec_mod.OrderSpecLine(sku="PURE-Original", qty=3, unit_price="19.99"),
+                spec_mod.OrderSpecLine(sku="PURE-Citrus", qty=7, unit_price="21.70"),
+                spec_mod.OrderSpecLine(sku="PURE-Tropical", qty=11, unit_price="18.33"),
+                spec_mod.OrderSpecLine(sku="PURESL", qty=13, unit_price="17.01"),
+            ],
+        )
+        from decimal import Decimal
+        order = payload_mod.build_payload(odd_spec)["order"][0]
+        exact = sum(
+            (Decimal(str(l.qty)) * Decimal(l.unit_price) for l in odd_spec.lines), Decimal("0"),
+        )
+        assert order["orderTotal"] == f"{exact:.2f}"
+
     def test_site_notes_folded_ahead_of_the_human_notes(self):
         order = payload_mod.build_payload(WHOLESALE_SPEC)["order"][0]
         body = order["notes"]["note"][0]["body"]

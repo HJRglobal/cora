@@ -159,6 +159,23 @@ class TestLineFieldValidation:
         ])
         assert any("unit_price must be >= 0" in e for e in _errors(raw))
 
+    def test_sub_cent_unit_price_is_refused(self):
+        """D-051 review, 2026-09-23: a float-summed, once-rounded order total
+        can diverge from the displayed per-line unitPrice values by a cent
+        when a price carries more than 2 decimal places -- refused here,
+        before it can reach payload.py's sum."""
+        raw = dict(VALID_WHOLESALE, lines=[
+            {"sku": "PURE-Original", "qty": 10, "unit_price": "21.705"},
+        ])
+        errors = _errors(raw)
+        assert any("more than 2 decimal places" in e for e in errors)
+
+    def test_whole_dollar_unit_price_is_allowed(self):
+        raw = dict(VALID_WHOLESALE, lines=[
+            {"sku": "PURE-Original", "qty": 10, "unit_price": "20"},
+        ])
+        assert spec_mod.validate_spec(raw).ok
+
     def test_zero_unit_price_is_allowed(self):
         """Observed live on real FBA orders (V3, 2026-09-23) -- zero is a
         real, if unhelpful, value; not itself a defect."""

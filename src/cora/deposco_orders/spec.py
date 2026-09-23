@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -233,10 +234,22 @@ def validate_spec(raw: dict) -> ValidationResult:
                 errors.append(f"line {i}: unit_price is required")
             else:
                 try:
-                    if float(unit_price) < 0:
-                        errors.append(f"line {i}: unit_price must be >= 0, got {unit_price!r}")
-                except ValueError:
+                    price = Decimal(unit_price)
+                except InvalidOperation:
                     errors.append(f"line {i}: unit_price {unit_price!r} is not a number")
+                else:
+                    if price < 0:
+                        errors.append(f"line {i}: unit_price must be >= 0, got {unit_price!r}")
+                    # A sub-cent price would carry undefined rounding into
+                    # payload.py's order-total sum (D-051 review, 2026-09-23:
+                    # a float-summed, once-rounded total can diverge from the
+                    # displayed per-line prices by a cent). Refuse it here
+                    # rather than silently rounding a human-typed dollar figure.
+                    elif -price.as_tuple().exponent > 2:
+                        errors.append(
+                            f"line {i}: unit_price {unit_price!r} has more than 2 "
+                            f"decimal places -- money is dollars and cents only"
+                        )
 
             msku = str(raw_line.get("msku") or "").strip()
             if msku and sku in msku_map:

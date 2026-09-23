@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from decimal import Decimal
 
 from . import spec as spec_mod
 from .spec import OrderSpec, OrderSpecLine
@@ -133,7 +134,16 @@ def build_payload(order_spec: OrderSpec) -> dict:
         _order_line(line, i, number)
         for i, line in enumerate(order_spec.lines, start=1)
     ]
-    subtotal = sum(line.qty * float(line.unit_price) for line in order_spec.lines)
+    # Decimal throughout, never float: a float-accumulated sum rounded once
+    # at the end can diverge by a cent from what the individually-displayed
+    # per-line unitPrice values (also in this payload) would sum to (D-051
+    # review, 2026-09-23, reproduced ~4.9% of randomized multi-line trials
+    # diverging). spec.py's validation already refuses a sub-cent unit_price,
+    # so this sum is exact.
+    subtotal = sum(
+        (Decimal(str(line.qty)) * Decimal(line.unit_price) for line in order_spec.lines),
+        Decimal("0"),
+    )
 
     order: dict = {
         "businessUnit": "F3E",
