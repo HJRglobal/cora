@@ -842,6 +842,27 @@ def test_markerless_task_with_cadence_row_reads_did_not_run_never_ok(roots, cade
     assert st["run_markers"]["coverage"] == "0 of 1"
 
 
+def test_registered_markerless_task_reads_awaiting_first_in_parity_and_status(roots, cadence):
+    """R14-6: a row stamped `registered:` today with no marker renders 'awaiting first
+    marker' in BOTH the ZONE-K parity table and mirror-status.json -- counted, never in
+    did_not_run (so the 08:45 lane does not WARN) and never counted as ok."""
+    cadence({"russet-lark-digest": {"cadence_hours": 24, "expects_output": True,
+                                    "registered": RM_TODAY.isoformat()},
+             "slate-heron-digest": {"cadence_hours": 24, "expects_output": True,
+                                    "registered": (RM_TODAY - _td(days=1)).isoformat()}})
+    _task(roots["tasks"], "russet-lark-digest")
+    _task(roots["tasks"], "slate-heron-digest")
+    _run(["--apply", "--only", "cowork_tasks"])
+    parity = (roots["zk"] / "PARITY-REPORT.md").read_text(encoding="utf-8")
+    assert "| **awaiting first marker** |" in _rm_row(parity, "russet-lark-digest")
+    assert "| **did not run** |" in _rm_row(parity, "slate-heron-digest")
+    assert "1 awaiting first marker" in parity and "reads **awaiting first marker**" in parity
+    st = json.loads((roots["zk"] / "mirror-status.json").read_text(encoding="utf-8"))
+    rm = st["run_markers"]
+    assert rm["did_not_run"] == ["slate-heron-digest"]
+    assert rm["awaiting_first"] == 1 and rm["ok"] == 0 and rm["coverage"] == "0 of 2"
+
+
 def test_task_without_cadence_row_reads_unknown_cadence_not_did_not_run(roots, cadence):
     """No cadence row -> the gap is not computable: 'unknown cadence', never
     'did not run' (which would alarm on every unregistered task) and never 'ok'."""

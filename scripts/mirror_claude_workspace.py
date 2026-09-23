@@ -538,9 +538,42 @@ RM_WROTE_NOTHING = "fired but wrote nothing"
 RM_UNREADABLE = "unreadable marker"
 RM_REPORTED_ERROR = "reported error"
 RM_UNKNOWN_CADENCE = "unknown cadence"
+# Code #14 R14-6 (ruling 9.11(ii)): a row whose cadence entry carries a `registered:`
+# date (the day the footer was injected) and that has NO marker yet reads 'awaiting
+# first marker' for ONE cadence after that date -- neither ok nor an alarm. It is
+# deliberately NOT in RUN_MARKER_ALARM_STATUSES and never collapses to RM_OK (a blind
+# row must never render as clean). No `registered:` = no excuse (today's behaviour).
+RM_AWAITING_FIRST = "awaiting first marker"
 RUN_MARKER_ALARM_STATUSES = (RM_DID_NOT_RUN, RM_WROTE_NOTHING, RM_UNREADABLE, RM_REPORTED_ERROR)
 _RM_RENDER_ORDER = (RM_DID_NOT_RUN, RM_WROTE_NOTHING, RM_UNREADABLE, RM_REPORTED_ERROR,
-                    RM_UNKNOWN_CADENCE, RM_OK)
+                    RM_UNKNOWN_CADENCE, RM_AWAITING_FIRST, RM_OK)
+
+
+def _registered_day(value) -> date | None:
+    """The DATE part of a cadence row's `registered:` value, or ``None`` (= absent, no
+    grace). YAML hands back a ``date`` for ``2026-09-19`` and a ``datetime`` for a full
+    timestamp; a quoted value arrives as a str and is parsed as ISO. Anything else
+    (bool, int, 'soon', '') is unparseable and therefore counts as ABSENT -- a typo
+    must never become an excuse."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, datetime):   # before `date`: datetime IS-A date
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            return datetime.fromisoformat(s).date()
+        except ValueError:
+            pass
+        try:
+            return date.fromisoformat(s)
+        except ValueError:
+            return None
+    return None
 
 
 def _today_az() -> date:
@@ -611,7 +644,11 @@ def evaluate_run_marker(task_id: str, marker: dict | None, cadence_entry: dict |
     Order matters: an unreadable marker is reported as such even when the cadence is
     unknown; a task with no cadence row is 'unknown cadence' (a gap is not
     computable), NOT 'did not run'; a task with a row and no marker inside 2x its
-    cadence is 'did not run' -- the row this whole slice exists to render honestly."""
+    cadence is 'did not run' -- the row this whole slice exists to render honestly.
+    R14-6: a markerless row whose entry carries a parseable, non-future `registered:`
+    date less than ONE cadence ago is 'awaiting first marker' (non-alarm, never ok);
+    the grace applies only while NO marker exists -- a marker that exists is judged
+    exactly as before."""
     row: dict = {"task": task_id, "status": RM_OK, "detail": "", "last_marker": "",
                  "ok": None, "outputs": None, "cadence_hours": None,
                  "expects_output": None, "note": ""}
@@ -640,9 +677,24 @@ def evaluate_run_marker(task_id: str, marker: dict | None, cadence_entry: dict |
         return row
     window_h = cadence_h * 2
     if marker is None:
+        # R14-6: the `registered:` grace -- ONE cadence (ruling 9.11(ii)), gated on the
+        # row carrying a parseable date. Mechanism parity with run_marker.evaluate (a
+        # registered-gated grace; no registered = no excuse), NOT numeric parity: that
+        # evaluator excuses 2x cadence. A date in the FUTURE is treated as absent
+        # (fail-closed: a typo'd year must not silence a real 'did not run').
+        reg = _registered_day(cadence_entry.get("registered")) if isinstance(cadence_entry, dict) else None
+        if reg is not None and reg <= today and (today - reg).days * 24 < cadence_h:
+            row["status"] = RM_AWAITING_FIRST
+            row["detail"] = (f"registered {reg.isoformat()}, first marker due within "
+                             f"{cadence_h:.0f}h (1x cadence grace) -- not yet an alarm, not ok")
+            return row
         row["status"] = RM_DID_NOT_RUN
         row["detail"] = (f"no run marker ever recorded (cadence {cadence_h:.0f}h) -- MISSED FIRE, "
                          f"or the footer is not yet injected")
+        if reg is not None:
+            row["detail"] += (f" (registered {reg.isoformat()} is in the future -- ignored)"
+                              if reg > today else
+                              f" (registered {reg.isoformat()}; the 1x cadence grace has elapsed)")
         return row
     try:
         marker_day = date.fromisoformat(row["last_marker"])
@@ -679,6 +731,7 @@ def run_marker_summary(plan: "Plan") -> dict:
         "with_marker": sum(1 for r in rows.values() if r.get("last_marker") or r.get("status") == RM_UNREADABLE),
         "ok": sum(1 for r in rows.values() if r.get("status") == RM_OK),
         "unknown_cadence": sum(1 for r in rows.values() if r.get("status") == RM_UNKNOWN_CADENCE),
+        "awaiting_first": sum(1 for r in rows.values() if r.get("status") == RM_AWAITING_FIRST),
         "did_not_run": sorted(k for k, r in rows.items() if r.get("status") == RM_DID_NOT_RUN),
         "wrote_nothing": sorted(k for k, r in rows.items() if r.get("status") == RM_WROTE_NOTHING),
         "unreadable": sorted(k for k, r in rows.items() if r.get("status") == RM_UNREADABLE),
@@ -1316,13 +1369,17 @@ def _render_run_markers(plan: Plan, cfg: Config) -> list[str]:
         f"- alarms: {len(rm['did_not_run'])} did not run, {len(rm['wrote_nothing'])} fired but "
         f"wrote nothing, {len(rm['unreadable'])} unreadable marker, {len(rm['reported_error'])} "
         f"reported error; {rm['unknown_cadence']} unknown cadence (no row in "
-        f"data/maps/cowork-run-cadence.yaml -- not computable, so neither alarmed nor ok)")
+        f"data/maps/cowork-run-cadence.yaml -- not computable, so neither alarmed nor ok); "
+        f"{rm['awaiting_first']} awaiting first marker (inside the 1x cadence `registered:` "
+        f"grace -- neither alarmed nor ok)")
     if plan.cadence_error:
         lines.append(f"- cadence map UNREADABLE ({_md_cell(plan.cadence_error)}) -- every task "
                      f"reads 'unknown cadence' until it parses")
     lines.append("- rule: a task with a declared cadence and no marker inside 2x that cadence "
                  "reads **did not run** -- never ok. A marker with `outputs: []` on an "
-                 "`expects_output` task reads **fired but wrote nothing**.")
+                 "`expects_output` task reads **fired but wrote nothing**. A markerless task "
+                 "whose row carries `registered:` reads **awaiting first marker** for ONE "
+                 "cadence after that date, then **did not run**.")
     lines.append("")
     lines.append("| task | status | last marker | ok | outputs | cadence (h) | detail |")
     lines.append("|---|---|---|---|---|---|---|")

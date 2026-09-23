@@ -30,29 +30,48 @@
 #                   (FIRED BUT WROTE NOTHING alarm on outputs == []). Set false for
 #                   a task whose legitimate steady state is doing nothing.
 #   note            free text shown in the parity report (ASCII, no client names).
+#   registered      OPTIONAL. The date the run-marker footer was actually injected
+#                   into this task's SKILL.md (ISO date `2026-09-25`, or a full
+#                   ISO timestamp). While the task has NO marker yet, the row reads
+#                   'awaiting first marker' -- neither an alarm nor ok -- for ONE
+#                   cadence after this date (ruling 9.11(ii), Code #14 R14-6), then
+#                   'did not run'. No `registered:` = no excuse (reads 'did not run'
+#                   at once). An unparseable or FUTURE date counts as absent. Stamp
+#                   it only with the REAL -Apply date: a guessed date silences a real
+#                   'did not run' for a whole cadence.
 #
 # SEEDS (2026-09-19): the four tasks that already self-log runs to ad-hoc jsonl
 # files at three different Drive paths. They are 'transitional' -- their own logs
 # stay in place until the footer lands via the pin script's -InjectRunMarkerFooter
 # -Apply; until then each reads 'did not run' here by design (0 of 109 tasks write
-# this contract today). Cadences are taken from each SKILL.md's description prose.
+# this contract today). They deliberately carry NO `registered:` -- the footer is
+# not applied yet (R14-6, 2026-09-23); Harrison adds `registered: <apply date>` to
+# each row when he runs -Apply.
+#
+# CADENCE SOURCE (R14-6, re-read 2026-09-23): every cadence_hours below is pinned
+# to the task's LIVE `cronExpression` in the Cowork app registry
+# (%APPDATA%\Claude\local-agent-mode-sessions\<account>\<org>\scheduled-tasks.json),
+# NOT to SKILL.md prose or CLAUDE.md framing. Cron -> hours: `M H * * *` = 24,
+# `M H * * D` = 168, `M H DOM * *` = 720. tests/test_cowork_run_markers.py carries a
+# host-only drift test that re-reads that registry (read-only) and fails on a
+# mismatch.
 
 connector-health-heartbeat:
-  cadence_hours: 24          # "Daily 6:40am connector reachability probe"
+  cadence_hours: 24          # LIVE cron "40 6 * * *" (daily 06:40 AZ)
   expects_output: true       # appends one status line every run
   note: "transitional: self-logs elsewhere (00-Founder/_ops/connector-heartbeat-log.jsonl)"
 
 cora-knowledge-review:
-  cadence_hours: 24          # "Daily 7:07am AZ -- flywheel-health monitor"
+  cadence_hours: 24          # LIVE cron "0 7 * * *" (daily 07:00 AZ; the SKILL prose says 7:07)
   expects_output: true       # writes its own audit line every run (Step 0 run-gap self-check)
   note: "transitional: self-logs elsewhere (_shared/projects/cora/cora-flywheel-health-runs.jsonl)"
 
 cowork-cora-redundancy-audit:
-  cadence_hours: 720         # "Monthly audit (1st, 10am)"
+  cadence_hours: 720         # LIVE cron "0 10 1 * *" (monthly, the 1st at 10:00 AZ)
   expects_output: true       # Step 5 audit log line every run, even when nothing is found
   note: "transitional: self-logs elsewhere (_shared/projects/cora/cowork-redundancy-audit-runs.jsonl)"
 
 hygiene-asana:
-  cadence_hours: 168         # weekly closure sweep (companion to the daily hygiene-nudge-daily)
+  cadence_hours: 168         # LIVE cron "30 6 * * 6" (weekly, Sat 06:30 AZ) -- not CLAUDE.md framing
   expects_output: true       # Step 4.6a mandatory audit line every run, even at 0 counts
   note: "transitional: self-logs elsewhere (_shared/projects/cora/hygiene-deferred.jsonl + reply-capture audit)"

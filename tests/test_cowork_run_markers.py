@@ -162,6 +162,146 @@ def test_evaluate_zero_cadence_row_is_unknown_cadence():
     assert row["status"] == m.RM_UNKNOWN_CADENCE
 
 
+# ── R14-6: the `registered:` grace (ONE cadence, ruling 9.11(ii)) ──────────────
+def _reg(cadence_h, registered, marker=None):
+    ent = {"cadence_hours": cadence_h, "expects_output": True, "registered": registered}
+    return m.evaluate_run_marker("t", marker, ent, today=TODAY)
+
+
+def test_registered_grace_is_one_cadence_daily():
+    """Registered today, no marker -> awaiting (0h < 24h). Registered yesterday -> 24h
+    is NOT < 24h, so the grace has elapsed: did not run. 1x, not run_marker's 2x."""
+    row = _reg(24, "2026-09-19")
+    assert row["status"] == m.RM_AWAITING_FIRST
+    assert "registered 2026-09-19" in row["detail"] and "1x cadence" in row["detail"]
+    late = _reg(24, "2026-09-18")
+    assert late["status"] == m.RM_DID_NOT_RUN and "grace has elapsed" in late["detail"]
+
+
+def test_registered_grace_weekly_boundary():
+    assert _reg(168, "2026-09-13")["status"] == m.RM_AWAITING_FIRST   # 144h < 168h
+    assert _reg(168, "2026-09-12")["status"] == m.RM_DID_NOT_RUN      # 168h, not < 168h
+
+
+def test_registered_accepts_date_datetime_and_iso():
+    from datetime import datetime, timezone  # noqa: PLC0415
+    for val in (date(2026, 9, 19),
+                datetime(2026, 9, 19, 0, 0, tzinfo=timezone.utc),
+                "2026-09-19T00:00:00+00:00",
+                "2026-09-19"):
+        assert _reg(24, val)["status"] == m.RM_AWAITING_FIRST, repr(val)
+
+
+def test_registered_parsed_from_real_yaml_forms(tmp_path):
+    """The loader hands evaluate_run_marker whatever yaml.safe_load produced: a bare
+    date and a bare timestamp both arrive as date/datetime objects, not strings."""
+    p = tmp_path / "c.yaml"
+    p.write_text("a:\n  cadence_hours: 24\n  expects_output: true\n  registered: 2026-09-19\n"
+                 "b:\n  cadence_hours: 24\n  expects_output: true\n"
+                 "  registered: 2026-09-19T00:00:00+00:00\n", encoding="utf-8")
+    cad, err = m.load_cadence(p)
+    assert err is None
+    for tid in ("a", "b"):
+        assert m.evaluate_run_marker(tid, None, cad[tid], today=TODAY)["status"] == m.RM_AWAITING_FIRST
+
+
+def test_unparseable_or_future_registered_is_no_excuse():
+    """A typo must never become an excuse: 'soon', '', a bool, an int, and a date AFTER
+    today all read as absent -> did not run (fail-closed)."""
+    for val in ("soon", "", True, 20260919, None, "2027-09-19"):
+        assert _reg(24, val)["status"] == m.RM_DID_NOT_RUN, repr(val)
+    assert "in the future -- ignored" in _reg(24, "2026-09-20")["detail"]
+
+
+def test_no_registered_key_keeps_todays_behaviour():
+    row = m.evaluate_run_marker("t", None, {"cadence_hours": 24, "expects_output": True}, today=TODAY)
+    assert row["status"] == m.RM_DID_NOT_RUN and "registered" not in row["detail"]
+
+
+def test_grace_never_masks_a_stale_or_empty_marker():
+    """The grace applies ONLY while no marker exists: registered today with a 20-day-old
+    marker on a weekly task is still did not run; a fresh empty marker still reads
+    fired but wrote nothing."""
+    stale = {"date": "2026-08-30", "unreadable": False, "ok": True, "outputs": 1}
+    assert _reg(168, "2026-09-19", stale)["status"] == m.RM_DID_NOT_RUN
+    empty = {"date": "2026-09-19", "unreadable": False, "ok": True, "outputs": 0}
+    assert _reg(24, "2026-09-19", empty)["status"] == m.RM_WROTE_NOTHING
+
+
+def test_awaiting_first_is_neither_alarm_nor_ok():
+    assert m.RM_AWAITING_FIRST not in m.RUN_MARKER_ALARM_STATUSES
+    assert m.RM_AWAITING_FIRST != m.RM_OK
+    order = list(m._RM_RENDER_ORDER)
+    assert order.index(m.RM_AWAITING_FIRST) < order.index(m.RM_OK)
+
+
+def test_seed_rows_carry_no_guessed_registered_date():
+    """The footer is NOT applied (0 SKILL.md carry it on 2026-09-23): a `registered:`
+    on a seed row would silence a real 'did not run'. Harrison stamps the real
+    -Apply date; until then the seeds must read did not run."""
+    data = yaml.safe_load(CADENCE_YAML.read_text(encoding="utf-8"))
+    for tid in ("connector-health-heartbeat", "cora-knowledge-review",
+                "cowork-cora-redundancy-audit", "hygiene-asana"):
+        assert "registered" not in data[tid], tid
+
+
+# ── the cadence map against the LIVE Cowork registry (this host only) ─────────
+def _cron_hours(expr: str) -> float | None:
+    """Map the three cron shapes the cadence map uses to hours; None for anything else.
+    str.split only -- no regex (D-171 n/a)."""
+    f = str(expr).split()
+    if len(f) != 5:
+        return None
+    mi, hr, dom, mon, dow = f
+    if not (mi.isdigit() and hr.isdigit()) or mon != "*":   # one fixed fire time only
+        return None
+    if dom == "*" and dow == "*":
+        return 24.0
+    if dom == "*" and dow.isdigit():
+        return 168.0
+    if dom.isdigit() and dow == "*":
+        return 720.0
+    return None
+
+
+def test_cron_hours_mapping():
+    assert _cron_hours("40 6 * * *") == 24
+    assert _cron_hours("30 6 * * 6") == 168
+    assert _cron_hours("0 10 1 * *") == 720
+    assert _cron_hours("0 7 * * 1-5") is None and _cron_hours("*/15 * * * *") is None
+    assert _cron_hours("bogus") is None
+
+
+def test_cadence_rows_match_live_cowork_cron():
+    """R14-6: every cadence_hours is pinned to the task's LIVE cronExpression. Reads
+    the Cowork registry READ-ONLY by glob (never a hard-coded account/org path);
+    skips when the registry is not on this host."""
+    import glob  # noqa: PLC0415
+    import json  # noqa: PLC0415
+    appdata = os.environ.get("APPDATA") or ""
+    files = glob.glob(os.path.join(appdata, "Claude", "local-agent-mode-sessions", "*", "*",
+                                   "scheduled-tasks.json")) if appdata else []
+    live: dict[str, str] = {}
+    for fp in files:
+        try:
+            data = json.loads(Path(fp).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for t in data.get("scheduledTasks") or []:
+            if isinstance(t, dict) and t.get("id") and t.get("cronExpression"):
+                live[str(t["id"])] = str(t["cronExpression"])
+    if not live:
+        pytest.skip("Cowork scheduled-task registry not on this host")
+    rows = yaml.safe_load(CADENCE_YAML.read_text(encoding="utf-8"))
+    for tid, ent in rows.items():
+        assert tid in live, f"{tid}: in the cadence map but not in the live Cowork registry"
+        hours = _cron_hours(live[tid])
+        assert hours is not None, f"{tid}: unsupported cron shape {live[tid]!r}"
+        assert float(ent["cadence_hours"]) == hours, (tid, live[tid], ent["cadence_hours"])
+        assert f'"{live[tid]}"' in CADENCE_YAML.read_text(encoding="utf-8"), \
+            f"{tid}: the yaml comment does not cite the live cron {live[tid]!r}"
+
+
 def test_alarm_statuses_are_exactly_the_health_lane_keys():
     """The mirror's alarm vocabulary and the nightly check's key list must agree, or a
     status the mirror emits is one the health lane silently ignores."""
