@@ -222,6 +222,28 @@ def _reset_cashflow_as_of_state():
 
 
 @pytest.fixture(autouse=True)
+def _meet_audit_dark_by_default(monkeypatch):
+    """Code #14 R14-8: the Meet join audit seam reads EVERY Workspace audit log's
+    API under an admin subject. No test may ever mint that token or reach the
+    Reports endpoint, so the service builder is redirected to a `dark:test` lane
+    state for every test (the default render is then byte-identical to today's).
+    A test that exercises the seam passes `service=` explicitly or patches
+    `_build_reports_service` itself (its monkeypatch runs after this one)."""
+    try:
+        from cora.connectors import meet_audit as _ma
+    except Exception:  # noqa: BLE001 -- a missing module must never break the suite
+        yield
+        return
+
+    def _blocked():
+        raise _ma.MeetAuditDark(_ma.STATE_DARK_TEST, "test isolation")
+
+    monkeypatch.setattr(_ma, "_build_reports_service", _blocked)
+    monkeypatch.delenv(_ma.ADMIN_SUBJECT_ENV, raising=False)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     """Isolate module-global state that otherwise leaks between tests.
 

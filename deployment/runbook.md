@@ -828,6 +828,7 @@ list in step with `grep -rn "googleapis.com/auth/" src/ scripts/`):
 | `drive` (full) | `src/cora/connectors/drive_connector.py:46`, `scripts/run_retroactive_hashtag_scan.py:153` | attachment filer upload, finance-receipt filing |
 | `spreadsheets.readonly` | `src/cora/connectors/drive_sweep.py:475`, `src/cora/tools/fighter_tracker_client.py:43` (DWD); `src/cora/connectors/gsheets_financials.py` (`_DRIVE_SCOPES`) requests it on a DIRECT service-account credential (no impersonation), NOT via DWD | oversized-sheet fallback, fighter roster; cash sheet reads (direct SA) |
 | `drive.metadata.readonly` | `src/cora/connectors/gsheets_financials.py` (`_DRIVE_META_SCOPES`) | DIRECT service-account credential (no impersonation) -- NOT a DWD scope, needs NO Admin-console grant, never paste it into the DWD list; cashflow sheet modifiedTime (the "as of" label) only (Code #14 S5) |
+| `admin.reports.audit.readonly` | `src/cora/connectors/meet_audit.py` (`REPORTS_SCOPE`, its own credential) | Meet join audit (Code #14 R14-8): Reports `activities.list` `applicationName=meet` `eventName=call_ended` ONLY, admin subject (default harrison@, `CORA_REPORTS_IMPERSONATE`, never cora@), READ-ONLY; the second D-308 admin-level lane. NOT YET GRANTED -- ships dark until Harrison adds it (the lane self-detects `unauthorized_client`) |
 
 **Granted but not requested by code** (as recorded 2026-08-26 on Harrison's "more
 capability" ruling): `gmail.readonly`, `https://mail.google.com/`, `calendar`
