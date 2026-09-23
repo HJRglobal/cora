@@ -551,3 +551,37 @@ class TestListsAndCode:
         # "*Status:*" has no space after the star -> not a bullet, must survive.
         out = format_reply("*Status:* open")
         assert "*Status:*" in out
+
+
+# ── Code #14: the pre-existing _BARE_DOC_URL_RE ReDoS (found by S3's timing test) ──
+import pytest as _pytest_redos  # noqa: E402
+
+
+@_pytest_redos.mark.parametrize("shape", ["a" * 40_000, "1" * 40_000, "-" * 40_000, "a." * 20_000,
+                                          "abc-" * 10_000 + ".intuit.com/x"],
+                                ids=["letters", "digits", "dashes", "dotted", "long-label"])
+def test_bare_doc_url_scan_is_linear_on_a_long_label_run(shape):
+    """The old `(?:[a-z0-9-]+\.){0,3}intuit\.com` bounded the repetitions, not the
+    inner `+`: a 40k run of letters/digits/dashes cost ~7 s on EVERY outbound Slack
+    post (sanitize_text). Must stay well under 0.2 s."""
+    import time
+    from cora import reply_formatter as rf
+    t0 = time.perf_counter()
+    rf.redact_links_and_ids(shape)
+    assert time.perf_counter() - t0 < 0.2
+
+
+@_pytest_redos.mark.parametrize("text,gone", [
+    ("see https://qbo.intuit.com/app/reportv2?x=1 ok", "intuit"),
+    ("https://c1.qbo.intuit.com/app/x", "intuit"),
+    ("https://sandbox-quickbooks.api.intuit.com/v3/company/1", "intuit"),
+    ("go to intuit.com/help", "intuit"),
+])
+def test_intuit_links_are_still_redacted_after_the_redos_fix(text, gone):
+    from cora import reply_formatter as rf
+    assert gone not in rf.redact_links_and_ids(text)
+
+
+def test_a_lookalike_domain_is_no_longer_partially_redacted():
+    from cora import reply_formatter as rf
+    assert rf.redact_links_and_ids("notintuit.com/x stays") == "notintuit.com/x stays"

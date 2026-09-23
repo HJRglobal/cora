@@ -137,7 +137,13 @@ _BARE_DOC_URL_RE = re.compile(
     # here AND on the egress boundary, covering the conversational-fabrication and
     # WebClient-bypass paths the QBO tool-description fix can't fully prevent.
     r"(?:docs\.google\.com|drive\.google\.com|app\.asana\.com|notion\.so"
-    r"|(?:[a-z0-9-]+\.){0,3}intuit\.com)"
+    # ReDoS FIX (Code #14, found by S3's timing test): the old `(?:[a-z0-9-]+\.){0,3}`
+    # bounded the REPETITIONS, not the inner `+`, so an unanchored search re-scanned
+    # any long letter/digit/dash run from every position -- O(n^2): a 40k run cost
+    # ~7 s, GIL held. A left boundary (never start inside a label run) + the DNS
+    # 63-char label bound make each attempt O(1). Side effect (correct): the zero-
+    # subdomain branch no longer matches the "intuit.com" tail of "notintuit.com".
+    r"|(?<![a-z0-9-])(?:[a-z0-9-]{1,63}\.){0,3}intuit\.com)"
     # ')' excluded so a URL inside "(...)" or a markdown link "[label](...)"
     # leaves a balanced empty shell for the 8b cleanup (these URLs never
     # legitimately contain a close-paren).
