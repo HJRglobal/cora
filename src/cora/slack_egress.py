@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import heapq
 import html
 import json
 import logging
@@ -71,7 +72,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from .reply_formatter import normalize_slack_bold, redact_links_and_ids
 
@@ -605,6 +606,65 @@ def _is_echo_hit(text: str, hit: tuple[int, int, str, str], spans: list[tuple[in
     return len(_WC_TOKEN_RE.findall(norm)) >= 2 and norm in joined_user
 
 
+def _iter_write_claim_hits(text: str, spans: list[tuple[int, int]]
+                           ) -> Iterator[tuple[int, int, int, str, str]]:
+    """Every unsuppressed completion-claim hit of *text* as (start, form index, end,
+    verb, form), in (start, form order) order -- the per-form rules of
+    _find_write_claim_span, so the FIRST item is exactly its hit. Code #14 D-051 round 3
+    (R2-A3): one lazy finditer per form (plus the receipt) merged by heapq.merge, so each
+    form's regex scans the text AT MOST ONCE however many hits a caller walks -- round
+    2's preference re-ran every form from each hop to the end of the reply (about 34
+    full grammar scans on an echo prefix + a long non-matching tail: 1.6 s at 40k)."""
+    def _form(idx: int, label: str, rx: re.Pattern[str]) -> Iterator[tuple[int, int, int, str, str]]:
+        for m in rx.finditer(text):
+            if spans and label not in _WC_FIRST_PERSON_FORMS and _inside(spans, m.start(), m.end()):
+                continue
+            yield m.start(), idx, m.end(), " ".join(_verb_of(m).split()).lower(), label
+
+    def _receipt(idx: int) -> Iterator[tuple[int, int, int, str, str]]:
+        for m in _WC_RECEIPT_RE.finditer(text):
+            if not _receipt_subject_ok(m) or (spans and _inside(spans, m.start(), m.end())):
+                continue
+            yield m.start(), idx, m.end(), " ".join(m.group("v").split()).lower(), "receipt"
+
+    gens = [_form(i, label, rx) for i, (label, rx) in enumerate(_WRITE_CLAIM_FORMS)]
+    gens.append(_receipt(len(_WRITE_CLAIM_FORMS)))
+    return heapq.merge(*gens)
+
+
+def _walk_write_claims(text: str, users: Any, spans: list[tuple[int, int]],
+                       want: tuple[str, str] | None = None
+                       ) -> tuple[tuple[int, int, str, str] | None, tuple[int, int, str, str] | None,
+                                  tuple[int, int, str, str] | None]:
+    """ONE pass over the merged hits -> (preferred, first hit of ``want``, first hit).
+    preferred = the first hit whose words the user did not write, checked over at most
+    1 + _WC_PREFER_MAX_HOPS distinct hit starts, else the first hit. The walk stops as
+    soon as both answers are known."""
+    joined = _echo_norm(" ".join(str(u) for u in (users or ()) if u)[:_WC_ECHO_MAX_CHARS]) if users else ""
+    first = pref = wanted = None
+    pref_done = False
+    checked = 0
+    last_start = -1
+    want_t = (str(want[0]), str(want[1])) if want is not None else None
+    for start, _idx, end, verb, label in _iter_write_claim_hits(text, spans):
+        hit = (start, end, verb, label)
+        if first is None:
+            first = hit
+        if want_t is not None and wanted is None and (verb, label) == want_t:
+            wanted = hit
+        if not pref_done and start > last_start:      # one check per start (a later form at the same start is the same claim)
+            last_start = start
+            if not users or not _is_echo_hit(text, hit, spans, joined):
+                pref, pref_done = hit, True
+            else:
+                checked += 1
+                if checked > _WC_PREFER_MAX_HOPS:
+                    pref, pref_done = first, True
+        if pref_done and (want_t is None or wanted is not None):
+            break
+    return (pref if pref_done else first), wanted, first
+
+
 def _preferred_write_claim_span(text: str, users: Any = (),
                                 spans: list[tuple[int, int]] | None = None
                                 ) -> tuple[int, int, str, str] | None:
@@ -614,22 +674,12 @@ def _preferred_write_claim_span(text: str, users: Any = (),
     fires -- but a reply that opens by echoing the user ("Task created: Pay the
     invoice -- that line is the portal notice you pasted", 'You said "I filed the Cox
     invoice ..."') must not hide the real phantom later in it ("I updated the Kroger
-    reorder sheet", "all three queued"). Bounded: at most _WC_PREFER_MAX_HOPS extra
-    searches, each linear."""
+    reorder sheet", "all three queued"). Round 3 (R2-A3): a SINGLE pass
+    (_walk_write_claims) -- each form scans the reply at most once, at most
+    1 + _WC_PREFER_MAX_HOPS hits are echo-checked."""
     if spans is None:
         spans = _user_quote_spans(text, users) if users else []
-    first = _find_write_claim_span(text, spans=spans)
-    if first is None or not users:
-        return first
-    joined = _echo_norm(" ".join(str(u) for u in users if u)[:_WC_ECHO_MAX_CHARS])
-    hit: tuple[int, int, str, str] | None = first
-    for _ in range(_WC_PREFER_MAX_HOPS):
-        if hit is None or not _is_echo_hit(text, hit, spans, joined):
-            break
-        hit = _find_write_claim_span(text, spans=spans, pos=hit[0] + 1)
-    else:
-        return first
-    return hit if hit is not None else first
+    return _walk_write_claims(text, users, spans)[0]
 
 
 def _find_write_claim(text: str, user_texts: Any = ()) -> tuple[str, str] | None:
@@ -843,30 +893,40 @@ def _locate_regex(rx: re.Pattern[str]) -> Callable[[str], tuple[int, int] | None
 
 
 def _locate_write_claim(clean: str, users: Any = (),
-                        want: tuple[str, str] | None = None) -> tuple[int, int] | None:
+                        want: tuple[str, str] | None = None,
+                        recorded: tuple[str, tuple[int, int]] | None = None) -> tuple[int, int] | None:
     """The span of the claim the screen RECORDED, found on the scrubbed reply with
     the same echo rule and the same preference (honesty-rails-10 /
     redos-slack-surfaces-6: locating the FIRST claim of the unmasked text could
     centre the snippet on a user-echo the screen had excluded; round 2: the recorded
     claim is the first NON-echo hit, so an earlier echo with the same verb and form
     must not win the snippet either). Falls back to the first hit of the wanted
-    (verb, form), then to the first hit."""
+    (verb, form), then to the first hit.
+
+    Round 3 (R2-A3): ``recorded`` = (the text the screen searched, the span it
+    recorded). When the scrub changed nothing (the common case) the recorded span IS
+    the answer and nothing is re-scanned; otherwise ONE walk (_walk_write_claims)
+    yields the preference and the wanted fallback together."""
+    if recorded is not None and recorded[0] == clean:
+        return recorded[1]
     try:
         spans = _user_quote_spans(clean, users) if users else []
     except Exception:  # noqa: BLE001 -- the locator never raises
         spans = []
-    pref = _preferred_write_claim_span(clean, users, spans)
+    pref, wanted, first = _walk_write_claims(clean, users, spans, want)
     if pref is not None and (want is None or (pref[2], pref[3]) == tuple(want)):
         return pref[0], pref[1]
-    hit = _find_write_claim_span(clean, spans=spans, want=want)
+    hit = wanted or first
     return (hit[0], hit[1]) if hit else None
 
 
-def _write_claim_locator(users: Any, verb: str, form: str) -> Callable[[str], tuple[int, int] | None]:
+def _write_claim_locator(users: Any, verb: str, form: str,
+                         recorded: tuple[str, tuple[int, int]] | None = None
+                         ) -> Callable[[str], tuple[int, int] | None]:
     frozen = tuple(users or ())
 
     def _loc(clean: str) -> tuple[int, int] | None:
-        return _locate_write_claim(clean, frozen, (verb, form))
+        return _locate_write_claim(clean, frozen, (verb, form), recorded)
     return _loc
 
 
@@ -1185,7 +1245,8 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
                 rec = hit
             verb, form = rec[2], rec[3]
             ref = _record_rail_hit(rail=PHANTOM_LOG_KEY, kind="lexicon", phrase=verb, text=text,
-                                   locate=_write_claim_locator(users, verb, form),
+                                   locate=_write_claim_locator(users, verb, form,
+                                                               recorded=(masked, (rec[0], rec[1]))),
                                    mode=mode, channel_name=channel_name, user_id=user_id,
                                    tool_use_count=count, rail_context=rail_context, form=form,
                                    memo=memo)

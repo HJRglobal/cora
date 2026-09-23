@@ -8,6 +8,9 @@ the honesty rails, found by the final reproduce-to-report check.
           matched, so made-up statuses slipped through uncounted and unredacted).
   R2-A2   a participle + ':' is a metadata LABEL only when the date is the WHOLE value
           (round 2 bailed on any value that merely opened with a date or a bare year).
+  R2-A3   the one-row-per-reply preference is a SINGLE pass (round 2 re-ran every form
+          from each hop to the end of the reply, twice with the ledger armed: 1.6 s at
+          40k on an echo prefix + a long non-matching tail).
 
 Every sentence in the must-fire lists below is a repro that wrote NO counted line at
 the round-2 tip (29d9212) and one at the pre-round-2 base (c14-backup-pre-r2).
@@ -287,3 +290,158 @@ class TestLabelIsTheWholeValueR3:
         rx = dict(se._WRITE_CLAIM_FORMS)["initial"]
         assert best_of_3(lambda: list(rx.finditer(shape))) < 0.2
         assert best_of_3(lambda: se._find_write_claim(shape)) < 0.5
+
+
+# ── R2-A3: the preference is ONE pass; the locator reuses the recorded span ────
+CTX_OPEN = {"channel_id": "C0TEST", "entity": "F3E", "snippet_withheld": None, "founder_belt": False}
+A3_USER = "the vendor portal says Task created: Pay the invoice -- is that ours?"
+A3_ECHO = "Task created: Pay the invoice\n"
+HR10_USER = "Quick check: the vendor portal says Task created: Pay the invoice -- is that ours?"
+HR10_REPLY = ("Task created: Pay the invoice -- that line is the vendor portal notification you pasted, "
+              "not mine, and nothing on my side confirms it yet today. Separately, I updated the Kroger "
+              "reorder sheet with the new case counts.")
+
+
+@pytest.fixture
+def ledger(tmp_path, monkeypatch):
+    path = tmp_path / "phantom-write-claims.jsonl"
+    monkeypatch.setattr(se, "PHANTOM_CLAIMS_LEDGER", path)
+    monkeypatch.setattr(se, "_RAIL_LEDGER_ARMED", True)
+    return path
+
+
+def _rows(path):
+    import json
+    return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()] \
+        if path.exists() else []
+
+
+def _pw(text, user):
+    return se.screen_phantom_write_claims(text, tool_use_count=0, channel_name="dm", user_id=HARRISON,
+                                          user_text=user, rail_context=CTX_OPEN)
+
+
+def _round2_preference(text, users, spans):
+    """The round-2 hop loop, verbatim, as the reference the single pass must agree with."""
+    first = se._find_write_claim_span(text, spans=spans)
+    if first is None or not users:
+        return first
+    joined = se._echo_norm(" ".join(str(u) for u in users if u)[:se._WC_ECHO_MAX_CHARS])
+    hit = first
+    for _ in range(se._WC_PREFER_MAX_HOPS):
+        if hit is None or not se._is_echo_hit(text, hit, spans, joined):
+            break
+        hit = se._find_write_claim_span(text, spans=spans, pos=hit[0] + 1)
+    else:
+        return first
+    return hit if hit is not None else first
+
+
+class _CountingRx:
+    """A compiled pattern whose finditer calls are counted (re.Pattern is immutable)."""
+
+    def __init__(self, rx, calls):
+        self._rx, self._calls = rx, calls
+
+    def finditer(self, *a, **k):
+        self._calls[self._rx.pattern] = self._calls.get(self._rx.pattern, 0) + 1
+        return self._rx.finditer(*a, **k)
+
+    def __getattr__(self, name):
+        return getattr(self._rx, name)
+
+
+def _a3_corpus():
+    from test_d051_r2_honesty_rails import (MUST_FIRE_R2, MUST_NOT_FIRE_R2, RS6_REPLY, RS6_USER,
+                                            TITLE_CASE_RECEIPTS)
+    from test_r149_honesty_precision import (DESCRIPTIVE_REPLIES, MUST_FIRE, MUST_FIRE_CODE14,
+                                             MUST_NOT_FIRE, REPLY_0915_PHANTOM, USER_0915)
+    users = ["", HR10_USER, RS6_USER, USER_0915, A3_USER,
+             "Task created: Pay the invoice. I staged it. I filed the Cox invoice with the bookkeeper"]
+    texts = ([t for t, _f in MUST_FIRE_R2] + list(MUST_NOT_FIRE_R2) + list(TITLE_CASE_RECEIPTS)
+             + [t for t, _f in MUST_FIRE] + list(MUST_NOT_FIRE) + [t for t, _f in MUST_FIRE_CODE14]
+             + [r for _u, r, _p in DESCRIPTIVE_REPLIES] + [HR10_REPLY, RS6_REPLY, REPLY_0915_PHANTOM]
+             + R2A2_MUST_FIRE + A1_REPROS)
+    for n in (1, 2, 5, 15):          # < 16 echoes: the round-2 loop and the single pass agree
+        texts.append(A3_ECHO * n + "Separately, I updated the Kroger reorder sheet.")
+        texts.append(A3_ECHO * n + "All three queued: A, B, C.\n- Created: Pay the rent")
+        texts.append('You said "I filed the Cox invoice with the bookkeeper" -- ' * n + "Staged cq-a24f9d2210fc.")
+    return texts, users
+
+
+class TestSinglePassPreferenceR3:
+    @pytest.mark.parametrize("fill", ["✅\n", "I\n", "*\n", "x\n", "- a\n", "x. ", "I "],
+                             ids=["check", "I_line", "star", "x_line", "bullet", "sent_starts", "I_run"])
+    def test_an_echo_prefix_with_a_long_non_matching_tail_is_bounded_at_40k(self, ledger, fill):
+        """The finding's own repro: 17 echo lines + 40k of filler, ledger armed. Round 2:
+        1.6 s screen / 0.75 s preference; bounds are the file's existing 1.0 s / 0.5 s."""
+        body = A3_ECHO * 17
+        body += fill * ((40000 - len(body)) // len(fill))
+        assert best_of_3(lambda: se._preferred_write_claim_span(body, [A3_USER])) < 0.5
+        assert best_of_3(lambda: _pw(body, A3_USER)) < 1.0
+        assert _rows(ledger)                                   # the row was still written
+
+    def test_each_form_scans_the_reply_at_most_once(self, monkeypatch):
+        calls: dict[str, int] = {}
+        forms = tuple((label, _CountingRx(rx, calls)) for label, rx in se._WRITE_CLAIM_FORMS)
+        monkeypatch.setattr(se, "_WRITE_CLAIM_FORMS", forms)
+        monkeypatch.setattr(se, "_WC_RECEIPT_RE", _CountingRx(se._WC_RECEIPT_RE, calls))
+        body = A3_ECHO * 17 + "✅\n" * 2000 + "Separately, I updated the Kroger reorder sheet."
+        se._preferred_write_claim_span(body, [A3_USER])
+        assert calls and max(calls.values()) == 1, calls
+        assert len(calls) == len(forms) + 1                   # every form + the receipt, once each
+
+    def test_the_first_hit_is_exactly_the_find_hit(self):
+        texts, users = _a3_corpus()
+        for text in texts:
+            for u in users:
+                spans = se._user_quote_spans(text, [u]) if u else []
+                assert se._walk_write_claims(text, [u] if u else [], spans)[2] == \
+                    se._find_write_claim_span(text, spans=spans), (text, u)
+
+    def test_the_single_pass_agrees_with_the_round_2_loop(self):
+        texts, users = _a3_corpus()
+        for text in texts:
+            for u in users:
+                us = [u] if u else []
+                spans = se._user_quote_spans(text, us) if us else []
+                assert se._preferred_write_claim_span(text, us, spans) == \
+                    _round2_preference(text, us, spans), (text, u)
+
+    def test_the_walk_checks_seventeen_hits_then_falls_back(self):
+        phantom = "Separately, I updated the Kroger reorder sheet."
+        rec16 = se._preferred_write_claim_span(A3_ECHO * 16 + phantom, [A3_USER])
+        assert rec16 is not None and rec16[2:] == ("updated", "first_person")
+        rec17 = se._preferred_write_claim_span(A3_ECHO * 17 + phantom, [A3_USER])
+        assert rec17 is not None and rec17[0] == 0 and rec17[3] == "receipt"
+
+    def test_the_locator_reuses_the_recorded_span_when_the_scrub_changes_nothing(self, ledger, monkeypatch):
+        walks = []
+        real = se._walk_write_claims
+        monkeypatch.setattr(se, "_walk_write_claims", lambda *a, **k: walks.append(1) or real(*a, **k))
+        _pw(HR10_REPLY, HR10_USER)
+        row = _rows(ledger)[0]
+        assert row["phrase"] == "updated" and "I updated the Kroger reorder sheet" in row["snippet"]
+        assert len(walks) == 1                                 # the preference only; the locator reused it
+
+    def test_the_locator_walks_the_scrubbed_text_when_the_scrub_moved_the_claim(self, ledger, monkeypatch):
+        walks = []
+        real = se._walk_write_claims
+        monkeypatch.setattr(se, "_walk_write_claims", lambda *a, **k: walks.append(1) or real(*a, **k))
+        reply = ("See https://drive.google.com/file/d/1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789/view for it. "
+                 + HR10_REPLY)                                 # the scrub redacts the Drive link
+        assert se._scrub_for_snippet(reply) != reply
+        _pw(reply, HR10_USER)
+        row = _rows(ledger)[0]
+        assert row["phrase"] == "updated" and "I updated the Kroger reorder sheet" in row["snippet"]
+        assert len(walks) == 2                                 # the preference + ONE locator walk
+
+    def test_the_locator_falls_back_to_the_wanted_then_the_first_hit(self):
+        clean = "Deleted. And later: I updated the sheet."
+        at = clean.index("I updated")
+        assert se._locate_write_claim(clean, (), ("updated", "first_person"))[0] == at
+        assert se._locate_write_claim(clean, (), ("nope", "first_person"))[0] == 0
+        assert se._locate_write_claim(clean, (), ("updated", "first_person"),
+                                      recorded=("other text", (3, 9)))[0] == at
+        assert se._locate_write_claim(clean, (), ("updated", "first_person"),
+                                      recorded=(clean, (3, 9))) == (3, 9)
