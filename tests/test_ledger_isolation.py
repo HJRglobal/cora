@@ -35,6 +35,7 @@ _LEDGER_CONSTS = [
     ("cora.feedback_log", "_LOG_PATH"),
     ("cora.user_feedback_tracker", "_LOG_PATH"),
     ("cora.tools.tool_dispatch", "_SHOPIFY_WRITE_AUDIT_PATH"),
+    ("cora.slack_egress", "PHANTOM_CLAIMS_LEDGER"),   # Code #14 S3
 ]
 
 

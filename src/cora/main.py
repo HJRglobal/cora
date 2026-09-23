@@ -222,6 +222,12 @@ def main() -> None:
         egress_rails.record_armed(log_to=log)
     except Exception:  # noqa: BLE001 -- a breadcrumb never blocks startup
         log.warning("egress-rails armed record failed (non-fatal)", exc_info=True)
+    # S3 (cq-439d89a84de4): the rail ledger is written by the BOT process only.
+    try:
+        from . import slack_egress
+        slack_egress.arm_rail_ledger()
+    except Exception:  # noqa: BLE001
+        log.warning("rail ledger arm failed (non-fatal)", exc_info=True)
 
     # Pre-warm all entity contexts in background so first requests don't pay the
     # cold-cache penalty (Google Drive read per entity, up to 2s each).

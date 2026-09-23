@@ -473,6 +473,10 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
         ("cora.code_queue", "_MENU_RUNS_LEDGER", "code-queue-menu-runs.jsonl"),
         # Code #12 S3' coverage: the bot's armed-rails record (egress_rails.record_armed).
         ("cora.egress_rails", "ARMED_STATE_PATH", "egress-rails-armed.json"),
+        # Code #14 S3 (cq-439d89a84de4): the phantom-claim adjudication ledger. Rows
+        # are written only when slack_egress.arm_rail_ledger() ran (the bot's main);
+        # this redirect is the belt behind that gate, born with the write path.
+        ("cora.slack_egress", "PHANTOM_CLAIMS_LEDGER", "phantom-write-claims.jsonl"),
         # Code #13 slice 9 integration: decision_lane's delivery ledger is a BARE
         # module constant (no env override) read at call time by delivery_index /
         # record_delivery -- the nightly decision-gate check now records a ping row
@@ -620,6 +624,7 @@ _GUARDED_LEDGERS = (
     "data/state/code-queue-menu-runs.jsonl",
     "data/state/mechanical-batch-card.json",
     "data/state/egress-rails-armed.json",
+    "data/state/phantom-write-claims.jsonl",
     # Code #13 slice 2: the missed-nightly catch-up ledger (writer: scripts/check_missed_nightly.py).
     "logs/nightly-catchup.jsonl",
     # Code #13 Rider 1 S-A: the cora@ mailbox intake sweep's watermark (writer:

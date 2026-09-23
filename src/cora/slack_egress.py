@@ -61,15 +61,23 @@ silently bypass the boundary. See the forensic rebuild log.
 from __future__ import annotations
 
 import functools
+import hashlib
 import html
+import json
 import logging
 import os
 import re
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable
 
 from .reply_formatter import normalize_slack_bold, redact_links_and_ids
 
 log = logging.getLogger(__name__)
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 # ── Mojibake repair (N9) ─────────────────────────────────────────────────────
@@ -359,27 +367,200 @@ def _mask_user_echo(text: str, user_texts: Any) -> str:
     return "".join(chars)
 
 
-def _find_write_claim(text: str) -> tuple[str, str] | None:
-    """(verb, form) of the FIRST completion claim in *text*, else None."""
-    best: tuple[int, str, str] | None = None
+def _find_write_claim_span(text: str) -> tuple[int, int, str, str] | None:
+    """(start, end, verb, form) of the FIRST completion claim in *text*, else None."""
+    best: tuple[int, int, str, str] | None = None
     for label, rx in _WRITE_CLAIM_FORMS:
         m = rx.search(text)
         if m is None:
             continue
         verb = next((g for g in (m.groupdict().get(k) for k in ("v", "v2", "v3")) if g), m.group(0))
         if best is None or m.start() < best[0]:
-            best = (m.start(), verb, label)
+            best = (m.start(), m.end(), verb, label)
     for m in _WC_RECEIPT_RE.finditer(text):
         np_toks = m.group("np").split()
         last = np_toks[-1].strip("`*'").lower().replace("’", "'") if np_toks else ""
         if last in _WC_RECEIPT_NOT_SUBJECT:
             continue
         if best is None or m.start() < best[0]:
-            best = (m.start(), m.group("v"), "receipt")
+            best = (m.start(), m.end(), m.group("v"), "receipt")
         break
     if best is None:
         return None
-    return " ".join(best[1].split()).lower(), best[2]
+    return best[0], best[1], " ".join(best[2].split()).lower(), best[3]
+
+
+def _find_write_claim(text: str) -> tuple[str, str] | None:
+    """(verb, form) of the FIRST completion claim in *text*, else None."""
+    hit = _find_write_claim_span(text)
+    return (hit[2], hit[3]) if hit else None
+
+
+# -- S3 (cq-439d89a84de4): the rail ledger -- a phantom hit adjudicable from disk --
+# The 9/17 hits (phrase='filed' in a teammate DM, 'updated' in #lex-website,
+# 'created' in #hjr-travel-booking) were UNADJUDICABLE: the WARN named only the
+# phrase and the reply text was nowhere on disk, so the observe-week count could
+# not be split into real phantoms and noise. Every firing line of the two seam
+# screens now appends ONE row to data/state/phantom-write-claims.jsonl carrying a
+# scrubbed +/-60-char snippet around the hit, response_chars and the tool count,
+# and the WARN gains response_chars / tool_use / ref (the row id) -- NOT the
+# snippet: bot logs are backed up to Drive and sessions quote WARN lines into
+# captures the KB ingests, so reply text in the log line would be a propagation
+# path (D-145). The ledger is the ADJUDICATION record; the 7d counter stays the
+# log scan (a ledger that starts empty at deploy would read a false "clean").
+#
+# THE SNIPPET: the FULL reply is scrubbed first (mojibake repair, a SILENT sentinel
+# delete -- never scrub_write_sentinels, which logs a sentinel-egress-leak line and
+# would double-count that rail -- bare-URL/GID/long-id redaction, banking-identifier
+# redaction), then the hit is re-located and windowed, because the banking redactor
+# keys on a cue up to 40 chars from the value and a window cut first could strand a
+# bare routing number. WITHHELD entirely ("[LEX — withheld]") in LEX scope, on a
+# Tier-2 grant turn, and in a non-founder custodian DM; in the FOUNDER DM (a PHI-
+# eligible context by carve-out) a snippet is kept only if a fail-closed content
+# belt passes. No scope context at all = withheld. Rows are written only in the
+# bot process (arm_rail_ledger, called at startup) and never under CORA_EVAL_MODE.
+PHANTOM_CLAIMS_LEDGER = _REPO_ROOT / "data" / "state" / "phantom-write-claims.jsonl"
+RAIL_SNIPPET_WITHHELD_LEX = "[LEX — withheld]"
+RAIL_SNIPPET_WITHHELD_GRANT = "[private retrieval — withheld]"
+RAIL_SNIPPET_WITHHELD_PHI = "[PHI screen — withheld]"
+RAIL_SNIPPET_NO_CONTEXT = "[no scope context — withheld]"
+RAIL_SNIPPET_UNAVAILABLE = "[snippet unavailable]"
+_SNIPPET_RADIUS = 60
+_SNIPPET_CAP = 200
+_RAIL_LEDGER_LOCK = threading.Lock()
+_RAIL_LEDGER_ARMED = False
+_RAIL_REF_COUNTER = [0]
+
+
+def arm_rail_ledger() -> None:
+    """Called ONCE by main at bot startup: rows are written only by the bot process
+    (a script importing this module -- the evals, the missed-message replay -- never
+    writes the live ledger)."""
+    global _RAIL_LEDGER_ARMED
+    _RAIL_LEDGER_ARMED = True
+
+
+def _rail_ledger_on() -> bool:
+    return _RAIL_LEDGER_ARMED and os.environ.get("CORA_EVAL_MODE", "") != "1"
+
+
+def _rail_ref(*parts: object) -> str:
+    with _RAIL_LEDGER_LOCK:
+        _RAIL_REF_COUNTER[0] += 1
+        n = _RAIL_REF_COUNTER[0]
+    raw = "|".join(str(p) for p in parts) + f"|{os.getpid()}|{n}|{time.time_ns()}"
+    return "pr-" + hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:10]
+
+
+def _append_rail_row(row: dict) -> bool:
+    """Fail-soft append (never raises, never blocks the reply)."""
+    if not _rail_ledger_on():
+        return False
+    path = Path(PHANTOM_CLAIMS_LEDGER)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(row, ensure_ascii=False) + "\n"
+        with _RAIL_LEDGER_LOCK:
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+        return True
+    except Exception:  # noqa: BLE001
+        log.warning("rail ledger append failed (non-fatal)", exc_info=True)
+        return False
+
+
+def _scrub_for_snippet(text: str) -> str:
+    t = repair_mojibake(text)
+    t = _SENTINEL_ANY_RE.sub("", t)                 # SILENT: never log a sentinel line here
+    t = redact_links_and_ids(t)
+    from .banking_identifiers import redact_banking_identifiers  # lazy
+    t, _n = redact_banking_identifiers(t)
+    return _LINK_TOKEN_RE.sub(" ", t)
+
+
+def _founder_belt_passes(snippet: str) -> bool:
+    """Fail-closed PHI belt for a snippet from the FOUNDER DM (a custodian context):
+    every predicate must read clean, and the LEX scrub must change nothing."""
+    try:
+        from . import phi_guard  # lazy
+        if (phi_guard.is_any_phi(snippet) or phi_guard.is_lex_program_context(snippet)
+                or phi_guard.non_lex_phi_backstop_trips(snippet)):
+            return False
+        return phi_guard.scrub_lex_phi(snippet) == snippet
+    except Exception:  # noqa: BLE001 -- an unevaluable belt withholds
+        return False
+
+
+def _rail_snippet(text: str, locate: Callable[[str], tuple[int, int] | None],
+                  rail_context: dict | None) -> str:
+    """The scrubbed +/-60-char window around the hit, or a WITHHELD marker. Never
+    raises; fails CLOSED (a marker, never the raw text)."""
+    ctx = rail_context if isinstance(rail_context, dict) else None
+    if ctx is None:
+        return RAIL_SNIPPET_NO_CONTEXT
+    withheld = ctx.get("snippet_withheld")
+    if withheld:
+        return str(withheld)
+    try:
+        clean = _scrub_for_snippet(text)
+        span = locate(clean)
+        if span is None:
+            window = clean[:120]
+        else:
+            lo = max(0, span[0] - _SNIPPET_RADIUS)
+            hi = min(len(clean), span[1] + _SNIPPET_RADIUS)
+            window = ("…" if lo > 0 else "") + clean[lo:hi] + ("…" if hi < len(clean) else "")
+        snippet = " ".join(window.split())[:_SNIPPET_CAP]
+    except Exception:  # noqa: BLE001
+        log.warning("rail snippet failed (non-fatal)", exc_info=True)
+        return RAIL_SNIPPET_UNAVAILABLE
+    if ctx.get("founder_belt") and not _founder_belt_passes(snippet):
+        return RAIL_SNIPPET_WITHHELD_PHI
+    return snippet
+
+
+def _record_rail_hit(*, rail: str, kind: str, phrase: str, text: str,
+                     locate: Callable[[str], tuple[int, int] | None], mode: str,
+                     channel_name: str, user_id: str, tool_use_count: int | None,
+                     rail_context: dict | None, form: str = "") -> str:
+    """Append one ledger row for one FIRING line; return its ref ('' when no row)."""
+    if not _rail_ledger_on():
+        return ""
+    ctx = rail_context if isinstance(rail_context, dict) else {}
+    ref = _rail_ref(rail, kind, phrase, channel_name, user_id)
+    row = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "rail": rail, "kind": kind, "phrase": phrase,
+        "snippet": _rail_snippet(text, locate, rail_context),
+        "mode": mode, "channel": channel_name or "", "channel_id": str(ctx.get("channel_id") or ""),
+        "user": user_id or "", "entity": str(ctx.get("entity") or ""),
+        "response_chars": len(text), "tool_use_count": tool_use_count,
+        "ref": ref, "pid": os.getpid(),
+    }
+    if form:
+        row["form"] = form
+    return ref if _append_rail_row(row) else ""
+
+
+def _locate_text(needle: str) -> Callable[[str], tuple[int, int] | None]:
+    low = str(needle or "").lower()
+
+    def _loc(clean: str) -> tuple[int, int] | None:
+        i = clean.lower().find(low) if low else -1
+        return (i, i + len(low)) if i >= 0 else None
+    return _loc
+
+
+def _locate_regex(rx: re.Pattern[str]) -> Callable[[str], tuple[int, int] | None]:
+    def _loc(clean: str) -> tuple[int, int] | None:
+        m = rx.search(clean)
+        return (m.start(), m.end()) if m else None
+    return _loc
+
+
+def _locate_write_claim(clean: str) -> tuple[int, int] | None:
+    hit = _find_write_claim_span(clean)
+    return (hit[0], hit[1]) if hit else None
 
 
 def _known_cq_ids() -> frozenset[str]:
@@ -421,7 +602,7 @@ def _prepend_honest_line(text: str) -> str:
 
 def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
                                 user_id: str = "", user_text: str = "",
-                                prior_user_texts: Any = ()):
+                                prior_user_texts: Any = (), rail_context: dict | None = None):
     """Screen ONE model reply for (1) ids that exist in no ledger and (2) a write
     claim made in a turn with zero tool_use.
 
@@ -443,6 +624,12 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
     ``prior_user_texts``; _mask_user_echo). The WARN names the VERB and the form
     label, never the matched words (an arrow / possessive form can carry up to
     three words before the verb, which in a LEX channel could be a name, D-145).
+
+    S3: every firing line also appends ONE row to PHANTOM_CLAIMS_LEDGER (the
+    adjudication record: a scrubbed snippet or a withheld marker, see
+    _rail_snippet) and names it `ref=` in the WARN with response_chars /
+    tool_use. ``rail_context`` = {channel_id, entity, snippet_withheld,
+    founder_belt} from app._dispatch_qa; absent = the snippet is withheld.
     """
     if not isinstance(text, str) or not text:
         return text
@@ -471,9 +658,15 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
                         "this turn", PHANTOM_LOG_KEY, label, len(found))
             continue
         for fid in sorted(found - set(known)):
-            emit("%s kind=fabricated-id id=%s ledger=%s mode=%s channel=#%s user=%s -- "
+            ref = _record_rail_hit(rail=PHANTOM_LOG_KEY, kind="fabricated-id", phrase=fid,
+                                   text=text, locate=_locate_text(fid), mode=mode,
+                                   channel_name=channel_name, user_id=user_id,
+                                   tool_use_count=count, rail_context=rail_context)
+            emit("%s kind=fabricated-id id=%s ledger=%s mode=%s channel=#%s user=%s "
+                 "response_chars=%d tool_use=%s ref=%s -- "
                  "the reply names an id that exists in no ledger",
-                 PHANTOM_LOG_KEY, fid, label, mode, channel_name or "?", user_id or "?")
+                 PHANTOM_LOG_KEY, fid, label, mode, channel_name or "?", user_id or "?",
+                 len(text), "?" if count is None else count, ref or "-")
             if mode == "enforce":
                 out = re.sub(re.escape(fid), "[unknown id]", out, flags=re.IGNORECASE)
     if count == 0:
@@ -489,9 +682,15 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
         hit = _find_write_claim(masked)
         if hit:
             verb, form = hit
-            emit("%s kind=lexicon phrase=%r form=%s mode=%s channel=#%s user=%s -- a write "
-                 "claim with zero tool_use this turn",
-                 PHANTOM_LOG_KEY, verb, form, mode, channel_name or "?", user_id or "?")
+            ref = _record_rail_hit(rail=PHANTOM_LOG_KEY, kind="lexicon", phrase=verb, text=text,
+                                   locate=_locate_write_claim, mode=mode,
+                                   channel_name=channel_name, user_id=user_id,
+                                   tool_use_count=count, rail_context=rail_context, form=form)
+            emit("%s kind=lexicon phrase=%r form=%s mode=%s channel=#%s user=%s "
+                 "response_chars=%d tool_use=%s ref=%s -- a write claim with zero tool_use "
+                 "this turn",
+                 PHANTOM_LOG_KEY, verb, form, mode, channel_name or "?", user_id or "?",
+                 len(text), count, ref or "-")
             if mode == "enforce":
                 out = _prepend_honest_line(out)
     return out
@@ -676,7 +875,8 @@ def _registry_symbols() -> frozenset[str]:
 
 
 def screen_capability_claims(text, *, tool_use_count, channel_name: str = "", user_id: str = "",
-                             entity: str = "", cross_entity: bool = False, founder: bool = False):
+                             entity: str = "", cross_entity: bool = False, founder: bool = False,
+                             rail_context: dict | None = None):
     """Screen ONE model reply for (1) a capability denial about a capability the bot
     HAS in this channel, in a zero-tool_use turn, and (2) an internal tool symbol
     spoken on a non-developer surface.
@@ -720,10 +920,15 @@ def screen_capability_claims(text, *, tool_use_count, channel_name: str = "", us
             if name and re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", out):
                 symbols.add(name)
         for sym in sorted(symbols):
-            emit("%s kind=toolname symbol=%s mode=%s channel=#%s user=%s tool_use=%s -- an "
+            ref = _record_rail_hit(rail=CAPABILITY_LOG_KEY, kind="toolname", phrase=sym, text=text,
+                                   locate=_locate_text(sym), mode=mode,
+                                   channel_name=channel_name, user_id=user_id,
+                                   tool_use_count=count, rail_context=rail_context)
+            emit("%s kind=toolname symbol=%s mode=%s channel=#%s user=%s tool_use=%s "
+                 "response_chars=%d ref=%s -- an "
                  "internal tool name reached a non-developer surface",
                  CAPABILITY_LOG_KEY, sym, mode, channel_name or "?", user_id or "?",
-                 "?" if count is None else count)
+                 "?" if count is None else count, len(text), ref or "-")
             if mode == "enforce":
                 out = re.sub(rf"(?<![A-Za-z0-9_]){re.escape(sym)}(?![A-Za-z0-9_])",
                              INTERNAL_TOOL_REDACTION, out)
@@ -749,10 +954,16 @@ def screen_capability_claims(text, *, tool_use_count, channel_name: str = "", us
                 if hit is None:
                     continue
                 term, hint = hit
-                emit("%s kind=denial phrase=%r term=%r mode=%s channel=#%s user=%s -- a capability "
+                ref = _record_rail_hit(rail=CAPABILITY_LOG_KEY, kind="denial",
+                                       phrase=m.group(0).strip(), text=text,
+                                       locate=_locate_text(m.group(0).strip()), mode=mode,
+                                       channel_name=channel_name, user_id=user_id,
+                                       tool_use_count=count, rail_context=rail_context)
+                emit("%s kind=denial phrase=%r term=%r mode=%s channel=#%s user=%s "
+                     "response_chars=%d tool_use=%s ref=%s -- a capability "
                      "denial with zero tool_use about a capability the bot has in this channel",
                      CAPABILITY_LOG_KEY, m.group(0).strip(), term, mode, channel_name or "?",
-                     user_id or "?")
+                     user_id or "?", len(text), count, ref or "-")
                 if mode == "enforce":
                     out = _prepend_capability_line(out, hint)
                 break  # one WARN per reply, like the S2' lexicon half (keeps the count per turn)

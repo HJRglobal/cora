@@ -964,6 +964,33 @@ def _self_inventory_force(text: str) -> str | None:
     return "cora_self_inventory" if self_inventory.is_self_inventory_question(text or "") else None
 
 
+def _rail_context(channel_id: str, user_id: str | None, entity: str, retrieval_grant: object,
+                  is_dm: bool, is_founder: bool) -> dict:
+    """S3: the rail-ledger scope for one turn. The snippet is WITHHELD in LEX scope, on a
+    Tier-2 grant turn (owner-private mail/files) and in any non-founder PHI-custodian
+    context; the FOUNDER DM (a custodian context by carve-out, and where most hits
+    land) keeps a snippet only if slack_egress's fail-closed content belt passes.
+    Co-extensive with the R1 posture (lex scope OR custodian) plus the grant.
+    Any error withholds (fail closed)."""
+    ctx = {"channel_id": channel_id or "", "entity": entity or "",
+           "snippet_withheld": None, "founder_belt": False}
+    granted = retrieval_grant is not None   # (not an `if` line: a web_guard pin reads that text)
+    try:
+        if web_guard.is_lex_scope(entity):
+            ctx["snippet_withheld"] = slack_egress.RAIL_SNIPPET_WITHHELD_LEX
+        elif granted:
+            ctx["snippet_withheld"] = slack_egress.RAIL_SNIPPET_WITHHELD_GRANT
+        elif user_id and lex_phi_access.phi_allowed(user_id, entity, is_dm=is_dm):
+            if is_founder and is_dm:
+                ctx["founder_belt"] = True
+            else:
+                ctx["snippet_withheld"] = slack_egress.RAIL_SNIPPET_WITHHELD_LEX
+    except Exception:  # noqa: BLE001
+        log.warning("rail context failed -- snippet withheld", exc_info=True)
+        ctx["snippet_withheld"] = slack_egress.RAIL_SNIPPET_WITHHELD_LEX
+    return ctx
+
+
 def _prior_user_texts(prior_messages: list[dict] | None) -> list[str]:
     """The last six USER turns' text (never assistant text), for the phantom-write
     screen's echo mask (R14-9(b)): words the user wrote are not Cora's claims."""
@@ -1493,6 +1520,9 @@ def _dispatch_qa(
     # cross-entity build titles); the tool re-checks both.
     queue_status_turn = _queue_status_turn(user_id, channel_name, retrieval_grant,
                                            user_message, prior_messages)
+    # S3 (cq-439d89a84de4): the rail ledger's scope for this turn -- computed ONCE,
+    # before the cache read, so the cached-serve screens carry it too.
+    rail_ctx = _rail_context(channel_id, user_id, entity, retrieval_grant, is_dm, is_founder)
     # Grant-path responses contain owner-private mail/file content — they must
     # never be served from (or stored into) the shared semantic cache, where a
     # different user's similar question would replay them.
@@ -1512,6 +1542,7 @@ def _dispatch_qa(
                 cached_response = slack_egress.screen_phantom_write_claims(
                     cached_response, tool_use_count=None,
                     channel_name=channel_name, user_id=user_id or "",
+                    rail_context=rail_ctx,
                 )
                 # Code #13 slice 1 (cq-2a88e32a75ea): the sibling screen -- a cached
                 # reply has no ledger so only the toolname half runs (count=None).
@@ -1519,6 +1550,7 @@ def _dispatch_qa(
                     cached_response, tool_use_count=None,
                     channel_name=channel_name, user_id=user_id or "",
                     entity=entity, cross_entity=is_founder, founder=is_founder,
+                    rail_context=rail_ctx,
                 )
                 say(
                     text=_guard_content(cached_response),
@@ -2060,6 +2092,7 @@ def _dispatch_qa(
             response_text, tool_use_count=_turn_tool_use_count(gen_meta),
             channel_name=channel_name, user_id=user_id or "",
             user_text=user_message, prior_user_texts=_prior_user_texts(prior_messages),
+            rail_context=rail_ctx,
         )
         # Code #13 slice 1 (cq-2a88e32a75ea): the honesty rail's sibling screen --
         # a capability DENIAL about something the bot has in this channel (zero
@@ -2069,6 +2102,7 @@ def _dispatch_qa(
             response_text, tool_use_count=_turn_tool_use_count(gen_meta),
             channel_name=channel_name, user_id=user_id or "",
             entity=entity, cross_entity=is_founder, founder=is_founder,
+            rail_context=rail_ctx,
         )
         if cache_storable and not is_structured_table:
             _try_cache_store(entity, user_message, question_embedding, response_text, hints)
@@ -2205,6 +2239,7 @@ def _dispatch_qa(
         response_text, tool_use_count=_turn_tool_use_count(gen_meta),
         channel_name=channel_name, user_id=user_id or "",
         user_text=user_message, prior_user_texts=_prior_user_texts(prior_messages),
+        rail_context=rail_ctx,
     )
     # Code #13 slice 1 (cq-2a88e32a75ea): the sibling capability screen (see the
     # non-streaming site above for the contract).
@@ -2212,6 +2247,7 @@ def _dispatch_qa(
         response_text, tool_use_count=_turn_tool_use_count(gen_meta),
         channel_name=channel_name, user_id=user_id or "",
         entity=entity, cross_entity=is_founder, founder=is_founder,
+        rail_context=rail_ctx,
     )
     if cache_storable and not is_structured_table:
         _try_cache_store(entity, user_message, question_embedding, response_text, hints)

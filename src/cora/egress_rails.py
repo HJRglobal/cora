@@ -128,8 +128,13 @@ def scan_rail_hits(cutoff: datetime, *, log_dir: Path | None = None) -> dict:
             if stamp is None or stamp < cutoff:
                 continue
             lines_in_window += 1
+            # S3 hardening: the key must START the message (right after the bot
+            # prefix), never merely appear in it -- the S3 fields (and any future
+            # field) must not be able to make one line count for a second rail.
+            head = _BOT_RAIL_LINE_RE.match(line)
+            body_at = head.end() if head else 0
             for key, rx in _FIRING_RE.items():
-                if rx.search(line):
+                if rx.match(line, body_at):
                     counts[key] += 1
     return {"counts": counts, "files_scanned": files_scanned, "bot_lines_in_window": lines_in_window}
 
