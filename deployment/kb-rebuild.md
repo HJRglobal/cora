@@ -8,7 +8,7 @@ backing up a ~6 GB regenerable file daily is large Drive cost for ~zero DR value
 
 If the DB is lost or corrupted, rebuild it — don't restore it.
 
-## Fast path — automatic (no manual work, ~1–3 nights)
+## Fast path — automatic (no manual work; recovers the RECENT DELTA in ~1–3 nights — a FULL-corpus rebuild this way is UNMEASURED; the only historical bound is ~20 nightly windows, the 2026-05-28..06-17 re-ingest — see `deployment/DR-MANIFEST.md` §3)
 
 1. Stop Cora (elevated): `schtasks /End /TN "cowork-cora-service"` + kill bot procs.
 2. Move the DB aside: `mv data/cora_kb.db data/cora_kb.db.bak` (the schema

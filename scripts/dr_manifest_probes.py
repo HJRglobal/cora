@@ -138,13 +138,23 @@ def _gb(n: int) -> str:
 
 # ── probes (each returns (status, detail)) ────────────────────────────────────
 def p_repo(c: Ctx) -> tuple[str, str]:
+    """The RESTORE target is `main` on origin -- record ITS hash. The live checkout may sit
+    on a feature branch during a Code session; that is reported, never called PASS."""
     head = _run(["git", "-C", str(c.live_root), "rev-parse", "--short", "HEAD"])
     branch = _run(["git", "-C", str(c.live_root), "rev-parse", "--abbrev-ref", "HEAD"])
     remote = _run(["git", "-C", str(c.live_root), "remote", "get-url", "origin"])
+    main_hash = _run(["git", "-C", str(c.live_root), "rev-parse", "--short", "origin/main"]) or \
+        _run(["git", "-C", str(c.live_root), "rev-parse", "--short", "main"])
     if not head:
         return FAIL, f"no git repo at {c.live_root}"
-    ok = bool(remote)
-    return (PASS if ok else FAIL), f"live checkout HEAD {head} on {branch}; origin {'set' if ok else 'MISSING'}"
+    if not remote:
+        return FAIL, f"origin remote MISSING; live HEAD {head} on {branch}; restore hash main={main_hash or '?'}"
+    if not main_hash:
+        return FAIL, f"main not resolvable in the live checkout; live HEAD {head} on {branch}"
+    detail = f"restore hash: origin/main {main_hash}; live checkout HEAD {head} on {branch}; origin set"
+    if branch != "main":
+        return MANUAL, detail + " -- the live checkout is NOT on main (a Code session holds it); the restore target is origin/main, not this HEAD"
+    return PASS, detail
 
 
 def p_lock(c: Ctx) -> tuple[str, str]:
@@ -187,7 +197,7 @@ def p_env_schema(c: Ctx) -> tuple[str, str]:
     dups = sorted(k for k, n in counts.items() if n > 1)
     status = PASS if not dups else FAIL
     return status, (f"{len(live_keys)} keys live; {len(missing)} active example keys missing in live"
-                    + (f" ({', '.join(missing[:6])})" if missing else "")
+                    + (f" ({', '.join(missing)})" if missing else "")   # ALL names (key names are allowed; a truncated list hides the one nobody restores)
                     + f"; {len(live_only)} live-only keys (documented as commented in .env.example or undocumented)"
                     + (f"; DUPLICATE keys: {', '.join(dups)}" if dups else "; no duplicate keys"))
 
@@ -219,7 +229,7 @@ def p_wdac(c: Ctx) -> tuple[str, str]:
     k, _, u = out.partition("|")
     label = {"0": "off", "1": "audit", "2": "enforced"}.get(k.strip(), k)
     return PASS, (f"code-integrity policy {label} (kernel {k}, user-mode {u}); service runs `python.exe -m cora.main`; "
-                 f"cora.exe {'present in the venv but blocked by policy -- never the action' if cora_exe else 'absent'}")
+                 f"cora.exe {'present in the venv -- ASSERTED blocked by policy (untested here; never use it as the action)' if cora_exe else 'absent'}")
 
 
 def p_service_task(c: Ctx) -> tuple[str, str]:
@@ -385,13 +395,31 @@ def p_windowless(c: Ctx) -> tuple[str, str]:
 
 
 def p_task_xml_backups(c: Ctx) -> tuple[str, str]:
+    """The committed per-task XML set must cover every manifest task (it is the restore form)."""
+    xdir = c.repo_root / "deployment" / "manifest" / "tasks"
+    try:
+        committed = {p.stem for p in xdir.glob("*.xml")}
+    except OSError:
+        committed = set()
+    expected = {t.get("log_slug") for t in c.tasks.values()} if c.tasks else set()
+    missing = sorted(expected - committed) if expected else []
     d = c.live_root / "deployment" / "task-backups"
     try:
         dates = sorted(p.name for p in d.iterdir() if p.is_dir())
     except OSError:
         dates = []
-    return INFO, (f"local XML exports: {dates or 'none'} (gitignored -- the committed record is deployment/manifest/task-estate.json; "
-                  "an XML export is a convenience, not the source of truth)")
+    status = PASS if committed and not missing else (FAIL if expected else INFO)
+    return status, (f"{len(committed)} committed task XML files under deployment/manifest/tasks"
+                    + (f"; MISSING for {len(missing)} live task(s): {', '.join(missing[:8])}" if missing else "; covers every live task" if expected else "")
+                    + f"; local dated exports (gitignored convenience): {dates or 'none'}")
+
+
+def _manifest_count() -> str:
+    """The committed task-estate count (so item titles never hardcode a number)."""
+    try:
+        return str(json.loads((OUT_DIR / "task-estate.json").read_text(encoding="utf-8")).get("count", "?"))
+    except (OSError, ValueError):
+        return "?"
 
 
 # ── the manifest items (order = the restore drill order) ──────────────────────
@@ -409,8 +437,8 @@ def build_items() -> list[Item]:
              "fetch the passphrase from the password manager FIRST; `restore_secrets.py <secrets-*.enc>` -> `.env` + `cora-calendar-sa.json`", "Harrison", "~10 min (after the passphrase)", p_secrets_bundle),
         Item("D06", "WDAC / code-integrity posture", "Windows Device Guard policy on the host (policy files under `C:\\Windows\\System32\\CodeIntegrity`); service action `python.exe -m cora.main` (the console-script `cora.exe` is BLOCKED)",
              "on a new host: either reproduce the policy (export the .cip set) or run without WDAC; either way register the service as `-m cora.main`, never `cora.exe`", "Harrison", "MANUAL", p_wdac),
-        Item("D07", "Service task `cowork-cora-service` (always-on bot)", "`deployment/setup-windows-task.ps1` (AtLogon, RestartOnFailure 999 x PT1M, windowless via run_hidden)",
-             "run the setup script (elevated), then `deployment\\restart-cora.ps1`; proof = a NEW pid row in `logs/cora-instances.jsonl`", "Cora-script (Harrison runs)", "~5 min", p_service_task),
+        Item("D07", "Service task `cowork-cora-service` (always-on bot)", "`deployment/manifest/tasks/cowork-cora-service.xml` (the live export: AtLogon, RestartOnFailure 999 x PT1M, windowless `python.exe -m cora.main` via run_hidden); `setup-windows-task.ps1` creates it fresh",
+             "`deployment\\register-estate-from-manifest.ps1 -Apply -Only cowork-cora-service` (elevated) after the .env is restored, then `Start-ScheduledTask`; proof = a NEW pid row in `logs/cora-instances.jsonl`", "Cora-script (Harrison runs)", "~5 min", p_service_task),
         Item("D08", "Live bot health (heartbeat + instances ledger)", "`data/health/heartbeat.txt` (60 s) + `logs/cora-instances.jsonl`",
              "start the service task; heartbeat must advance within 2 min", "Cora-script", "~2 min", p_bot_alive),
         Item("D09", "`cora-watchdog` (5-min heartbeat watchdog, RunLevel Highest) + `restart-cora.ps1`", "`deployment/setup-cora-watchdog-task.ps1` + `deployment/cora-watchdog.ps1`",
@@ -421,8 +449,8 @@ def build_items() -> list[Item]:
              "install Drive for Desktop, sign in, set the mount letter to G:, wait for the tree to stream; the bot degrades 14/14 entity contexts without it (9/9 incident)", "Harrison", "~30 min + initial sync UNMEASURED", p_drive_mount),
         Item("D12", "Pinned KB-excluded Drive folder ids", "`src/cora/kb_exclusions.KB_EXCLUDED_FOLDER_IDS` (code; incl. the `_shared/projects/cora` parent pin, the Computers roots, the personal/finance/LEX pins)",
              "nothing to restore -- they ship with the repo; re-verify the ids still resolve after any Drive restructure", "Cora-script", "n/a", p_pinned_folders),
-        Item("D13", "Scheduled estate (96 tasks) = `deployment/manifest/task-estate.json`", "the live Task Scheduler registry, derived by `scripts/generate_task_estate_manifest.py` (M1)",
-             "bootstrap Phase 5: every `setup-*.ps1`, then `rewrap-tasks-hidden.ps1 -Apply`; tasks without a setup script re-register from the manifest JSON; `--diff-only` must print zero drift", "Harrison (elevated) + Cora-script", "~30-45 min", p_scheduled_estate),
+        Item("D13", f"Scheduled estate ({_manifest_count()} tasks) = `deployment/manifest/task-estate.json` + `deployment/manifest/tasks/*.xml`", "the live Task Scheduler registry, derived by `scripts/generate_task_estate_manifest.py` (M1): the JSON is the diff view, the per-task XML is the restore form",
+             "bootstrap Phase 5: `Set-TimeZone` to the manifest's host_time_zone, then `deployment\\register-estate-from-manifest.ps1 -Apply` (elevated; registers every task from its XML, keeps the intent-disabled ones disabled); NOT the setup-*.ps1 scripts (drifted clocks / re-enable disabled tasks); `--diff-only` must print zero drift", "Harrison (elevated) + Cora-script", "~15-30 min", p_scheduled_estate),
         Item("D14", "Interactive-logon dependency of the whole estate", "every task `LogonType=Interactive` (manifest column `run_as`)",
              "DECISION: auto-logon on the host/VM or a stored-credential logon type; then the cold-boot drill", "Harrison", "MANUAL", p_interactive_logon),
         Item("D15", "Backups landing folder + offsite verify", "`backup_logs.py` daily 20:30 AZ -> `G:\\...\\_shared\\projects\\cora\\backups\\YYYY-MM-DD\\` (logs, ledgers, feature DBs, snapshots, secrets); log line `Offsite verify: PASS`",
@@ -439,8 +467,8 @@ def build_items() -> list[Item]:
              "ships with D01/D03; `rewrap-tasks-hidden.ps1 -Apply` after registering tasks", "Cora-script", "~2 min", p_windowless),
         Item("D21", "Cowork estate (Claude desktop scheduled tasks) -- cross-reference", "`%USERPROFILE%\\OneDrive\\Documents\\Claude\\Scheduled\\*` + `C:\\Users\\Harri\\code\\pin-scheduled-task-models.ps1` (weekly task `cowork-model-pin-weekly`)",
              "NOT migrated (charter D4): stays on the office machine; revisit at Phase 3", "Harrison", "n/a", p_cowork_estate),
-        Item("D22", "Task XML exports (`deployment/task-backups/<date>`)", "local, gitignored exports from `rewrap-tasks-hidden.ps1`",
-             "convenience only; the committed record is the manifest JSON", "Cora-script", "n/a", p_task_xml_backups),
+        Item("D22", "Task XML restore set (`deployment/manifest/tasks/<slug>.xml`, committed) + local `deployment/task-backups/<date>` exports", "the generator exports every task's XML on each run (committed with the manifest); `rewrap-tasks-hidden.ps1` also writes local, gitignored dated exports",
+             "the committed XML set IS the restore form (D13); the dated local exports are a convenience that does not survive a bare-metal loss", "Cora-script", "n/a", p_task_xml_backups),
         Item("D23", "Restore drill: cold boot with NO user logged on", "this manifest (D14) + the VM at step 2",
              "power-cycle the VM, do NOT sign in, wait 15 min: does the service start, does the heartbeat advance, do the 02:00-06:10 tasks fire?", "Harrison", "MANUAL (step 2)", None,
              "runs on the VM at step 2; the office host cannot be rebooted for a drill without a stop window"),

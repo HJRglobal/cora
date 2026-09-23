@@ -1,8 +1,9 @@
 # setup-backup-task.ps1
 #
 # Registers cowork-cora-backup as a Windows Task Scheduler task.
-# The task runs the log backup script once daily at 1:00 PM (local time) -- moved
-# off 4:30 AM so its online backup reads the KB while no KB-sync is writing it.
+# The task runs the log backup script once daily at 8:30 PM AZ (local time) -- the
+# LIVE trigger since 2026-07-27 (moved off 1:00 PM for the memory-incident mitigation;
+# originally moved off 4:30 AM so the online backup reads the KB while no KB-sync writes).
 # This is a one-shot daily task, not a persistent service.
 #
 # Usage (run from any directory, as the current user -- no elevation needed):
@@ -16,8 +17,6 @@ $ErrorActionPreference = "Stop"
 $TASK_NAME    = "cowork-cora-backup"
 $REPO_DIR     = "C:\Users\Harri\code\cora"
 $SCRIPT_PATH  = "$REPO_DIR\scripts\backup_logs.py"
-# 1:00PM AZ -- moved off 4:30AM so the online backup reads the 5.7GB cora_kb.db
-# while it is quiescent (no KB-sync writer active), not during kb-sync-drive.
 # 20:30 AZ = the LIVE trigger (moved 2026-07-27 from 1:00PM for the memory-incident
 # mitigation; the file kept the old default until DR/VM step-1 M3 reconciled it against
 # the task-estate manifest, 2026-09-23). A re-run must not silently move the task back.
@@ -121,7 +120,7 @@ Write-Host "  OK  NextRunTime  : $($info.NextRunTime)"
 Write-Host ""
 Write-Host "=== Setup complete ==="
 Write-Host ""
-Write-Host "The backup will run automatically every day at 1:00 PM."
+Write-Host "The backup will run automatically every day at $TRIGGER_TIME (local time)."
 Write-Host "To run it manually right now:"
 Write-Host "  Start-ScheduledTask -TaskName '$TASK_NAME'"
 Write-Host "Or run the script directly with --dry-run first to preview:"

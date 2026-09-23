@@ -42,18 +42,36 @@ class TestCostTable:
             assert abs((q["vm_128_usd"] + storage_128 + q["backup_usd"]) - q["total_128_usd"]) < 0.02, q["provider"]
         assert re.match(r"\d{4}-\d{2}-\d{2}", card.ACCESSED)
 
-    def test_band_verdict_is_computed(self):
+    def test_band_verdict_is_computed_per_row_and_the_headline_is_derived(self, monkeypatch):
         assert card.in_band(450) and not card.in_band(299.99) and not card.in_band(600.01)
-        text = card.render_cost_table_text()
         for q in card.PROVIDER_QUOTES:
-            assert q["provider"] in text and "*BAA:*" in text
-            expected = "in band" if card.in_band(q["total_64_usd"]) else "OUTSIDE band"
-            assert expected in text
-        fallback, blocks = card.build_card()
+            row = card.render_provider_row(q)
+            assert row.startswith(f"- *{q['provider']}*") and "*BAA:*" in row and q["baa"] in row
+            v64 = "in band" if card.in_band(q["total_64_usd"]) else "OUTSIDE band"
+            v128 = "in band" if card.in_band(q["total_128_usd"]) else "OUTSIDE band"
+            assert f"*${q['total_64_usd']:,.0f}/mo* ({v64})" in row and f"*${q['total_128_usd']:,.0f}/mo* ({v128})" in row
+            if q.get("storage_128_usd", q["storage_usd"]) != q["storage_usd"]:
+                assert f"storage ${q['storage_usd']:,.0f} (64 GB) / ${q['storage_128_usd']:,.0f} (128 GB)" in row
+        _, blocks = card.build_card()
         header = blocks[0]["text"]["text"]
         outside = sum(1 for q in card.PROVIDER_QUOTES if not card.in_band(q["total_64_usd"]))
-        assert f"({outside}/{len(card.PROVIDER_QUOTES)})" in header
+        total = len(card.PROVIDER_QUOTES)
+        assert f"({outside}/{total})" in header
+        assert ("Every one of the" in header) == (outside == total)
         assert "Justin" in " ".join(b.get("text", {}).get("text", "") for b in blocks if b.get("type") == "section")
+        # a quote correction that puts one provider in band flips the derived phrase, never a typed sentence
+        monkeypatch.setitem(card.PROVIDER_QUOTES[0], "total_64_usd", 590.0)
+        assert "of the" in card.band_headline() and "Every one of the" not in card.band_headline()
+        assert f"({outside - 1}/{total})" in card.band_headline()
+
+    def test_one_section_per_provider_and_no_section_over_slacks_limit(self):
+        _, blocks = card.build_card()
+        sections = [b["text"]["text"] for b in blocks if b.get("type") == "section"]
+        for q in card.PROVIDER_QUOTES:
+            own = [s for s in sections if s.startswith(f"- *{q['provider']}*")]
+            assert len(own) == 1 and q["baa"] in own[0], q["provider"]      # the BAA column survives on ITS row
+        assert all(len(s) <= card.SLACK_SECTION_LIMIT for s in sections)
+        assert not any("..." == s[-3:] for s in sections)                  # nothing was sliced
 
 
 class TestProposeOnly:
@@ -95,21 +113,27 @@ class TestD2Template:
         assert "LEX KB partition, ~2.1 GB" in text and "pending" in text
         card.assert_propose_only(blocks)
 
-    def test_refuses_when_a_mandatory_input_is_missing(self):
-        with pytest.raises(ValueError):
-            card.render_d2_card(baa_status_per_provider={}, emily_weighed_in="yes", emily_date="2026-10-01",
-                                phi_bytes_proposed="x", target_provider="p")
-        with pytest.raises(ValueError):
-            card.render_d2_card(baa_status_per_provider={"p": "s"}, emily_weighed_in="maybe", emily_date="",
-                                phi_bytes_proposed="x", target_provider="p")
-        with pytest.raises(ValueError):
-            card.render_d2_card(baa_status_per_provider={"p": "s"}, emily_weighed_in="yes", emily_date="",
-                                phi_bytes_proposed="x", target_provider="p")
-        with pytest.raises(ValueError):
-            card.render_d2_card(baa_status_per_provider={"p": "s"}, emily_weighed_in="no", emily_date="",
-                                phi_bytes_proposed="", target_provider="p")
+    def test_refuses_when_a_mandatory_input_is_missing_or_blank(self):
+        ok = dict(baa_status_per_provider={"p": "signed"}, emily_weighed_in="yes", emily_date="2026-10-01",
+                  phi_bytes_proposed="x", target_provider="p")
+        card.render_d2_card(**ok)   # the control renders
+        for bad in (
+            dict(ok, baa_status_per_provider={}),                          # no BAA map
+            dict(ok, baa_status_per_provider={"p": ""}),                   # a BLANK status line
+            dict(ok, baa_status_per_provider={"q": "signed"}),             # target provider has no line
+            dict(ok, emily_weighed_in="maybe"),                            # not yes|no
+            dict(ok, emily_weighed_in="yes", emily_date=""),               # yes without a date
+            dict(ok, emily_weighed_in="yes", emily_date="Oct 1"),          # date not YYYY-MM-DD
+            dict(ok, phi_bytes_proposed=""),                               # no bytes line
+        ):
+            with pytest.raises(ValueError):
+                card.render_d2_card(**bad)
 
-    def test_no_emily_input_is_shown_as_required_not_hidden(self):
+    def test_no_emily_input_is_a_visible_input_not_a_precondition(self):
+        """Charter D2 (Harrison-edited): BAA + Emily are mandatory VISIBLE inputs, NOT preconditions
+        (D-108: Harrison is the sole authority). 'no' renders truthfully and never claims to block."""
         _, blocks = card.render_d2_card(baa_status_per_provider={"p": "s"}, emily_weighed_in="no", emily_date="",
                                         phi_bytes_proposed="none", target_provider="p")
-        assert "REQUIRED before sign-off" in blocks[0]["text"]["text"]
+        text = blocks[0]["text"]["text"]
+        assert "Emily has NOT weighed in" in text and "not a precondition" in text
+        assert "REQUIRED before sign-off" not in text

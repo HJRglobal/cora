@@ -46,9 +46,18 @@ DRIFT (--diff / the Monday digest)
     passed. scripts/cora_health_report.task_estate_section reads
     diff_against_committed() for the Monday digest (read-only: it never writes).
 
-READ-ONLY. This script never registers, edits, enables or disables a task, never
-writes outside deployment/manifest/ and the two GENERATED doc blocks, and carries
-no secret: actions are paths + flags; the .env is never read.
+READ-ONLY. This script never registers, edits, enables or disables a task and never
+writes outside deployment/manifest/ and the two GENERATED doc blocks. It carries no
+secret VALUE: task actions are paths + flags, the task XML carries triggers/settings/
+principal SID only, and the .env is read ONLY as a side effect of importing the mirror's
+Cowork-estate reader (whose module loads it) -- the environment is snapshotted and
+restored around that import and nothing from it is written. scripts/secrets_scan.py
+gates every emitted file in CI.
+
+RESTORE. deployment/manifest/tasks/<slug>.xml = one full-fidelity Task Scheduler export
+per task; deployment/register-estate-from-manifest.ps1 -Apply registers the whole estate
+from them (bootstrap Phase 5). The setup-*.ps1 scripts CREATE new tasks; the manifest
+carries them from then on.
 
     .venv\Scripts\python.exe scripts\generate_task_estate_manifest.py            # write manifest + diff vs committed
     .venv\Scripts\python.exe scripts\generate_task_estate_manifest.py --diff-only
@@ -101,7 +110,11 @@ COWORK_PIN_SCRIPT = r"C:\Users\Harri\code\code\pin-scheduled-task-models.ps1"
 
 #: Fields that participate in the drift diff (everything else is volatile).
 DIFF_KINDS: tuple[str, ...] = ("added", "removed", "cron_changed", "enabled_changed",
-                               "action_changed", "principal_changed")
+                               "action_changed", "principal_changed", "settings_changed")
+#: Non-volatile settings that participate in `settings_changed` (the 2026-06-09 gmail
+#: ExecutionTimeLimit incident class; the service's RestartCount/Interval).
+SETTINGS_DIFF_KEYS: tuple[str, ...] = ("execution_time_limit", "multiple_instances", "restart_count",
+                                       "restart_interval", "wake_to_run", "run_only_if_network_available")
 WARN_PREFIX = "task-estate-drift"
 
 _DAYS = (("Sun", 1), ("Mon", 2), ("Tue", 4), ("Wed", 8), ("Thu", 16), ("Fri", 32), ("Sat", 64))
@@ -125,12 +138,12 @@ $rows = foreach ($t in $ts) {
   $trig = @(foreach ($tr in @($t.Triggers)) {
     if ($null -eq $tr) { continue }
     $en = $true; if ($null -ne $tr.Enabled) { $en = [bool]$tr.Enabled }
-    $ri = ''; $rd = ''
-    if ($null -ne $tr.Repetition) { $ri = [string]$tr.Repetition.Interval; $rd = [string]$tr.Repetition.Duration }
+    $ri = ''; $rd = ''; $stop = $false
+    if ($null -ne $tr.Repetition) { $ri = [string]$tr.Repetition.Interval; $rd = [string]$tr.Repetition.Duration; $stop = [bool]$tr.Repetition.StopAtDurationEnd }
     [pscustomobject]@{
       type = [string]$tr.CimClass.CimClassName; enabled = $en; start_boundary = [string]$tr.StartBoundary
       days_interval = $tr.DaysInterval; days_of_week = $tr.DaysOfWeek; weeks_interval = $tr.WeeksInterval
-      rep_interval = $ri; rep_duration = $rd; exec_limit = [string]$tr.ExecutionTimeLimit; user_id = [string]$tr.UserId
+      rep_interval = $ri; rep_duration = $rd; rep_stop_at_end = $stop; exec_limit = [string]$tr.ExecutionTimeLimit; user_id = [string]$tr.UserId
     }
   })
   $acts = @(foreach ($a in @($t.Actions)) {
@@ -272,12 +285,15 @@ def enumerate_cim() -> list[dict[str, Any]]:
     if isinstance(data, dict):
         data = [data]
     tasks = [d for d in data if isinstance(d, dict) and name_matches(d.get("name", ""))]
-    generic = [t["name"] for t in tasks
-               if any(str(tr.get("type") or "") == _GENERIC_TRIGGER for tr in (t.get("triggers") or []) if isinstance(tr, dict))]
-    xmls = fetch_task_xml(generic)
+    # Every task's full-fidelity XML is the RESTORE form (deployment/manifest/tasks/<slug>.xml,
+    # registered by deployment/register-estate-from-manifest.ps1). Tasks whose triggers CIM
+    # reports only as the generic MSFT_TaskTrigger also get their triggers re-read from it.
+    xmls = fetch_task_xml([t["name"] for t in tasks])
     for t in tasks:
         xml_text = xmls.get(t["name"], "")
-        if xml_text:
+        t["_xml"] = xml_text
+        generic = any(str(tr.get("type") or "") == _GENERIC_TRIGGER for tr in (t.get("triggers") or []) if isinstance(tr, dict))
+        if xml_text and generic:
             parsed = triggers_from_xml(xml_text)
             if parsed:
                 t["triggers"] = parsed
@@ -286,18 +302,25 @@ def enumerate_cim() -> list[dict[str, Any]]:
 
 
 # ── enumeration 2: schtasks CSV (independent code path in Windows) ────────────
-def enumerate_schtasks_csv() -> set[str]:
+def enumerate_schtasks_csv() -> set[str] | None:
+    """None when schtasks failed or parsed to nothing -- a failed second method must read
+    as UNAVAILABLE, never as 'DISAGREE: 0 tasks' (D-051 lens A)."""
     proc = subprocess.run(["schtasks", "/query", "/fo", "CSV", "/v"], capture_output=True, text=True,
                           timeout=120, creationflags=_NO_WINDOW, encoding="utf-8", errors="replace")
+    if proc.returncode != 0:
+        log.info("schtasks rc=%s: %s", proc.returncode, (proc.stderr or proc.stdout).strip()[:200])
+        return None
     names: set[str] = set()
+    rows = 0
     for row in csv.DictReader(io.StringIO(proc.stdout)):
+        rows += 1
         raw = str(row.get("TaskName") or "")
         if raw == "TaskName":       # /v repeats the header before each block on some builds
             continue
         name = raw.rsplit("\\", 1)[-1]
         if name_matches(name):
             names.add(name)
-    return names
+    return names if rows else None
 
 
 # ── enumeration 3: the in-process cora_health view (the service's own table) ──
@@ -320,8 +343,9 @@ def enumeration_agreement(cim_names: set[str], csv_names: set[str] | None,
                           health_names: set[str] | None) -> dict[str, Any]:
     out: dict[str, Any] = {"cim_count": len(cim_names), "agree": True, "methods": {}}
     for label, other in (("schtasks_csv", csv_names), ("cora_health_view", health_names)):
-        if other is None:
-            out["methods"][label] = {"available": False}
+        if other is None or (not other and cim_names):
+            # a method that returned NOTHING while CIM sees tasks failed; it is not a disagreement
+            out["methods"][label] = {"available": False, "reason": "no rows returned" if other is not None else "call failed"}
             continue
         only_cim = sorted(cim_names - other)
         only_other = sorted(other - cim_names)
@@ -387,7 +411,9 @@ def trigger_text(trig: dict[str, Any]) -> str:
         # generic MSFT_TaskTrigger with no XML detail available, or an unknown class
         base = f"{t.replace('MSFT_Task', '').replace('XML:', '').replace('Trigger', '') or 'trigger'} from {str(trig.get('start_boundary') or '')[:16]}"
     if rep:
-        base = f"every {rep} ({base})"
+        dur = str(trig.get("rep_duration") or "")
+        stop = " stop-at-end" if trig.get("rep_stop_at_end") else ""
+        base = f"every {rep}" + (f" for {dur}{stop}" if dur else "") + f" ({base})"
     return base.strip() + dis
 
 
@@ -475,7 +501,8 @@ def load_intent(path: Path = TASK_STATE_YAML) -> dict[str, Any]:
 def intent_for(name: str, enabled: bool, intent: dict[str, Any]) -> tuple[str, str]:
     """(intent, drift) -- drift is non-empty when the host state contradicts the yaml."""
     if name in intent.get("running", ()):
-        return "running", ""
+        # the yaml's ONLY task-state CRITICAL: the always-on service must be enabled + Running
+        return "running", ("host DISABLED but intent running" if not enabled else "")
     if name in intent.get("disabled", ()):
         return "disabled", ("host ENABLED but intent disabled" if enabled else "")
     if name in intent.get("enabled", ()):
@@ -497,20 +524,31 @@ def load_setup_scripts(deploy_dir: Path = DEPLOYMENT_DIR) -> dict[str, str]:
     return out
 
 
+_PS_COMMENT_LINE_RE = re.compile(r"^\s*#.*$", re.MULTILINE)
+_PS_BLOCK_COMMENT_RE = re.compile(r"<#.*?#>", re.DOTALL)
+
+
+def _strip_ps_comments(text: str) -> str:
+    """Drop `# ...` lines and `<# ... #>` blocks: a comment that names another task
+    (`#     schtasks /Change /TN "Cora - F3E Daily Ecom Brief" /Disable`) must never read
+    as a registration (D-051 lens A, 2026-09-23)."""
+    return _PS_COMMENT_LINE_RE.sub("", _PS_BLOCK_COMMENT_RE.sub("", text))
+
+
 def _registration_re(name: str) -> re.Pattern[str]:
-    """A REGISTRATION-shaped mention: `$TaskName = "<name>"`, `-TaskName "<name>"`,
-    `/TN "<name>"` (any quote style). A comment that merely names another task
-    ("BEFORE 'Cora - Weekly Health Metrics'") does not match."""
+    """A REGISTRATION-shaped mention on a NON-comment line: `$TaskName = "<name>"`,
+    `-TaskName "<name>"`, or `schtasks /Create ... /TN "<name>"` (any quote style). A
+    `/TN` on a `/Change`, `/Delete` or `/End` line is not a registration."""
     q = re.escape(name)
-    return re.compile(r"""(?:\$\w*(?:TaskName|TASK_NAME|TASKNAME)\w*\s*=\s*|-TaskName\s+|/TN\s+)["']""" + q + r"""["']""")
+    return re.compile(r"""(?:\$\w*(?:TaskName|TASK_NAME|TASKNAME)\w*\s*=\s*|-TaskName\s+|/Create\b[^\r\n]*?/TN\s+)["']""" + q + r"""["']""")
 
 
 def setup_scripts_for(name: str, scripts: dict[str, str]) -> list[str]:
-    """The setup-*.ps1 files that REGISTER this exact task name. Registration-shaped
-    matches win; a bare quoted mention is the fallback only when no script
-    registers the name in that shape."""
+    """The setup-*.ps1 files that REGISTER this exact task name (comments stripped
+    first). Registration-shaped matches win; a bare quoted mention on a non-comment
+    line is the fallback only when no script registers the name in that shape."""
     reg = _registration_re(name)
-    setup = {fn: text for fn, text in scripts.items() if fn.startswith("setup-")}
+    setup = {fn: _strip_ps_comments(text) for fn, text in scripts.items() if fn.startswith("setup-")}
     strong = sorted(fn for fn, text in setup.items() if reg.search(text))
     if strong:
         return strong
@@ -545,10 +583,12 @@ def ladder_lane_for(name: str, script: str, index: list[tuple[str, str, str]]) -
     return "UNROWED"
 
 
-def load_run_markers() -> dict[str, dict[str, Any]]:
+def load_run_markers(path: Path | None = None) -> dict[str, dict[str, Any]]:
+    """Latest marker per task from logs/task-runs.jsonl (an explicit `path` wins over the
+    module default AND over any ambient TASK_RUNS_LEDGER_PATH)."""
     try:
         from cora import run_marker  # noqa: PLC0415
-        return run_marker.latest_by_task()
+        return run_marker.latest_by_task(path) if path is not None else run_marker.latest_by_task()
     except Exception as exc:  # noqa: BLE001
         log.info("run markers unavailable: %s", exc)
         return {}
@@ -606,22 +646,35 @@ def normalize_task(raw: dict[str, Any], *, intent: dict[str, Any], scripts: dict
         "ladder_lane": ladder_lane_for(name, script, ladder),
         "setup_scripts": setup_scripts_for(name, scripts),
         "description": str(raw.get("description") or "")[:200],
+        "_xml": str(raw.get("_xml") or ""),   # lifted out of the JSON by build_manifest -> tasks/<slug>.xml
     }
 
 
 # ── the Cowork estate cross-reference (ONE reader: the mirror's) ──────────────
 def cowork_estate_crossref(pin_state: str | None = None) -> dict[str, Any]:
+    """Count + a digest of the Cowork task ids -- NEVER the id list. The ids name personal
+    and staff-adjacent tasks (D-051 lens B); a committed inventory of them is a leak. The
+    digest still lets the mirror's own delta detect adds/removes."""
     out: dict[str, Any] = {"migrates": False, "doctrine": "charter D4 (2026-09-01): the Cowork estate stays on the office machine; revisit at Phase 3",
                            "pin_task": COWORK_PIN_TASK, "pin_script": COWORK_PIN_SCRIPT.replace("code\\code", "code"),
                            "reader": "scripts/mirror_claude_workspace._task_dirs"}
+    # mirror_claude_workspace loads the live .env at import (module-level load_dotenv). Nothing
+    # from it is written anywhere here, but the environment is snapshotted and restored so the
+    # generator's own process never carries those values past this call.
+    saved_env = dict(os.environ)
     try:
         import mirror_claude_workspace as mw  # noqa: PLC0415
         cfg = mw.load_config()
         dirs = mw._task_dirs(cfg)  # noqa: SLF001 -- the one implementation, reused on purpose
+        import hashlib  # noqa: PLC0415
+        digest = hashlib.sha256("\n".join(sorted(d.name for d in dirs)).encode("utf-8")).hexdigest()[:16]
         out.update({"available": True, "root": str(mw._tasks_root(cfg)), "count": len(dirs),  # noqa: SLF001
-                    "task_ids": [d.name for d in dirs]})
+                    "task_ids_sha256_16": digest})
     except Exception as exc:  # noqa: BLE001
         out.update({"available": False, "reason": str(exc)})
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_env)
     if pin_state is not None:
         out["pin_task_state"] = pin_state
     return out
@@ -649,15 +702,20 @@ def run_marker_coverage(tasks: list[dict[str, Any]], log_dir: Path = TASK_LOG_DI
 
 def build_manifest(tasks: list[dict[str, Any]], *, agreement: dict[str, Any] | None = None,
                    cowork: dict[str, Any] | None = None, now: datetime | None = None,
-                   host: str = "", log_dir: Path = TASK_LOG_DIR) -> dict[str, Any]:
+                   host: str = "", log_dir: Path = TASK_LOG_DIR, host_time_zone: str = "") -> dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     tasks = sorted(tasks, key=lambda t: t["name"].lower())
+    # the per-task XML is written as files by write_outputs, never embedded in the JSON
+    task_xml = {t["log_slug"]: t.pop("_xml", "") for t in tasks}
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "generated_at_az": now.astimezone(AZ).strftime("%Y-%m-%d %H:%M AZ"),
         "generator": "scripts/generate_task_estate_manifest.py",
         "host": host or os.environ.get("COMPUTERNAME", ""),
+        "host_time_zone": host_time_zone,
+        "task_xml_dir": "deployment/manifest/tasks",
+        "_task_xml": task_xml,
         "source": "Get-ScheduledTask + Get-ScheduledTaskInfo (CIM), cross-checked vs schtasks CSV + cora_health view",
         "name_filters": {"prefixes": list(NAME_PREFIXES), "exact": list(NAME_EXACT)},
         "count": len(tasks),
@@ -700,7 +758,16 @@ def diff_manifests(prev_tasks: list[dict[str, Any]], cur_tasks: list[dict[str, A
             out["action_changed"].append(f"{WARN_PREFIX}: action_changed {n}")
         if _principal_text(p) != _principal_text(c):
             out["principal_changed"].append(f"{WARN_PREFIX}: principal_changed {n}: {_principal_text(p)} -> {_principal_text(c)}")
+        ps, cs = _settings_text(p), _settings_text(c)
+        if ps != cs:
+            out["settings_changed"].append(f"{WARN_PREFIX}: settings_changed {n}: {ps} -> {cs}")
     return out
+
+
+def _settings_text(t: dict[str, Any]) -> str:
+    parts = [f"{k}={t.get(k)}" for k in SETTINGS_DIFF_KEYS]
+    parts.append(f"user_id={(t.get('run_as') or {}).get('user_id', '')}")
+    return ";".join(parts)
 
 
 def warn_lines(diff: dict[str, list[str]]) -> list[str]:
@@ -729,16 +796,32 @@ def diff_against_committed(out_dir: Path = OUT_DIR, live_tasks: list[dict[str, A
                 "manifest_count": committed.get("count"), "manifest_generated_at": committed.get("generated_at_utc")}
     diff = diff_manifests(committed["tasks"], live_tasks)
     lines = warn_lines(diff)
+    # host time zone: clock triggers are host-local, so a different zone IS drift
+    tz_live = host_time_zone() if os.name == "nt" else ""
+    tz_manifest = str(committed.get("host_time_zone") or "")
+    if tz_live and tz_manifest and tz_live != tz_manifest:
+        lines.append(f"{WARN_PREFIX}: timezone_changed host: {tz_manifest} -> {tz_live}")
+        diff["timezone_changed"] = [lines[-1]]
     return {"available": True, "manifest_count": committed.get("count"), "live_count": len(live_tasks),
             "manifest_generated_at": committed.get("generated_at_utc"),
             "drift": {k: len(v) for k, v in diff.items()}, "warn_lines": lines, "drifted": bool(lines)}
 
 
-def normalize_all(raw_tasks: list[dict[str, Any]], *, log_dir: Path = TASK_LOG_DIR) -> list[dict[str, Any]]:
+def host_time_zone() -> str:
+    """The host's Windows time-zone id ((Get-TimeZone).Id); '' when unreadable."""
+    try:
+        return _run_powershell("(Get-TimeZone).Id", timeout=30).strip()
+    except Exception as exc:  # noqa: BLE001
+        log.info("time zone unreadable: %s", exc)
+        return ""
+
+
+def normalize_all(raw_tasks: list[dict[str, Any]], *, log_dir: Path = TASK_LOG_DIR,
+                  marker_path: Path | None = None) -> list[dict[str, Any]]:
     intent = load_intent()
     scripts = load_setup_scripts()
     ladder = load_ladder_index()
-    markers = load_run_markers()
+    markers = load_run_markers(marker_path)
     return [normalize_task(r, intent=intent, scripts=scripts, ladder=ladder, markers=markers, log_dir=log_dir)
             for r in raw_tasks]
 
@@ -800,32 +883,32 @@ def render_markdown(m: dict[str, Any]) -> str:
 def render_bootstrap_block(m: dict[str, Any]) -> str:
     """The `## Scheduled estate` body for bootstrap-new-machine.md. Date-only stamp so a
     same-day regeneration is byte-identical."""
-    date = m["generated_at_utc"][:10]
+    date = m["generated_at_az"][:10]   # AZ date, same as the DR block: an evening run must not stamp tomorrow
     L = [f"_Generated {date} by `scripts/generate_task_estate_manifest.py --update-docs` from the live registry: "
          f"**{m['count']} tasks** ({m['enabled_count']} enabled). Source of truth: `deployment/manifest/{MANIFEST_JSON}`. "
          f"Do not hand-list tasks here -- regenerate._", "",
-         "**Register order on a rebuild** (each `setup-*.ps1` is idempotent; run from an ELEVATED PowerShell at the repo root):",
-         "1. `deployment\\setup-windows-task.ps1` (the always-on service, `-m cora.main`) then `deployment\\setup-cora-watchdog-task.ps1`.",
-         "2. `deployment\\setup-kb-sync-tasks.ps1` (the KB ingest bundle) and every other `setup-*.ps1` in the table below.",
-         "3. `deployment\\rewrap-tasks-hidden.ps1 -Apply` (windowless run_hidden wrapping for the whole estate; D-266).",
-         "4. Tasks marked **none** below have no setup script: re-register them from `deployment/manifest/task-estate.json` "
-         "(trigger + child command + run level are recorded per task) or from a `deployment/task-backups/<date>` XML export.",
-         "5. Re-check `Get-ScheduledTask | Where-Object { $_.TaskName -like 'cowork-cora-*' -or $_.TaskName -like 'Cora - *' -or $_.TaskName -eq 'cora-watchdog' } | Measure-Object`"
-         f" -> expect **{m['count']}**, then run the generator with `--diff-only` -> expect zero `task-estate-drift` lines.",
-         "6. The Cowork estate (Claude desktop scheduled tasks) is NOT registered by any of this: it stays on the office machine (charter D4); "
+         f"**Register the estate FROM THE MANIFEST** (from an ELEVATED PowerShell at the repo root; host time zone must be `{m.get('host_time_zone') or 'the office host zone'}` first -- `Set-TimeZone`):",
+         "1. `.\\deployment\\register-estate-from-manifest.ps1` (dry-run plan) then `.\\deployment\\register-estate-from-manifest.ps1 -Apply` -- registers every task below from "
+         "`deployment/manifest/tasks/<slug>.xml` (full-fidelity Task Scheduler exports: triggers, windowless action, settings, run level, and `Enabled=false` for the "
+         f"{len(m['disabled'])} intent-disabled tasks). The `setup-*.ps1` scripts are NOT run on a rebuild: several carry drifted clocks or would re-enable disabled tasks; they create NEW tasks only.",
+         "2. Restore `.env` (Phase 4) BEFORE starting anything; then `Start-ScheduledTask -TaskName cowork-cora-service` (the service otherwise starts at the next logon).",
+         "3. Verify: `Get-ScheduledTask | Where-Object { $_.TaskName -like 'cowork-cora-*' -or $_.TaskName -like 'Cora - *' -or $_.TaskName -eq 'cora-watchdog' } | Measure-Object`"
+         f" -> expect **{m['count']}**, then `.venv\\Scripts\\python.exe scripts\\generate_task_estate_manifest.py --diff-only` -> expect ZERO `task-estate-drift` lines "
+         "(cron / enabled / action / principal / settings / time zone are all compared).",
+         "4. The Cowork estate (Claude desktop scheduled tasks) is NOT registered by any of this: it stays on the office machine (charter D4); "
          f"its weekly pin task is `{COWORK_PIN_TASK}`.", "",
-         "| Task | Trigger | Register with | Run level / logon | SWA | Intent |", "|---|---|---|---|---|---|"]
+         "| Task | Trigger | XML (restore form) | Created by (setup script, informational) | Run level / logon | SWA | Intent |", "|---|---|---|---|---|---|---|"]
     for t in m["tasks"]:
         L.append("| " + " | ".join(_cell(x) for x in (
-            f"`{t['name']}`", t["trigger_text"],
-            ", ".join(f"`deployment\\{s}`" for s in t["setup_scripts"]) or "**none** (manifest JSON / XML export)",
+            f"`{t['name']}`", t["trigger_text"], f"`tasks/{t['log_slug']}.xml`",
+            ", ".join(f"`{s}`" for s in t["setup_scripts"]) or "(none -- manifest XML only)",
             f"{t['run_as']['run_level']} / {t['run_as']['logon_type']}", "yes" if t["start_when_available"] else "**no**",
             t["intent"])) + " |")
     return "\n".join(L) + "\n"
 
 
 def render_runbook_table(m: dict[str, Any]) -> str:
-    date = m["generated_at_utc"][:10]
+    date = m["generated_at_az"][:10]   # AZ date, same as the DR block: an evening run must not stamp tomorrow
     L = [f"_Generated {date} by `scripts/generate_task_estate_manifest.py --update-docs` from the live registry "
          f"({m['count']} tasks, {m['enabled_count']} enabled). Full columns: `deployment/manifest/{MANIFEST_MD}`. Do not hand-edit._", "",
          "| Task Name | Schedule | Script | State | Run level | Notes |", "|---|---|---|---|---|---|"]
@@ -875,12 +958,36 @@ def update_docs(m: dict[str, Any], *, bootstrap: Path = BOOTSTRAP_DOC, runbook: 
     return changed
 
 
+TASK_XML_SUBDIR = "tasks"
+
+
 def write_outputs(m: dict[str, Any], out_dir: Path = OUT_DIR) -> list[Path]:
+    """JSON + MD + one XML per task under <out_dir>/tasks/ (stale XML files for tasks no
+    longer in the manifest are removed, so a removed task cannot be resurrected by the
+    registration script). The `_task_xml` map never enters the JSON."""
     out_dir.mkdir(parents=True, exist_ok=True)
+    task_xml = m.pop("_task_xml", {}) or {}
     jp, mp = out_dir / MANIFEST_JSON, out_dir / MANIFEST_MD
     jp.write_text(json.dumps(m, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
     mp.write_text(render_markdown(m), encoding="utf-8", newline="\n")
-    return [jp, mp]
+    written = [jp, mp]
+    if any(task_xml.values()):
+        xdir = out_dir / TASK_XML_SUBDIR
+        xdir.mkdir(parents=True, exist_ok=True)
+        keep: set[str] = set()
+        for slug, xml_text in sorted(task_xml.items()):
+            if not xml_text:
+                continue
+            body = re.sub(r"^\s*<\?xml[^>]*\?>", '<?xml version="1.0" encoding="UTF-8"?>', xml_text.lstrip("﻿"), count=1).strip()
+            xp = xdir / f"{slug}.xml"
+            xp.write_text(body + "\n", encoding="utf-8", newline="\n")
+            written.append(xp)
+            keep.add(xp.name)
+        for stale in xdir.glob("*.xml"):
+            if stale.name not in keep:
+                stale.unlink()
+    m["_task_xml"] = task_xml      # leave the in-memory manifest as it was handed in
+    return written
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -906,19 +1013,24 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.WARNING if args.quiet else logging.INFO, format="%(levelname)s %(message)s")
 
+    if args.fixture and args.update_docs:
+        print("REFUSED: --update-docs with --fixture would rewrite the REAL bootstrap/runbook blocks with fixture data.")
+        return 2
+
     log_dir = TASK_LOG_DIR
+    marker_path: Path | None = None
     if args.live_root:
         global LIVE_ROOT
         LIVE_ROOT = args.live_root
         log_dir = args.live_root / "logs" / "tasks"
-        os.environ.setdefault("TASK_RUNS_LEDGER_PATH", str(args.live_root / "logs" / "task-runs.jsonl"))
+        marker_path = args.live_root / "logs" / "task-runs.jsonl"   # explicit; an ambient env var must not win
 
     try:
         raw = _load_fixture(args.fixture) if args.fixture else enumerate_cim()
     except Exception as exc:  # noqa: BLE001
         print(f"ERROR: enumeration failed: {exc}")
         return 2
-    tasks = normalize_all(raw, log_dir=log_dir)
+    tasks = normalize_all(raw, log_dir=log_dir, marker_path=marker_path)
     names = {t["name"] for t in tasks}
 
     agreement: dict[str, Any] = {"cim_count": len(names), "agree": True, "methods": {}}
@@ -932,7 +1044,8 @@ def main(argv: list[str] | None = None) -> int:
         agreement = enumeration_agreement(names, csv_names, enumerate_health_view())
         cowork = cowork_estate_crossref(pin_task_state())
 
-    manifest = build_manifest(tasks, agreement=agreement, cowork=cowork, log_dir=log_dir)
+    manifest = build_manifest(tasks, agreement=agreement, cowork=cowork, log_dir=log_dir,
+                              host_time_zone=("" if args.fixture else host_time_zone()))
 
     prev_path = args.previous or (args.out_dir / MANIFEST_JSON)
     prev = load_manifest(prev_path)

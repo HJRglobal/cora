@@ -15,6 +15,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
 
@@ -88,10 +90,69 @@ class TestShapes:
         vals = ss.live_secret_values(env)
         assert set(vals) == {"SLACK_BOT_TOKEN", "MAKE_SALES_DECK_WEBHOOK_URL"}
 
-    def test_env_example_keys_include_commented_entries(self, tmp_path):
+    def test_env_example_keys_include_commented_and_empty_entries(self, tmp_path):
         ex = tmp_path / ".env.example"
-        ex.write_text("# SLACK_USER_TOKEN=<value>\nOPENAI_API_KEY=<value>\n# comment\n", encoding="utf-8")
-        assert ss.env_example_keys(ex) == {"SLACK_USER_TOKEN", "OPENAI_API_KEY"}
+        ex.write_text("# SLACK_USER_TOKEN=<value>\nOPENAI_API_KEY=<value>\nEMPTY_DOCUMENTED_KEY=\n# comment\n", encoding="utf-8")
+        assert ss.env_example_keys(ex) == {"SLACK_USER_TOKEN", "OPENAI_API_KEY", "EMPTY_DOCUMENTED_KEY"} | set(ss.EXTRA_SECRET_KEYS)
+
+    def test_the_passphrase_is_a_secret_whatever_its_shape(self, tmp_path):
+        """CORA_BACKUP_PASSPHRASE decrypts every other secret; it has no token shape and may be
+        short. It is a hit on a line, inline, and in the belt (D-051 lens B HIGH)."""
+        keys = ss.env_example_keys(tmp_path / "absent.env.example")     # EXTRA keys survive an absent example file
+        assert "CORA_BACKUP_PASSPHRASE" in keys
+        text = "\n".join([
+            "CORA_BACKUP_PASSPHRASE=correct horse battery",              # anchored
+            "- set `CORA_BACKUP_PASSPHRASE=horsebattery9` in the User scope",  # inline
+            "| CORA_BACKUP_PASSPHRASE | see the password manager |",     # a NAME in a table cell: fine",
+        ])
+        hits = ss.scan_text(text, "d.md", env_keys=keys)
+        assert [(h.line, h.key) for h in hits] == [(1, "CORA_BACKUP_PASSPHRASE"), (2, "CORA_BACKUP_PASSPHRASE")]
+        env = tmp_path / ".env"
+        env.write_text("CORA_BACKUP_PASSPHRASE=short8ch\nDEPOSCO_PROD_PASS=Wh4le9xQ\nSLACK_BOT_TOKEN=abc\n", encoding="utf-8")
+        vals = ss.live_secret_values(env)
+        assert set(vals) == {"CORA_BACKUP_PASSPHRASE", "DEPOSCO_PROD_PASS"}    # 8-char passwords are in the belt; a 3-char token is noise
+
+    def test_inline_assignments_in_bullets_code_and_tables_are_hits_for_secret_keys(self):
+        keys = {"DEPOSCO_PROD_PASS", "HUBSPOT_PORTAL_ID", "OPENAI_API_KEY"}
+        text = "\n".join([
+            "- DEPOSCO_PROD_PASS=Wh4le9xQz1 is the production password",
+            "set `OPENAI_API_KEY=abcdefghijklmnopqrstuvwxyz` in .env",
+            "| DEPOSCO_PROD_PASS | Wh4le9xQz1 |",          # no '=': the belt catches a live value, rule 2 does not
+            "- HUBSPOT_PORTAL_ID=246351746 (identifier, fine inline)",
+            "INSTAGRAM_F3E_ACCESS_TOKEN=<long-lived token from Task 3>",   # placeholder split at its space
+        ])
+        hits = ss.scan_text(text, "r.md", env_keys=keys | {"INSTAGRAM_F3E_ACCESS_TOKEN"})
+        assert [(h.line, h.key) for h in hits] == [(1, "DEPOSCO_PROD_PASS"), (2, "OPENAI_API_KEY")]
+
+
+class TestTestPathsAreBeltOnly:
+    """The hook's second gate scans STAGED files, which include test files whose fixtures are
+    secret-SHAPED by construction (this very file). Under tests/ only the live-.env belt applies;
+    everywhere else all three rules apply; a LIVE value under tests/ still blocks."""
+
+    def test_is_test_path_both_separators(self):
+        assert ss.is_test_path("tests/test_x.py") and ss.is_test_path("tests\\sub\\test_y.py")
+        assert not ss.is_test_path("deployment/tests.md") and not ss.is_test_path("scripts/test_helper.py")
+
+    def test_shaped_fixture_under_tests_is_not_a_hit_but_is_under_deployment(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ss, "_REPO_ROOT", tmp_path)
+        fixture = "aws: AKIAIOSFODNN7EXAMPLQ\nOPENAI_API_KEY=abcdefghijklmnopqrstuvwxyz0123456789\n"
+        (tmp_path / "tests").mkdir(); (tmp_path / "deployment").mkdir()
+        (tmp_path / "tests" / "test_fixture.py").write_text(fixture, encoding="utf-8")
+        (tmp_path / "deployment" / "runbook.md").write_text(fixture, encoding="utf-8")
+        hits = ss.scan_paths([tmp_path / "tests", tmp_path / "deployment"], env_belt=False, env_keys={"OPENAI_API_KEY"})
+        assert {h.path.replace("\\", "/") for h in hits} == {"deployment/runbook.md"}
+        assert sorted(h.kind for h in hits) == ["env-assignment", "shape"]
+
+    def test_live_value_under_tests_still_blocks_and_names_the_key_only(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ss, "_REPO_ROOT", tmp_path)
+        env = tmp_path / ".env"
+        env.write_text("SLACK_BOT_TOKEN=live-token-value-Zq8x1kLm3pQ\n", encoding="utf-8")
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_leak.py").write_text("TOKEN = 'live-token-value-Zq8x1kLm3pQ'\n", encoding="utf-8")
+        hits = ss.scan_paths([tmp_path / "tests"], env_belt=True, env_file=env, env_keys=set())
+        assert [(h.kind, h.key) for h in hits] == [("live-env-value", "SLACK_BOT_TOKEN")]
+        assert "Zq8x1kLm3pQ" not in hits[0].render()
 
 
 class TestCIGuard:
@@ -102,5 +163,13 @@ class TestCIGuard:
         docs = REPO / "docs"
         if docs.exists():
             roots.append(docs)
+        roots += [p for p in (REPO / "scripts" / "stage_vm_step2_card.py", REPO / "scripts" / "register_estate_placeholder") if p.exists()]
         hits = ss.scan_paths([r for r in roots if r.exists()], env_belt=True)
         assert hits == [], "\n".join(h.render() for h in hits)
+
+    def test_live_belt_is_armed_wherever_a_live_env_resolves(self):
+        """A worktree has no .env; LIVE_ENV falls back to the live checkout's. Wherever that file
+        exists the belt must carry keys -- a vacuous belt (0 keys) is a silent no-op, not a pass."""
+        if not ss.LIVE_ENV.exists():
+            pytest.skip("no live .env on this host (CI): the belt is documented as inert here")
+        assert len(ss.live_secret_values(ss.LIVE_ENV)) > 0

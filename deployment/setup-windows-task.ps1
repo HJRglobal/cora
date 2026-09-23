@@ -43,16 +43,20 @@ if (-not (Test-Path $ENV_FILE -PathType Leaf)) {
 Write-Host "  OK  $ENV_FILE"
 
 # ------------------------------------------------------------------
-# [3/5] Locate the venv cora.exe entry point (absolute path -- Task
-# Scheduler has no user PATH, and "uv run" risks the venv-lock deadlock)
+# [3/5] Locate the venv python.exe (absolute path -- Task Scheduler has
+# no user PATH, and "uv run" risks the venv-lock deadlock). The action is
+# `python.exe -m cora.main`, NEVER the console-script cora.exe: the host's
+# WDAC code-integrity policy blocks cora.exe (DR-MANIFEST D06), and the
+# LIVE task has run `-m cora.main` since 2026-08 (doctrine 5). This script
+# registered cora.exe until the 2026-09-23 DR/VM review caught it (HIGH).
 # ------------------------------------------------------------------
-Write-Host "[3/5] Locating .venv\Scripts\cora.exe..."
-$CoraExe = Join-Path $REPO_DIR ".venv\Scripts\cora.exe"
-if (-not (Test-Path $CoraExe -PathType Leaf)) {
-    Write-Host "  ERROR: $CoraExe not found. Run 'uv sync' in $REPO_DIR first." -ForegroundColor Red
+Write-Host "[3/5] Locating .venv\Scripts\python.exe..."
+$PythonExe = Join-Path $REPO_DIR ".venv\Scripts\python.exe"
+if (-not (Test-Path $PythonExe -PathType Leaf)) {
+    Write-Host "  ERROR: $PythonExe not found. Run 'uv sync' in $REPO_DIR first." -ForegroundColor Red
     exit 1
 }
-Write-Host "  OK  $CoraExe"
+Write-Host "  OK  $PythonExe -m cora.main"
 
 # ------------------------------------------------------------------
 # [4/5] Build and register the task (idempotent - remove then re-add)
@@ -79,7 +83,8 @@ if ($orphans) {
 # Windowless action: route the command through run_hidden.py under pythonw.exe
 . "$PSScriptRoot\_task-action.ps1"
 $action = New-WrappedTaskAction -TaskName $TASK_NAME `
-    -Execute $CoraExe `
+    -Execute $PythonExe `
+    -Argument "-m cora.main" `
     -WorkingDirectory $REPO_DIR
 
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME

@@ -200,10 +200,11 @@ Save (Ctrl+S) and close.
 
 **Critical:** `.env` is gitignored. NEVER commit it. NEVER paste these values into chat or any external system.
 
-Verify the bot can start with the new secrets:
+Verify the bot can start with the new secrets (the SAME form the service task runs -- never the
+console-script `cora.exe`, which the host's WDAC code-integrity policy blocks, DR-MANIFEST D06):
 
 ```powershell
-uv run cora
+.venv\Scripts\python.exe -m cora.main
 ```
 
 Expect logs:
@@ -239,112 +240,110 @@ decision recorded in `deployment/DR-MANIFEST.md`, not something this phase sets.
 <!-- BEGIN GENERATED: scheduled-estate -->
 _Generated 2026-09-23 by `scripts/generate_task_estate_manifest.py --update-docs` from the live registry: **96 tasks** (78 enabled). Source of truth: `deployment/manifest/task-estate.json`. Do not hand-list tasks here -- regenerate._
 
-**Register order on a rebuild** (each `setup-*.ps1` is idempotent; run from an ELEVATED PowerShell at the repo root):
-1. `deployment\setup-windows-task.ps1` (the always-on service, `-m cora.main`) then `deployment\setup-cora-watchdog-task.ps1`.
-2. `deployment\setup-kb-sync-tasks.ps1` (the KB ingest bundle) and every other `setup-*.ps1` in the table below.
-3. `deployment\rewrap-tasks-hidden.ps1 -Apply` (windowless run_hidden wrapping for the whole estate; D-266).
-4. Tasks marked **none** below have no setup script: re-register them from `deployment/manifest/task-estate.json` (trigger + child command + run level are recorded per task) or from a `deployment/task-backups/<date>` XML export.
-5. Re-check `Get-ScheduledTask | Where-Object { $_.TaskName -like 'cowork-cora-*' -or $_.TaskName -like 'Cora - *' -or $_.TaskName -eq 'cora-watchdog' } | Measure-Object` -> expect **96**, then run the generator with `--diff-only` -> expect zero `task-estate-drift` lines.
-6. The Cowork estate (Claude desktop scheduled tasks) is NOT registered by any of this: it stays on the office machine (charter D4); its weekly pin task is `cowork-model-pin-weekly`.
+**Register the estate FROM THE MANIFEST** (from an ELEVATED PowerShell at the repo root; host time zone must be `US Mountain Standard Time` first -- `Set-TimeZone`):
+1. `.\deployment\register-estate-from-manifest.ps1` (dry-run plan) then `.\deployment\register-estate-from-manifest.ps1 -Apply` -- registers every task below from `deployment/manifest/tasks/<slug>.xml` (full-fidelity Task Scheduler exports: triggers, windowless action, settings, run level, and `Enabled=false` for the 18 intent-disabled tasks). The `setup-*.ps1` scripts are NOT run on a rebuild: several carry drifted clocks or would re-enable disabled tasks; they create NEW tasks only.
+2. Restore `.env` (Phase 4) BEFORE starting anything; then `Start-ScheduledTask -TaskName cowork-cora-service` (the service otherwise starts at the next logon).
+3. Verify: `Get-ScheduledTask | Where-Object { $_.TaskName -like 'cowork-cora-*' -or $_.TaskName -like 'Cora - *' -or $_.TaskName -eq 'cora-watchdog' } | Measure-Object` -> expect **96**, then `.venv\Scripts\python.exe scripts\generate_task_estate_manifest.py --diff-only` -> expect ZERO `task-estate-drift` lines (cron / enabled / action / principal / settings / time zone are all compared).
+4. The Cowork estate (Claude desktop scheduled tasks) is NOT registered by any of this: it stays on the office machine (charter D4); its weekly pin task is `cowork-model-pin-weekly`.
 
-| Task | Trigger | Register with | Run level / logon | SWA | Intent |
-|---|---|---|---|---|---|
-| `Cora - Asana Hygiene Nudges` | daily 06:40 | `deployment\setup-asana-hygiene-nudges-task.ps1` | Highest / Interactive | yes | UNROWED |
-| `Cora - Cash Flow Pulse` | daily 15:30 | `deployment\setup-cashflow-pulse-task.ps1` | Highest / Interactive | yes | disabled |
-| `Cora - Cash Snapshot` | daily 06:45 | `deployment\setup-cashflow-snapshot-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `Cora - Channel Health Monitor` | weekly Sun 04:15 | `deployment\setup-channel-health-monitor-task.ps1` | Highest / Interactive | yes | UNROWED |
-| `Cora - Daily Briefing` | weekly Mon,Tue,Wed,Thu,Fri 07:30 | `deployment\setup-daily-briefing-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `Cora - Daily Synthesis (BDM)` | daily 06:52 | `deployment\setup-daily-synthesis-bdm-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `Cora - Daily Synthesis (F3C)` | daily 06:58 | `deployment\setup-daily-synthesis-f3c-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `Cora - Daily Synthesis (F3E)` | daily 06:33 | `deployment\setup-daily-synthesis-f3e-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `Cora - Daily Synthesis (HJRP)` | daily 06:35 | `deployment\setup-daily-synthesis-hjrp-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `Cora - Daily Synthesis (HJRPROD)` | daily 06:56 | `deployment\setup-daily-synthesis-hjrprod-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `Cora - Daily Synthesis (LEX)` | daily 06:39 | `deployment\setup-daily-synthesis-lex-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `Cora - Daily Synthesis (OSN)` | daily 06:37 | `deployment\setup-daily-synthesis-osn-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `Cora - Daily Synthesis (Portfolio)` | daily 06:31 | `deployment\setup-daily-synthesis-portfolio-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `Cora - Daily Synthesis (UFL)` | daily 06:54 | `deployment\setup-daily-synthesis-ufl-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `Cora - Deal Aging Alerts` | daily 15:00 | `deployment\setup-deal-aging-alerts-task.ps1` | Limited / Interactive | yes | disabled |
-| `Cora - Drive Materialization` | daily 05:45 | `deployment\setup-drive-materialization-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `Cora - Drive Sweep` | daily 06:00 | `deployment\setup-drive-sweep-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `Cora - Due Date Escalation` | daily 14:00 | `deployment\setup-due-date-escalation-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `Cora - Email Attachment Filer` | every PT4H (from 2026-05-27T22:00) | `deployment\setup-attachment-filer-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `Cora - Expected Invoice Check` | monthly day 9 09:38 | `deployment\setup-monthly-finance-report-tasks.ps1` | Limited / Interactive | **no** | UNROWED |
-| `Cora - F3E Blog Pipeline` | weekly Mon 08:50 | `deployment\setup-f3e-blog-pipeline-task.ps1` | Limited / Interactive | **no** | UNROWED |
-| `Cora - F3E Daily Ecom Brief` | daily 07:10 | `deployment\setup-daily-synthesis-f3e-task.ps1`, `deployment\setup-f3e-ecom-brief-task.ps1` | Limited / Interactive | yes | disabled |
-| `Cora - False Deflection Watch` | weekly Mon 08:00 | `deployment\setup-false-deflection-watch-task.ps1` | Highest / Interactive | yes | UNROWED |
-| `Cora - Friction Mining` | weekly Sun 17:30 | `deployment\setup-friction-mining-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `Cora - HubSpot Deal Monitor` | every PT1H (from 2026-06-03T16:00) | `deployment\setup-hubspot-deal-monitor-task.ps1` | Limited / Interactive | yes | disabled |
-| `Cora - Inventory Alerts` | daily 16:00 | `deployment\setup-daily-synthesis-f3e-task.ps1`, `deployment\setup-inventory-alerts-task.ps1` | Limited / Interactive | yes | disabled |
-| `Cora - KB Evals` | weekly Mon 09:05 | `deployment\setup-kb-evals-task.ps1` | Limited / Interactive | yes | enabled |
-| `Cora - Klaviyo Billing Audit` | monthly day 9 09:53 | `deployment\setup-monthly-finance-report-tasks.ps1` | Limited / Interactive | **no** | UNROWED |
-| `Cora - Knowledge Check` | weekly Mon,Tue,Wed,Thu,Fri 08:05 | `deployment\setup-knowledge-check-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `Cora - LEX Dump Folder Sync` | daily 04:45 | `deployment\setup-lex-dump-folder-sync-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `Cora - LEX Swept PHI Check` | daily 07:06 | `deployment\setup-lex-swept-phi-check-task.ps1` | Limited / Interactive | yes | enabled |
-| `Cora - Log Compaction` | monthly day 1 14:00 | `deployment\setup-compaction-task.ps1` | Limited / Interactive | **no** | UNROWED |
-| `Cora - Meeting Action Capture` | every PT1H (from 2026-06-05T11:00) | `deployment\setup-meeting-action-capture-task.ps1` | Limited / Interactive | yes | disabled |
-| `Cora - Meeting Ask Capture` | every PT15M (daily 07:08) | `deployment\setup-meeting-ask-capture-task.ps1` | Limited / Interactive | **no** | UNROWED |
-| `Cora - Missed Nightly Catch-Up` | daily 08:30 | `deployment\setup-missed-nightly-catchup-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `Cora - OSN Metrics Digest` | weekly Mon 15:00 | `deployment\setup-osn-metrics-digest-task.ps1` | Highest / Interactive | yes | UNROWED |
-| `Cora - QBO Monthly Reports` | monthly day 2 07:45 | `deployment\setup-qbo-monthly-reports-task.ps1` | Limited / Interactive | **no** | UNROWED |
-| `Cora - QBO Token Monitor` | daily 06:50 | `deployment\setup-qbo-token-monitor-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `Cora - Revops Sweep` | daily 10:15 | `deployment\setup-revops-sweep-task.ps1` | Limited / Interactive | **no** | UNROWED |
-| `Cora - Shopify DTC Summary` | daily 15:00 | `deployment\setup-shopify-dtc-summary-task.ps1` | Limited / Interactive | yes | disabled |
-| `Cora - Strategy Memo` | weekly Sun 18:30 | `deployment\setup-strategy-memo-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `Cora - Weekly Health Metrics` | weekly Mon 09:30 | `deployment\setup-weekly-health-metrics-task.ps1` | Highest / Interactive | yes | UNROWED |
-| `Cora - Weekly Pipeline Digest` | weekly Mon 15:00 | `deployment\setup-pipeline-digest-task.ps1` | Limited / Interactive | yes | disabled |
-| `cora-watchdog` | every PT5M (from 2026-07-16T10:27) | `deployment\setup-cora-watchdog-task.ps1` | Highest / Interactive | yes | UNROWED |
-| `cowork-cora-ai-visibility-scan` | weekly Mon 10:15 | `deployment\setup-ai-visibility-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `cowork-cora-asana-email-sync` | every PT1H (from 2026-06-01T00:10) | **none** (manifest JSON / XML export) | Limited / Interactive | **no** | disabled |
-| `cowork-cora-autowrite-digest` | weekly Mon 11:00 | `deployment\setup-autowrite-digest-task.ps1` | Limited / Interactive | **no** | UNROWED |
-| `cowork-cora-backup` | daily 20:30 | `deployment\setup-backup-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `cowork-cora-bank-snapshot` | daily 07:05 | `deployment\setup-qbo-bank-snapshot-task.ps1` | Limited / Interactive | yes | enabled |
-| `cowork-cora-cashflow-actuals` | weekly Mon 06:25 | `deployment\setup-cashflow-actuals-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `cowork-cora-cashflow-forecast-snapshot` | weekly Mon 06:15 | `deployment\setup-cashflow-forecast-snapshot-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `cowork-cora-channel-sweep` | daily 08:40 | `deployment\setup-channel-sweep-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `cowork-cora-claude-mirror` | daily 03:45 + daily 12:15 | `deployment\setup-claude-mirror-task.ps1` | Limited / Interactive | yes | enabled |
-| `cowork-cora-completion-sweep` | daily 14:00 | **none** (manifest JSON / XML export) | Limited / Interactive | **no** | UNROWED |
-| `cowork-cora-decision-capture` | daily 07:15 | **none** (manifest JSON / XML export) | Limited / Interactive | **no** | UNROWED |
-| `cowork-cora-delegated-work` | every PT15M (from 2026-08-01T00:00) | `deployment\setup-delegated-work-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `cowork-cora-digest` | daily 05:20 | `deployment\setup-digest-task.ps1` | Limited / Interactive | yes | disabled |
-| `cowork-cora-feedback-health` | weekly Mon 08:30 | **none** (manifest JSON / XML export) | Limited / Interactive | **no** | UNROWED |
-| `cowork-cora-finance-adherence` | weekly Mon 08:15 | `deployment\setup-finance-adherence-task.ps1` | Limited / Interactive | yes | enabled |
-| `cowork-cora-finance-close-pack` | weekly Mon 09:00 | `deployment\setup-finance-close-pack-task.ps1` | Limited / Interactive | yes | enabled |
-| `cowork-cora-finance-receipt-digest` | weekly Mon 10:30 | `deployment\setup-finance-receipt-digest-task.ps1` | Limited / Interactive | **no** | UNROWED |
-| `cowork-cora-finance-weekly` | weekly Mon 14:30 | `deployment\setup-finance-weekly-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `cowork-cora-fireflies-coverage` | weekly Mon 08:10 | `deployment\setup-fireflies-coverage-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `cowork-cora-founders-os-sweep` | daily 06:30 | `deployment\setup-founders-os-sweep-task.ps1` | Highest / Interactive | yes | UNROWED |
-| `cowork-cora-gap-autofill` | daily 06:10 | `deployment\setup-gap-autofill-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `cowork-cora-gap-digest` | weekly Mon 08:00 | **none** (manifest JSON / XML export) | Limited / Interactive | **no** | disabled |
-| `cowork-cora-health-check` | daily 08:45 | **none** (manifest JSON / XML export) | Limited / Interactive | **no** | UNROWED |
-| `cowork-cora-hubspot-email-sync` | every PT1H (from 2026-05-31T23:23) | **none** (manifest JSON / XML export) | Limited / Interactive | **no** | disabled |
-| `cowork-cora-influencer-digest` | weekly Mon 08:20 | `deployment\setup-influencer-digest-task.ps1` | Limited / Interactive | yes | disabled |
-| `cowork-cora-influencer-overdue-alerts` | daily 09:10 | `deployment\setup-influencer-overdue-alerts-task.ps1` | Limited / Interactive | yes | disabled |
-| `cowork-cora-influencer-scan` | every PT2H (from 2026-05-27T22:00) | `deployment\setup-influencer-scan-task.ps1` | Limited / Interactive | yes | disabled |
-| `cowork-cora-info-for-cora-sweep` | daily 06:05 | `deployment\setup-info-for-cora-sweep-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `cowork-cora-inventory-state-sync` | daily 06:20 | `deployment\setup-inventory-state-sync-task.ps1` | Limited / Interactive | yes | enabled |
-| `cowork-cora-kb-hygiene` | monthly day 1 15:00 | `deployment\setup-kb-hygiene-task.ps1` | Limited / Interactive | **no** | UNROWED |
-| `cowork-cora-kb-sync-asana` | daily 03:00 | `deployment\setup-kb-sync-tasks.ps1` | Limited / Interactive | yes | UNROWED |
-| `cowork-cora-kb-sync-drive` | daily 04:30 | `deployment\setup-kb-sync-tasks.ps1` | Limited / Interactive | yes | UNROWED |
-| `cowork-cora-kb-sync-fireflies` | daily 03:30 | `deployment\setup-kb-sync-tasks.ps1` | Limited / Interactive | yes | UNROWED |
-| `cowork-cora-kb-sync-gmail` | daily 02:30 | `deployment\setup-kb-sync-tasks.ps1` | Limited / Interactive | yes | UNROWED |
-| `cowork-cora-kb-sync-notion` | daily 05:00 | `deployment\setup-kb-sync-tasks.ps1` | Limited / Interactive | yes | UNROWED |
-| `cowork-cora-kb-sync-slack` | daily 02:00 | `deployment\setup-kb-sync-tasks.ps1` | Limited / Interactive | yes | UNROWED |
-| `cowork-cora-kb-sync-static` | daily 04:00 + daily 12:20 | `deployment\setup-kb-sync-tasks.ps1` | Limited / Interactive | yes | UNROWED |
-| `cowork-cora-knowledge-check-report` | weekly Mon 07:20 | `deployment\setup-knowledge-check-report-task.ps1` | Limited / Interactive | **no** | UNROWED |
-| `cowork-cora-knowledge-review` | weekly Mon,Tue,Wed,Thu,Fri 07:00 | `deployment\setup-knowledge-review-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `cowork-cora-lexicon-mining` | weekly Sun 17:50 | `deployment\setup-lexicon-mining-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `cowork-cora-meeting-capture-audit` | daily 07:22 | `deployment\setup-meeting-capture-audit-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `cowork-cora-meeting-capture-ensure` | every PT15M (daily 06:07) | `deployment\setup-meeting-capture-ensure-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `cowork-cora-monthly-deliverables` | monthly day 1 09:00 | **none** (manifest JSON / XML export) | Limited / Interactive | **no** | disabled |
-| `cowork-cora-person-dossier-refresh` | weekly Sun 16:30 | `deployment\setup-person-dossier-refresh-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `cowork-cora-pm-adoption-digest` | weekly Mon 08:20 | `deployment\setup-pm-adoption-digest-task.ps1` | Limited / Interactive | **no** | UNROWED |
-| `cowork-cora-proactive-gaps` | daily 06:00 | **none** (manifest JSON / XML export) | Limited / Interactive | **no** | disabled |
-| `cowork-cora-project-channel-sync` | daily 16:00 | `deployment\setup-project-channel-sync-task.ps1` | Limited / Interactive | yes | disabled |
-| `cowork-cora-qbo-token-refresh` | daily 02:00 | `deployment\setup-qbo-token-refresh-task.ps1` | Highest / Interactive | yes | UNROWED |
-| `cowork-cora-reconciliation` | daily 05:30 | `deployment\setup-kb-sync-tasks.ps1` | Limited / Interactive | yes | UNROWED |
-| `cowork-cora-security-monitor` | every PT15M (from 2026-05-27T22:33) | `deployment\setup-security-monitor-task.ps1` | Limited / Interactive | yes | UNROWED |
-| `cowork-cora-service` | at logon | `deployment\setup-windows-task.ps1` | Limited / Interactive | yes | running |
-| `cowork-cora-session-capture` | daily 05:15 + daily 12:30 | `deployment\setup-session-capture-task.ps1` | Limited / Interactive | yes | UNROWED |
+| Task | Trigger | XML (restore form) | Created by (setup script, informational) | Run level / logon | SWA | Intent |
+|---|---|---|---|---|---|---|
+| `Cora - Asana Hygiene Nudges` | daily 06:40 | `tasks/Cora-Asana-Hygiene-Nudges.xml` | `setup-asana-hygiene-nudges-task.ps1` | Highest / Interactive | yes | UNROWED |
+| `Cora - Cash Flow Pulse` | daily 15:30 | `tasks/Cora-Cash-Flow-Pulse.xml` | `setup-cashflow-pulse-task.ps1` | Highest / Interactive | yes | disabled |
+| `Cora - Cash Snapshot` | daily 06:45 | `tasks/Cora-Cash-Snapshot.xml` | `setup-cashflow-snapshot-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `Cora - Channel Health Monitor` | weekly Sun 04:15 | `tasks/Cora-Channel-Health-Monitor.xml` | `setup-channel-health-monitor-task.ps1` | Highest / Interactive | yes | UNROWED |
+| `Cora - Daily Briefing` | weekly Mon,Tue,Wed,Thu,Fri 07:30 | `tasks/Cora-Daily-Briefing.xml` | `setup-daily-briefing-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `Cora - Daily Synthesis (BDM)` | daily 06:52 | `tasks/Cora-Daily-Synthesis-BDM.xml` | `setup-daily-synthesis-bdm-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `Cora - Daily Synthesis (F3C)` | daily 06:58 | `tasks/Cora-Daily-Synthesis-F3C.xml` | `setup-daily-synthesis-f3c-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `Cora - Daily Synthesis (F3E)` | daily 06:33 | `tasks/Cora-Daily-Synthesis-F3E.xml` | `setup-daily-synthesis-f3e-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `Cora - Daily Synthesis (HJRP)` | daily 06:35 | `tasks/Cora-Daily-Synthesis-HJRP.xml` | `setup-daily-synthesis-hjrp-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `Cora - Daily Synthesis (HJRPROD)` | daily 06:56 | `tasks/Cora-Daily-Synthesis-HJRPROD.xml` | `setup-daily-synthesis-hjrprod-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `Cora - Daily Synthesis (LEX)` | daily 06:39 | `tasks/Cora-Daily-Synthesis-LEX.xml` | `setup-daily-synthesis-lex-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `Cora - Daily Synthesis (OSN)` | daily 06:37 | `tasks/Cora-Daily-Synthesis-OSN.xml` | `setup-daily-synthesis-osn-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `Cora - Daily Synthesis (Portfolio)` | daily 06:31 | `tasks/Cora-Daily-Synthesis-Portfolio.xml` | `setup-daily-synthesis-portfolio-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `Cora - Daily Synthesis (UFL)` | daily 06:54 | `tasks/Cora-Daily-Synthesis-UFL.xml` | `setup-daily-synthesis-ufl-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `Cora - Deal Aging Alerts` | daily 15:00 | `tasks/Cora-Deal-Aging-Alerts.xml` | `setup-deal-aging-alerts-task.ps1` | Limited / Interactive | yes | disabled |
+| `Cora - Drive Materialization` | daily 05:45 | `tasks/Cora-Drive-Materialization.xml` | `setup-drive-materialization-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `Cora - Drive Sweep` | daily 06:00 | `tasks/Cora-Drive-Sweep.xml` | `setup-drive-sweep-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `Cora - Due Date Escalation` | daily 14:00 | `tasks/Cora-Due-Date-Escalation.xml` | `setup-due-date-escalation-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `Cora - Email Attachment Filer` | every PT4H (from 2026-05-27T22:00) | `tasks/Cora-Email-Attachment-Filer.xml` | `setup-attachment-filer-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `Cora - Expected Invoice Check` | monthly day 9 09:38 | `tasks/Cora-Expected-Invoice-Check.xml` | `setup-monthly-finance-report-tasks.ps1` | Limited / Interactive | **no** | UNROWED |
+| `Cora - F3E Blog Pipeline` | weekly Mon 08:50 | `tasks/Cora-F3E-Blog-Pipeline.xml` | `setup-f3e-blog-pipeline-task.ps1` | Limited / Interactive | **no** | UNROWED |
+| `Cora - F3E Daily Ecom Brief` | daily 07:10 | `tasks/Cora-F3E-Daily-Ecom-Brief.xml` | `setup-f3e-ecom-brief-task.ps1` | Limited / Interactive | yes | disabled |
+| `Cora - False Deflection Watch` | weekly Mon 08:00 | `tasks/Cora-False-Deflection-Watch.xml` | `setup-false-deflection-watch-task.ps1` | Highest / Interactive | yes | UNROWED |
+| `Cora - Friction Mining` | weekly Sun 17:30 | `tasks/Cora-Friction-Mining.xml` | `setup-friction-mining-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `Cora - HubSpot Deal Monitor` | every PT1H (from 2026-06-03T16:00) | `tasks/Cora-HubSpot-Deal-Monitor.xml` | `setup-hubspot-deal-monitor-task.ps1` | Limited / Interactive | yes | disabled |
+| `Cora - Inventory Alerts` | daily 16:00 | `tasks/Cora-Inventory-Alerts.xml` | `setup-inventory-alerts-task.ps1` | Limited / Interactive | yes | disabled |
+| `Cora - KB Evals` | weekly Mon 09:05 | `tasks/Cora-KB-Evals.xml` | `setup-kb-evals-task.ps1` | Limited / Interactive | yes | enabled |
+| `Cora - Klaviyo Billing Audit` | monthly day 9 09:53 | `tasks/Cora-Klaviyo-Billing-Audit.xml` | `setup-monthly-finance-report-tasks.ps1` | Limited / Interactive | **no** | UNROWED |
+| `Cora - Knowledge Check` | weekly Mon,Tue,Wed,Thu,Fri 08:05 | `tasks/Cora-Knowledge-Check.xml` | `setup-knowledge-check-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `Cora - LEX Dump Folder Sync` | daily 04:45 | `tasks/Cora-LEX-Dump-Folder-Sync.xml` | `setup-lex-dump-folder-sync-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `Cora - LEX Swept PHI Check` | daily 07:06 | `tasks/Cora-LEX-Swept-PHI-Check.xml` | `setup-lex-swept-phi-check-task.ps1` | Limited / Interactive | yes | enabled |
+| `Cora - Log Compaction` | monthly day 1 14:00 | `tasks/Cora-Log-Compaction.xml` | `setup-compaction-task.ps1` | Limited / Interactive | **no** | UNROWED |
+| `Cora - Meeting Action Capture` | every PT1H (from 2026-06-05T11:00) | `tasks/Cora-Meeting-Action-Capture.xml` | `setup-meeting-action-capture-task.ps1` | Limited / Interactive | yes | disabled |
+| `Cora - Meeting Ask Capture` | every PT15M for PT13H stop-at-end (daily 07:08) | `tasks/Cora-Meeting-Ask-Capture.xml` | `setup-meeting-ask-capture-task.ps1` | Limited / Interactive | **no** | UNROWED |
+| `Cora - Missed Nightly Catch-Up` | daily 08:30 | `tasks/Cora-Missed-Nightly-Catch-Up.xml` | `setup-missed-nightly-catchup-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `Cora - OSN Metrics Digest` | weekly Mon 15:00 | `tasks/Cora-OSN-Metrics-Digest.xml` | `setup-osn-metrics-digest-task.ps1` | Highest / Interactive | yes | UNROWED |
+| `Cora - QBO Monthly Reports` | monthly day 2 07:45 | `tasks/Cora-QBO-Monthly-Reports.xml` | `setup-qbo-monthly-reports-task.ps1` | Limited / Interactive | **no** | UNROWED |
+| `Cora - QBO Token Monitor` | daily 06:50 | `tasks/Cora-QBO-Token-Monitor.xml` | `setup-qbo-token-monitor-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `Cora - Revops Sweep` | daily 10:15 | `tasks/Cora-Revops-Sweep.xml` | `setup-revops-sweep-task.ps1` | Limited / Interactive | **no** | UNROWED |
+| `Cora - Shopify DTC Summary` | daily 15:00 | `tasks/Cora-Shopify-DTC-Summary.xml` | `setup-shopify-dtc-summary-task.ps1` | Limited / Interactive | yes | disabled |
+| `Cora - Strategy Memo` | weekly Sun 18:30 | `tasks/Cora-Strategy-Memo.xml` | `setup-strategy-memo-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `Cora - Weekly Health Metrics` | weekly Mon 09:30 | `tasks/Cora-Weekly-Health-Metrics.xml` | `setup-weekly-health-metrics-task.ps1` | Highest / Interactive | yes | UNROWED |
+| `Cora - Weekly Pipeline Digest` | weekly Mon 15:00 | `tasks/Cora-Weekly-Pipeline-Digest.xml` | `setup-pipeline-digest-task.ps1` | Limited / Interactive | yes | disabled |
+| `cora-watchdog` | every PT5M (from 2026-07-16T10:27) | `tasks/cora-watchdog.xml` | `setup-cora-watchdog-task.ps1` | Highest / Interactive | yes | UNROWED |
+| `cowork-cora-ai-visibility-scan` | weekly Mon 10:15 | `tasks/cowork-cora-ai-visibility-scan.xml` | `setup-ai-visibility-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-asana-email-sync` | every PT1H (from 2026-06-01T00:10) | `tasks/cowork-cora-asana-email-sync.xml` | (none -- manifest XML only) | Limited / Interactive | **no** | disabled |
+| `cowork-cora-autowrite-digest` | weekly Mon 11:00 | `tasks/cowork-cora-autowrite-digest.xml` | `setup-autowrite-digest-task.ps1` | Limited / Interactive | **no** | UNROWED |
+| `cowork-cora-backup` | daily 20:30 | `tasks/cowork-cora-backup.xml` | `setup-backup-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-bank-snapshot` | daily 07:05 | `tasks/cowork-cora-bank-snapshot.xml` | `setup-qbo-bank-snapshot-task.ps1` | Limited / Interactive | yes | enabled |
+| `cowork-cora-cashflow-actuals` | weekly Mon 06:25 | `tasks/cowork-cora-cashflow-actuals.xml` | `setup-cashflow-actuals-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-cashflow-forecast-snapshot` | weekly Mon 06:15 | `tasks/cowork-cora-cashflow-forecast-snapshot.xml` | `setup-cashflow-forecast-snapshot-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-channel-sweep` | daily 08:40 | `tasks/cowork-cora-channel-sweep.xml` | `setup-channel-sweep-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-claude-mirror` | daily 03:45 + daily 12:15 | `tasks/cowork-cora-claude-mirror.xml` | `setup-claude-mirror-task.ps1` | Limited / Interactive | yes | enabled |
+| `cowork-cora-completion-sweep` | daily 14:00 | `tasks/cowork-cora-completion-sweep.xml` | (none -- manifest XML only) | Limited / Interactive | **no** | UNROWED |
+| `cowork-cora-decision-capture` | daily 07:15 | `tasks/cowork-cora-decision-capture.xml` | (none -- manifest XML only) | Limited / Interactive | **no** | UNROWED |
+| `cowork-cora-delegated-work` | every PT15M for P3650D stop-at-end (from 2026-08-01T00:00) | `tasks/cowork-cora-delegated-work.xml` | `setup-delegated-work-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-digest` | daily 05:20 | `tasks/cowork-cora-digest.xml` | `setup-digest-task.ps1` | Limited / Interactive | yes | disabled |
+| `cowork-cora-feedback-health` | weekly Mon 08:30 | `tasks/cowork-cora-feedback-health.xml` | (none -- manifest XML only) | Limited / Interactive | **no** | UNROWED |
+| `cowork-cora-finance-adherence` | weekly Mon 08:15 | `tasks/cowork-cora-finance-adherence.xml` | `setup-finance-adherence-task.ps1` | Limited / Interactive | yes | enabled |
+| `cowork-cora-finance-close-pack` | weekly Mon 09:00 | `tasks/cowork-cora-finance-close-pack.xml` | `setup-finance-close-pack-task.ps1` | Limited / Interactive | yes | enabled |
+| `cowork-cora-finance-receipt-digest` | weekly Mon 10:30 | `tasks/cowork-cora-finance-receipt-digest.xml` | `setup-finance-receipt-digest-task.ps1` | Limited / Interactive | **no** | UNROWED |
+| `cowork-cora-finance-weekly` | weekly Mon 14:30 | `tasks/cowork-cora-finance-weekly.xml` | `setup-finance-weekly-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-fireflies-coverage` | weekly Mon 08:10 | `tasks/cowork-cora-fireflies-coverage.xml` | `setup-fireflies-coverage-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-founders-os-sweep` | daily 06:30 | `tasks/cowork-cora-founders-os-sweep.xml` | `setup-founders-os-sweep-task.ps1` | Highest / Interactive | yes | UNROWED |
+| `cowork-cora-gap-autofill` | daily 06:10 | `tasks/cowork-cora-gap-autofill.xml` | `setup-gap-autofill-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-gap-digest` | weekly Mon 08:00 | `tasks/cowork-cora-gap-digest.xml` | (none -- manifest XML only) | Limited / Interactive | **no** | disabled |
+| `cowork-cora-health-check` | daily 08:45 | `tasks/cowork-cora-health-check.xml` | (none -- manifest XML only) | Limited / Interactive | **no** | UNROWED |
+| `cowork-cora-hubspot-email-sync` | every PT1H (from 2026-05-31T23:23) | `tasks/cowork-cora-hubspot-email-sync.xml` | (none -- manifest XML only) | Limited / Interactive | **no** | disabled |
+| `cowork-cora-influencer-digest` | weekly Mon 08:20 | `tasks/cowork-cora-influencer-digest.xml` | `setup-influencer-digest-task.ps1` | Limited / Interactive | yes | disabled |
+| `cowork-cora-influencer-overdue-alerts` | daily 09:10 | `tasks/cowork-cora-influencer-overdue-alerts.xml` | `setup-influencer-overdue-alerts-task.ps1` | Limited / Interactive | yes | disabled |
+| `cowork-cora-influencer-scan` | every PT2H (from 2026-05-27T22:00) | `tasks/cowork-cora-influencer-scan.xml` | `setup-influencer-scan-task.ps1` | Limited / Interactive | yes | disabled |
+| `cowork-cora-info-for-cora-sweep` | daily 06:05 | `tasks/cowork-cora-info-for-cora-sweep.xml` | `setup-info-for-cora-sweep-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-inventory-state-sync` | daily 06:20 | `tasks/cowork-cora-inventory-state-sync.xml` | `setup-inventory-state-sync-task.ps1` | Limited / Interactive | yes | enabled |
+| `cowork-cora-kb-hygiene` | monthly day 1 15:00 | `tasks/cowork-cora-kb-hygiene.xml` | `setup-kb-hygiene-task.ps1` | Limited / Interactive | **no** | UNROWED |
+| `cowork-cora-kb-sync-asana` | daily 03:00 | `tasks/cowork-cora-kb-sync-asana.xml` | `setup-kb-sync-tasks.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-kb-sync-drive` | daily 04:30 | `tasks/cowork-cora-kb-sync-drive.xml` | `setup-kb-sync-tasks.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-kb-sync-fireflies` | daily 03:30 | `tasks/cowork-cora-kb-sync-fireflies.xml` | `setup-kb-sync-tasks.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-kb-sync-gmail` | daily 02:30 | `tasks/cowork-cora-kb-sync-gmail.xml` | `setup-kb-sync-tasks.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-kb-sync-notion` | daily 05:00 | `tasks/cowork-cora-kb-sync-notion.xml` | `setup-kb-sync-tasks.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-kb-sync-slack` | daily 02:00 | `tasks/cowork-cora-kb-sync-slack.xml` | `setup-kb-sync-tasks.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-kb-sync-static` | daily 04:00 + daily 12:20 | `tasks/cowork-cora-kb-sync-static.xml` | `setup-kb-sync-tasks.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-knowledge-check-report` | weekly Mon 07:20 | `tasks/cowork-cora-knowledge-check-report.xml` | `setup-knowledge-check-report-task.ps1` | Limited / Interactive | **no** | UNROWED |
+| `cowork-cora-knowledge-review` | weekly Mon,Tue,Wed,Thu,Fri 07:00 | `tasks/cowork-cora-knowledge-review.xml` | `setup-knowledge-review-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-lexicon-mining` | weekly Sun 17:50 | `tasks/cowork-cora-lexicon-mining.xml` | `setup-lexicon-mining-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-meeting-capture-audit` | daily 07:22 | `tasks/cowork-cora-meeting-capture-audit.xml` | `setup-meeting-capture-audit-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-meeting-capture-ensure` | every PT15M for PT14H stop-at-end (daily 06:07) | `tasks/cowork-cora-meeting-capture-ensure.xml` | `setup-meeting-capture-ensure-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-monthly-deliverables` | monthly day 1 09:00 | `tasks/cowork-cora-monthly-deliverables.xml` | (none -- manifest XML only) | Limited / Interactive | **no** | disabled |
+| `cowork-cora-person-dossier-refresh` | weekly Sun 16:30 | `tasks/cowork-cora-person-dossier-refresh.xml` | `setup-person-dossier-refresh-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-pm-adoption-digest` | weekly Mon 08:20 | `tasks/cowork-cora-pm-adoption-digest.xml` | `setup-pm-adoption-digest-task.ps1` | Limited / Interactive | **no** | UNROWED |
+| `cowork-cora-proactive-gaps` | daily 06:00 | `tasks/cowork-cora-proactive-gaps.xml` | (none -- manifest XML only) | Limited / Interactive | **no** | disabled |
+| `cowork-cora-project-channel-sync` | daily 16:00 | `tasks/cowork-cora-project-channel-sync.xml` | `setup-project-channel-sync-task.ps1` | Limited / Interactive | yes | disabled |
+| `cowork-cora-qbo-token-refresh` | daily 02:00 | `tasks/cowork-cora-qbo-token-refresh.xml` | `setup-qbo-token-refresh-task.ps1` | Highest / Interactive | yes | UNROWED |
+| `cowork-cora-reconciliation` | daily 05:30 | `tasks/cowork-cora-reconciliation.xml` | `setup-kb-sync-tasks.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-security-monitor` | every PT15M (from 2026-05-27T22:33) | `tasks/cowork-cora-security-monitor.xml` | `setup-security-monitor-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-service` | at logon | `tasks/cowork-cora-service.xml` | `setup-windows-task.ps1` | Limited / Interactive | yes | running |
+| `cowork-cora-session-capture` | daily 05:15 + daily 12:30 | `tasks/cowork-cora-session-capture.xml` | `setup-session-capture-task.ps1` | Limited / Interactive | yes | UNROWED |
 <!-- END GENERATED: scheduled-estate -->
 
 ### Verify the estate
@@ -398,23 +397,31 @@ Get-Content "C:\Users\Harri\code\cora\logs\cora-$(Get-Date -Format yyyy-MM-dd).l
 
 Should show recent connecting / heartbeat / app_mention entries.
 
-### Confirm the digest will fire
+### Confirm the estate is live (the proofs `deployment/DR-MANIFEST.md` defines)
 
 ```powershell
-Get-ScheduledTaskInfo -TaskName "cowork-cora-digest" | Format-List LastRunTime, LastTaskResult, NextRunTime
+# D08: heartbeat advancing (< 2 min old) and a NEW pid row in the instances ledger
+Get-Item "C:\Users\Harri\code\cora\data\health\heartbeat.txt" | Select-Object LastWriteTime
+Get-Content "C:\Users\Harri\code\cora\logs\cora-instances.jsonl" -Tail 1
+# D13: the registry matches the committed manifest (zero drift)
+.venv\Scripts\python.exe scripts\generate_task_estate_manifest.py --diff-only
+# the whole probe table in one go
+.venv\Scripts\python.exe scripts\dr_manifest_probes.py
 ```
 
-`NextRunTime` should show tomorrow at 05:00.
+(`cowork-cora-digest` is intent-DISABLED -- it never fires; do not wait for a digest file.)
 
 ### Tomorrow morning
 
-After 5am, check that the digest landed:
+After 08:45 AZ, confirm the nightly ingest set fired and the health check ran:
 
 ```powershell
-ls "G:\My Drive\HJR-Founder-OS\_shared\projects\cora\knowledge-gaps\"
+Get-ChildItem "C:\Users\Harri\code\cora\logs\tasks\" -Filter "cowork-cora-kb-sync-*-$(Get-Date -Format yyyy-MM-dd).log"
+Get-ChildItem "C:\Users\Harri\code\cora\logs\tasks\" -Filter "cowork-cora-health-check-$(Get-Date -Format yyyy-MM-dd).log"
 ```
 
-You should see today's digest file (or yesterday's, depending on timing).
+Both should list files (one per kb-sync door + the 08:45 health check). The Monday digest in
+#cora-health carries the `Task estate: N live / N manifest | drift none` line.
 
 ---
 
@@ -422,7 +429,9 @@ You should see today's digest file (or yesterday's, depending on timing).
 
 | Symptom | Most likely cause | Fix |
 |---|---|---|
-| `uv run cora` exits silently | `.env` has `REPLACE_ME_*` still or wrong prefix | Re-check .env values |
+| `python.exe -m cora.main` exits silently | `.env` has `REPLACE_ME_*` still or wrong prefix | Re-check .env values |
+| `.venv\Scripts\cora.exe` refuses to launch / "blocked by policy" | WDAC code-integrity policy blocks the console script (DR-MANIFEST D06) | Never use `cora.exe`; the action is `python.exe -m cora.main` (the manifest XML already carries it) |
+| `register-estate-from-manifest.ps1` prints WARNING about the time zone | the new host's zone differs from the manifest's `host_time_zone` | `Set-TimeZone "<manifest host_time_zone>"` then re-run; clock triggers are host-local |
 | `Bolt app is running!` never appears | `xapp-1-` token missing `connections:write` scope | Regenerate token with correct scope |
 | Cora doesn't reply in Slack | Bot not invited to channel OR wrong workspace | `/invite @Cora`; verify Slack workspace is HJR Global |
 | Setup script fails at "uv.exe not found" | uv not on PATH | Re-run uv install + reopen PowerShell |
@@ -446,12 +455,14 @@ For deeper troubleshooting see `deployment/runbook.md`.
 
 ## Sanity check questions to ask before declaring bootstrap complete
 
-- [ ] `Get-ScheduledTask` shows all 3 cowork-cora-* tasks in `Ready` or `Running` state
-- [ ] `Get-Process python*` shows a running python process (Cora is alive)
+- [ ] The Cora-named task count equals the manifest `count` (`Get-ScheduledTask | Where-Object { $_.TaskName -like "cowork-cora-*" -or $_.TaskName -like "Cora - *" -or $_.TaskName -eq "cora-watchdog" } | Measure-Object`) and `generate_task_estate_manifest.py --diff-only` prints ZERO `task-estate-drift` lines
+- [ ] `scripts\dr_manifest_probes.py` shows FAIL = 0 (MANUAL / UNMEASURED rows are expected and listed)
+- [ ] `cowork-cora-service` is `Running` and `logs\cora-instances.jsonl` carries a NEW pid row from this host
 - [ ] `@Cora ping` in `#cora-build` produces a threaded reply within 10 seconds
-- [ ] Most recent log file shows a heartbeat within the last 2 minutes
+- [ ] `data\health\heartbeat.txt` is under 2 minutes old
 - [ ] Anthropic console shows the new API key is the only active one (old one revoked if relevant)
 - [ ] Slack app config shows the new tokens are the only active ones (old ones revoked if relevant)
 - [ ] `.env` is NOT showing as modified or untracked in `git status` (gitignored correctly)
 
-If all 7 pass, Cora is fully back online.
+If all 8 pass, the bot estate is back online. **The KB and the full RTO are separate: see
+`deployment/DR-MANIFEST.md` §3 (two restore paths, both UNMEASURED until the VM drill).**

@@ -63,7 +63,7 @@ PROVIDER_QUOTES: list[dict[str, Any]] = [
         "egress": "100 GB free, then $0.087/GB",
         "baa": "YES -- included by default in the Microsoft Product Terms / DPA (no separate contract); VMs, Storage, Backup, VNet in scope",
         "baa_url": "https://learn.microsoft.com/en-us/azure/compliance/offerings/offering-hipaa-us",
-        "in_band_path": "8 vCPU/64 GB E8as_v5 Windows = $598.60 compute-only (~$778 loaded); Azure Hybrid Benefit (own Windows Server licenses + SA) bills the Linux rate: D16as_v5 $502.24, E8as_v5 $329.96",
+        "in_band_path": "8 vCPU/64 GB E8as_v5 Windows = $598.60 compute-only but ~$778 LOADED (P30 + snapshots) -- NOT in band at the same spec; only Azure Hybrid Benefit (own Windows Server licenses + SA, Linux rate: D16as_v5 $502 / E8as_v5 $330 compute) or a 4 vCPU CI-only start reaches the band",
         "sources": [
             "https://prices.azure.com/api/retail/prices (Retail Prices API, armRegionName=westus3, Consumption; D16as_v5 1.424/h, E16as_v5 1.64/h, P30 LRS 122.88/mo, LRS snapshots 0.05/GB-mo)",
             "https://azure.microsoft.com/en-us/pricing/details/bandwidth/",
@@ -79,7 +79,7 @@ PROVIDER_QUOTES: list[dict[str, Any]] = [
         "egress": "100 GB free, then $0.09/GB",
         "baa": "YES -- self-service acceptance in AWS Artifact; EC2 + EBS are HIPAA-eligible services",
         "baa_url": "https://aws.amazon.com/compliance/hipaa-eligible-services-reference/",
-        "in_band_path": "8 vCPU/32 GB m7i.2xlarge Windows = $562.98 compute-only; 8 vCPU/64 GB r7i.2xlarge = $654.96 (~$806 loaded) -- only the 8/32 compute sits in band",
+        "in_band_path": "8 vCPU/64 GB r7i.2xlarge Windows = $654.96 compute, ~$806 LOADED -- NOT in band at the same spec (only 8 vCPU/32 GB m7i.2xlarge COMPUTE-ONLY, $563, sits in band, below the 64 GB floor); the band needs a re-rule or a 4 vCPU CI-only start",
         "sources": [
             "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-west-2/index.csv (Price List Bulk API; Windows On-Demand, gp3, snapshots)",
             "https://aws.amazon.com/ec2/pricing/on-demand/ (100 GB/month free data transfer out)",
@@ -95,7 +95,7 @@ PROVIDER_QUOTES: list[dict[str, Any]] = [
         "egress": "Premium Tier $0.12/GiB (first TiB), ~1 GB free",
         "baa": "YES -- self-serve acceptance in the Cloud console (IAM & Admin > Privacy & Security); Compute Engine + Persistent Disk covered",
         "baa_url": "https://cloud.google.com/security/compliance/hipaa",
-        "in_band_path": "Windows license is $0.046/vCPU-h everywhere ($268.64/mo at 8 vCPU): n2-highmem-8 = $699 VM-only; only 4 vCPU sizes reach the band",
+        "in_band_path": "Windows license is $0.046/vCPU-h everywhere ($268.64/mo at 8 vCPU): n2-highmem-8 8 vCPU/64 GB = $699 VM-only, ~$965 LOADED -- NOT in band; only 4 vCPU sizes (CI-only) reach the band",
         "sources": [
             "https://cloud.google.com/products/compute/pricing/general-purpose (N2 table, region selector, Default USD)",
             "https://cloud.google.com/compute/disks-image-pricing",
@@ -112,7 +112,7 @@ PROVIDER_QUOTES: list[dict[str, Any]] = [
         "egress": "10 TB/mo included per plan + 2 TB account free, then $0.01/GB",
         "baa": "CONDITIONAL -- executes a BAA only through sales for its 'Configurable HIPAA Server' offering (ToS s.17); not self-serve; LA is marked HIPAA-compliant on its matrix",
         "baa_url": "https://www.vultr.com/legal/tos/",
-        "in_band_path": "voc-m-8c-64gb dedicated 8 vCPU/64 GB $320 + license $128 = $448 (~$508 with 1 TB); the 128 GB license figure is DERIVED from the $16/vCPU pattern, not published",
+        "in_band_path": "voc-m-8c-64gb dedicated 8 vCPU/64 GB $320 + license $128 + block top-up $60 = $508 BEFORE backups; with 7 daily snapshots at $0.05/GB-mo the loaded figure is ~$648-858 depending on image size -- NOT in band at the same spec (2-point automatic backups, +20%, ~$572 is the closest); the 128 GB license figure is DERIVED from the $16/vCPU pattern, not published",
         "sources": [
             "https://www.vultr.com/servers/windows/ (Windows plan + license table)",
             "https://api.vultr.com/v2/plans?type=voc-m (public API: monthly_cost)",
@@ -133,42 +133,71 @@ def in_band(total: float) -> bool:
     return lo <= total <= hi
 
 
+SLACK_SECTION_LIMIT = 3000   # Slack refuses a section text above this; we never slice, we refuse
+
+
+def render_provider_row(q: dict[str, Any]) -> str:
+    """ONE provider's row (mrkdwn): both totals with computed band verdicts, storage PER
+    SIZE when the plan needs a top-up on one row, egress, and the BAA column."""
+    flag64 = "in band" if in_band(q["total_64_usd"]) else "OUTSIDE band"
+    flag128 = "in band" if in_band(q["total_128_usd"]) else "OUTSIDE band"
+    s64 = q["storage_usd"]
+    s128 = q.get("storage_128_usd", s64)
+    storage = f"storage ${s64:,.0f}" if s128 == s64 else f"storage ${s64:,.0f} (64 GB) / ${s128:,.0f} (128 GB)"
+    return (f"- *{q['provider']}* ({q['region']}): 64 GB `{q['sku_64']}` *${q['total_64_usd']:,.0f}/mo* ({flag64}) | "
+            f"128 GB `{q['sku_128']}` *${q['total_128_usd']:,.0f}/mo* ({flag128}) | {storage} + backup ~${q['backup_usd']:,.0f} | "
+            f"egress {q['egress']} | *BAA:* {q['baa']}\n    in-band path: {q['in_band_path']}")
+
+
 def render_cost_table_text() -> str:
-    """Plain-text cost table (mrkdwn-safe) with the BAA column on EVERY row."""
-    lines = [f"*Provider cost table -- Windows Server VM, 16 vCPU, ~1 TiB SSD, 7 restore points, list prices, accessed {ACCESSED}. Ruled band: ${RULED_BAND_USD[0]}-{RULED_BAND_USD[1]}/mo.*"]
-    for q in PROVIDER_QUOTES:
-        flag64 = "in band" if in_band(q["total_64_usd"]) else "OUTSIDE band"
-        flag128 = "in band" if in_band(q["total_128_usd"]) else "OUTSIDE band"
-        lines.append(
-            f"- *{q['provider']}* ({q['region']}): 64 GB `{q['sku_64']}` *${q['total_64_usd']:,.0f}/mo* ({flag64}) | "
-            f"128 GB `{q['sku_128']}` *${q['total_128_usd']:,.0f}/mo* ({flag128}) | storage ${q['storage_usd']:,.0f} + backup ~${q['backup_usd']:,.0f} | "
-            f"egress {q['egress']} | *BAA:* {q['baa']}"
-        )
-        lines.append(f"    in-band path: {q['in_band_path']}")
-    return "\n".join(lines)
+    """The whole table as one string (the packet / dry-run view); the card posts one
+    section PER PROVIDER so no row can be truncated."""
+    head = f"*Provider cost table -- Windows Server VM, 16 vCPU, ~1 TiB SSD, 7 restore points, list prices, accessed {ACCESSED}. Ruled band: ${RULED_BAND_USD[0]}-{RULED_BAND_USD[1]}/mo.*"
+    return "\n".join([head] + [render_provider_row(q) for q in PROVIDER_QUOTES])
+
+
+def band_headline() -> str:
+    """Derived, never typed: how many 64 GB rows sit outside the band at the ruled spec."""
+    n, total = sum(1 for q in PROVIDER_QUOTES if not in_band(q["total_64_usd"])), len(PROVIDER_QUOTES)
+    lead = "Every one of the" if n == total else ("None of the" if n == 0 else f"{n} of the")
+    return (f"{lead} {total} shortlisted rows lands OUTSIDE the ruled ${RULED_BAND_USD[0]}-{RULED_BAND_USD[1]}/mo band at the "
+            f"16 vCPU spec ({n}/{total}): the Windows Server license alone is ~$537/mo at 16 vCPU on every hyperscaler. "
+            "Loaded to the same spec (64 GB floor, ~1 TiB SSD, 7 restore points) NO pay-as-you-go 8 vCPU row is in band either "
+            "(Vultr ~$648-858 depending on image size; Azure ~$778 / AWS ~$806 / GCP ~$965); the band is reached only by "
+            "Azure Hybrid Benefit (own Windows Server licenses + SA), a 4 vCPU CI-only start, or a re-ruled band -- see each row.")
 
 
 def build_card() -> tuple[str, list[dict[str, Any]]]:
-    """(fallback text, blocks). Propose-only: no button spends, provisions or signs."""
-    outside = sum(1 for q in PROVIDER_QUOTES if not in_band(q["total_64_usd"]))
+    """(fallback text, blocks). Propose-only: no button spends, provisions or signs. One
+    section per provider so the D2-mandatory BAA column can never be cut by a length slice."""
     header = ("*VM step 2 provisioning -- ready for Justin's sanity check + your go* (DR/VM step 1, M4; T0 propose-only)\n"
-              f"Every one of the {len(PROVIDER_QUOTES)} shortlisted rows lands OUTSIDE the ruled ${RULED_BAND_USD[0]}-{RULED_BAND_USD[1]}/mo band at the "
-              f"16 vCPU spec ({outside}/{len(PROVIDER_QUOTES)}): the Windows Server license alone is ~$537/mo at 16 vCPU on every hyperscaler. "
-              "In-band paths exist at 8 vCPU or with Azure Hybrid Benefit -- see each row.")
-    table = render_cost_table_text()
-    justin = ("*Justin's sanity check:* a Gmail DRAFT asking him to (1) confirm the checkpoint date, (2) pick the band posture "
-              "(hold $300-600 => 8 vCPU / AHB / Vultr; or re-rule the band for 16 vCPU) is staged in the packet (D-137: Harrison sends). "
+              + band_headline())
+    justin = ("*Justin's sanity check (charter D1):* a Gmail DRAFT is staged in the packet (D-137: Harrison sends) asking him for "
+              "(1) the checkpoint date and (2) his READ on the four options -- incl. whether HJR holds Windows Server licenses with "
+              "Software Assurance (unlocks Azure Hybrid Benefit). The band-vs-size RULING is Harrison's after that read (C5 / D-108). "
               "Cover-line date reads `[Justin to name]`.")
     footer = (f"Packet: `{PACKET_PATH}` (spec, PHI-free sandbox scope by exclusion, secrets posture, step-2 parity checklist, D2 card template, rollback). "
               "NO provisioning, NO account, NO spend, NO quote accepted -- this card asks for nothing but a read. "
-              "Decision owner: Harrison after Justin (charter C5: spend is a write).")
-    blocks = [
+              "Decision owner: Harrison after Justin's read (charter C5: spend is a write).")
+    head_line = f"*Provider cost table -- Windows Server VM, 16 vCPU, ~1 TiB SSD, 7 restore points, list prices, accessed {ACCESSED}. Ruled band: ${RULED_BAND_USD[0]}-{RULED_BAND_USD[1]}/mo. BAA column on every row (charter D2).*"
+    blocks: list[dict[str, Any]] = [
         {"type": "section", "text": {"type": "mrkdwn", "text": header}},
         {"type": "divider"},
-        {"type": "section", "text": {"type": "mrkdwn", "text": table[:2900]}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": head_line}},
+    ]
+    for q in PROVIDER_QUOTES:
+        row = render_provider_row(q)
+        if len(row) > SLACK_SECTION_LIMIT:
+            raise ValueError(f"provider row for {q['provider']} exceeds Slack's section limit ({len(row)} chars) -- shorten the notes, never truncate")
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": row}})
+    blocks += [
         {"type": "section", "text": {"type": "mrkdwn", "text": justin}},
         {"type": "context", "elements": [{"type": "mrkdwn", "text": footer}]},
     ]
+    for b in blocks:
+        t = b.get("text", {}).get("text", "") if isinstance(b.get("text"), dict) else ""
+        if len(t) > SLACK_SECTION_LIMIT:
+            raise ValueError(f"a card section exceeds Slack's limit ({len(t)} chars)")
     fallback = "VM step 2 provisioning -- ready for Justin's sanity check + your go (T0 propose-only; see the packet)"
     return fallback, blocks
 
@@ -176,19 +205,29 @@ def build_card() -> tuple[str, list[dict[str, Any]]]:
 def render_d2_card(*, baa_status_per_provider: dict[str, str], emily_weighed_in: str, emily_date: str,
                    phi_bytes_proposed: str, target_provider: str) -> tuple[str, list[dict[str, Any]]]:
     """TEMPLATE for the LATER KB-restore step (charter D2). Never posted by this script.
-    Renders every mandatory field; a caller that omits one gets a ValueError, not a card."""
-    if not baa_status_per_provider:
-        raise ValueError("D2 card requires BAA status per provider")
+    Renders every mandatory field; a caller that omits or blanks one gets a ValueError,
+    not a card. Charter D2 (Harrison-edited): BAA status and Emily's input are MANDATORY
+    VISIBLE INPUTS -- inputs, NOT preconditions (consistent with D-108: Harrison is the sole
+    ultimate authority). So 'no' renders truthfully as a visible input; it never blocks."""
+    if not baa_status_per_provider or any(not str(s).strip() for s in baa_status_per_provider.values()):
+        raise ValueError("D2 card requires a NON-BLANK BAA status for every listed provider")
+    if target_provider not in baa_status_per_provider:
+        raise ValueError(f"D2 card: target provider {target_provider!r} has no BAA status line")
     if emily_weighed_in not in ("yes", "no"):
         raise ValueError("D2 card requires emily_weighed_in = yes|no")
-    if emily_weighed_in == "yes" and not emily_date:
-        raise ValueError("D2 card requires the date Emily weighed in")
+    if emily_weighed_in == "yes":
+        import re as _re  # noqa: PLC0415
+        if not _re.fullmatch(r"\d{4}-\d{2}-\d{2}", emily_date or ""):
+            raise ValueError("D2 card requires the date Emily weighed in as YYYY-MM-DD")
     if not phi_bytes_proposed:
         raise ValueError("D2 card requires the PHI-adjacent bytes proposed to move (or 'none')")
     baa_lines = "\n".join(f"- {p}: {s}" for p, s in sorted(baa_status_per_provider.items()))
+    emily = (f"yes ({emily_date})" if emily_weighed_in == "yes"
+             else "no -- Emily has NOT weighed in (charter D2: a mandatory VISIBLE input, not a precondition; "
+                  "standing flag: PHI-adjacent data on a host without a BAA is a regulatory exposure for LEX)")
     text = (f"*D2 decision card -- PHI-adjacent move to `{target_provider}` needs HARRISON'S EXPLICIT SIGN-OFF*\n"
             f"*{D2_MANDATORY_FIELDS[0]}:*\n{baa_lines}\n"
-            f"*{D2_MANDATORY_FIELDS[1]}:* {emily_weighed_in}" + (f" ({emily_date})" if emily_weighed_in == "yes" else " -- REQUIRED before sign-off (D-108)") + "\n"
+            f"*{D2_MANDATORY_FIELDS[1]}:* {emily}\n"
             f"*{D2_MANDATORY_FIELDS[2]}:* {phi_bytes_proposed}\n"
             f"*{D2_MANDATORY_FIELDS[3]}:* pending -- reply in this thread; nothing moves until then.")
     blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]

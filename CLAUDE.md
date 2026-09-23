@@ -2,7 +2,9 @@
 
 This file is the authoritative startup read for every Code session.
 Read this first, then check `decisions.md` for the full decision log.
-TOM entries are newest-first. Do not edit past TOM entries.
+The TOP OF MIND block below is a hand-maintained POINTER table (one row per merged bundle,
+newest last) -- a Code session that lands a bundle adds/refreshes ITS row in its docs slice;
+the pre-2026-09-23 narrative TOM lives in git history (`git show 1e93c99:CLAUDE.md`).
 
 ---
 

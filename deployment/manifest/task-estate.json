@@ -1,9 +1,11 @@
 {
   "schema_version": 1,
-  "generated_at_utc": "2026-09-23T15:55:19Z",
-  "generated_at_az": "2026-09-23 08:55 AZ",
+  "generated_at_utc": "2026-09-23T18:01:37Z",
+  "generated_at_az": "2026-09-23 11:01 AZ",
   "generator": "scripts/generate_task_estate_manifest.py",
   "host": "H-REMOTE",
+  "host_time_zone": "US Mountain Standard Time",
+  "task_xml_dir": "deployment/manifest/tasks",
   "source": "Get-ScheduledTask + Get-ScheduledTaskInfo (CIM), cross-checked vs schtasks CSV + cora_health view",
   "name_filters": {
     "prefixes": [
@@ -127,119 +129,7 @@
     "available": true,
     "root": "C:\\Users\\Harri\\OneDrive\\Documents\\Claude\\Scheduled",
     "count": 111,
-    "task_ids": [
-      "connector-health-heartbeat",
-      "cora-knowledge-review",
-      "cora-slack-clarity-weekly-check",
-      "cowork-cora-org-remodel-sweep",
-      "cowork-cora-redundancy-audit",
-      "daily-morning-brief",
-      "f3-events-delivery-daily-watch",
-      "f3-events-pipeline-weekly",
-      "f3-intake-triage-weekly",
-      "f3-pure-tiktok-daily-digest",
-      "f3-rangeme-decision-check",
-      "f3-retail-contact-research-weekly",
-      "f3e-amazon-ads-reactivation-trigger",
-      "f3e-amazon-mood-appeal-recheck",
-      "f3e-amazon-pure-review-watch",
-      "f3e-ambassador-followup-nudge",
-      "f3e-apollo-spy-v2-first-fire-readback",
-      "f3e-az-vendor-reply-watch",
-      "f3e-channel-inventory-sweep",
-      "f3e-content-winners-weekly",
-      "f3e-day7-kill-check-2026-09-16",
-      "f3e-digest-first-fire-verification",
-      "f3e-google-product-ratings-check",
-      "f3e-judgeme-collection-remeasure",
-      "f3e-klaviyo-masked-email-verify",
-      "f3e-meta-klaviyo-midweek-winner-check",
-      "f3e-meta-review-syndication-check",
-      "f3e-mood-checkin-picker-case-trigger",
-      "f3e-oneshot-0828-amazon-postalign-checks",
-      "f3e-otterly-ai-visibility-weekly-review",
-      "f3e-otterly-gemini-addon-recheck",
-      "f3e-paid-media-mer-weekly-digest",
-      "f3e-parent-edit-propagation-verify",
-      "f3e-press-wave-silence-check-0813",
-      "f3e-pure-reviews-walmart-syndication-watch",
-      "f3e-rangeme-weekly-followup",
-      "f3e-stranded-removal-watch",
-      "f3e-t24-alignment-propagation-verify",
-      "f3e-tiktok-discount-end-review",
-      "f3e-tiktok-fbt-receipt-watch",
-      "f3e-verify-polar-meta-backfill",
-      "f3e-walmart-ad-center-support-ticket-check",
-      "f3e-walmart-case-16161756-check",
-      "f3e-walmart-reactivation-watch",
-      "f3e-weekly-learn-draft-pipeline",
-      "fire-cora-to-claude-announcement",
-      "fndr--813-dw-delegation-checkpoint-prep",
-      "fndr-aging-drafts-digest",
-      "fndr-context-budget-v2-verify",
-      "fndr-daily-meeting-capture-audit-interim",
-      "fndr-daily-synthesis-persist",
-      "fndr-email-triage-draft-staging",
-      "fndr-email-triage-twice-daily",
-      "fndr-f3-cultural-radar",
-      "fndr-freelancer-deliverables-sync",
-      "fndr-gotham-90day-review",
-      "fndr-hannah-bootstrap-verify",
-      "fndr-hannah-pipeline-checkpoint-line",
-      "fndr-lex-weekly-recap-draft",
-      "fndr-monthly-f3-video-calendar-refresh",
-      "fndr-nightly-cowork-session-capture",
-      "fndr-notetaker-coverage-read-day2",
-      "fndr-notetaker-coverage-read-day3",
-      "fndr-oneshot-0825-loop-watch-verify",
-      "fndr-parked-pack-review-2026-09-01",
-      "fndr-press-pitch-tracker-sync",
-      "fndr-press-steady-state",
-      "fndr-renewals-radar",
-      "fndr-reply-watch",
-      "fndr-saas-spend-audit",
-      "fndr-scheduled-task-verify-and-execute",
-      "fndr-tessa-ops-capacity-reeval",
-      "fndr-tommy-drip-reminder-week1",
-      "fndr-tommy-drip-reminder-week2",
-      "fndr-tommy-drip-reminder-week3",
-      "fndr-tommy-drip-reminder-week4",
-      "fndr-unfired-work-sweep",
-      "fndr-weekly-alex-workflow-analysis",
-      "fndr-weekly-content-pipeline-digest",
-      "fndr-weekly-finance-workflow-review",
-      "fndr-weekly-hannah-knowledge-index",
-      "fndr-weekly-press-digest",
-      "fndr-weekly-task-verdict-review",
-      "fndr-weekly-tommy-pipeline-brief",
-      "fndr-weekly-tommy-workflow-analysis",
-      "fndr-x9-storage-runlist-reminder",
-      "hjrprod-oneshot-watchtower-outside-date-check",
-      "hubspot-new-contact-watch",
-      "hygiene-asana",
-      "hygiene-drive",
-      "hygiene-fireflies",
-      "hygiene-gmail",
-      "hygiene-hubspot",
-      "hygiene-notion",
-      "hygiene-qbo",
-      "hygiene-sheets-docs",
-      "hygiene-slack",
-      "hygiene-weekly-orchestrator",
-      "japan-trip-planning-kickoff",
-      "lex-swept-phi-check",
-      "memory-consolidation",
-      "nightly-fireflies-sweep",
-      "oneamerica-whole-life-refresh",
-      "pers-bevnet-speaker-reply-check",
-      "pers-mxlonv-precheck-verify",
-      "pers-slc-precheck-verify",
-      "pod-daily-guest-pipeline-sync",
-      "session-launchpad",
-      "session-launchpad-fable",
-      "travel-points-monthly-refresh",
-      "weekly-portfolio-refresh"
-    ],
+    "task_ids_sha256_16": "c056ba524549c06d",
     "pin_task_state": "Ready"
   },
   "tasks": [
@@ -259,6 +149,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -320,6 +211,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -381,6 +273,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -442,6 +335,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -503,6 +397,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -564,6 +459,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -625,6 +521,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -686,6 +583,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -747,6 +645,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -808,6 +707,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -869,6 +769,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -930,6 +831,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -991,6 +893,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -1052,6 +955,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -1113,6 +1017,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -1174,6 +1079,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -1235,6 +1141,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -1296,6 +1203,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -1357,6 +1265,7 @@
           "weeks_interval": null,
           "rep_interval": "PT4H",
           "rep_duration": "",
+          "rep_stop_at_end": true,
           "exec_limit": "",
           "user_id": ""
         }
@@ -1379,8 +1288,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-23T06:00:01",
-      "next_run_time": "2026-09-23T10:00:00",
+      "last_run_time": "2026-09-23T10:00:01",
+      "next_run_time": "2026-09-23T14:00:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -1391,7 +1300,7 @@
       "log": {
         "pattern": "logs/tasks/Cora-Email-Attachment-Filer-<YYYY-MM-DD>.log",
         "newest": "logs/tasks/Cora-Email-Attachment-Filer-2026-09-23.log",
-        "newest_mtime_utc": "2026-09-23T13:00:40Z",
+        "newest_mtime_utc": "2026-09-23T17:04:01Z",
         "count": 21
       },
       "intent": "UNROWED",
@@ -1496,6 +1405,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -1557,6 +1467,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -1598,7 +1509,6 @@
       "intent_drift": "",
       "ladder_lane": "UNROWED",
       "setup_scripts": [
-        "setup-daily-synthesis-f3e-task.ps1",
         "setup-f3e-ecom-brief-task.ps1"
       ],
       "description": "Cora: compose + post the F3 Energy daily ecom + ops brief to #f3-ops-cockpit (07:10 AZ). Script-side; reads Shopify/Polar/HubSpot/Asana."
@@ -1619,6 +1529,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -1680,6 +1591,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -1741,6 +1653,7 @@
           "weeks_interval": null,
           "rep_interval": "PT1H",
           "rep_duration": "",
+          "rep_stop_at_end": true,
           "exec_limit": "",
           "user_id": ""
         }
@@ -1764,8 +1677,8 @@
       "run_only_if_network_available": false,
       "last_task_result": 0,
       "last_run_time": "2026-06-04T17:00:01",
-      "next_run_time": "2026-09-23T09:00:00",
-      "number_of_missed_runs": 2655,
+      "next_run_time": "2026-09-23T12:00:00",
+      "number_of_missed_runs": 2658,
       "run_marker": {
         "registered": false,
         "present": false,
@@ -1802,6 +1715,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -1843,7 +1757,6 @@
       "intent_drift": "",
       "ladder_lane": "UNROWED",
       "setup_scripts": [
-        "setup-daily-synthesis-f3e-task.ps1",
         "setup-inventory-alerts-task.ps1"
       ],
       "description": "Cora: Post F3E + OSN inventory alerts when stock falls below configured thresholds. Daily at 16:00 UTC (9am AZ)."
@@ -1864,6 +1777,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -2003,6 +1917,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -2064,6 +1979,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -2125,6 +2041,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -2264,6 +2181,7 @@
           "weeks_interval": null,
           "rep_interval": "PT1H",
           "rep_duration": "",
+          "rep_stop_at_end": true,
           "exec_limit": "",
           "user_id": ""
         }
@@ -2287,8 +2205,8 @@
       "run_only_if_network_available": false,
       "last_task_result": 0,
       "last_run_time": "2026-06-18T11:00:01",
-      "next_run_time": "2026-09-23T09:00:00",
-      "number_of_missed_runs": 2325,
+      "next_run_time": "2026-09-23T12:00:00",
+      "number_of_missed_runs": 2328,
       "run_marker": {
         "registered": false,
         "present": false,
@@ -2314,7 +2232,7 @@
       "path": "\\",
       "state": "Ready",
       "enabled": true,
-      "trigger_text": "every PT15M (daily 07:08)",
+      "trigger_text": "every PT15M for PT13H stop-at-end (daily 07:08)",
       "triggers": [
         {
           "type": "MSFT_TaskDailyTrigger",
@@ -2325,6 +2243,7 @@
           "weeks_interval": null,
           "rep_interval": "PT15M",
           "rep_duration": "PT13H",
+          "rep_stop_at_end": true,
           "exec_limit": "",
           "user_id": ""
         }
@@ -2347,8 +2266,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-23T08:53:02",
-      "next_run_time": "2026-09-23T09:08:00",
+      "last_run_time": "2026-09-23T10:53:02",
+      "next_run_time": "2026-09-23T11:08:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -2359,7 +2278,7 @@
       "log": {
         "pattern": "logs/tasks/Cora-Meeting-Ask-Capture-<YYYY-MM-DD>.log",
         "newest": "logs/tasks/Cora-Meeting-Ask-Capture-2026-09-23.log",
-        "newest_mtime_utc": "2026-09-23T15:53:04Z",
+        "newest_mtime_utc": "2026-09-23T17:53:06Z",
         "count": 21
       },
       "intent": "UNROWED",
@@ -2386,6 +2305,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -2447,6 +2367,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -2586,6 +2507,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -2647,6 +2569,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -2669,8 +2592,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-22T10:15:01",
-      "next_run_time": "2026-09-23T10:15:00",
+      "last_run_time": "2026-09-23T10:15:01",
+      "next_run_time": "2026-09-24T10:15:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -2680,9 +2603,9 @@
       "log_slug": "Cora-Revops-Sweep",
       "log": {
         "pattern": "logs/tasks/Cora-Revops-Sweep-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/Cora-Revops-Sweep-2026-09-22.log",
-        "newest_mtime_utc": "2026-09-22T17:16:03Z",
-        "count": 20
+        "newest": "logs/tasks/Cora-Revops-Sweep-2026-09-23.log",
+        "newest_mtime_utc": "2026-09-23T17:16:34Z",
+        "count": 21
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -2708,6 +2631,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -2769,6 +2693,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -2830,6 +2755,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -2891,6 +2817,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -2952,6 +2879,7 @@
           "weeks_interval": null,
           "rep_interval": "PT5M",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -2974,8 +2902,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-23T08:52:01",
-      "next_run_time": "2026-09-23T08:57:00",
+      "last_run_time": "2026-09-23T10:57:01",
+      "next_run_time": "2026-09-23T11:02:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -2986,7 +2914,7 @@
       "log": {
         "pattern": "logs/tasks/cora-watchdog-<YYYY-MM-DD>.log",
         "newest": "logs/tasks/cora-watchdog-2026-09-23.log",
-        "newest_mtime_utc": "2026-09-23T15:52:01Z",
+        "newest_mtime_utc": "2026-09-23T17:57:02Z",
         "count": 21
       },
       "intent": "UNROWED",
@@ -3013,6 +2941,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -3074,6 +3003,7 @@
           "weeks_interval": null,
           "rep_interval": "PT1H",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -3097,8 +3027,8 @@
       "run_only_if_network_available": false,
       "last_task_result": 0,
       "last_run_time": "2026-06-01T15:10:01",
-      "next_run_time": "2026-09-23T09:10:00",
-      "number_of_missed_runs": 2729,
+      "next_run_time": "2026-09-23T11:10:00",
+      "number_of_missed_runs": 2731,
       "run_marker": {
         "registered": false,
         "present": false,
@@ -3133,6 +3063,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -3194,6 +3125,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -3255,6 +3187,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -3316,6 +3249,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -3377,6 +3311,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -3438,6 +3373,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -3499,6 +3435,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         },
@@ -3511,6 +3448,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -3572,6 +3510,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -3631,6 +3570,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -3679,7 +3619,7 @@
       "path": "\\",
       "state": "Ready",
       "enabled": true,
-      "trigger_text": "every PT15M (from 2026-08-01T00:00)",
+      "trigger_text": "every PT15M for P3650D stop-at-end (from 2026-08-01T00:00)",
       "triggers": [
         {
           "type": "MSFT_TaskTimeTrigger",
@@ -3690,6 +3630,7 @@
           "weeks_interval": null,
           "rep_interval": "PT15M",
           "rep_duration": "P3650D",
+          "rep_stop_at_end": true,
           "exec_limit": "",
           "user_id": ""
         }
@@ -3712,8 +3653,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-23T08:45:01",
-      "next_run_time": "2026-09-23T09:00:00",
+      "last_run_time": "2026-09-23T11:00:01",
+      "next_run_time": "2026-09-23T11:15:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -3724,7 +3665,7 @@
       "log": {
         "pattern": "logs/tasks/cowork-cora-delegated-work-<YYYY-MM-DD>.log",
         "newest": "logs/tasks/cowork-cora-delegated-work-2026-09-23.log",
-        "newest_mtime_utc": "2026-09-23T15:45:02Z",
+        "newest_mtime_utc": "2026-09-23T18:00:02Z",
         "count": 21
       },
       "intent": "UNROWED",
@@ -3751,6 +3692,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -3812,6 +3754,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -3871,6 +3814,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -3932,6 +3876,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -3993,6 +3938,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -4054,6 +4000,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -4115,6 +4062,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -4176,6 +4124,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -4237,6 +4186,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -4298,6 +4248,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -4357,6 +4308,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -4416,6 +4368,7 @@
           "weeks_interval": null,
           "rep_interval": "PT1H",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -4439,8 +4392,8 @@
       "run_only_if_network_available": false,
       "last_task_result": 0,
       "last_run_time": "2026-06-02T11:23:02",
-      "next_run_time": "2026-09-23T09:23:00",
-      "number_of_missed_runs": 2709,
+      "next_run_time": "2026-09-23T11:23:00",
+      "number_of_missed_runs": 2711,
       "run_marker": {
         "registered": false,
         "present": false,
@@ -4475,6 +4428,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -4536,6 +4490,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -4559,8 +4514,8 @@
       "run_only_if_network_available": true,
       "last_task_result": 0,
       "last_run_time": "2026-08-03T09:10:01",
-      "next_run_time": "2026-09-23T09:10:00",
-      "number_of_missed_runs": 50,
+      "next_run_time": "2026-09-24T09:10:00",
+      "number_of_missed_runs": 51,
       "run_marker": {
         "registered": false,
         "present": false,
@@ -4597,6 +4552,7 @@
           "weeks_interval": null,
           "rep_interval": "PT2H",
           "rep_duration": "",
+          "rep_stop_at_end": true,
           "exec_limit": "",
           "user_id": ""
         }
@@ -4620,8 +4576,8 @@
       "run_only_if_network_available": true,
       "last_task_result": 0,
       "last_run_time": "2026-08-03T10:00:01",
-      "next_run_time": "2026-09-23T10:00:00",
-      "number_of_missed_runs": 611,
+      "next_run_time": "2026-09-23T12:00:00",
+      "number_of_missed_runs": 612,
       "run_marker": {
         "registered": false,
         "present": false,
@@ -4658,6 +4614,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -4719,6 +4676,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -4858,6 +4816,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -4919,6 +4878,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -4980,6 +4940,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -5041,6 +5002,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -5102,6 +5064,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -5163,6 +5126,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -5224,6 +5188,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         },
@@ -5236,6 +5201,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -5297,6 +5263,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -5358,6 +5325,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -5419,6 +5387,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -5480,6 +5449,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -5530,7 +5500,7 @@
       "path": "\\",
       "state": "Ready",
       "enabled": true,
-      "trigger_text": "every PT15M (daily 06:07)",
+      "trigger_text": "every PT15M for PT14H stop-at-end (daily 06:07)",
       "triggers": [
         {
           "type": "MSFT_TaskDailyTrigger",
@@ -5541,6 +5511,7 @@
           "weeks_interval": null,
           "rep_interval": "PT15M",
           "rep_duration": "PT14H",
+          "rep_stop_at_end": true,
           "exec_limit": "",
           "user_id": ""
         }
@@ -5563,8 +5534,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-23T08:52:02",
-      "next_run_time": "2026-09-23T09:07:00",
+      "last_run_time": "2026-09-23T10:52:02",
+      "next_run_time": "2026-09-23T11:07:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -5575,7 +5546,7 @@
       "log": {
         "pattern": "logs/tasks/cowork-cora-meeting-capture-ensure-<YYYY-MM-DD>.log",
         "newest": "logs/tasks/cowork-cora-meeting-capture-ensure-2026-09-23.log",
-        "newest_mtime_utc": "2026-09-23T15:52:24Z",
+        "newest_mtime_utc": "2026-09-23T17:52:31Z",
         "count": 21
       },
       "intent": "UNROWED",
@@ -5678,6 +5649,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -5739,6 +5711,7 @@
           "weeks_interval": 1,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -5800,6 +5773,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -5859,6 +5833,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -5920,6 +5895,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -5981,6 +5957,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }
@@ -6042,6 +6019,7 @@
           "weeks_interval": null,
           "rep_interval": "PT15M",
           "rep_duration": "",
+          "rep_stop_at_end": true,
           "exec_limit": "",
           "user_id": ""
         }
@@ -6064,8 +6042,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-23T08:48:41",
-      "next_run_time": "2026-09-23T09:03:40",
+      "last_run_time": "2026-09-23T10:48:41",
+      "next_run_time": "2026-09-23T11:03:40",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -6076,7 +6054,7 @@
       "log": {
         "pattern": "logs/tasks/cowork-cora-security-monitor-<YYYY-MM-DD>.log",
         "newest": "logs/tasks/cowork-cora-security-monitor-2026-09-23.log",
-        "newest_mtime_utc": "2026-09-23T15:48:42Z",
+        "newest_mtime_utc": "2026-09-23T17:48:41Z",
         "count": 21
       },
       "intent": "UNROWED",
@@ -6103,6 +6081,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": "H-REMOTE\\Harri"
         }
@@ -6137,7 +6116,7 @@
       "log": {
         "pattern": "logs/tasks/cowork-cora-service-<YYYY-MM-DD>.log",
         "newest": "logs/tasks/cowork-cora-service-2026-09-20.log",
-        "newest_mtime_utc": "2026-09-23T15:54:35Z",
+        "newest_mtime_utc": "2026-09-23T18:00:43Z",
         "count": 6
       },
       "intent": "running",
@@ -6164,6 +6143,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         },
@@ -6176,6 +6156,7 @@
           "weeks_interval": null,
           "rep_interval": "",
           "rep_duration": "",
+          "rep_stop_at_end": false,
           "exec_limit": "",
           "user_id": ""
         }

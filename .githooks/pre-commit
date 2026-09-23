@@ -37,3 +37,31 @@ if [ -n "$FOUND" ]; then
   echo ""
   exit 1
 fi
+
+# Second gate (DR/VM step 1, charter D3): scripts/secrets_scan.py over the staged files --
+# token SHAPES beyond the prefix list above, documented KEY=value assignments with a real
+# value, and the live-.env value belt (names the KEY, never prints a value). The venv is
+# looked up in this checkout first, then in the MAIN checkout (a `git worktree` has no
+# .venv of its own -- the common git dir's parent is the main checkout). Skipped, LOUDLY,
+# only when neither exists (a fresh clone before uv sync).
+PY=""
+if [ -x ".venv/Scripts/python.exe" ]; then
+  PY=".venv/Scripts/python.exe"
+else
+  COMMON=$(git rev-parse --git-common-dir 2>/dev/null)
+  MAIN_ROOT=$(dirname "$COMMON")
+  if [ -n "$COMMON" ] && [ -x "$MAIN_ROOT/.venv/Scripts/python.exe" ]; then
+    PY="$MAIN_ROOT/.venv/Scripts/python.exe"
+  fi
+fi
+if [ -n "$PY" ] && [ -f "scripts/secrets_scan.py" ]; then
+  if ! "$PY" scripts/secrets_scan.py --staged; then
+    echo ""
+    echo "  BLOCKED: scripts/secrets_scan.py found a secret VALUE or a real KEY=value in the staged files (see HIT lines)."
+    echo "  Key NAMES are fine; values live only in .env / the encrypted bundle."
+    echo ""
+    exit 1
+  fi
+elif [ -f "scripts/secrets_scan.py" ]; then
+  echo "  pre-commit: secrets_scan.py second gate SKIPPED -- no .venv here or in the main checkout (run uv sync)."
+fi

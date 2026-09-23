@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Weekly finance SOP adherence check (A1-A3): cash-sheet freshness, Clover lane retired, monthly filing presence, per-entity bank-statement freshness. Read-only; deterministic facts block for the close pack and the weekly finance review. No model call.</Description>
+    <URI>\cowork-cora-finance-adherence</URI>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-21-680525238-924693030-406301295-1001</UserId>
+      <LogonType>InteractiveToken</LogonType>
+    </Principal>
+  </Principals>
+  <Settings>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT20M</ExecutionTimeLimit>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <IdleSettings>
+      <Duration>PT10M</Duration>
+      <WaitTimeout>PT1H</WaitTimeout>
+      <StopOnIdleEnd>true</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
+  </Settings>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2026-08-04T08:15:00-07:00</StartBoundary>
+      <ScheduleByWeek>
+        <WeeksInterval>1</WeeksInterval>
+        <DaysOfWeek>
+          <Monday />
+        </DaysOfWeek>
+      </ScheduleByWeek>
+    </CalendarTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\Users\Harri\code\cora\.venv\Scripts\pythonw.exe</Command>
+      <Arguments>C:\Users\Harri\code\cora\deployment\run_hidden.py --name cowork-cora-finance-adherence -- C:\Users\Harri\code\cora\.venv\Scripts\python.exe scripts\run_finance_adherence_check.py</Arguments>
+      <WorkingDirectory>C:\Users\Harri\code\cora</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>

@@ -1,15 +1,15 @@
 {
   "schema_version": 1,
-  "generated_at_utc": "2026-09-23T16:09:44Z",
-  "generated_at_az": "2026-09-23 09:09 AZ",
+  "generated_at_utc": "2026-09-23T18:01:38Z",
+  "generated_at_az": "2026-09-23 11:01 AZ",
   "host": "H-REMOTE",
   "live_root": "C:\\Users\\Harri\\code\\cora",
   "summary": {
     "PASS": 19,
     "FAIL": 0,
-    "MANUAL": 2,
+    "MANUAL": 3,
     "UNMEASURED": 1,
-    "INFO": 2
+    "INFO": 1
   },
   "kb_rto": {
     "a_snapshot": "UNMEASURED",
@@ -24,8 +24,8 @@
       "restore_step": "`git clone <origin> C:\\Users\\Harri\\code\\cora`; checkout `main` at the recorded hash",
       "owner": "Harrison",
       "rto": "~5 min",
-      "status": "PASS",
-      "detail": "live checkout HEAD e46bd61 on claude/deposco-push-write-path-2026-09-22; origin set"
+      "status": "MANUAL",
+      "detail": "restore hash: origin/main f65b7fc; live checkout HEAD 6f65b37 on claude/deposco-push-write-path-2026-09-22; origin set -- the live checkout is NOT on main (a Code session holds it); the restore target is origin/main, not this HEAD"
     },
     {
       "id": "D02",
@@ -55,7 +55,7 @@
       "owner": "Harrison",
       "rto": "~15 min",
       "status": "PASS",
-      "detail": "73 keys live; 7 active example keys missing in live (HEALTH_BIND, HEALTH_PING_INTERVAL_S, HEALTH_PORT, POLAR_CLIENT_ID, POLAR_CLIENT_SECRET, POLAR_VIEW_ID); 23 live-only keys (documented as commented in .env.example or undocumented); no duplicate keys"
+      "detail": "73 keys live; 7 active example keys missing in live (HEALTH_BIND, HEALTH_PING_INTERVAL_S, HEALTH_PORT, POLAR_CLIENT_ID, POLAR_CLIENT_SECRET, POLAR_VIEW_ID, SLACK_USER_TOKEN); 23 live-only keys (documented as commented in .env.example or undocumented); no duplicate keys"
     },
     {
       "id": "D05",
@@ -65,7 +65,7 @@
       "owner": "Harrison",
       "rto": "~10 min (after the passphrase)",
       "status": "PASS",
-      "detail": "newest 2026-09-22/secrets-2026-09-22.enc (27420 B, 12.7 h old); restore_secrets.py present; passphrase env var visible to this process"
+      "detail": "newest 2026-09-22/secrets-2026-09-22.enc (27420 B, 14.5 h old); restore_secrets.py present; passphrase env var visible to this process"
     },
     {
       "id": "D06",
@@ -75,13 +75,13 @@
       "owner": "Harrison",
       "rto": "MANUAL",
       "status": "PASS",
-      "detail": "code-integrity policy enforced (kernel 2, user-mode 2); service runs `python.exe -m cora.main`; cora.exe present in the venv but blocked by policy -- never the action"
+      "detail": "code-integrity policy enforced (kernel 2, user-mode 2); service runs `python.exe -m cora.main`; cora.exe present in the venv -- ASSERTED blocked by policy (untested here; never use it as the action)"
     },
     {
       "id": "D07",
       "item": "Service task `cowork-cora-service` (always-on bot)",
-      "source_of_truth": "`deployment/setup-windows-task.ps1` (AtLogon, RestartOnFailure 999 x PT1M, windowless via run_hidden)",
-      "restore_step": "run the setup script (elevated), then `deployment\\restart-cora.ps1`; proof = a NEW pid row in `logs/cora-instances.jsonl`",
+      "source_of_truth": "`deployment/manifest/tasks/cowork-cora-service.xml` (the live export: AtLogon, RestartOnFailure 999 x PT1M, windowless `python.exe -m cora.main` via run_hidden); `setup-windows-task.ps1` creates it fresh",
+      "restore_step": "`deployment\\register-estate-from-manifest.ps1 -Apply -Only cowork-cora-service` (elevated) after the .env is restored, then `Start-ScheduledTask`; proof = a NEW pid row in `logs/cora-instances.jsonl`",
       "owner": "Cora-script (Harrison runs)",
       "rto": "~5 min",
       "status": "PASS",
@@ -95,7 +95,7 @@
       "owner": "Cora-script",
       "rto": "~2 min",
       "status": "PASS",
-      "detail": "heartbeat 5 s old; pid 5384 started 2026-09-20T05:44:15Z"
+      "detail": "heartbeat -4 s old; pid 5384 started 2026-09-20T05:44:15Z"
     },
     {
       "id": "D09",
@@ -139,11 +139,11 @@
     },
     {
       "id": "D13",
-      "item": "Scheduled estate (96 tasks) = `deployment/manifest/task-estate.json`",
-      "source_of_truth": "the live Task Scheduler registry, derived by `scripts/generate_task_estate_manifest.py` (M1)",
-      "restore_step": "bootstrap Phase 5: every `setup-*.ps1`, then `rewrap-tasks-hidden.ps1 -Apply`; tasks without a setup script re-register from the manifest JSON; `--diff-only` must print zero drift",
+      "item": "Scheduled estate (96 tasks) = `deployment/manifest/task-estate.json` + `deployment/manifest/tasks/*.xml`",
+      "source_of_truth": "the live Task Scheduler registry, derived by `scripts/generate_task_estate_manifest.py` (M1): the JSON is the diff view, the per-task XML is the restore form",
+      "restore_step": "bootstrap Phase 5: `Set-TimeZone` to the manifest's host_time_zone, then `deployment\\register-estate-from-manifest.ps1 -Apply` (elevated; registers every task from its XML, keeps the intent-disabled ones disabled); NOT the setup-*.ps1 scripts (drifted clocks / re-enable disabled tasks); `--diff-only` must print zero drift",
       "owner": "Harrison (elevated) + Cora-script",
-      "rto": "~30-45 min",
+      "rto": "~15-30 min",
       "status": "PASS",
       "detail": "96 live / 96 manifest; 0 task-estate-drift line(s)"
     },
@@ -229,13 +229,13 @@
     },
     {
       "id": "D22",
-      "item": "Task XML exports (`deployment/task-backups/<date>`)",
-      "source_of_truth": "local, gitignored exports from `rewrap-tasks-hidden.ps1`",
-      "restore_step": "convenience only; the committed record is the manifest JSON",
+      "item": "Task XML restore set (`deployment/manifest/tasks/<slug>.xml`, committed) + local `deployment/task-backups/<date>` exports",
+      "source_of_truth": "the generator exports every task's XML on each run (committed with the manifest); `rewrap-tasks-hidden.ps1` also writes local, gitignored dated exports",
+      "restore_step": "the committed XML set IS the restore form (D13); the dated local exports are a convenience that does not survive a bare-metal loss",
       "owner": "Cora-script",
       "rto": "n/a",
-      "status": "INFO",
-      "detail": "local XML exports: ['2026-09-02', '2026-09-03'] (gitignored -- the committed record is deployment/manifest/task-estate.json; an XML export is a convenience, not the source of truth)"
+      "status": "PASS",
+      "detail": "96 committed task XML files under deployment/manifest/tasks; covers every live task; local dated exports (gitignored convenience): ['2026-09-02', '2026-09-03']"
     },
     {
       "id": "D23",

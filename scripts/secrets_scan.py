@@ -27,13 +27,23 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)   # D-266: every spawn windowless (tests/test_run_hidden.py rail)
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 ENV_EXAMPLE = _REPO_ROOT / ".env.example"
-LIVE_ENV = _REPO_ROOT / ".env"
+#: The live .env: this checkout's, else the LIVE checkout's (a git worktree has none -- the
+#: belt must not silently become a no-op there; D-051 lens E, 2026-09-23).
+_LIVE_ROOT = Path(os.environ.get("CORA_LIVE_ROOT", r"C:\Users\Harri\code\cora"))
+LIVE_ENV = (_REPO_ROOT / ".env") if (_REPO_ROOT / ".env").exists() else (_LIVE_ROOT / ".env")
+
+#: Keys that are secrets whatever their value looks like (the passphrase that decrypts every
+#: other secret is a plain phrase -- no token shape, possibly short; D-051 lens B HIGH).
+EXTRA_SECRET_KEYS: frozenset[str] = frozenset({"CORA_BACKUP_PASSPHRASE"})
 
 SCAN_SUFFIXES = {".md", ".json", ".yaml", ".yml", ".txt", ".ps1", ".py", ".toml", ".cfg", ".ini", ".example"}
 
@@ -61,8 +71,13 @@ _PLACEHOLDER_RE = re.compile(
     r"your|paste|example|xxx|dummy|test|redact|placeholder|changeme|<[^>]*>|\.\.\.|here\b|sample|fake|todo",
     re.IGNORECASE)
 _ENV_LINE_RE = re.compile(r"^\s*(?:export\s+)?([A-Z][A-Z0-9_]{2,})\s*=\s*(.+?)\s*$")
+#: `KEY=value` anywhere in a line (bullet / inline code / table cell); the value stops at
+#: whitespace, a closing backtick/quote or a table pipe.
+_INLINE_ASSIGN_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Z][A-Z0-9_]{2,})\s*=\s*([^\s`'\"|]+)")
 _SECRET_KEY_RE = re.compile(
-    r"(TOKEN|SECRET|API_KEY|_KEY$|PASS(WORD)?$|_PASS$|PAT$|PAT_|WEBHOOK|PING_URL|ACCESS_TOKEN|PRIVATE|CLIENT_SECRET|_JSON$)")
+    r"(TOKEN|SECRET|API_KEY|_KEY$|PASS(WORD|WD|PHRASE)?$|_PASS$|_PWD$|PASSPHRASE|CREDENTIAL|PAT$|PAT_|WEBHOOK|PING_URL|ACCESS_TOKEN|PRIVATE|CLIENT_SECRET|_JSON$)")
+#: Password-class keys: a real value can be short (8+), so the belt floor is lower for them.
+_PASSWORD_KEY_RE = re.compile(r"(PASS(WORD|WD|PHRASE)?$|_PASS$|_PWD$|PASSPHRASE)")
 _NON_SECRET_KEY_RE = re.compile(r"(_ID$|_IDS$|_CHANNEL$|_MODEL$|_DIR$|_STORE$|_ENVIRONMENT$|_BU$|_TENANT$|_URI$|_CERT$|_HOURS$|_ENABLED$|_USER$)")
 _PATH_LIKE_RE = re.compile(r"^(?:[A-Za-z]:\\|\\\\|/|\./|\.\\|~|data[\\/]|logs[\\/]|scripts[\\/])")
 _LITERAL_VALUES = {"0", "1", "true", "false", "on", "off", "yes", "no", "none", "null", "all", "observe", "enforce",
@@ -80,11 +95,16 @@ class Hit:
         return f"{self.path}:{self.line}: {self.kind} [{self.key}]"
 
 
+_ENV_KEY_ANY_RE = re.compile(r"^\s*#?\s*([A-Z][A-Z0-9_]{2,})\s*=")
+
+
 def env_example_keys(path: Path = ENV_EXAMPLE) -> set[str]:
-    keys: set[str] = set()
+    """Every documented KEY (active or commented), including `KEY=` with an EMPTY value --
+    a key documented without a placeholder is still a key the rules must know."""
+    keys: set[str] = set(EXTRA_SECRET_KEYS)
     try:
         for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            m = _ENV_LINE_RE.match(raw.lstrip("# ").strip()) if raw.strip().startswith("#") else _ENV_LINE_RE.match(raw)
+            m = _ENV_KEY_ANY_RE.match(raw)
             if m:
                 keys.add(m.group(1))
     except OSError:
@@ -114,6 +134,8 @@ def _is_placeholder(value: str) -> bool:
     v = value.strip().strip("'\"`")
     if not v or v.lower() in _LITERAL_VALUES or len(v) < 8:
         return True
+    if v[0] in "<[{$":          # `<long-lived token from Step 4>` split at its first space is still a placeholder
+        return True
     if _PLACEHOLDER_RE.search(v):
         return True
     if _PATH_LIKE_RE.match(v):
@@ -134,34 +156,57 @@ def live_secret_values(path: Path = LIVE_ENV) -> dict[str, str]:
         if not m:
             continue
         key, val = m.group(1), m.group(2).strip().strip("'\"")
-        if not _SECRET_KEY_RE.search(key) or _NON_SECRET_KEY_RE.search(key):
+        extra = key in EXTRA_SECRET_KEYS
+        if not extra and (not _SECRET_KEY_RE.search(key) or _NON_SECRET_KEY_RE.search(key)):
             continue
-        if len(val) < 12 or _PATH_LIKE_RE.match(val) or val.lower() in _LITERAL_VALUES:
+        floor = 8 if (extra or _PASSWORD_KEY_RE.search(key)) else 12   # passwords can be short; tokens are not
+        if len(val) < floor or _PATH_LIKE_RE.match(val) or val.lower() in _LITERAL_VALUES:
             continue
         out[key] = val
     return out
 
 
+def is_test_path(rel: str) -> bool:
+    """A repo-relative path under tests/ (either separator). Test files are BELT-ONLY: their
+    secret-SHAPED fixtures are inputs by construction (the scanner's own tests carry an AWS
+    example key, an assembled xoxb-, `CORA_BACKUP_PASSPHRASE=correct horse battery` ...), so
+    the shape + env-assignment rules would block every commit that touches them. A LIVE .env
+    value in a test file is a real leak and still blocks (the belt runs everywhere)."""
+    parts = rel.replace("\\", "/").split("/")
+    return bool(parts) and parts[0] == "tests"
+
+
 def scan_text(text: str, path: str, *, env_keys: set[str] | None = None,
-              live_values: dict[str, str] | None = None) -> list[Hit]:
+              live_values: dict[str, str] | None = None, shapes: bool = True) -> list[Hit]:
     hits: list[Hit] = []
     env_keys = env_keys if env_keys is not None else env_example_keys()
     live_values = live_values if live_values is not None else {}
     for i, line in enumerate(text.splitlines(), 1):
-        for kind, rx in SHAPES:
-            for m in rx.finditer(line):
-                if not _is_placeholder(m.group(0)):
-                    hits.append(Hit(path, i, "shape", kind))
+        if shapes:
+            for kind, rx in SHAPES:
+                for m in rx.finditer(line):
+                    if not _is_placeholder(m.group(0)):
+                        hits.append(Hit(path, i, "shape", kind))
+        # Rule 2: a documented KEY=value with a REAL value. Line-anchored for every documented
+        # key; ANYWHERE in the line (a bullet, inline code, a table cell) for secret-shaped
+        # keys -- the shapes a runbook actually uses (D-051 lens B: `- DEPOSCO_PROD_PASS=...`,
+        # "set `KEY=...` in .env", `| KEY | value |` all scanned clean before).
         m = _ENV_LINE_RE.match(line)
         if m and m.group(1) in env_keys and not _is_placeholder(m.group(2)):
             key, val = m.group(1), m.group(2).strip().strip("'\"`")
-            # A documented key with a real value is a hit when the KEY is secret-shaped
-            # (token / key / secret / password / PAT / webhook / ping URL). An identifier
-            # key (channel id, portal id, folder id, model name, flag) may legitimately be
-            # shown in a doc -- unless its value itself looks like a token.
             identifier_key = bool(_NON_SECRET_KEY_RE.search(key))
-            if (_SECRET_KEY_RE.search(key) and not identifier_key) or (not identifier_key and _token_like(val)):
+            secret_key = key in EXTRA_SECRET_KEYS or (bool(_SECRET_KEY_RE.search(key)) and not identifier_key)
+            if secret_key or (not identifier_key and _token_like(val)):
                 hits.append(Hit(path, i, "env-assignment", key))
+        else:
+            for m2 in _INLINE_ASSIGN_RE.finditer(line):
+                key, val = m2.group(1), m2.group(2).strip().strip("'\"`")
+                if key not in env_keys:
+                    continue
+                secret_key = key in EXTRA_SECRET_KEYS or (bool(_SECRET_KEY_RE.search(key)) and not _NON_SECRET_KEY_RE.search(key))
+                if secret_key and not _is_placeholder(val):
+                    hits.append(Hit(path, i, "env-assignment", key))
+                    break
         for key, val in live_values.items():
             if val in line:
                 hits.append(Hit(path, i, "live-env-value", key))
@@ -197,20 +242,33 @@ def scan_paths(roots: list[Path], *, env_belt: bool = True, env_keys: set[str] |
             rel = str(p.relative_to(_REPO_ROOT))
         except ValueError:
             rel = str(p)
-        hits.extend(scan_text(text, rel, env_keys=keys, live_values=live))
+        if is_test_path(rel):
+            hits.extend(scan_text(text, rel, env_keys=set(), live_values=live, shapes=False))   # belt only
+        else:
+            hits.extend(scan_text(text, rel, env_keys=keys, live_values=live))
     return hits
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Scan docs/manifests for secret VALUES (key names are fine).")
-    ap.add_argument("paths", nargs="+", type=Path)
+    ap.add_argument("paths", nargs="*", type=Path)
+    ap.add_argument("--staged", action="store_true",
+                    help="scan the files staged for commit (git diff --cached --name-only) -- the pre-commit hook path")
     ap.add_argument("--no-env-belt", action="store_true", help="skip the live-.env value belt")
     ap.add_argument("--env-file", type=Path, default=None,
-                    help="the live .env to take belt values from (default: <repo>/.env; a worktree has none)")
+                    help="the live .env to take belt values from (default: <repo>/.env, else the live checkout's)")
     args = ap.parse_args(argv)
+    paths = list(args.paths)
+    if args.staged:
+        out = subprocess.run(["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"], capture_output=True,
+                             text=True, cwd=str(_REPO_ROOT), encoding="utf-8", errors="replace", creationflags=_NO_WINDOW)
+        paths += [_REPO_ROOT / p.strip() for p in out.stdout.splitlines() if p.strip()
+                  and not p.strip().startswith(".githooks/") and p.strip() != ".env"]
+    if not paths:
+        print("secrets-scan: nothing to scan"); return 0
     env_file = args.env_file or LIVE_ENV
-    hits = scan_paths(args.paths, env_belt=not args.no_env_belt, env_file=env_file)
-    files = iter_files(args.paths)
+    hits = scan_paths(paths, env_belt=not args.no_env_belt, env_file=env_file)
+    files = iter_files(paths)
     print(f"secrets-scan: {len(files)} file(s), {len(hits)} hit(s)"
           + ("" if args.no_env_belt else f"; live-env belt keys={len(live_secret_values(env_file))}"))
     for h in hits:

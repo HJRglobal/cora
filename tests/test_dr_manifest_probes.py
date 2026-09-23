@@ -66,6 +66,34 @@ class TestItems:
         out = dmp.run_probes([boom], _ctx(tmp_path))
         assert out[0].result["status"] == dmp.FAIL and "kaboom" in out[0].result["detail"]
 
+    def test_d13_title_carries_the_committed_count_not_a_typed_number(self):
+        items = {i.id: i for i in dmp.build_items()}
+        committed = json.loads((REPO / "deployment" / "manifest" / "task-estate.json").read_text(encoding="utf-8"))
+        assert f"({committed['count']} tasks)" in items["D13"].item
+        assert "register-estate-from-manifest.ps1" in items["D13"].restore_step and "setup-*.ps1" not in items["D13"].restore_step.split("NOT")[0]
+
+    def test_repo_probe_records_main_hash_and_flags_a_feature_branch(self, tmp_path, monkeypatch):
+        answers = {"rev-parse --short HEAD": "e46bd61", "rev-parse --abbrev-ref HEAD": "claude/other-branch",
+                   "remote get-url origin": "git@github.com:HJRglobal/cora.git", "rev-parse --short origin/main": "f65b7fc"}
+        monkeypatch.setattr(dmp, "_run", lambda cmd, cwd=None, timeout=60: answers.get(" ".join(cmd[3:]), ""))
+        status, detail = dmp.p_repo(_ctx(tmp_path))
+        assert status == dmp.MANUAL and "origin/main f65b7fc" in detail and "claude/other-branch" in detail
+        answers["rev-parse --abbrev-ref HEAD"] = "main"
+        assert dmp.p_repo(_ctx(tmp_path))[0] == dmp.PASS
+        answers["remote get-url origin"] = ""
+        assert dmp.p_repo(_ctx(tmp_path))[0] == dmp.FAIL
+
+    def test_xml_restore_set_probe_fails_when_a_live_task_has_no_xml(self, tmp_path):
+        ctx = _ctx(tmp_path)
+        ctx.repo_root = tmp_path
+        (tmp_path / "deployment" / "manifest" / "tasks").mkdir(parents=True)
+        (tmp_path / "deployment" / "manifest" / "tasks" / "a-task.xml").write_text("<Task/>", encoding="utf-8")
+        ctx.tasks = {"A": {"log_slug": "a-task"}, "B": {"log_slug": "b-task"}}
+        status, detail = dmp.p_task_xml_backups(ctx)
+        assert status == dmp.FAIL and "MISSING for 1" in detail and "b-task" in detail
+        ctx.tasks = {"A": {"log_slug": "a-task"}}
+        assert dmp.p_task_xml_backups(ctx)[0] == dmp.PASS
+
     def test_manual_and_unmeasured_items_take_their_status_from_the_rto(self, tmp_path):
         m = dmp.Item("X2", "x", "s", "r", "Harrison", "MANUAL (step 2)", None, "do it by hand")
         u = dmp.Item("X3", "x", "s", "r", "Harrison", "UNMEASURED", None, "measure at step 2")
@@ -140,6 +168,11 @@ class TestCommittedBaseline:
             assert section in text, section
         hits = ss.scan_paths([jp, doc], env_belt=True)
         assert hits == [], "\n".join(h.render() for h in hits)
+        # the D13 row's counts are the committed task-estate count, not a typed number
+        estate = json.loads((REPO / "deployment" / "manifest" / "task-estate.json").read_text(encoding="utf-8"))
+        d13 = next(i for i in j["items"] if i["id"] == "D13")
+        assert f"{estate['count']} live / {estate['count']} manifest" in d13["detail"], d13["detail"]
+        assert f"({estate['count']} tasks)" in d13["item"]
         # names only: no live .env VALUE-shaped line in the doc
         assert not re.search(r"^\s*[A-Z][A-Z0-9_]+=(?!<)[^\s<]{8,}", text, re.MULTILINE)
 

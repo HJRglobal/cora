@@ -80,6 +80,14 @@ class TestTriggerText:
         t = tem.trigger_text({"type": "MSFT_TaskTimeTrigger", "start_boundary": "2026-07-16T10:27:00", "rep_interval": "PT5M"})
         assert t == "every PT5M (from 2026-07-16T10:27)"
 
+    def test_repetition_duration_is_part_of_the_restorable_text(self):
+        """A repeating daily trigger's DURATION (and stop-at-end) is restore-relevant and
+        diff-relevant: PT13H vs P1D is a different task (D-051 lens A)."""
+        base = {"type": "MSFT_TaskDailyTrigger", "start_boundary": "2026-08-25T07:08:00", "days_interval": 1, "rep_interval": "PT15M"}
+        assert tem.trigger_text(dict(base, rep_duration="PT13H", rep_stop_at_end=True)) == "every PT15M for PT13H stop-at-end (daily 07:08)"
+        assert tem.trigger_text(dict(base, rep_duration="P1D", rep_stop_at_end=False)) == "every PT15M for P1D (daily 07:08)"
+        assert tem.trigger_text(dict(base, rep_duration="PT13H")) != tem.trigger_text(dict(base, rep_duration="P1D"))
+
     def test_monthly_from_xml_detail_is_restorable(self):
         t = tem.trigger_text({"type": "XML:CalendarTrigger/ScheduleByMonth", "start_boundary": "2026-06-09T14:00:00",
                               "days_of_month": ["1"], "months": ["January", "February", "March", "April", "May", "June",
@@ -102,7 +110,7 @@ class TestTriggerText:
         assert [r["type"] for r in rows] == ["XML:CalendarTrigger/ScheduleByMonth", "XML:TimeTrigger"]
         assert rows[0]["days_of_month"] == ["1"] and rows[0]["months"] == ["January", "July"]
         assert tem.trigger_text(rows[0]) == "monthly day 1 14:00 in Jan,Jul"
-        assert tem.trigger_text(rows[1]) == "every PT5M (from 2026-07-16T10:27)"
+        assert tem.trigger_text(rows[1]) == "every PT5M for P1D (from 2026-07-16T10:27)"   # the Duration is part of the schedule (review MEDIUM)
 
     def test_xml_parser_never_raises_on_garbage(self):
         assert tem.triggers_from_xml("<not xml") == []
@@ -142,6 +150,42 @@ class TestNormalize:
         assert tem.ladder_lane_for("cowork-cora-backup", "scripts/backup_logs.py", idx) == "UNROWED"
         assert tem.ladder_lane_for("cowork-cora-service", "cora.main", idx) == "UNROWED"
 
+    def test_running_intent_reports_a_disabled_service_as_drift(self):
+        intent = {"running": {"cowork-cora-service"}, "disabled": set(), "enabled": set(), "run_markers": {}}
+        assert tem.intent_for("cowork-cora-service", False, intent) == ("running", "host DISABLED but intent running")
+        assert tem.intent_for("cowork-cora-service", True, intent) == ("running", "")
+
+    def test_registration_match_ignores_comments_and_non_create_tn_lines(self):
+        """The 2026-09-23 review finding: a `# schtasks /Change /TN "<other task>" /Disable` comment
+        attributed the wrong setup script. Only non-comment registration shapes count."""
+        scripts = {
+            "setup-daily-synthesis-f3e-task.ps1": '#     schtasks /Change /TN "Cora - F3E Daily Ecom Brief" /Disable\n$TaskName = "Cora - Daily Synthesis (F3E)"\n',
+            "setup-f3e-ecom-brief-task.ps1": '$TaskName = "Cora - F3E Daily Ecom Brief"\n',
+            "setup-compaction-task.ps1": 'schtasks /Create /TN "Cora - Log Compaction" /SC MONTHLY /D 1 /ST 14:00\n# schtasks /Delete /TN "Cora - Other" /F\n',
+            "setup-other.ps1": '<# multi-line block\n$TaskName = "Cora - Log Compaction"\n#>\nWrite-Host "nothing"\n',
+        }
+        assert tem.setup_scripts_for("Cora - F3E Daily Ecom Brief", scripts) == ["setup-f3e-ecom-brief-task.ps1"]
+        assert tem.setup_scripts_for("Cora - Log Compaction", scripts) == ["setup-compaction-task.ps1"]
+        assert tem.setup_scripts_for("Cora - Other", scripts) == []
+
+    def test_normalized_task_carries_its_xml_for_the_restore_set(self, tmp_path):
+        raw = _raw()
+        raw[0]["_xml"] = '<?xml version="1.0" encoding="UTF-16"?><Task/>'
+        tasks = _norm(raw, tmp_path)
+        assert tasks[0]["_xml"].startswith("<?xml")
+        m = tem.build_manifest(copy.deepcopy(tasks), host="fixture")
+        assert "_xml" not in m["tasks"][0] and m["_task_xml"][tasks[0]["log_slug"]].startswith("<?xml")
+        out = tmp_path / "manifest"
+        written = tem.write_outputs(m, out)
+        xml_files = sorted((out / tem.TASK_XML_SUBDIR).glob("*.xml"))
+        assert [p.name for p in xml_files] == [f"{tasks[0]['log_slug']}.xml"]      # only the task that had XML
+        assert xml_files[0].read_text(encoding="utf-8").startswith('<?xml version="1.0" encoding="UTF-8"?>')
+        assert "_task_xml" not in json.loads((out / tem.MANIFEST_JSON).read_text(encoding="utf-8"))
+        # a stale XML for a task no longer in the manifest is removed on the next write
+        stale = out / tem.TASK_XML_SUBDIR / "Cora-Gone.xml"; stale.write_text("<Task/>", encoding="utf-8")
+        tem.write_outputs(m, out)
+        assert not stale.exists() and len(written) >= 3
+
 
 # ── the drift monitor (fail-capable) ──────────────────────────────────────────
 class TestDiff:
@@ -154,7 +198,7 @@ class TestDiff:
         assert lines == ["task-estate-drift: added Cora - Injected Fake Task",
                          "task-estate-drift: removed cowork-cora-backup"]
 
-    def test_each_change_kind_has_its_own_line_and_volatile_fields_are_silent(self, tmp_path):
+    def test_each_change_kind_has_its_own_line(self, tmp_path):
         prev = _norm(_raw(), tmp_path)
         cur = copy.deepcopy(prev)
         by = {t["name"]: t for t in cur}
@@ -162,19 +206,44 @@ class TestDiff:
         by["Cora - Log Compaction"]["enabled"] = True
         by["Cora - Weekly Health Metrics"]["action_text"] += " --extra"
         by["cowork-cora-service"]["run_as"]["run_level"] = "Highest"
-        # volatile: must NOT appear
-        by["cowork-cora-backup"]["last_run_time"] = "2099-01-01T00:00:00"
-        by["cowork-cora-backup"]["last_task_result"] = 1
-        by["cowork-cora-backup"]["next_run_time"] = ""
-        by["cowork-cora-backup"]["log"]["newest_mtime_utc"] = "2099-01-01T00:00:00Z"
-        by["cowork-cora-backup"]["run_marker"]["last_ts"] = "2099-01-01T00:00:00+00:00"
         d = tem.diff_manifests(prev, cur)
         assert d["cron_changed"] == ["task-estate-drift: cron_changed cowork-cora-backup: daily 20:30 -> daily 13:00"]
         assert d["enabled_changed"] == ["task-estate-drift: enabled_changed Cora - Log Compaction: False -> True"]
         assert d["action_changed"] == ["task-estate-drift: action_changed Cora - Weekly Health Metrics"]
         assert d["principal_changed"] == ["task-estate-drift: principal_changed cowork-cora-service: Interactive/Limited/SWA=True -> Interactive/Highest/SWA=True"]
-        assert d["added"] == [] and d["removed"] == []
+        assert d["added"] == [] and d["removed"] == [] and d["settings_changed"] == []
         assert len(tem.warn_lines(d)) == 4
+
+    def test_volatile_fields_on_an_otherwise_untouched_task_are_silent(self, tmp_path):
+        """The volatile mutations sit on a task with NO genuine change, so a regression that
+        folded a volatile field into any comparison would surface as a line naming it."""
+        prev = _norm(_raw(), tmp_path)
+        cur = copy.deepcopy(prev)
+        t = {x["name"]: x for x in cur}["cowork-cora-backup"]
+        t["last_run_time"] = "2099-01-01T00:00:00"
+        t["last_task_result"] = 1
+        t["next_run_time"] = ""
+        t["number_of_missed_runs"] = 7
+        t["log"]["newest_mtime_utc"] = "2099-01-01T00:00:00Z"
+        t["log"]["newest"] = "logs/tasks/cowork-cora-backup-2099-01-01.log"
+        t["run_marker"]["last_ts"] = "2099-01-01T00:00:00+00:00"
+        t["run_marker"]["present"] = False
+        t["description"] = "changed description"
+        assert tem.warn_lines(tem.diff_manifests(prev, cur)) == []
+
+    def test_settings_changes_have_their_own_line(self, tmp_path):
+        """The 2026-06-09 incident class: a shortened ExecutionTimeLimit killed the gmail sweep
+        nightly for two weeks and nothing compared it."""
+        prev = _norm(_raw(), tmp_path)
+        cur = copy.deepcopy(prev)
+        by = {t["name"]: t for t in cur}
+        by["cowork-cora-backup"]["execution_time_limit"] = "PT10M"
+        by["cowork-cora-service"]["restart_count"] = 0
+        by["Cora - Weekly Health Metrics"]["run_as"]["user_id"] = "S-1-5-21-9-9-9-1002"
+        d = tem.diff_manifests(prev, cur)
+        assert len(d["settings_changed"]) == 3 and all(ln.startswith("task-estate-drift: settings_changed ") for ln in d["settings_changed"])
+        assert any("cowork-cora-backup" in ln and "execution_time_limit=PT1H" in ln and "execution_time_limit=PT10M" in ln for ln in d["settings_changed"])
+        assert len(tem.warn_lines(d)) == 3
 
     def test_identical_manifests_yield_no_lines(self, tmp_path):
         prev = _norm(_raw(), tmp_path)
@@ -202,7 +271,7 @@ class TestRender:
     def test_generated_blocks_are_idempotent_and_marker_gated(self, tmp_path):
         m = tem.build_manifest(_norm(_raw(), tmp_path), host="fixture")
         b1, b2 = tem.render_bootstrap_block(m), tem.render_bootstrap_block(m)
-        assert b1 == b2 and "cowork-cora-backup" in b1 and "**none**" in b1     # Log Compaction has no setup script
+        assert b1 == b2 and "cowork-cora-backup" in b1 and "(none -- manifest XML only)" in b1     # Log Compaction has no setup script: its XML is the only restore form
         assert tem.render_runbook_table(m) == tem.render_runbook_table(m)
         doc = "intro\n<!-- BEGIN GENERATED: scheduled-estate -->\nold\n<!-- END GENERATED: scheduled-estate -->\noutro\n"
         once = tem.replace_generated_block(doc, "scheduled-estate", b1)
@@ -254,6 +323,16 @@ class TestCommittedManifest:
         rm = m["run_marker_coverage"]
         assert rm["tasks_total"] == m["count"] and 0 <= rm["tasks_with_marker"] <= rm["tasks_total"]
         assert m["cowork_estate"]["migrates"] is False
+        # D-051 lens B: the Cowork task ids (personal + staff-named) never enter the committed file
+        assert "task_ids" not in m["cowork_estate"] and "_task_xml" not in m
+        assert "task_ids_sha256_16" in m["cowork_estate"] or not m["cowork_estate"].get("available")
+        # the restore form: one XML per task, the host time zone recorded (clock triggers are host-local)
+        assert m.get("host_time_zone"), "manifest must record the host time zone"
+        xml_dir = COMMITTED.parent / tem.TASK_XML_SUBDIR
+        xml_slugs = {p.stem for p in xml_dir.glob("*.xml")}
+        assert xml_slugs == {t["log_slug"] for t in m["tasks"]}, "deployment/manifest/tasks/*.xml must cover exactly the manifest tasks"
+        for t in m["tasks"]:
+            assert "_xml" not in t
 
     def test_committed_docs_carry_the_generated_blocks(self):
         bs = (REPO / "deployment" / "bootstrap-new-machine.md").read_text(encoding="utf-8")
@@ -290,10 +369,25 @@ class TestHealthReportSection:
 
 
 # ── live host (Windows only) ──────────────────────────────────────────────────
+def test_failed_second_method_reads_unavailable_not_disagree(monkeypatch):
+    """schtasks failing (rc != 0 / no rows) must not be recorded as 'DISAGREE: 0 tasks'."""
+    class _P:  # noqa: D401
+        def __init__(self, rc, out):
+            self.returncode, self.stdout, self.stderr = rc, out, ""
+    monkeypatch.setattr(tem.subprocess, "run", lambda *a, **k: _P(1, ""))
+    assert tem.enumerate_schtasks_csv() is None
+    monkeypatch.setattr(tem.subprocess, "run", lambda *a, **k: _P(0, ""))
+    assert tem.enumerate_schtasks_csv() is None
+    ag = tem.enumeration_agreement({"cowork-cora-service"}, None, set())
+    assert ag["methods"]["schtasks_csv"] == {"available": False, "reason": "call failed"}
+    assert ag["methods"]["cora_health_view"]["available"] is False and ag["agree"] is True
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Task Scheduler is Windows-only")
 def test_live_enumeration_records_three_methods():
     raw = tem.enumerate_cim()
-    assert len(raw) >= 1
+    if not raw:
+        pytest.skip("no Cora estate registered on this host (run after bootstrap Phase 5)")
     names = {r["name"] for r in raw}
     assert all(tem.name_matches(n) for n in names)
     ag = tem.enumeration_agreement(names, tem.enumerate_schtasks_csv(), tem.enumerate_health_view())

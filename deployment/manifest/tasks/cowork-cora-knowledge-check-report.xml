@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Cora weekly knowledge-check participation report: per-person asked/answered/confirmed/skipped/no-response over 7d. DM to Hannah, ahead of the Monday training-readiness audit.</Description>
+    <URI>\cowork-cora-knowledge-check-report</URI>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-21-680525238-924693030-406301295-1001</UserId>
+      <LogonType>InteractiveToken</LogonType>
+    </Principal>
+  </Principals>
+  <Settings>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <RestartOnFailure>
+      <Count>1</Count>
+      <Interval>PT5M</Interval>
+    </RestartOnFailure>
+    <IdleSettings>
+      <Duration>PT10M</Duration>
+      <WaitTimeout>PT1H</WaitTimeout>
+      <StopOnIdleEnd>true</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
+  </Settings>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2026-08-25T07:20:00-07:00</StartBoundary>
+      <ScheduleByWeek>
+        <WeeksInterval>1</WeeksInterval>
+        <DaysOfWeek>
+          <Monday />
+        </DaysOfWeek>
+      </ScheduleByWeek>
+    </CalendarTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\Users\Harri\code\cora\.venv\Scripts\pythonw.exe</Command>
+      <Arguments>C:\Users\Harri\code\cora\deployment\run_hidden.py --name cowork-cora-knowledge-check-report -- C:\Users\Harri\code\cora\.venv\Scripts\python.exe "C:\Users\Harri\code\cora\scripts\run_knowledge_check_report.py"</Arguments>
+      <WorkingDirectory>C:\Users\Harri\code\cora</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>

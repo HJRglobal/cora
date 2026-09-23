@@ -48,7 +48,7 @@ _Generated 2026-09-23 by `scripts/generate_task_estate_manifest.py --update-docs
 | `Cora - LEX Swept PHI Check` | daily 07:06 | `scripts/run_lex_swept_phi_check.py` | Ready | Limited |  |
 | `Cora - Log Compaction` | monthly day 1 14:00 | `scripts/compact_logs.py` | Ready | Limited | SWA=false |
 | `Cora - Meeting Action Capture` | every PT1H (from 2026-06-05T11:00) | `scripts/run_meeting_action_capture.py` | Disabled | Limited | intent: disabled; console action (not run_hidden-wrapped) |
-| `Cora - Meeting Ask Capture` | every PT15M (daily 07:08) | `scripts/run_meeting_ask_capture.py` | Ready | Limited | SWA=false |
+| `Cora - Meeting Ask Capture` | every PT15M for PT13H stop-at-end (daily 07:08) | `scripts/run_meeting_ask_capture.py` | Ready | Limited | SWA=false |
 | `Cora - Missed Nightly Catch-Up` | daily 08:30 | `scripts/check_missed_nightly.py` | Ready | Limited |  |
 | `Cora - OSN Metrics Digest` | weekly Mon 15:00 | `scripts/run_osn_metrics_digest.py` | Ready | Highest |  |
 | `Cora - QBO Monthly Reports` | monthly day 2 07:45 | `scripts/run_qbo_monthly_reports.py` | Ready | Limited | SWA=false |
@@ -70,7 +70,7 @@ _Generated 2026-09-23 by `scripts/generate_task_estate_manifest.py --update-docs
 | `cowork-cora-claude-mirror` | daily 03:45 + daily 12:15 | `scripts/mirror_claude_workspace.py` | Ready | Limited |  |
 | `cowork-cora-completion-sweep` | daily 14:00 | `scripts/run_completion_sweep.py` | Ready | Limited | SWA=false |
 | `cowork-cora-decision-capture` | daily 07:15 | `scripts/capture_decisions.py` | Ready | Limited | SWA=false |
-| `cowork-cora-delegated-work` | every PT15M (from 2026-08-01T00:00) | `scripts/run_delegated_work_runner.py` | Ready | Limited |  |
+| `cowork-cora-delegated-work` | every PT15M for P3650D stop-at-end (from 2026-08-01T00:00) | `scripts/run_delegated_work_runner.py` | Ready | Limited |  |
 | `cowork-cora-digest` | daily 05:20 | `scripts/generate_knowledge_gaps_digest.py` | Disabled | Limited | intent: disabled; console action (not run_hidden-wrapped) |
 | `cowork-cora-feedback-health` | weekly Mon 08:30 | `scripts/run_feedback_health_report.py` | Ready | Limited | SWA=false |
 | `cowork-cora-finance-adherence` | weekly Mon 08:15 | `scripts/run_finance_adherence_check.py` | Ready | Limited |  |
@@ -100,7 +100,7 @@ _Generated 2026-09-23 by `scripts/generate_task_estate_manifest.py --update-docs
 | `cowork-cora-knowledge-review` | weekly Mon,Tue,Wed,Thu,Fri 07:00 | `scripts/run_knowledge_review.py` | Ready | Limited |  |
 | `cowork-cora-lexicon-mining` | weekly Sun 17:50 | `scripts/run_lexicon_mining.py` | Ready | Limited |  |
 | `cowork-cora-meeting-capture-audit` | daily 07:22 | `scripts/run_meeting_capture_audit.py` | Ready | Limited |  |
-| `cowork-cora-meeting-capture-ensure` | every PT15M (daily 06:07) | `scripts/run_meeting_capture_ensure.py` | Ready | Limited |  |
+| `cowork-cora-meeting-capture-ensure` | every PT15M for PT14H stop-at-end (daily 06:07) | `scripts/run_meeting_capture_ensure.py` | Ready | Limited |  |
 | `cowork-cora-monthly-deliverables` | monthly day 1 09:00 | `scripts/generate_monthly_deliverables.py` | Disabled | Limited | intent: disabled; SWA=false; console action (not run_hidden-wrapped) |
 | `cowork-cora-person-dossier-refresh` | weekly Sun 16:30 | `scripts/run_person_dossier_refresh.py` | Ready | Limited |  |
 | `cowork-cora-pm-adoption-digest` | weekly Mon 08:20 | `scripts/run_pm_adoption_digest.py` | Ready | Limited | SWA=false |

@@ -375,8 +375,9 @@ class TestRender:
         assert s["available"] and s["lanes"] == len(lr.KNOWN_LANES)
         assert s["schema_problems"] == []
         assert set(s["by_tier"]) == set(lr.TIERS)
-        # pending == whatever the file says (all 21 at seed; 0 after the 2026-09-19 batch confirm)
-        assert sorted(s["pending_confirmation"]) == sorted(lr.pending_confirmation(lr.load(_REAL)))
+        # 0 after the 2026-09-19 batch confirm (applied 2026-09-20). A NEW lane ships
+        # pending-Harrison and is confirmed in its own commit -- which must update this pin.
+        assert s["pending_confirmation"] == []
 
 
 # ── the readers: nightly health check + Monday digest ─────────────────────────
