@@ -59,6 +59,12 @@ Thumbs.db
 
 # Credentials (private keys)
 .credentials/
+# Belt only (ruling 2026-09-19 4b.5, Code #14 R14-7b): the LIVE QBO token file is
+# .credentials/qbo-tokens.json (src/cora/connectors/qbo_oauth.py _TOKEN_FILE),
+# already covered by the line above. data/qbo-tokens.json has never existed or
+# been tracked -- the old runbook named it by mistake. This rule closes no leak;
+# it only stops a future mis-pathed write from ever being committable.
+data/qbo-tokens.json
 
 # Temporary fix/debug scripts (FUSE workarounds — safe to delete from Windows side)
 tmp_*.py
