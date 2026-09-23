@@ -1036,6 +1036,102 @@ class TestPositivePureAttachment:
         assert dbl < base * 2.6 + 0.05, "superlinear: %.4fs -> %.4fs" % (base, dbl)
 
 
+class TestCrossSentenceReference:
+    """r143-claims-5: every rail-2 check was sentence-scoped, so a pronoun laundered a
+    clean word across a sentence boundary. The Mood fail-closed guard on the two
+    ruled phrases was defeated the same way ("F3 Mood is our evening can. Like F3
+    Energy, it runs on a cleaner fuel source." cleared the phrase for Mood).
+    run_preflight now carries each sentence's lines to the next (rail2_context_after)."""
+
+    MUST_TRIP = (
+        "F3 Mood is our evening can. Like F3 Energy, it runs on a cleaner fuel source.",
+        "F3 Mood is our evening can. Like F3 Energy, it runs on natural caffeine from green tea.",
+        "F3 Mood is our evening can. It is all-natural.",
+        "F3 Mood is our evening can. It runs on a cleaner fuel source.",
+        "F3 Energy is our training can. We love it because it is all-natural.",
+        "F3 Energy is great. It is F3 Pure's clean sibling.",
+        "F3 Mood is calm. F3 Pure is clean-sweetened, and it is too.",
+        "F3 Mood is our evening can. This is the clean way to wind down.",
+        "F3 Mood is the evening can. Our team loves the flavor. It is all-natural.",   # carried past a brand-less sentence
+    )
+    STILL_PASS = (
+        "F3 Mood is caffeine-free. F3 Energy carries 120 mg of natural caffeine from green tea, "
+        "and its L-theanine keeps it smooth.",                       # the pronoun is not in the phrase's clause
+        "F3 Mood is caffeine-free. F3 Pure and F3 Energy both carry natural caffeine from green tea.",
+        "F3 Mood is calm. F3 Pure is clean-sweetened, and it tastes great.",
+        "F3 Pure is our clean-sweetened can. It is all-natural.",   # "It" = Pure
+        "F3 Mood keeps you calm. F3 Pure is clean-sweetened. It is all-natural.",
+        "F3 Energy is the stack. F3 Pure is clean-sweetened, unlike it.",
+        "F3 Energy carries the full stack. F3 Pure is the clean-sweetened version.",
+    )
+
+    @pytest.mark.parametrize("text", MUST_TRIP)
+    def test_a_pronoun_cannot_launder_a_clean_word_across_sentences(self, text):
+        assert "R2" in _pf(text).tripped_rail_ids, text
+        assert not rh.new_preflight(text).passed
+
+    def test_the_carry_is_what_catches_it(self):
+        """Proof that these are CROSS-sentence closures: the plain single-sentence
+        check passes the second sentence, and the carried check trips it."""
+        for text in self.MUST_TRIP[:4]:
+            first, second = pf.sentences(text)
+            carried = pf.rail2_context_after(first, frozenset())
+            assert pf.rail2_attribution_hit(second) is None, second
+            assert pf.rail2_attribution_hit(second, context_lines=carried) is not None, second
+
+    def test_the_review_shapes_are_in_the_gate(self):
+        for s in self.MUST_TRIP[:7]:
+            assert s in rh.CLAIMS_HOLE_PROBES["clean_natural_on_energy_mood"], s
+
+    @pytest.mark.parametrize("text", STILL_PASS)
+    def test_a_resolvable_or_harmless_pronoun_still_passes(self, text):
+        r = _pf(text)
+        assert r.passed, r.render()
+
+    def test_the_carry_crosses_paragraphs_and_fields(self):
+        para = pf.run_preflight(title="t", summary="",
+                                body_html="<p>F3 Mood is our evening can.</p><p>It is all-natural.</p>")
+        assert "R2" in para.tripped_rail_ids
+        field = pf.run_preflight(title="F3 Mood Tonight", summary="", body_html="<p>It is all-natural.</p>")
+        assert "R2" in field.tripped_rail_ids
+
+    def test_context_is_additive_only(self):
+        """With no back-reference, or an empty context, the carried check IS the plain one."""
+        for s in ("F3 Energy is clean.", "F3 Pure is clean-sweetened; F3 Energy is the full stack.",
+                  "Clean living matters.", rh.FALSE_POSITIVE_SET[0]):
+            for ctx in (frozenset(), frozenset({"MOOD"}), frozenset({"ENERGY", "MOOD"})):
+                plain = pf.rail2_attribution_hit(s)
+                carried = pf.rail2_attribution_hit(s, context_lines=ctx)
+                assert (plain is None) == (carried is None), (s, ctx)
+
+    def test_context_after(self):
+        e = frozenset({"ENERGY"})
+        assert pf.rail2_context_after("F3 Mood is calm.", e) == {"MOOD"}
+        assert pf.rail2_context_after("Our team loves it.", e) == e              # brand-less: keep
+        assert pf.rail2_context_after("It pairs with F3 Pure.", e) == {"PURE", "ENERGY"}
+        assert pf.rail2_context_after("F3 Pure is great.", e) == {"PURE"}
+
+    def test_the_source_pin_still_ships_the_attribution_rail(self):
+        src = "\n".join(ln for ln in inspect.getsource(pf.run_preflight).splitlines()
+                        if not ln.strip().startswith("#"))
+        assert "rail2_attribution_hit(sent, context_lines=carried)" in src
+        assert "rail2_context_after(sent, carried)" in src
+
+    def test_d171_the_carry_is_linear(self):
+        def run(n):
+            body = "<p>" + ("F3 Mood is calm. It is great, and this is it. " * n) + "</p>"
+            return _best_of_3(lambda: pf.run_preflight(title="t", summary="", body_html=body))
+        base, dbl = run(400), run(800)
+        assert dbl < base * 2.6 + 0.05, "superlinear: %.4fs -> %.4fs" % (base, dbl)
+
+    @pytest.mark.parametrize("text", ["it " * 13000, "this " * 8000, "it, " * 10000, " " * 40000],
+                             ids=range(4))   # a 40k id overflows PYTEST_CURRENT_TEST on Windows
+    def test_d171_back_reference_scan_is_fast_at_40k(self, text):
+        dt = _best_of_3(lambda: pf.rail2_attribution_hit("F3 Energy " + text + " clean.",
+                                                         context_lines=frozenset({"MOOD"})))
+        assert dt < 1.0, "%r...: %.3fs" % (text[:12], dt)
+
+
 class TestIdiomOverTripsAreFailClosed:
     """r143-claims-7, DECIDED FAIL-CLOSED: the verb tokens over-trip non-claim idioms
     and they are NOT redacted. Every redaction candidate clears a claim shape of its

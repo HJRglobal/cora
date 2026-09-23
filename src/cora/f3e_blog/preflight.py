@@ -1023,7 +1023,51 @@ def _has_relation(words: list[str], *, weak: bool = False) -> bool:
     return bool(t) and t[-1] in _AUX   # VP ellipsis: "..., and F3 Energy does."
 
 
-def rail2_attribution_hit(sentence: str) -> tuple[str, str] | None:
+#: Pronouns that point back at a line named in an EARLIER sentence ("F3 Mood is our
+#: evening can. It is all-natural."). Demonstratives count only as a clause's
+#: first word, which is where they are its subject ("This is all-natural.");
+#: elsewhere they are usually determiners ("this season").
+_BACKREF_PRONOUNS = frozenset({
+    "it", "it's", "its", "itself", "they", "they're", "their", "theirs", "them", "themselves",
+    "both",
+})
+_BACKREF_DEMONSTRATIVES = frozenset({"this", "that", "that's", "these", "those"})
+
+
+def _has_back_reference(words: list[str]) -> bool:
+    t = _lower_tokens(words)
+    if set(t) & _BACKREF_PRONOUNS:
+        return True
+    i = 0
+    while i < len(t) and t[i] in _LEAD_FILLERS:
+        i += 1
+    return i < len(t) and t[i] in _BACKREF_DEMONSTRATIVES
+
+
+def _rail2_backref_flags(sentence: str) -> list[bool]:
+    """Per _clause_split segment: True when the segment names NO Energy/Mood line of
+    its own and carries a back-reference, i.e. its subject may be a line named in
+    an earlier sentence. A segment that names Energy/Mood itself resolves its own
+    pronouns ("F3 Pure and F3 Energy both ...")."""
+    return [bool(w) and _has_back_reference(w) and not (brand_lines_in(seg) & _RAIL2_EM)
+            for seg, _ in _clause_split(sentence or "") for w in (_words(seg),)]
+
+
+def rail2_context_after(sentence: str, context: frozenset[str]) -> frozenset[str]:
+    """The lines a LATER sentence's pronoun may refer to, once this sentence is read.
+    It holds the sentence's own lines, plus the carried context when this sentence
+    itself refers back. It never empties: a brand-less sentence keeps the carried
+    lines, which fails closed."""
+    own = brand_lines_in(sentence or "")
+    if not own:
+        return context
+    if any(_rail2_backref_flags(sentence)):
+        own = own | context
+    return frozenset(own)
+
+
+def rail2_attribution_hit(sentence: str, *, context_lines: frozenset[str] = frozenset()
+                          ) -> tuple[str, str] | None:
     """The SHIPPING rail-2 test since R14-3 (see the block comment above): trips when
     a clean token is predicated of Energy/Mood -- i.e. it is neither POSITIVELY
     Pure-attached, nor an environmental object of an environmental action, nor
@@ -1062,24 +1106,51 @@ def rail2_attribution_hit(sentence: str) -> tuple[str, str] | None:
     lines (the union), never replace them. The first cut let the fold REPLACE the
     host clause's inheritance, so "F3 Mood: clean, and F3 Pure too." cleared: the
     brand-less host picked up only Pure (r143-claims-3).
+
+    CROSS-SENTENCE REFERENCE (r143-claims-5). `context_lines` are the lines an
+    earlier sentence named (see rail2_context_after). They apply only when a
+    clause here that names no Energy/Mood line of its own carries a back-reference
+    ("F3 Mood is our evening can. It is all-natural.", "... Like F3 Energy, it runs
+    on a cleaner fuel source."). Then they:
+      * count for the Energy/Mood gate;
+      * widen the exemption scope, but only when the ruled phrase sits in such a
+        clause (so the phrase is never cleared for Mood through a pronoun);
+      * make that clause's relation veto strict ("..., and it is too.").
+    With no back-reference, or an empty context, the result is exactly the
+    single-sentence result, so the context can only ADD trips.
     """
     sent = sentence or ""
     lines = brand_lines_in(sent)
-    if not (lines & _RAIL2_EM):
+    ctx = frozenset(context_lines or ())
+    pron: list[bool] | None = None
+    ref: frozenset[str] = frozenset()
+    if ctx:
+        pron = _rail2_backref_flags(sent)
+        if any(pron):
+            ref = ctx
+    if not ((lines | ref) & _RAIL2_EM):
         return None
-    scan_sent = _redact_phrase_exemptions(sent, lines)
+    scope = set(lines)
+    if ref & _RAIL2_EM:
+        pron_segs = [seg for (seg, _), p in zip(_clause_split(sent), pron or ()) if p]
+        if any(pat.search(seg) for seg in pron_segs for pat, _ in _RAIL2_PHRASE_EXEMPTIONS):
+            scope |= ref
+    scan_sent = _redact_phrase_exemptions(sent, scope)
     scan_sent = _redact(scan_sent, _NATURAL_OCCURRENCE_RES + (_NATURAL_OCCURRENCE_HYPHEN_RE,))
     scan_sent = _redact(scan_sent, _CLEAN_ENVIRONMENT_RES)
     scan_sent = _redact_env_events(scan_sent)
-    clauses = _rail2_clauses(scan_sent)
+    if pron is not None and len(pron) != len(_clause_split(scan_sent)):
+        pron = [True] * len(_clause_split(scan_sent))   # cannot align: every clause refers back
+    clauses = _rail2_clauses(scan_sent, pron if ref else None)
     n = len(clauses)
     rows = []
     related = False
+    ref_em = bool(ref & _RAIL2_EM)
     for c in clauses:
         text = " ".join([c.host] + c.bare) if c.bare else c.host
         host_own = brand_lines_in(c.host)
         own = host_own | (brand_lines_in(" ".join(c.bare)) if c.bare else set())
-        if _has_relation(_words(text), weak=not own):
+        if _has_relation(_words(text), weak=not (own or (c.pron and ref_em))):
             related = True
         rows.append((c, text, host_own, own))
     for idx, (c, text, host_own, own) in enumerate(rows):
@@ -1091,7 +1162,7 @@ def rail2_attribution_hit(sentence: str) -> tuple[str, str] | None:
             if (_pure_is_subject(host_words)
                     or _pure_locative_disjunct(host_words, idx, n, c.prev, c.next)):
                 continue  # the clean word is positively Pure's
-        return sorted(hit)[0], "/".join(sorted(lines & _RAIL2_EM))
+        return sorted(hit)[0], "/".join(sorted((lines | ref) & _RAIL2_EM))
     return None
 
 # rail 3 -- Mood is never a sleep aid. Cleared framing is "composure, not sedation",
@@ -1418,12 +1489,21 @@ def run_preflight(
     # ATTRIBUTION scope since R14-3 (ruling ESC-1 (A) / D-329, 2026-09-19; the
     # rail2_harness gate passes). The pre-R14-3 same-sentence scan survives only
     # as rail2_legacy_hit, the frozen baseline the harness measures against.
+    # D-051 r143-claims-5: the lines each sentence names are carried to the next, so
+    # a pronoun cannot launder a clean word onto Energy/Mood across a sentence
+    # boundary. The carried check only ever ADDS a trip to the plain one. The carry
+    # runs across fields in reading order (title, summary, body, then structured
+    # data / alt text) and across paragraphs: a body that opens "It is all-natural."
+    # under an "F3 Mood Tonight" title refers to the title's line (fail closed).
+    carried: frozenset[str] = frozenset()
     for name, text in fields:
         for sent in sentences(text):
-            hit = rail2_attribution_hit(sent)
+            hit = rail2_attribution_hit(sent) or (
+                rail2_attribution_hit(sent, context_lines=carried) if carried else None)
             if hit:
                 trips.append(_trip("R2", name, "%r near %s: %s" % (hit[0], hit[1], sent)))
                 break
+            carried = rail2_context_after(sent, carried)
 
     # --- rail 3: sleep-aid language in a doc about a product ---
     # Gated on a PRODUCT reference rather than on the literal token "Mood": an

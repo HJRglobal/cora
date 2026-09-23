@@ -101,6 +101,16 @@ CLAIMS_HOLE_PROBES: dict[str, tuple[str, ...]] = {
         "Like F3 Energy, F3 Pure is clean-sweetened.",
         "F3 Energy, or the clean version of F3 Pure, hits hard.",
         "Clean energy from F3 Pure, or F3 Energy.",
+        # D-051 r143-claims-5: a pronoun across a sentence boundary laundered a clean
+        # word (or a ruled phrase) onto Mood/Energy. These are TWO-sentence probes;
+        # new_preflight splits them, so the gate measures the cross-sentence carry
+        "F3 Mood is our evening can. Like F3 Energy, it runs on a cleaner fuel source.",
+        "F3 Mood is our evening can. Like F3 Energy, it runs on natural caffeine from green tea.",
+        "F3 Mood is our evening can. It is all-natural.",
+        "F3 Mood is our evening can. It runs on a cleaner fuel source.",
+        "F3 Energy is our training can. We love it because it is all-natural.",
+        "F3 Energy is great. It is F3 Pure's clean sibling.",
+        "F3 Mood is calm. F3 Pure is clean-sweetened, and it is too.",
         # D-051 r143-claims-3: the bare-brand fold REPLACED the host clause's
         # inheritance instead of joining it
         "F3 Energy: all-natural, F3 Pure too.",
@@ -355,7 +365,11 @@ class Differential:
 
 
 def differential(sentences_iter) -> Differential:
-    """Frozen legacy vs SHIPPING rail-2 over any sentence corpus (pure; no other rail)."""
+    """Frozen legacy vs SHIPPING rail-2 over any sentence corpus (pure; no other rail).
+
+    Sentence by sentence, so the shipping rail's cross-sentence carry (D-051
+    r143-claims-5, run_preflight + rail2_context_after) is NOT in these counts. It
+    only adds trips, and the gate measures it through new_preflight."""
     sents = [s for s in sentences_iter if s and s.strip()]
     legacy = [s for s in sents if pf.rail2_legacy_hit(s)]
     attrib = [s for s in sents if pf.rail2_attribution_hit(s)]
