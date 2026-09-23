@@ -191,6 +191,8 @@ class TestRegistryAndWiring:
             "Cora - Missed Nightly Catch-Up": "scripts/check_missed_nightly.py",
             # Code #13 Rider 1 S-A: the cora@ mailbox intake sweep
             "Cora - Mailbox Intake Sweep": "scripts/run_mailbox_intake_sweep.py",
+            # Code #14 R14-7a: the every-15-min meeting-ask / recap poll
+            "Cora - Meeting Ask Capture": "scripts/run_meeting_ask_capture.py",
         }
         for entry in data.get("run_markers") or []:
             path = scripts.get(entry["name"])

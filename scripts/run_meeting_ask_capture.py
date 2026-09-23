@@ -68,6 +68,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 from cora import meeting_asks  # noqa: E402
 from cora import meeting_recap  # noqa: E402
+from cora import run_marker  # noqa: E402
 from cora.connectors import fireflies_connector as ffc  # noqa: E402
 from cora.connectors import fireflies_diarization as ffd  # noqa: E402
 
@@ -526,6 +527,30 @@ def process_recap(transcript: dict, *, dry_run: bool,
     return out
 
 
+#: The run-marker task name. MUST equal the `run_markers:` row in
+#: data/maps/scheduled-task-state.yaml (and the Task Scheduler name) -- the 08:45
+#: health check keys the cadence diff on this exact string.
+RUN_MARKER_TASK = "Cora - Meeting Ask Capture"
+
+
+def _mark(args, *, ok: bool, outputs: int = 0, outcome: str, detail: str = "",
+          started: float | None = None) -> None:
+    """Write ONE run marker -- only on a LIVE scheduled-shape run (Code #14 R14-7a).
+
+    --dry-run writes nothing (D-290: a dry-run flag is a claim about EVERY write
+    site, and this is one), and a --transcript-id inspection is an operator probe of
+    one meeting, not a fire of the scheduled lane, so it must not refresh the
+    lane's freshness either. `detail` carries COUNTS only -- never a meeting title
+    (a LEX title in logs/task-runs.jsonl would be a D-145 leak)."""
+    if args.dry_run or args.transcript_id:
+        return
+    run_marker.write(
+        RUN_MARKER_TASK, script="run_meeting_ask_capture.py", ok=ok,
+        outputs=outputs, outcome=outcome, detail=detail,
+        elapsed_s=(time.time() - started) if started is not None else None,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dry-run", action="store_true",
@@ -538,8 +563,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-meetings", type=int, default=10)
     args = ap.parse_args(argv)
 
+    started = time.time()
     if not os.environ.get("FIREFLIES_API_KEY"):
         print("FIREFLIES_API_KEY not set -- nothing to do.", file=sys.stderr)
+        _mark(args, ok=False, outcome="no_fireflies_key",
+              detail="FIREFLIES_API_KEY not set", started=started)
         return 1
 
     run_start = int(time.time())
@@ -552,6 +580,8 @@ def main(argv: list[str] | None = None) -> int:
             transcripts = _fetch_since(since, args.max_meetings)
         except Exception as exc:  # noqa: BLE001
             print(f"ERROR: Fireflies query failed: {exc}", file=sys.stderr)
+            _mark(args, ok=False, outcome="fireflies_error",
+                  detail=f"Fireflies query failed ({type(exc).__name__})", started=started)
             return 1
 
     print(f"meeting-ask capture: {len(transcripts)} transcript(s) in window "
@@ -563,6 +593,9 @@ def main(argv: list[str] | None = None) -> int:
         token = os.environ.get("SLACK_BOT_TOKEN", "")
         if not token:
             print("SLACK_BOT_TOKEN not set -- cannot send cards.", file=sys.stderr)
+            _mark(args, ok=False, outcome="no_slack_token",
+                  detail=f"SLACK_BOT_TOKEN not set; {len(transcripts)} transcript(s) unscanned",
+                  started=started)
             return 1
         client = WebClient(token=token)
 
@@ -596,6 +629,15 @@ def main(argv: list[str] | None = None) -> int:
           f"{totals['phi_skipped']} PHI-skipped, "
           f"{totals['overflow']} over cap, {totals['excluded']} meeting(s) excluded, "
           f"{totals['recap_carded']} recap card(s)")
+    sent = int(totals["carded"]) + int(totals["recap_carded"])
+    _mark(args, ok=True, outputs=sent, outcome="carded" if sent else "nothing-new",
+          detail=(f"transcripts={len(transcripts)} asks={totals['asks']} "
+                  f"carded={totals['carded']} recap_carded={totals['recap_carded']} "
+                  f"already_carded={totals['skipped_dup']} "
+                  f"unaddressable={totals['no_recipient']} "
+                  f"phi_skipped={totals['phi_skipped']} over_cap={totals['overflow']} "
+                  f"excluded={totals['excluded']}"),
+          started=started)
     return 0
 
 

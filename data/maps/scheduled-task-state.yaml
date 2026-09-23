@@ -109,6 +109,10 @@ enabled:
   # the 06:33 F3E daily synthesis that consumes it -- a later slot would leave
   # every synthesis reading a ~24h-old file.
   - cowork-cora-inventory-state-sync
+  # Every 15 min 07:08-20:08 AZ: Cora-directed meeting asks + recap cards
+  # (scripts/run_meeting_ask_capture.py; deployment/setup-meeting-ask-capture-task.ps1).
+  # Documentary entry added Code #14 R14-7a alongside its run_markers row below.
+  - Cora - Meeting Ask Capture
 
 # ── Run-marker contract (session #11 S4, retires the cq-a251dee3f5cf class) ────
 # Task Scheduler knows a task RAN and its exit code; it cannot know the run
@@ -153,6 +157,10 @@ run_markers:
     cadence_hours: 24         # daily 08:30 AZ (Code #13 slice 2; deployment/setup-missed-nightly-catchup-task.ps1)
     expects_output: false     # a night where every task fired legitimately replays 0 tasks
     registered: 2026-09-19T00:00:00+00:00   # the marker WARNs 'never recorded' until Harrison registers the task -- that is the reminder
+  - name: Cora - Meeting Ask Capture
+    cadence_hours: 12         # every 15 min 07:08-20:08 AZ (deployment/setup-meeting-ask-capture-task.ps1); longest legitimate gap ~11h overnight, inside the 2x = 24h window
+    expects_output: false     # a window with no new transcript / no Cora-directed ask legitimately cards 0
+    registered: 2026-09-22T00:00:00+00:00   # marker writer added Code #14 R14-7a (scripts/run_meeting_ask_capture.py; live, non-dry, non --transcript-id runs only)
   - name: Cora - Mailbox Intake Sweep
     cadence_hours: 24         # daily 06:11 AZ (Code #13 Rider 1 S-A; deployment/setup-mailbox-intake-task.ps1; 06:10 is gap-autofill's LIVE slot)
     expects_output: false     # a day with no human note emailed to cora@ legitimately queues 0 proposals
