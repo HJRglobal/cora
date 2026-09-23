@@ -449,6 +449,48 @@ def _user_quote_spans(text: str, user_texts: Any) -> list[tuple[int, int]]:
     return spans
 
 
+_PERSON_NAME_TTL_S = 60.0
+_PERSON_NAME_CACHE: dict[str, Any] = {"at": None, "names": frozenset()}
+
+
+def _person_name_tokens() -> frozenset[str]:
+    """Lower-cased name tokens of every org-roles person (60s cache, the registry's own
+    TTL). Fail-soft: an unreadable registry yields the empty set, so a title-case
+    receipt is judged by shape alone -- the rail errs toward FIRING, never silence."""
+    now = time.monotonic()
+    at = _PERSON_NAME_CACHE["at"]
+    if at is not None and now - at < _PERSON_NAME_TTL_S:
+        return _PERSON_NAME_CACHE["names"]
+    try:
+        from . import org_roles  # lazy: the registry loader reads data/maps
+        names = frozenset(
+            tok.lower() for r in org_roles.all_roles()
+            for tok in _WC_TOKEN_RE.findall(str(getattr(r, "name", "") or "")) if len(tok) > 1)
+    except Exception:  # noqa: BLE001
+        names = frozenset()
+    _PERSON_NAME_CACHE.update({"at": now, "names": names - _WC_RECEIPT_NOUNS})
+    return _PERSON_NAME_CACHE["names"]
+
+
+def _is_person_subject(np_toks: list[str], raw_last: str, last: str) -> bool:
+    """Code #14 D-051 round 2 (F1-R3): a receipt's last np token names a TEAMMATE only
+    when it is a known person's name ("Hannah Grant updated:", "Justin created: the
+    deck") or follows a lower-cased PLURAL noun ("Tasks Justin created:", "Deals Tommy
+    updated (last 7 days):"). Title case alone never skips -- round 1 skipped every
+    capitalized last token outside a hand-listed noun set, which silenced 8 of 11
+    mimicked receipts ("**Calendar Invite Created:**", "Inventory Adjustment staged:",
+    "Slack DM queued (draft):", "Kroger PO updated:")."""
+    if not raw_last[:1].isupper() or raw_last.isupper() or last in _WC_RECEIPT_NOUNS:
+        return False            # lower-case, an ACRONYM (DM / PO / SKU), or a receipt noun
+    if last in _person_name_tokens():
+        return True
+    if len(np_toks) >= 2:
+        prev = np_toks[-2].strip("`*'").lower()
+        if len(prev) > 3 and prev.endswith("s") and not prev.endswith("ss") and prev.isalpha():
+            return True
+    return False
+
+
 def _receipt_subject_ok(m: re.Match) -> bool:
     # A bare bullet char is not a noun phrase (round 2, honesty-rails-8): the np class
     # admits '-' / '*', so "- Created: 2024-03-01" backtracked into np='-' and read the
@@ -462,8 +504,8 @@ def _receipt_subject_ok(m: re.Match) -> bool:
     last = raw_last.lower().replace("’", "'")
     if last in _WC_RECEIPT_NOT_SUBJECT:
         return False
-    if len(np_toks) >= 2 and raw_last[:1].isupper() and last not in _WC_RECEIPT_NOUNS:
-        return False   # a proper-name subject ("Tasks Justin created:")
+    if _is_person_subject(np_toks, raw_last, last):
+        return False   # a teammate subject ("Tasks Justin created:", "Hannah Grant updated:")
     if (m.group("short") is not None and len(np_toks) == 1 and raw_last[:1].isupper()
             and last not in _WC_RECEIPT_NOUNS):
         return False   # "Justin created." describes a teammate, "Prompt staged." is a receipt

@@ -209,3 +209,65 @@ class TestInitialPrecisionR2:
         assert _best_of_3(lambda: list(rx.finditer(shape))) < 0.2
         assert _best_of_3(lambda: list(se._WC_RECEIPT_RE.finditer(shape))) < 0.2
         assert _best_of_3(lambda: se._find_write_claim(shape)) < 0.5
+
+
+# ── F1-R3: a title-case receipt is skipped only for a TEAMMATE subject ─────────
+TITLE_CASE_RECEIPTS = [
+    "**Calendar Invite Created:** Tue 2pm with Justin", "**Meeting Invite Created:** Thursday 10am",
+    "Slack DM queued (draft): to Tessa", "Slack DM staged (draft): to Tessa", "Draft DM queued: to Justin",
+    "Inventory Adjustment staged: Pure Original +12 cases", "Kroger PO updated: 40 cases",
+    "F3E SKU updated: Pure 12pk", "Payment Link created: https://pay.example/x",
+    "**Shopify Discount Created:** 10% off", "Price Change queued (draft): Pure 12pk", "QBO Bill created: Cox",
+    "HubSpot Deal updated: Kroger", "Kickoff Prompt staged (draft):",
+]
+TEAMMATE_SUBJECTS = [
+    "Tasks Justin created:", "Deals Tommy updated (last 7 days):", "Invoices Jerry filed:",
+    "Hannah Grant updated:", "Justin created: the deck", "Harrison staged: three prompts.", "Justin created.",
+]
+
+
+class TestReceiptSubjectR2:
+    @pytest.fixture(autouse=True)
+    def names(self, monkeypatch):
+        monkeypatch.setattr(se, "_person_name_tokens",
+                            lambda: frozenset({"justin", "tommy", "jerry", "hannah", "grant", "tessa"}),
+                            raising=False)
+
+    @pytest.mark.parametrize("text", TITLE_CASE_RECEIPTS)
+    def test_title_case_receipts_fire(self, text):
+        assert se._find_write_claim(text) is not None and se._find_write_claim(text)[1] == "receipt", text
+
+    @pytest.mark.parametrize("text", TEAMMATE_SUBJECTS)
+    def test_teammate_subjects_never_fire(self, text):
+        assert se._find_write_claim(text) is None, (text, se._find_write_claim(text))
+
+    def test_a_zero_tool_mimicked_receipt_writes_a_counted_line(self, caplog):
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        _write("**Calendar Invite Created:** Tue 2pm with Justin\nLink: (sent to both of you)")
+        hits = _msgs(caplog, se.PHANTOM_LOG_KEY, "lexicon")
+        assert len(hits) == 1 and "form=receipt" in hits[0]
+
+    @pytest.mark.parametrize("shape", [
+        "Deals Tommy updated:\n" * 2000, "Invoices Jerry filed (x):\n" * 1600,
+        ("Aaaa Bbbb Cccc Dddd staged:\n" * 1400), "Tasks " * 8000 + "Justin created:",
+    ], ids=["plural_name", "plural_paren", "title4", "plural_run"])
+    def test_the_subject_rule_is_linear_at_40k(self, shape):
+        assert _best_of_3(lambda: list(se._WC_RECEIPT_RE.finditer(shape))) < 0.2
+        assert _best_of_3(lambda: se._find_write_claim(shape)) < 0.5
+
+
+class TestPersonNameTokens:
+    def test_the_real_registry_supplies_first_and_last_names(self, monkeypatch):
+        monkeypatch.setitem(se._PERSON_NAME_CACHE, "at", None)
+        names = se._person_name_tokens()
+        assert {"justin", "hannah", "tommy"} <= names
+        assert not (names & se._WC_RECEIPT_NOUNS)
+
+    def test_an_unreadable_registry_falls_back_to_shape_alone(self, monkeypatch):
+        from cora import org_roles
+        monkeypatch.setitem(se._PERSON_NAME_CACHE, "at", None)
+        monkeypatch.setattr(org_roles, "all_roles", lambda: (_ for _ in ()).throw(OSError("locked")))
+        assert se._person_name_tokens() == frozenset()
+        assert se._find_write_claim("Tasks Justin created:") is None          # the plural shape still skips
+        assert se._find_write_claim("Inventory Adjustment staged: +12") is not None
+        monkeypatch.setitem(se._PERSON_NAME_CACHE, "at", None)
