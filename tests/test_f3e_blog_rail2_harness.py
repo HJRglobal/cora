@@ -41,6 +41,13 @@ _SCRIPT = _REPO / "scripts" / "run_f3e_blog_rail2_differential.py"
 #: pin below stays an EXACT set, it only gains the closures listed here.
 R143_LEGACY_MISSES = frozenset({
     "F3 Energy is the super-cleaner fuel.",                          # r143-claims-2
+    "F3 Energy burns cleanly.",                                      # r143-claims-8
+    "F3 Energy delivers energy cleanly.",
+    "F3 Energy is cleansed of junk.",
+    "F3 Energy's cleanliness sets it apart.",
+    "F3 Energy's cleanness sets it apart.",
+    "F3 Energy's naturalness sets it apart.",
+    "F3 Mood is one of the naturals.",
 })
 
 
@@ -722,3 +729,65 @@ class TestExactPhraseEdges:
             return _best_of_3(lambda: pf.rail2_attribution_hit(text))
         base, dbl = run(1500), run(3000)
         assert dbl < base * 2.6 + 0.05, "superlinear: %.4fs -> %.4fs" % (base, dbl)
+
+
+class TestTokenizerGaps:
+    """r143-claims-8: whole-token additions (never a prefix match)."""
+
+    MUST_TRIP = (
+        "F3 Energy burns cleanly.",
+        "F3 Energy delivers energy cleanly.",
+        "F3 Energy is cleansed of junk.",
+        "F3 Energy's cleanliness sets it apart.",
+        "F3 Energy's cleanness sets it apart.",
+        "F3 Energy's naturalness sets it apart.",
+        "F3 Mood is one of the naturals.",
+        "F3 Energy is CLEANLY made.",                 # case never matters
+        "F3 Energy is cleanly-made.",                 # the hyphen split reaches the new tokens
+    )
+
+    @pytest.mark.parametrize("sentence", MUST_TRIP)
+    def test_the_gap_tokens_trip(self, sentence):
+        assert pf.rail2_attribution_hit(sentence) is not None, sentence
+        assert "R2" in _pf(sentence).tripped_rail_ids, sentence
+
+    def test_the_gap_shapes_are_in_the_gate(self):
+        for s in self.MUST_TRIP[:7]:
+            assert s in rh.CLAIMS_HOLE_PROBES["clean_natural_on_energy_mood"], s
+
+    def test_no_prefix_matching_the_partner_name_is_not_a_claim(self):
+        assert "cleanhub" not in pf._ATTRIBUTION_CLEAN_TOKENS
+        assert pf.rail2_attribution_hit(rh.FALSE_POSITIVE_SET[1]) is None      # the CleanHub sentence
+        assert pf.rail2_attribution_hit("F3 Energy partners with CleanHub.") is None
+
+    def test_the_new_tokens_still_clear_on_pure(self):
+        assert pf.rail2_attribution_hit("F3 Pure is cleanly sweetened.") is None
+        assert _pf("F3 Pure's cleanliness sets it apart.").passed
+
+    def test_the_legacy_token_set_is_still_frozen(self):
+        for tok in ("cleanly", "cleansed", "cleanliness", "cleanness", "naturalness", "naturals"):
+            assert tok not in pf._CLEAN_TOKENS and tok in pf._ATTRIBUTION_CLEAN_TOKENS, tok
+
+
+class TestIdiomOverTripsAreFailClosed:
+    """r143-claims-7, DECIDED FAIL-CLOSED: the verb tokens over-trip non-claim idioms
+    and they are NOT redacted. Every redaction candidate clears a claim shape of its
+    own, and an over-trip costs one bounded revision, not a leak. This pins the
+    decision, so reversing it has to be a deliberate edit."""
+
+    OVER_TRIPS = (
+        "Power through spring cleaning with F3 Energy.",
+        "Fans cleaned out every cooler of F3 Energy at the event.",
+        "F3 Energy fuels your clean-and-jerk.",
+    )
+    # what the obvious redactions ("cleaned out", "spring cleaning", "clean and jerk")
+    # would also have cleared
+    CLAIMS_A_REDACTION_WOULD_CLEAR = (
+        "F3 Energy cleaned out my system.",
+        "F3 Energy is a spring cleaning for your body.",
+        "F3 Energy is clean and jerk-free.",
+    )
+
+    @pytest.mark.parametrize("sentence", OVER_TRIPS + CLAIMS_A_REDACTION_WOULD_CLEAR)
+    def test_both_the_idiom_and_its_claim_twin_trip(self, sentence):
+        assert "R2" in _pf(sentence).tripped_rail_ids, sentence

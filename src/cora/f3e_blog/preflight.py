@@ -570,8 +570,20 @@ _RAIL2_PHRASE_EXEMPTIONS: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
 # ("F3 Energy cleans up your afternoon" passed BOTH rails) and the cores a
 # hyphenated compound is split into ("clean-energy", "cleaner-fuel",
 # "naturally-caffeinated" were single tokens outside the set and passed BOTH rails).
+# D-051 r143-claims-8: the adverb, the missing participle and the abstract nouns
+# passed BOTH rails too ("F3 Energy burns cleanly.", "is cleansed of junk",
+# "F3 Energy's cleanliness / naturalness sets it apart"). They are listed as whole
+# tokens, NEVER as a prefix match: a "clean" prefix would read the CleanHub partner
+# name (a measured false positive) as a claim.
+#
+# r143-claims-7 is DECIDED FAIL-CLOSED: the verb tokens over-trip idioms ("spring
+# cleaning", "cleaned out every cooler", "clean-and-jerk"), and they are NOT
+# redacted. Each redaction candidate would clear a claim shape of its own ("F3
+# Energy cleaned out my system", "a spring cleaning for your body", "clean and
+# jerk-free"), and the cost of an over-trip is one bounded revision, not a leak.
 _ATTRIBUTION_CLEAN_TOKENS = _CLEAN_TOKENS | frozenset({
     "cleans", "cleaned", "cleaning", "cleanse", "cleanses", "cleansing",
+    "cleansed", "cleanly", "cleanliness", "cleanness", "naturalness", "naturals",
 })
 # ...with the chemistry exemption kept for the hyphenated spelling too, so the
 # compound split cannot turn "a naturally-occurring amino acid" into a trip.

@@ -119,6 +119,14 @@ CLAIMS_HOLE_PROBES: dict[str, tuple[str, ...]] = {
         "F3 Mood is a clean-energy calm.",
         "F3 Energy is naturally-caffeinated.",
         "F3 Energy is the natural-energy pick.",
+        # D-051 r143-claims-8: tokenizer gaps that passed BOTH rails
+        "F3 Energy burns cleanly.",
+        "F3 Energy delivers energy cleanly.",
+        "F3 Energy is cleansed of junk.",
+        "F3 Energy's cleanliness sets it apart.",
+        "F3 Energy's cleanness sets it apart.",
+        "F3 Energy's naturalness sets it apart.",
+        "F3 Mood is one of the naturals.",
     ),
     "nsf_on_pure_mood": (
         "F3 Pure is NSF Certified for Sport.",
