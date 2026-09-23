@@ -992,8 +992,16 @@ def _rail_context(channel_id: str, user_id: str | None, entity: str, retrieval_g
 
 
 # Tools whose result is OWNER-PRIVATE content the asker alone may see: personal notes
-# (D-049) and the asker's own mailbox (D-043 Tier-2 door).
-_OWNER_PRIVATE_TOOLS = frozenset({"cora_my_notes", "cora_remember", "cora_forget_note", "gmail_inbox"})
+# (D-049), the asker's own mailbox (D-043 Tier-2 door) and a draft composed from it,
+# and the peer-walled person dossier (a person's email / meetings / tasks) -- plus,
+# Code #14 D-051 round 2 (honesty-rails-11), every personal / confidential dashboard
+# reader, DERIVED from tool_dispatch.VERBATIM_TABLE_TOOLS' `personal_` members (the
+# registry labels them "personal/confidential ... D-043 class"), so a new personal_*
+# reader is withheld without an edit here.
+_OWNER_PRIVATE_NAMED_TOOLS = frozenset({"cora_my_notes", "cora_remember", "cora_forget_note",
+                                        "gmail_inbox", "gmail_create_draft", "cora_person_dossier"})
+_OWNER_PRIVATE_TOOLS = _OWNER_PRIVATE_NAMED_TOOLS | frozenset(
+    name for name in _tool_dispatch.VERBATIM_TABLE_TOOLS if name.startswith("personal_"))
 
 
 def _rail_context_for_reply(rail_ctx: dict, kb_meta: dict | None, gen_meta: dict | None) -> dict:

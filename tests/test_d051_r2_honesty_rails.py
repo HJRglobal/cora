@@ -403,3 +403,51 @@ class TestRowRecordsTheRealPhantomR2:
         user = "Task created: Pay the invoice. I staged it. I filed the Cox invoice with the bookkeeper"
         assert _best_of_3(lambda: se._preferred_write_claim_span(shape, [user])) < 0.5
         assert _best_of_3(lambda: _pw(shape, user)) < 1.0
+
+
+# ── honesty-rails-11: every owner-private tool withholds the snippet ──────────
+class TestOwnerPrivateToolsR2:
+    @pytest.fixture
+    def app(self):
+        import cora.app as app
+        return app
+
+    @pytest.mark.parametrize("tool", [
+        "cora_person_dossier", "gmail_create_draft", "personal_oneamerica_portfolio",
+        "personal_capital_program_state", "personal_travel_points",
+    ])
+    def test_the_re_review_gaps_now_withhold(self, app, tool):
+        ctx = app._rail_context_for_reply(dict(CTX_OPEN), {}, {"tool_names": ["asana_get_my_tasks", tool]})
+        assert ctx["snippet_withheld"] == se.RAIL_SNIPPET_WITHHELD_PERSONAL
+
+    def test_every_verbatim_personal_tool_is_owner_private(self, app):
+        from cora.tools import tool_dispatch as td
+        personal = {n for n in td.VERBATIM_TABLE_TOOLS if n.startswith("personal_")}
+        assert personal == {"personal_oneamerica_portfolio", "personal_capital_program_state",
+                            "personal_travel_points"}                       # the registry marker, pinned
+        assert personal <= app._OWNER_PRIVATE_TOOLS
+
+    def test_every_registered_personal_tool_is_owner_private(self, app):
+        """A future personal_* reader that skips VERBATIM_TABLE_TOOLS still fails here."""
+        from cora.tools import tool_dispatch as td
+        registered = {n for n in td._TOOL_FUNCTIONS if n.startswith("personal_")}
+        assert registered and registered <= app._OWNER_PRIVATE_TOOLS
+
+    def test_the_named_owner_private_tools_are_registered(self, app):
+        from cora.tools import tool_dispatch as td
+        assert app._OWNER_PRIVATE_NAMED_TOOLS <= set(td._TOOL_FUNCTIONS)
+
+    def test_a_dossier_turn_writes_the_marker_not_the_content(self, app, ledger):
+        import json
+        ctx = app._rail_context_for_reply(dict(CTX_OPEN), {}, {"tool_names": ["cora_person_dossier"]})
+        se.screen_phantom_write_claims("Tessa's week: 14 emails with the Kroger buyer. I updated her notes.",
+                                       tool_use_count=0, channel_name="dm", user_id=HARRISON,
+                                       rail_context=ctx)
+        rows = _rows(ledger)
+        assert rows and all(r["snippet"] == se.RAIL_SNIPPET_WITHHELD_PERSONAL for r in rows)
+        assert "Kroger" not in json.dumps(rows)
+
+    def test_an_ordinary_read_tool_keeps_its_scope(self, app):
+        base = dict(CTX_OPEN)
+        assert app._rail_context_for_reply(base, {}, {"tool_names": ["calendar_get_my_events",
+                                                                     "qbo_get_profit_loss"]}) is base
