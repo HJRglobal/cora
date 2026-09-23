@@ -405,6 +405,41 @@ class TestRowRecordsTheRealPhantomR2:
         assert _best_of_3(lambda: _pw(shape, user)) < 1.0
 
 
+# ── forcing-seams-5 (orphan half): the card-status read agrees with known_ids() ─
+class TestCardStatusOrphanR2:
+    @pytest.fixture
+    def qledger(self, tmp_path, monkeypatch):
+        from cora import code_queue as cq
+        monkeypatch.setattr(cq, "_EVENT_LEDGER", tmp_path / "code-session-queue.jsonl")
+        monkeypatch.setattr(cq, "_FINGERPRINT_LEDGER", tmp_path / "fp.jsonl")
+        monkeypatch.setattr(cq, "_SIGNALS_LEDGER", tmp_path / "sig.jsonl")
+        cq._KNOWN_IDS_CACHE.update({"key": None, "ids": frozenset()})
+        cq._append_event({"event": "captured", "id": "cq-0123456789ab", "ts": cq._now_iso(),
+                          "status": "APPROVED", "title": "mirror", "kind": "capability_ask",
+                          "severity": "HIGH", "entity": "FNDR", "signal": "explicit"})
+        cq._append_event({"event": "recurrence", "id": "cq-8f7d6da0112a", "ts": cq._now_iso()})
+        return cq
+
+    def test_an_orphan_id_is_not_reported_absent(self, qledger):
+        cq = qledger
+        assert "cq-8f7d6da0112a" in cq.known_ids()                  # the rail calls it KNOWN
+        out = cq.render_card_status(["cq-8f7d6da0112a", "cq-000000000002"])
+        orphan = next(l for l in out.splitlines() if "cq-8f7d6da0112a" in l)
+        absent = next(l for l in out.splitlines() if "cq-000000000002" in l)
+        assert "not in the queue ledger" not in orphan and "events only" in orphan
+        assert absent.endswith("not in the queue ledger")
+
+    def test_relaying_the_orphan_line_trips_no_rail(self, qledger, caplog, monkeypatch):
+        cq = qledger
+        monkeypatch.setattr(se, "_ID_LEDGERS", (
+            ("cq", re.compile(r"\bcq-[0-9a-f]{12}\b", re.IGNORECASE), cq.known_ids),))
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        line = next(l for l in cq.render_card_status(["cq-8f7d6da0112a"]).splitlines()
+                    if "cq-8f7d6da0112a" in l)
+        _write(line, user_text="did cq-8f7d6da0112a land?", count=0)
+        assert not [r for r in caplog.records if r.getMessage().startswith(se.PHANTOM_LOG_KEY + " kind=")]
+
+
 # ── honesty-rails-11: every owner-private tool withholds the snippet ──────────
 class TestOwnerPrivateToolsR2:
     @pytest.fixture

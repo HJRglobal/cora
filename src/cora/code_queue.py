@@ -4170,7 +4170,15 @@ def render_card_status(cq_ids: Any = None, *, now: datetime | None = None) -> st
         lines.append("*Code-queue status (from the ledger):*")
         for cid in ids[:20]:
             if cid not in raw_by_id:
-                lines.append(f"- `{cid}` -- not in the queue ledger")
+                # Code #14 D-051 round 2 (forcing-seams-5): membership is the RAW ledger
+                # (known_ids(), the fabricated-id rail's reference set), not the fold -- an
+                # ORPHAN id (events, no `captured`) is in the ledger and must not be
+                # reported absent.
+                if events.get(cid):
+                    lines.append(f"- `{cid}` -- in the queue ledger with events only (no captured "
+                                 "record), so it has no status to report")
+                else:
+                    lines.append(f"- `{cid}` -- not in the queue ledger")
                 continue
             decisions = [e for e in events.get(cid, []) if e.get("event") in _QS_DECISION_EVENTS]
             lines.append(_qs_line(cid, safe_by_id.get(cid), raw_by_id.get(cid),
