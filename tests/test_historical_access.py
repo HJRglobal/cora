@@ -508,8 +508,10 @@ def test_app_grant_skips_semantic_cache():
     assert "retrieval_grant is None" in _APP_SRC
     assert "cache_storable" in _APP_SRC
     # Both cache-store call sites are guarded by cache_storable (Phase 2.1 also
-    # excludes verbatim tables from the cache: `and not is_structured_table`).
-    assert _APP_SRC.count("if cache_storable and not is_structured_table:") == 2
+    # excludes verbatim tables from the cache: `and not is_structured_table`;
+    # Code #14 D-051 r2 (D-043): and never a tool-bearing turn, `_reply_cacheable`).
+    assert _APP_SRC.count(
+        "if cache_storable and not is_structured_table and _reply_cacheable(gen_meta):") == 2
 
 
 def test_app_has_dm_retrieval_branch():

@@ -2156,7 +2156,7 @@ def _dispatch_qa(
             entity=entity, cross_entity=is_founder, founder=is_founder,
             rail_context=rail_ctx,
         )
-        if cache_storable and not is_structured_table:
+        if cache_storable and not is_structured_table and _reply_cacheable(gen_meta):
             _try_cache_store(entity, user_message, question_embedding, response_text, hints)
         response_text = _guard_content(response_text)
         log.info(
@@ -2303,7 +2303,7 @@ def _dispatch_qa(
         entity=entity, cross_entity=is_founder, founder=is_founder,
         rail_context=rail_ctx,
     )
-    if cache_storable and not is_structured_table:
+    if cache_storable and not is_structured_table and _reply_cacheable(gen_meta):
         _try_cache_store(entity, user_message, question_embedding, response_text, hints)
     response_text = _guard_content(response_text)
 
@@ -2679,6 +2679,20 @@ def _turn_tool_use_count(gen_meta: dict | None) -> int:
                 + int(m.get("web_fetch_requests") or 0))
     except (TypeError, ValueError):
         return int(m.get("tool_use_count") or 0)
+
+
+def _reply_cacheable(gen_meta: dict | None) -> bool:
+    """D-043: the semantic cache is ENTITY-keyed, never user-keyed, and a hit needs
+    only cosine >= 0.95 -- so the next asker in the same entity with the same question
+    is served whatever was stored. A reply whose turn ran ANY tool may carry
+    ASKER-scoped data: gmail_inbox reads the asker's own mailbox, and the my-tasks /
+    my-calendar / my-deals / notes / dossier tools are per-user. Such a reply is never
+    stored (Code #14 D-051 re-review: "what are my tasks?" from one HJRG teammate
+    replayed to the next for 5 minutes, an inbox summary for 30). Fail-closed: ANY
+    client tool or server web tool counts, never a hand list. Verbatim tables were
+    already excluded; zero-tool replies built on KB context still cache (the
+    unstripped_personal / grant / custodian / pending gates in cache_storable)."""
+    return _turn_tool_use_count(gen_meta) == 0 and not (gen_meta or {}).get("tool_names")
 
 
 def _try_cache_store(
