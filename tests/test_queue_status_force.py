@@ -133,6 +133,33 @@ COMPOUND_VERB_AND_STATUS = [
     "please dismiss `cq-621dfad586aa` -- did my other presses land?",
     "did the stage press land? also approve cq-621dfad586aa",
 ]
+# D-051 forcing-seams-3 PARTIAL (re-review): the same compound with a word between
+# the verb and the id, or with a NON-queue command in another clause. Each forced
+# the read at bca189c, which blinded S2's zero-tool screen to a narrated "Staged
+# cq-..." / "Deleted ..." on exactly this shape.
+COMMAND_CLAUSE_AND_STATUS = [
+    "can you stage the cq-621dfad586aa one too? and did my other cards land?",
+    "could you stage both cq-621dfad586aa and cq-9c4e2d8f5f1a? have my other cards registered?",
+    "can you please go ahead and stage it (cq-621dfad586aa)? did my other cards register?",
+    "can you approve the cq-621dfad586aa item? which cards are still unresponded?",
+    "which cards are still unresponded? and delete the duplicate Sprouts task",
+    "have my cards registered? draft an email to Tommy about Sprouts",
+    "Cora, can you stage it? have my other cards registered?",
+    "yes, stage it -- and have my other cards registered?",
+    "did those go through? stage the rest",
+]
+# ... while a verb that does NOT open a command clause still leaves the question
+# forcing: a decision list, a noun reading, "update me", a closing remark.
+COMMAND_WORDS_THAT_ARE_NOT_COMMANDS = [
+    "have my cards registered? Keep, park or stage?",
+    "have my cards registered? stage presses don't seem to stick",
+    "have my cards registered? queue still shows them all",
+    "can you update me on which cards are still pending a decision?",
+    "have my cards registered? keep in mind I pressed them twice",
+    "can you check whether my cards registered?",
+    "could you tell me which cards are still unresponded?",
+    "have my cards registered? thanks",
+]
 
 # D-051 forcing-seams-1: follow-up turns that must NOT force even with a card
 # question (Q1) in the priors -- a generic pronoun / determiner, a confirm turn, or
@@ -290,6 +317,15 @@ class TestPredicate:
         assert cq.is_queue_status_question(text) is False
         assert cq.is_queue_status_question(text, prior_user_texts=[Q1]) is False
 
+    @pytest.mark.parametrize("text", COMMAND_CLAUSE_AND_STATUS)
+    def test_a_command_clause_anywhere_never_forces(self, text):
+        assert cq.is_queue_status_question(text) is False
+        assert cq.is_queue_status_question(text, prior_user_texts=[Q1]) is False
+
+    @pytest.mark.parametrize("text", COMMAND_WORDS_THAT_ARE_NOT_COMMANDS)
+    def test_a_command_word_that_opens_no_command_clause_still_forces(self, text):
+        assert cq.is_queue_status_question(text) is True
+
     def test_a_verb_mid_sentence_that_is_not_next_to_an_id_still_forces(self):
         # the adjacency bound: "stage press on cq-X" is a press noun, not a command
         assert cq.is_queue_status_question("did my stage press on cq-f880ce946bb6 land?") is True
@@ -355,6 +391,10 @@ class TestPredicate:
         # (F2-R5 verb-frame patterns)
         "confirm " * 5_000 + "x", "you " * 10_000 + "x", "please," * 6_000,
         "review" + " " * 40_000 + "x", "(" * 40_000,
+        # (forcing-seams-3 command-clause pattern)
+        "? " * 20_000, "? and " * 7_000, "? can you " * 4_000, " -- " * 10_000,
+        "? can you please go ahead and " * 1_400, "?" + " " * 40_000 + "stage",
+        "? stage" * 6_000, "\n" * 40_000, "?" * 40_000, "?!" * 20_000,
     ], ids=["spaces", "card", "responded", "bang", "still", "cq",
             "any", "those", "any-tabs", "stage-cq", "stage-spaces-cq", "restage-tick",
             "the-rest", "monday-menu", "monday-tabs", "catch-up", "knowledge-spaces",
@@ -364,7 +404,9 @@ class TestPredicate:
             "those-take-spaces", "did-any", "these-dash",
             "landing", "landing-spaces-pages", "web-spaces", "pop-dash", "my-presses",
             "my-tabs-presses",
-            "confirm", "you", "please-comma", "review-spaces", "parens"])
+            "confirm", "you", "please-comma", "review-spaces", "parens",
+            "q-space", "q-and", "q-can-you", "dash-runs", "q-go-ahead", "q-spaces-stage",
+            "q-stage", "newlines", "q-run", "q-bang-run"])
     def test_raw_regexes_are_linear_past_the_gate(self, shape):
         """D-171: the 500-char gate runs first, but each compiled pattern must stand
         on its own at Slack's 40k cap too. Best of 3: measured ~14ms worst shape on
@@ -374,7 +416,7 @@ class TestPredicate:
                cq._QS_STATUS_RE, cq._QS_PRONOUN_RE, cq._QS_CARD_BEFORE_RE,
                cq._QS_ID_STATUS_RE, cq._QS_VERB_ID_RE, cq._QS_FOREIGN_RE, cq._QS_CQ_ID_RE,
                cq._QS_SURFACE_RE, cq._QS_WEAK_OBJECT_RE, cq._QS_CARD_BEFORE_VERBISH_RE,
-               cq._QS_VERB_FRAME_RE)
+               cq._QS_VERB_FRAME_RE, cq._QS_COMMAND_CLAUSE_RE)
         best = float("inf")
         for _ in range(3):
             t0 = time.perf_counter()
@@ -811,6 +853,18 @@ class TestDispatchQaBehaviour:
         assert seen["force_tool"] is None
         cache.lookup.assert_called_once()
         cache.store.assert_not_called()
+
+    @pytest.mark.parametrize("text", [
+        "can you stage the cq-621dfad586aa one too? and did my other cards land?",
+        "which cards are still unresponded? and delete the duplicate Sprouts task",
+    ])
+    def test_a_command_compound_reaches_the_model_unforced(self, text, monkeypatch):
+        """D-051 forcing-seams-3: with no forced read the turn's tool ledger stays at
+        zero unless the model itself calls a tool, so S2's zero-tool lexicon screen
+        can still see a narrated 'Staged cq-...' / 'Deleted ...'."""
+        seen, _cache = _drive_dispatch_qa(monkeypatch, text,
+                                          prior=[{"role": "user", "content": Q1}])
+        assert seen["force_tool"] != "cora_queue_status"
 
     def test_an_earlier_force_still_wins_on_the_same_text(self, monkeypatch):
         t = "queue a code session: cards don't refresh after a press -- they still show as unresponded"

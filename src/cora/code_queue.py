@@ -3984,6 +3984,43 @@ _QS_ID_STATUS_RE = re.compile(
 _QS_VERB_ID_RE = re.compile(
     r"\b(?:re-?stage|stage|approve|dismiss|ship|un-?park|park|keep|snooze|re-?queue|queue)\b"
     r"[^\w\n]{0,8}cq-", re.IGNORECASE)
+# D-051 forcing-seams-3 (round 2): _QS_VERB_ID_RE catches a queue verb only NEXT
+# TO an id, so the same compound with any word between ("can you stage the cq-X
+# one too? and did my other cards land?", "can you please go ahead and stage it
+# (cq-X)? ...") -- or with a non-queue command ("which cards are still
+# unresponded? and delete the duplicate Sprouts task", "have my cards
+# registered? draft an email to Tommy") -- still forced the read, and the read's
+# tool_use switches S2's zero-tool lexicon screen off for exactly the turn whose
+# narrated "Staged ..." / "Deleted ..." it exists to catch. So a COMMAND CLAUSE
+# anywhere fails the gate: a write verb opening the message in a request frame
+# ("can / could / would / will you [please] [go ahead and] VERB"), or opening any
+# clause after a break (. ! ? ; newline, a spaced dash), optionally after a
+# conjunction / acknowledgement. Not a command: the verb in a list or closing its
+# clause ("Keep, park, dismiss or Stage/Queue", "Complete."), the verb read as a
+# noun ("stage presses don't stick", "queue still shows them", "log shows
+# nothing"), "update me", "keep in mind". A miss costs recall only: the read tool
+# stays offered to the model. Every quantifier is bounded; a clause can start only
+# at \A or a break character, and the decoration run is POSSESSIVE (everything
+# after it starts with a word char or an optional '@', so giving chars back can
+# never help) and never eats a break character (each break is its own start) --
+# without both, a 40k run of "!" cost ~200 ms a scan (D-171).
+_QS_COMMAND_CLAUSE_RE = re.compile(
+    r"(?:\A|[.!?\n;]|[ \t](?:-{1,2}|–|—)[ \t])"
+    r"[^\w\n.!?;]{0,8}+"
+    r"(?:(?:and|also|then|plus|but|or|oh|ok|okay|now|so|yes|yeah|yep|sure|great|thanks|cool)"
+    r"[,!]?[ \t]{1,3})?"
+    r"(?:(?:hey|hi)[,!]?[ \t]{1,3})?(?:@?cora[,:]?[ \t]{1,3})?"
+    r"(?:(?:can|could|would|will)[ \t]{1,3}you[ \t]{1,3})?"
+    r"(?:(?:please|pls|plz|also|just)[ \t]{1,3})?"
+    r"(?:go[ \t]{1,3}ahead[ \t]{1,3}(?:and[ \t]{1,3})?)?"
+    r"(?:re-?stage|stage|approve|dismiss|ship|un-?park|park|keep(?![ \t]{1,3}in[ \t]{1,3}mind)|"
+    r"snooze|re-?queue|queue|mark|close|delegate|resend|re-?post|post|send|file|log|create|"
+    r"draft|dm|remember|add|delete|remove|move|flag|fix|build|update(?![ \t]{1,3}me\b)|"
+    r"cancel|complete|assign|schedule|reply|forward|email)\b"
+    r"(?![ \t]{0,3}[,/)\-.!?]|[ \t]{1,3}(?:press(?:es)?|taps?|clicks?|buttons?|cards?|looks?|"
+    r"is|are|was|were|seems?|still|has|have|had|shows?|showed|says?|said|doesn't|didn't|"
+    r"isn't|wasn't|won't)\b)",
+    re.IGNORECASE)
 # Follow-up turns ("did those go through?") refer back; only valid when a recent
 # prior user turn was itself a card-status question (Tier A). The pronoun must be
 # one that REFERS TO PRESSES / CARDS (D-051 forcing-seams-1): the first cut took
@@ -4112,7 +4149,7 @@ def _qs_tier_a(text: str) -> bool:
 def _qs_gates(text: str) -> bool:
     return (bool(text) and len(text) <= _QS_MAX_CHARS
             and not _QS_IMPERATIVE_RE.match(text) and bool(_QS_REQUEST_RE.search(text))
-            and not _QS_VERB_ID_RE.search(text))
+            and not _QS_VERB_ID_RE.search(text) and not _QS_COMMAND_CLAUSE_RE.search(text))
 
 
 def is_queue_status_question(text: str, *, prior_user_texts: Any = ()) -> bool:
@@ -4121,7 +4158,8 @@ def is_queue_status_question(text: str, *, prior_user_texts: Any = ()) -> bool:
     one of the queue's own outcome words), or is a follow-up ("did those go
     through?") to such a question in the last three user turns (Tier B: a
     press-referring pronoun, no object of its own). Fail-closed: > 500 chars, an
-    imperative / command opening, a queue verb next to a cq- id anywhere, or no
+    imperative / command opening, a queue verb next to a cq- id anywhere, a
+    command clause anywhere (a request-framed or clause-opening write verb), or no
     question / request form -> False. The caller gates on founder + DM, on no
     staged write pending and on no verb attempt; this predicate reads text only.
     Regex over bounded input plus plain span logic (D-171: re-timed, tests pin the
