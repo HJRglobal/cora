@@ -335,6 +335,55 @@ class TestKnownIds:
         assert {lbl for lbl, _rx, _fn in se._ID_LEDGERS} == {"cq", "dw"}
 
 
+class TestUserTypedIdEcho:
+    """Code #14 D-051 forcing-seams-5: "did cq-000000000002 land?" about a mistyped id
+    -> the card-status read renders "`cq-000000000002` -- not in the queue ledger" and
+    the model relays it. An unknown id the user typed THIS turn is an echo, not a
+    fabrication; an id the user did not type is screened in full."""
+
+    RELAY = "- `cq-000000000002` -- not in the queue ledger"
+
+    def test_a_relayed_user_typed_unknown_id_is_not_a_fabrication(self, ledgers, caplog):
+        caplog.set_level(logging.INFO, logger=se.__name__)
+        out = se.screen_phantom_write_claims(self.RELAY, tool_use_count=1, channel_name="dm",
+                                             user_id="U0B2RM2JYJ1", user_text="did cq-000000000002 land?")
+        assert out == self.RELAY
+        assert _hits(caplog, "fabricated-id") == []
+        assert any("fabricated-id echo" in r.getMessage() and r.levelno == logging.INFO
+                   for r in caplog.records)
+
+    def test_the_echo_line_is_never_counted(self, ledgers, caplog):
+        caplog.set_level(logging.INFO, logger=se.__name__)
+        se.screen_phantom_write_claims(self.RELAY, tool_use_count=1, user_text="did cq-000000000002 land?")
+        echo = [r.getMessage() for r in caplog.records if "fabricated-id echo" in r.getMessage()]
+        assert echo and all(" kind=" not in m for m in echo)
+
+    def test_an_id_the_user_did_not_type_is_still_screened(self, ledgers, caplog):
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        se.screen_phantom_write_claims(self.RELAY + "\n- `cq-000000000003` -- queued", tool_use_count=1,
+                                       user_text="did cq-000000000002 land?")
+        fab = _hits(caplog, "fabricated-id")
+        assert len(fab) == 1 and "cq-000000000003" in fab[0]
+
+    def test_an_id_typed_only_in_a_prior_turn_is_still_screened(self, ledgers, caplog):
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        se.screen_phantom_write_claims(self.RELAY, tool_use_count=1, user_text="and the other one?",
+                                       prior_user_texts=["did cq-000000000002 land?"])
+        assert len(_hits(caplog, "fabricated-id")) == 1
+
+    def test_enforce_never_redacts_the_users_own_id(self, ledgers, monkeypatch):
+        monkeypatch.setenv("CORA_SENTINEL_ENFORCE", "enforce")
+        out = se.screen_phantom_write_claims(self.RELAY + " and cq-000000000003", tool_use_count=1,
+                                             user_text="did CQ-000000000002 land?")
+        assert "cq-000000000002" in out and "cq-000000000003" not in out and "[unknown id]" in out
+
+    def test_a_zero_tool_claim_about_a_typed_id_still_trips_the_lexicon(self, ledgers, caplog):
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        se.screen_phantom_write_claims("Staged cq-000000000002.", tool_use_count=0,
+                                       user_text="stage cq-000000000002 please")
+        assert _hits(caplog, "fabricated-id") == [] and len(_hits(caplog, "lexicon")) == 1
+
+
 # ── seam placement pins ───────────────────────────────────────────────────────
 
 class TestSeamPlacement:

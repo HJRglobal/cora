@@ -715,6 +715,12 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
     form label, never the matched words (an arrow / possessive form can carry up to
     three words before the verb, which in a LEX channel could be a name, D-145).
 
+    Fabricated-id half (Code #14 D-051 forcing-seams-5): an unknown id that appears
+    verbatim in the user's CURRENT message is an ECHO of what they typed ("did
+    cq-000000000002 land?" -> "`cq-000000000002` -- not in the queue ledger"), not
+    a fabrication -- it is logged at INFO (no ``kind=``, never counted) and never
+    redacted. Ids the user did not type this turn are screened in full.
+
     S3: every firing line also appends ONE row to PHANTOM_CLAIMS_LEDGER (the
     adjudication record: a scrubbed snippet or a withheld marker, see
     _rail_snippet) and names it `ref=` in the WARN with response_chars /
@@ -747,7 +753,14 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
             log.warning("%s kind=fabricated-id ledger=%s ABSENT -- %d id(s) not checked "
                         "this turn", PHANTOM_LOG_KEY, label, len(found))
             continue
-        for fid in sorted(found - set(known)):
+        unknown = found - set(known)
+        typed = ({m.group(0).lower() for m in rx.finditer(user_text)}
+                 if isinstance(user_text, str) and user_text else set())
+        echoed = unknown & typed
+        if echoed:
+            log.info("%s fabricated-id echo -- %d unknown %s id(s) the user typed this turn "
+                     "were not counted", PHANTOM_LOG_KEY, len(echoed), label)
+        for fid in sorted(unknown - typed):
             ref = _record_rail_hit(rail=PHANTOM_LOG_KEY, kind="fabricated-id", phrase=fid,
                                    text=text, locate=_locate_text(fid), mode=mode,
                                    channel_name=channel_name, user_id=user_id,
