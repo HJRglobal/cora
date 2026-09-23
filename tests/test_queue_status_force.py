@@ -149,12 +149,18 @@ class TestPredicate:
     ], ids=["spaces", "card", "responded", "bang", "still", "cq"])
     def test_raw_regexes_are_linear_past_the_gate(self, shape):
         """D-171: the 500-char gate runs first, but each compiled pattern must stand
-        on its own at Slack's 40k cap too."""
-        t0 = time.perf_counter()
-        for rx in (cq._QS_IMPERATIVE_RE, cq._QS_REQUEST_RE, cq._QS_OBJECT_RE,
-                   cq._QS_STATUS_RE, cq._QS_PRONOUN_RE, cq._QS_CARD_BEFORE_RE):
-            list(rx.finditer(shape))
-        assert time.perf_counter() - t0 < 0.2
+        on its own at Slack's 40k cap too. Best of 3: measured ~14ms worst shape on
+        an idle host (the bound is ~14x that); a single run flaked once under five
+        concurrent full suites -- the minimum is what the pattern costs."""
+        rxs = (cq._QS_IMPERATIVE_RE, cq._QS_REQUEST_RE, cq._QS_OBJECT_RE,
+               cq._QS_STATUS_RE, cq._QS_PRONOUN_RE, cq._QS_CARD_BEFORE_RE)
+        best = float("inf")
+        for _ in range(3):
+            t0 = time.perf_counter()
+            for rx in rxs:
+                list(rx.finditer(shape))
+            best = min(best, time.perf_counter() - t0)
+        assert best < 0.2
 
 
 # ── the renderer (read-only) ─────────────────────────────────────────────────
