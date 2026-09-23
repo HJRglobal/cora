@@ -15,7 +15,9 @@ Options:
     --freshness-days N    Look back N days on first run / backfill (default: 730).
     --only-email EMAIL    Sweep a single account (useful for testing / manual backfill).
     --backfill            Ignore watermarks -- re-sweep all files in the freshness window.
-    --with-slack          Post a summary message to #cora-drive-sweep after the run.
+    --with-slack          Post a summary message to #cora-health (DRIVE_SWEEP_NOTIFY_CHANNEL_ID)
+                          after the run; falls back ONCE to Harrison's DM when the channel is
+                          missing / archived / not joined. Never posts under --dry-run.
 
 Environment variables required (already in .env if Cora is running):
     GOOGLE_SERVICE_ACCOUNT_JSON   Path to service account JSON
@@ -32,6 +34,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +48,18 @@ load_dotenv(_REPO_ROOT / ".env")
 
 LOG_DIR = _REPO_ROOT / "logs"
 _ACCOUNTS_YAML = _REPO_ROOT / "data" / "maps" / "monitored-email-accounts.yaml"
+
+# --with-slack target: #cora-health (listed in the Founder/Cora block of the
+# slack-channel-registry). Pinned as an ID -- #cora-drive-sweep, the old bare-name
+# default, has NEVER existed (chat.postMessage channel_not_found on 19 of 19 task logs,
+# 2026-09-03..09-22), so every summary since the task shipped was dropped.
+DRIVE_SWEEP_NOTIFY_CHANNEL_ID = "C0B7CADQ98S"  # #cora-health
+# The env override is honoured ONLY when it is a channel/group/DM id -- a bare name is
+# what produced the silent 19-day loss. One class, one quantifier: linear (D-171).
+_SLACK_CHANNEL_ID_RE = re.compile(r"[CGD][A-Z0-9]{8,}")
+# Codes meaning "the target itself is wrong" -> ONE Harrison-DM fallback per run.
+# Anything else (ratelimited, invalid_auth, ...) is logged only.
+_DM_FALLBACK_ERRORS = frozenset({"channel_not_found", "is_archived", "not_in_channel"})
 
 
 def _setup_logging() -> None:
@@ -61,20 +76,86 @@ def _setup_logging() -> None:
     )
 
 
-def _post_slack_summary(stats: dict, dry_run: bool, channel: str) -> None:
-    """Post aggregate stats to a Slack channel after the sweep."""
-    import anthropic  # noqa: F401 -- just check env is loaded
+def _resolve_notify_channel() -> str:
+    """The --with-slack target: DRIVE_SWEEP_NOTIFY_CHANNEL when it is a channel ID,
+    else the pinned DRIVE_SWEEP_NOTIFY_CHANNEL_ID (a bare name WARNs + falls back).
+    Read per call, never bound at import."""
+    raw = (os.environ.get("DRIVE_SWEEP_NOTIFY_CHANNEL") or "").strip()
+    if not raw:
+        return DRIVE_SWEEP_NOTIFY_CHANNEL_ID
+    if _SLACK_CHANNEL_ID_RE.fullmatch(raw):
+        return raw
+    logging.getLogger("run_drive_sweep").warning(
+        "DRIVE_SWEEP_NOTIFY_CHANNEL=%r is not a Slack channel id; using %s (#cora-health)",
+        raw[:80], DRIVE_SWEEP_NOTIFY_CHANNEL_ID,
+    )
+    return DRIVE_SWEEP_NOTIFY_CHANNEL_ID
+
+
+def _slack_error_code(exc: Exception) -> str:
+    """The one-token Slack error code of a SlackApiError (e.g. ``channel_not_found``),
+    so a failure is ONE greppable line. str(exc) spans two lines and the code sat on
+    the continuation line, which is why the 9/19 audit grep missed it."""
     try:
+        code = exc.response.get("error")  # type: ignore[attr-defined]
+    except Exception:
+        code = None
+    return str(code) if code else "unknown"
+
+
+def _post_slack_summary(stats: dict, dry_run: bool, channel: str) -> None:
+    """Post aggregate stats to a Slack channel after the sweep.
+
+    Aggregate counters only (no file names, no content), so neither #cora-health nor
+    the Harrison-DM fallback receives anything entity-scoped. main() reaches this ONLY
+    outside --dry-run (_notify_after_run). On channel_not_found / is_archived /
+    not_in_channel it falls back ONCE (this is called once per run) to Harrison's DM,
+    with a WARNING naming the failed channel + code; any other error is logged only.
+    Every send is a slack_sdk.WebClient in a process that imports cora, so the
+    class-level egress sanitize patch applies (D-034)."""
+    log = logging.getLogger("run_drive_sweep")
+    token = os.environ.get("SLACK_BOT_TOKEN", "")
+    if not token:
+        log.warning("SLACK_BOT_TOKEN unset -- Drive sweep summary not posted")
+        return
+    try:
+        import cora  # noqa: F401 -- installs the class-level egress patch (D-034)
         from slack_sdk import WebClient
-        token = os.environ.get("SLACK_BOT_TOKEN", "")
-        if not token:
-            return
-        client = WebClient(token=token)
-        client.chat_postMessage(channel=channel, text=_format_slack_summary(stats, dry_run))
+        from slack_sdk.errors import SlackApiError
     except Exception as exc:
-        logging.getLogger("run_drive_sweep").warning(
-            "Could not post Slack summary: %s", exc
-        )
+        log.warning("Could not post Slack summary: error=%s", type(exc).__name__)
+        return
+    client = WebClient(token=token)
+    text = _format_slack_summary(stats, dry_run)
+    try:
+        client.chat_postMessage(channel=channel, text=text)
+        return
+    except SlackApiError as exc:
+        code = _slack_error_code(exc)
+        log.warning("Could not post Slack summary: channel=%s error=%s", channel, code)
+    except Exception as exc:
+        log.warning("Could not post Slack summary: channel=%s error=%s", channel, type(exc).__name__)
+        return
+    if code not in _DM_FALLBACK_ERRORS:
+        return
+    from cora.repeat_signal import HARRISON_SLACK_ID
+    log.warning(
+        "Drive sweep summary channel %s unusable (error=%s) -- falling back ONCE to Harrison's DM",
+        channel, code,
+    )
+    try:
+        opened = client.conversations_open(users=[HARRISON_SLACK_ID])
+        client.chat_postMessage(channel=opened["channel"]["id"], text=text)
+    except SlackApiError as exc:
+        log.warning("Drive sweep summary DM fallback failed: error=%s", _slack_error_code(exc))
+    except Exception as exc:
+        log.warning("Drive sweep summary DM fallback failed: error=%s", type(exc).__name__)
+
+
+def _notify_after_run(stats: dict, *, with_slack: bool, dry_run: bool) -> None:
+    """The ONE Slack write site of a run -- unreachable under --dry-run (D-290)."""
+    if with_slack and not dry_run:
+        _post_slack_summary(stats, dry_run=dry_run, channel=_resolve_notify_channel())
 
 
 def _format_slack_summary(stats: dict, dry_run: bool) -> str:
@@ -138,7 +219,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--with-slack", action="store_true",
-        help="Post summary to Slack after run (channel: DRIVE_SWEEP_NOTIFY_CHANNEL env var or cora-drive-sweep)"
+        help=("Post summary to Slack after run (channel: DRIVE_SWEEP_NOTIFY_CHANNEL env var when it "
+              "is a channel ID, else #cora-health C0B7CADQ98S; never under --dry-run)")
     )
     args = parser.parse_args()
 
@@ -224,9 +306,7 @@ def main() -> int:
 
     log.info(_format_done_line(stats))
 
-    if args.with_slack and not args.dry_run:
-        channel = os.environ.get("DRIVE_SWEEP_NOTIFY_CHANNEL", "cora-drive-sweep")
-        _post_slack_summary(stats, dry_run=args.dry_run, channel=channel)
+    _notify_after_run(stats, with_slack=args.with_slack, dry_run=args.dry_run)
 
     return 0
 
