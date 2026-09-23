@@ -742,6 +742,68 @@ _ID_LEDGERS: tuple[tuple[str, re.Pattern[str], Callable[[], frozenset[str]]], ..
 # is ever touched (the body is kept byte-identical anyway).
 _LINK_TOKEN_RE = re.compile(r"<[^<>\n]{1,400}>")
 
+# Code #14 D-051 round 2 (F1-R1 / forcing-seams-5): the user-typed-id exemption.
+# Round 1 exempted EVERY unknown id the user typed this turn, so a fabricated STATE
+# claim about that id ("did cq-000000000002 land?" -> "Yes -- cq-000000000002 is
+# staged.") wrote no counted line at any tool count -- and round 1 had accepted the
+# lexicon half's noun-subject gap ("cq-X has been staged." reads zero) BECAUSE the id
+# half caught it. The exemption is now a PURE ECHO only: every sentence carrying the
+# id must hold no completion claim (the lexicon grammar, run at ANY tool count) and
+# no noun-subject state claim ("cq-X is / has been / 's been staged"). The typed set
+# is this message plus the last six user turns (a forced status follow-up names no
+# id: "and is it there now?"). Anything else about a typed id is screened in full,
+# redaction under enforce included.
+_ID_STATE_CLAIM_RE = re.compile(
+    r"\b(?:cq|dw)-[0-9a-f]{12}\b[`*_]{0,3}[ \t]*+"
+    r"(?:is|are|was|were|has|have|had|got|gets|['’]s)"
+    r"(?:[ \t]++(?:now|just|already|successfully|officially|also|finally|all|been)){0,3}"
+    r"[ \t]++(?:staged|queued|approved|shipped|filed|created|updated|deleted|merged|closed|dismissed|"
+    r"parked|kept|live|done|completed?|locked[ \t]++in|canonicali[sz]ed)\b",
+    re.IGNORECASE)
+_ID_SENTENCE_BREAK_RE = re.compile(r"[.!?;\n]")
+_ID_ECHO_RADIUS = 300
+_ID_ECHO_MAX_OCCURRENCES = 64
+
+
+def _typed_ids(rx: re.Pattern[str], user_texts: Any) -> set[str]:
+    """The ids of *rx*'s family in the user's own words (this message + the last six
+    user turns), capped at _WC_ECHO_MAX_CHARS like the lexicon echo rule."""
+    joined = " ".join(str(u) for u in (user_texts or ()) if isinstance(u, str) and u)
+    return {m.group(0).lower() for m in rx.finditer(joined[:_WC_ECHO_MAX_CHARS])}
+
+
+def _id_sentence(text: str, start: int, end: int) -> str:
+    """The sentence (bounded +/-_ID_ECHO_RADIUS chars) that carries text[start:end]."""
+    lo = max(0, start - _ID_ECHO_RADIUS)
+    before = text[lo:start]
+    cut = 0
+    for b in _ID_SENTENCE_BREAK_RE.finditer(before):
+        cut = b.end()
+    after = text[end:end + _ID_ECHO_RADIUS]
+    m = _ID_SENTENCE_BREAK_RE.search(after)
+    return before[cut:] + text[start:end] + (after[:m.start()] if m else after)
+
+
+def _id_is_pure_echo(text: str, fid: str) -> bool:
+    """True only when EVERY occurrence of *fid* in *text* sits in a sentence with no
+    completion claim and no noun-subject state claim. Fails toward COUNTING: an
+    unevaluable sentence or more than _ID_ECHO_MAX_OCCURRENCES occurrences is not an
+    echo."""
+    try:
+        seen = 0
+        for m in re.finditer(re.escape(fid), text, re.IGNORECASE):
+            seen += 1
+            if seen > _ID_ECHO_MAX_OCCURRENCES:
+                return False
+            sentence = _id_sentence(text, m.start(), m.end())
+            if _ID_STATE_CLAIM_RE.search(sentence) or _find_write_claim_span(sentence) is not None:
+                return False
+        return seen > 0
+    except Exception:  # noqa: BLE001 -- an unevaluable echo is counted, never hidden
+        log.warning("%s id-echo rule failed -- the id is screened in full", PHANTOM_LOG_KEY,
+                    exc_info=True)
+        return False
+
 
 def _prepend_honest_line(text: str) -> str:
     """ENFORCE-mode correction: the honest template becomes the reply's FIRST line;
@@ -780,11 +842,14 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
     form label, never the matched words (an arrow / possessive form can carry up to
     three words before the verb, which in a LEX channel could be a name, D-145).
 
-    Fabricated-id half (Code #14 D-051 forcing-seams-5): an unknown id that appears
-    verbatim in the user's CURRENT message is an ECHO of what they typed ("did
-    cq-000000000002 land?" -> "`cq-000000000002` -- not in the queue ledger"), not
-    a fabrication -- it is logged at INFO (no ``kind=``, never counted) and never
-    redacted. Ids the user did not type this turn are screened in full.
+    Fabricated-id half (Code #14 D-051 forcing-seams-5, round 2 F1-R1): an unknown
+    id the user typed (this message or the last six user turns) that the reply
+    relays as a PURE ECHO ("did cq-000000000002 land?" -> "`cq-000000000002` -- not
+    in the queue ledger") is not a fabrication -- it is logged at INFO (no
+    ``kind=``, never counted) and never redacted. A pure echo carries no completion
+    claim and no noun-subject state claim in any sentence that names it
+    (_id_is_pure_echo, at ANY tool count); "Yes -- cq-000000000002 is staged." about
+    a typed id is screened in full, like every id the user did not type.
 
     S3: every firing line also appends ONE row to PHANTOM_CLAIMS_LEDGER (the
     adjudication record: a scrubbed snippet or a withheld marker, see
@@ -804,6 +869,11 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
     emit = log.error if mode == "enforce" else log.warning
     out = text
     memo = _SnippetMemo(text)
+    try:
+        priors = list(prior_user_texts or ())[-6:]
+    except TypeError:
+        priors = []
+    users = [u for u in [user_text, *priors] if isinstance(u, str) and u]
     for label, rx, reader in _ID_LEDGERS:
         found = {m.group(0).lower() for m in rx.finditer(out)}
         if not found:
@@ -834,13 +904,13 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
                         "this turn ref=%s", PHANTOM_LOG_KEY, label, len(found), ref or "-")
             continue
         unknown = found - set(known)
-        typed = ({m.group(0).lower() for m in rx.finditer(user_text)}
-                 if isinstance(user_text, str) and user_text else set())
-        echoed = unknown & typed
+        typed = _typed_ids(rx, users) if unknown else set()
+        claim_view = _LINK_TOKEN_RE.sub(" ", text)
+        echoed = {fid for fid in unknown & typed if _id_is_pure_echo(claim_view, fid)}
         if echoed:
-            log.info("%s fabricated-id echo -- %d unknown %s id(s) the user typed this turn "
-                     "were not counted", PHANTOM_LOG_KEY, len(echoed), label)
-        for fid in sorted(unknown - typed):
+            log.info("%s fabricated-id echo -- %d unknown %s id(s) the user typed were relayed "
+                     "as a pure echo and not counted", PHANTOM_LOG_KEY, len(echoed), label)
+        for fid in sorted(unknown - echoed):
             ref = _record_rail_hit(rail=PHANTOM_LOG_KEY, kind="fabricated-id", phrase=fid,
                                    text=text, locate=_locate_text(fid), mode=mode,
                                    channel_name=channel_name, user_id=user_id,
@@ -854,8 +924,6 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
                 out = re.sub(re.escape(fid), "[unknown id]", out, flags=re.IGNORECASE)
     if count == 0:
         masked = _LINK_TOKEN_RE.sub(" ", out)
-        users = [u for u in [user_text, *list(prior_user_texts or ())[-6:]]
-                 if isinstance(u, str) and u]
         spans: list[tuple[int, int]] = []
         if users:
             try:

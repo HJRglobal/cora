@@ -338,8 +338,9 @@ class TestKnownIds:
 class TestUserTypedIdEcho:
     """Code #14 D-051 forcing-seams-5: "did cq-000000000002 land?" about a mistyped id
     -> the card-status read renders "`cq-000000000002` -- not in the queue ledger" and
-    the model relays it. An unknown id the user typed THIS turn is an echo, not a
-    fabrication; an id the user did not type is screened in full."""
+    the model relays it. An unknown id the user typed (this turn or the last six user
+    turns, round 2) relayed as a PURE ECHO is not a fabrication; a claim about it and
+    an id the user did not type are screened in full (tests/test_d051_r2_honesty_rails.py)."""
 
     RELAY = "- `cq-000000000002` -- not in the queue ledger"
 
@@ -365,9 +366,17 @@ class TestUserTypedIdEcho:
         fab = _hits(caplog, "fabricated-id")
         assert len(fab) == 1 and "cq-000000000003" in fab[0]
 
-    def test_an_id_typed_only_in_a_prior_turn_is_still_screened(self, ledgers, caplog):
+    def test_an_id_typed_only_in_a_prior_turn_is_an_echo_when_relayed(self, ledgers, caplog):
+        """DELIBERATE FLIP (Code #14 D-051 round 2, forcing-seams-5 residual): the
+        queue-status force covers follow-ups within three turns and the model passes
+        cq_id from history, so a relay on the follow-up ("and the other one?") is the
+        same echo. A claim about that id still counts (the pure-echo rule)."""
         caplog.set_level(logging.WARNING, logger=se.__name__)
         se.screen_phantom_write_claims(self.RELAY, tool_use_count=1, user_text="and the other one?",
+                                       prior_user_texts=["did cq-000000000002 land?"])
+        assert _hits(caplog, "fabricated-id") == []
+        se.screen_phantom_write_claims("cq-000000000002 is staged.", tool_use_count=1,
+                                       user_text="and the other one?",
                                        prior_user_texts=["did cq-000000000002 land?"])
         assert len(_hits(caplog, "fabricated-id")) == 1
 
@@ -377,11 +386,14 @@ class TestUserTypedIdEcho:
                                              user_text="did CQ-000000000002 land?")
         assert "cq-000000000002" in out and "cq-000000000003" not in out and "[unknown id]" in out
 
-    def test_a_zero_tool_claim_about_a_typed_id_still_trips_the_lexicon(self, ledgers, caplog):
+    def test_a_zero_tool_claim_about_a_typed_id_trips_both_halves(self, ledgers, caplog):
+        """DELIBERATE FLIP (Code #14 D-051 round 2, F1-R1): a completion claim ON the
+        typed id is not an echo -- the id half counts it as the base did (the 0653
+        incident shape: one lexicon line plus one line per fabricated id)."""
         caplog.set_level(logging.WARNING, logger=se.__name__)
         se.screen_phantom_write_claims("Staged cq-000000000002.", tool_use_count=0,
                                        user_text="stage cq-000000000002 please")
-        assert _hits(caplog, "fabricated-id") == [] and len(_hits(caplog, "lexicon")) == 1
+        assert len(_hits(caplog, "fabricated-id")) == 1 and len(_hits(caplog, "lexicon")) == 1
 
 
 # ── seam placement pins ───────────────────────────────────────────────────────
