@@ -196,7 +196,11 @@ _DRIVE_PATH_REPLACEMENT = "a portfolio document"
 # Redaction shells: when a redacted URL sat inside parens or a markdown link,
 # the surrounding "()" / "[label]()" survives as a visible artifact (live
 # 2026-06-11 follow-up replies). Clean them after the redaction pass.
-_EMPTY_MD_LINK_RE = re.compile(r"\[([^\]\n]*)\]\(\s*\)")  # [label]() -> label
+# Code #14 D-051 (redos-slack-surfaces-3): the label class EXCLUDES '[' -- with '['
+# admitted, every '[' rescanned to the end of the string (O(n^2): 8.9 s on 40k '[',
+# twice per reply plus once per S3 snippet scrub). A nested "[a [b]()" now cleans
+# the innermost shell ("[a b") -- the same shells, linear.
+_EMPTY_MD_LINK_RE = re.compile(r"\[([^\[\]\n]*)\]\(\s*\)")  # [label]() -> label
 _EMPTY_PARENS_RE = re.compile(r"\(\s*\)")
 _EMPTY_BRACKETS_RE = re.compile(r"\[\s*\]")
 

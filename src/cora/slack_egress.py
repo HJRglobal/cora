@@ -448,33 +448,44 @@ def _inside(spans: list[tuple[int, int]], start: int, end: int) -> bool:
 
 
 def _find_write_claim_span(text: str, user_texts: Any = (),
-                           spans: list[tuple[int, int]] | None = None) -> tuple[int, int, str, str] | None:
+                           spans: list[tuple[int, int]] | None = None,
+                           want: tuple[str, str] | None = None) -> tuple[int, int, str, str] | None:
     """(start, end, verb, form) of the FIRST completion claim in *text*, else None.
 
     A hit whose span lies entirely inside a user-typed quoted span (``spans``, or
-    computed from ``user_texts``) is skipped unless it is first-person."""
+    computed from ``user_texts``) is skipped unless it is first-person. ``want`` =
+    (verb, form): return the first unsuppressed hit of THAT form and verb (the S3
+    ledger locates the claim that actually fired), falling back to the first hit."""
     if spans is None:
         spans = _user_quote_spans(text, user_texts) if user_texts else []
     best: tuple[int, int, str, str] | None = None
     for label, rx in _WRITE_CLAIM_FORMS:
+        if want is not None and label != want[1]:
+            continue
         for m in rx.finditer(text):
             if best is not None and m.start() >= best[0]:
                 break
             if spans and label not in _WC_FIRST_PERSON_FORMS and _inside(spans, m.start(), m.end()):
                 continue
-            best = (m.start(), m.end(), _verb_of(m), label)
+            verb = _verb_of(m)
+            if want is not None and " ".join(verb.split()).lower() != want[0]:
+                continue
+            best = (m.start(), m.end(), verb, label)
             break
-    for m in _WC_RECEIPT_RE.finditer(text):
-        if best is not None and m.start() >= best[0]:
+    if want is None or want[1] == "receipt":
+        for m in _WC_RECEIPT_RE.finditer(text):
+            if best is not None and m.start() >= best[0]:
+                break
+            if not _receipt_subject_ok(m):
+                continue
+            if spans and _inside(spans, m.start(), m.end()):
+                continue
+            if want is not None and " ".join(m.group("v").split()).lower() != want[0]:
+                continue
+            best = (m.start(), m.end(), m.group("v"), "receipt")
             break
-        if not _receipt_subject_ok(m):
-            continue
-        if spans and _inside(spans, m.start(), m.end()):
-            continue
-        best = (m.start(), m.end(), m.group("v"), "receipt")
-        break
     if best is None:
-        return None
+        return _find_write_claim_span(text, spans=spans) if want is not None else None
     return best[0], best[1], " ".join(best[2].split()).lower(), best[3]
 
 
@@ -512,6 +523,10 @@ PHANTOM_CLAIMS_LEDGER = _REPO_ROOT / "data" / "state" / "phantom-write-claims.js
 RAIL_SNIPPET_WITHHELD_LEX = "[LEX — withheld]"
 RAIL_SNIPPET_WITHHELD_GRANT = "[private retrieval — withheld]"
 RAIL_SNIPPET_WITHHELD_PHI = "[PHI screen — withheld]"
+# Code #14 D-051 (honesty-rails-11): a turn built on OWNER-PRIVATE unstripped content
+# -- the asker's own mailbox (D-043 Tier-1 unstripped), personal notes (D-049) --
+# withholds exactly like the Tier-2 grant turn of the same data class.
+RAIL_SNIPPET_WITHHELD_PERSONAL = "[owner-private content — withheld]"
 RAIL_SNIPPET_NO_CONTEXT = "[no scope context — withheld]"
 RAIL_SNIPPET_UNAVAILABLE = "[snippet unavailable]"
 _SNIPPET_RADIUS = 60
@@ -580,18 +595,54 @@ def _founder_belt_passes(snippet: str) -> bool:
         return False
 
 
+class _SnippetMemo:
+    """ONE scrub (and ONE full-text founder belt) per screen call, shared by every
+    ledger row that call writes (Code #14 D-051 redos-slack-surfaces-2 /
+    honesty-rails-12: the fabricated-id loop used to re-scrub the WHOLE reply once
+    per unknown id -- O(ids x length) on the bolt worker)."""
+
+    __slots__ = ("text", "_clean", "_belt")
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self._clean: str | None = None
+        self._belt: bool | None = None
+
+    def clean(self) -> str:
+        if self._clean is None:
+            self._clean = _scrub_for_snippet(self.text)
+        return self._clean
+
+    def full_belt_passes(self) -> bool:
+        """honesty-rails-3: the founder-DM belt reads the FULL scrubbed reply BEFORE
+        any window is cut -- its cues (Lexington / DDD / AHCCCS, care nouns, the
+        120-char cue proximity) can sit far outside +/-60 chars of the hit, the same
+        'windowing first strands the cue' class the banking scrub order closes."""
+        if self._belt is None:
+            try:
+                self._belt = _founder_belt_passes(" ".join(self.clean().split()))
+            except Exception:  # noqa: BLE001 -- an unevaluable belt withholds
+                self._belt = False
+        return self._belt
+
+
 def _rail_snippet(text: str, locate: Callable[[str], tuple[int, int] | None],
-                  rail_context: dict | None) -> str:
+                  rail_context: dict | None, memo: "_SnippetMemo | None" = None) -> str:
     """The scrubbed +/-60-char window around the hit, or a WITHHELD marker. Never
-    raises; fails CLOSED (a marker, never the raw text)."""
+    raises; fails CLOSED (a marker, never the raw text). In the founder DM the
+    content belt runs on the FULL scrubbed reply first (any trip anywhere withholds),
+    then again on the window."""
     ctx = rail_context if isinstance(rail_context, dict) else None
     if ctx is None:
         return RAIL_SNIPPET_NO_CONTEXT
     withheld = ctx.get("snippet_withheld")
     if withheld:
         return str(withheld)
+    memo = memo if memo is not None and memo.text is text else _SnippetMemo(text)
     try:
-        clean = _scrub_for_snippet(text)
+        clean = memo.clean()
+        if ctx.get("founder_belt") and not memo.full_belt_passes():
+            return RAIL_SNIPPET_WITHHELD_PHI
         span = locate(clean)
         if span is None:
             window = clean[:120]
@@ -611,7 +662,8 @@ def _rail_snippet(text: str, locate: Callable[[str], tuple[int, int] | None],
 def _record_rail_hit(*, rail: str, kind: str, phrase: str, text: str,
                      locate: Callable[[str], tuple[int, int] | None], mode: str,
                      channel_name: str, user_id: str, tool_use_count: int | None,
-                     rail_context: dict | None, form: str = "") -> str:
+                     rail_context: dict | None, form: str = "",
+                     memo: "_SnippetMemo | None" = None) -> str:
     """Append one ledger row for one FIRING line; return its ref ('' when no row)."""
     if not _rail_ledger_on():
         return ""
@@ -620,7 +672,7 @@ def _record_rail_hit(*, rail: str, kind: str, phrase: str, text: str,
     row = {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "rail": rail, "kind": kind, "phrase": phrase,
-        "snippet": _rail_snippet(text, locate, rail_context),
+        "snippet": _rail_snippet(text, locate, rail_context, memo),
         "mode": mode, "channel": channel_name or "", "channel_id": str(ctx.get("channel_id") or ""),
         "user": user_id or "", "entity": str(ctx.get("entity") or ""),
         "response_chars": len(text), "tool_use_count": tool_use_count,
@@ -647,9 +699,22 @@ def _locate_regex(rx: re.Pattern[str]) -> Callable[[str], tuple[int, int] | None
     return _loc
 
 
-def _locate_write_claim(clean: str) -> tuple[int, int] | None:
-    hit = _find_write_claim_span(clean)
+def _locate_write_claim(clean: str, users: Any = (),
+                        want: tuple[str, str] | None = None) -> tuple[int, int] | None:
+    """The span of the claim the screen FIRED on, found on the scrubbed reply with
+    the same echo rule and the fired (verb, form) (honesty-rails-10 /
+    redos-slack-surfaces-6: locating the FIRST claim of the unmasked text could
+    centre the snippet on a user-echo the screen had excluded)."""
+    hit = _find_write_claim_span(clean, users, want=want)
     return (hit[0], hit[1]) if hit else None
+
+
+def _write_claim_locator(users: Any, verb: str, form: str) -> Callable[[str], tuple[int, int] | None]:
+    frozen = tuple(users or ())
+
+    def _loc(clean: str) -> tuple[int, int] | None:
+        return _locate_write_claim(clean, frozen, (verb, form))
+    return _loc
 
 
 def _known_cq_ids() -> frozenset[str]:
@@ -724,8 +789,10 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
     S3: every firing line also appends ONE row to PHANTOM_CLAIMS_LEDGER (the
     adjudication record: a scrubbed snippet or a withheld marker, see
     _rail_snippet) and names it `ref=` in the WARN with response_chars /
-    tool_use. ``rail_context`` = {channel_id, entity, snippet_withheld,
-    founder_belt} from app._dispatch_qa; absent = the snippet is withheld.
+    tool_use -- including the counted ABSENT / UNAVAILABLE cannot-check lines
+    (integration-tests-8). The reply is scrubbed ONCE per call (_SnippetMemo).
+    ``rail_context`` = {channel_id, entity, snippet_withheld, founder_belt} from
+    app._dispatch_qa; absent = the snippet is withheld.
     """
     if not isinstance(text, str) or not text:
         return text
@@ -736,22 +803,35 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
     mode = _sentinel_mode()
     emit = log.error if mode == "enforce" else log.warning
     out = text
+    memo = _SnippetMemo(text)
     for label, rx, reader in _ID_LEDGERS:
         found = {m.group(0).lower() for m in rx.finditer(out)}
         if not found:
             continue
+        first = min(found)
         try:
             known = reader()
         except Exception:  # noqa: BLE001 -- an unreadable ledger must not redact real ids
+            ref = _record_rail_hit(rail=PHANTOM_LOG_KEY, kind="fabricated-id",
+                                   phrase=f"ledger={label} UNAVAILABLE", text=text,
+                                   locate=_locate_text(first), mode=mode,
+                                   channel_name=channel_name, user_id=user_id,
+                                   tool_use_count=count, rail_context=rail_context, memo=memo)
             log.warning("%s kind=fabricated-id ledger=%s UNAVAILABLE -- %d id(s) not "
-                        "checked this turn", PHANTOM_LOG_KEY, label, len(found), exc_info=True)
+                        "checked this turn ref=%s", PHANTOM_LOG_KEY, label, len(found),
+                        ref or "-", exc_info=True)
             continue
         if known is None:
             # D-051 lens C F6: a ledger that does not EXIST is "cannot check", not
             # "nothing is known" -- an empty reference set would redact every real
             # id under ENFORCE. Skip the family, loudly.
+            ref = _record_rail_hit(rail=PHANTOM_LOG_KEY, kind="fabricated-id",
+                                   phrase=f"ledger={label} ABSENT", text=text,
+                                   locate=_locate_text(first), mode=mode,
+                                   channel_name=channel_name, user_id=user_id,
+                                   tool_use_count=count, rail_context=rail_context, memo=memo)
             log.warning("%s kind=fabricated-id ledger=%s ABSENT -- %d id(s) not checked "
-                        "this turn", PHANTOM_LOG_KEY, label, len(found))
+                        "this turn ref=%s", PHANTOM_LOG_KEY, label, len(found), ref or "-")
             continue
         unknown = found - set(known)
         typed = ({m.group(0).lower() for m in rx.finditer(user_text)}
@@ -764,7 +844,7 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
             ref = _record_rail_hit(rail=PHANTOM_LOG_KEY, kind="fabricated-id", phrase=fid,
                                    text=text, locate=_locate_text(fid), mode=mode,
                                    channel_name=channel_name, user_id=user_id,
-                                   tool_use_count=count, rail_context=rail_context)
+                                   tool_use_count=count, rail_context=rail_context, memo=memo)
             emit("%s kind=fabricated-id id=%s ledger=%s mode=%s channel=#%s user=%s "
                  "response_chars=%d tool_use=%s ref=%s -- "
                  "the reply names an id that exists in no ledger",
@@ -788,9 +868,10 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
         if hit:
             verb, form = hit[2], hit[3]
             ref = _record_rail_hit(rail=PHANTOM_LOG_KEY, kind="lexicon", phrase=verb, text=text,
-                                   locate=_locate_write_claim, mode=mode,
-                                   channel_name=channel_name, user_id=user_id,
-                                   tool_use_count=count, rail_context=rail_context, form=form)
+                                   locate=_write_claim_locator(users if spans else (), verb, form),
+                                   mode=mode, channel_name=channel_name, user_id=user_id,
+                                   tool_use_count=count, rail_context=rail_context, form=form,
+                                   memo=memo)
             emit("%s kind=lexicon phrase=%r form=%s mode=%s channel=#%s user=%s "
                  "response_chars=%d tool_use=%s ref=%s -- a write claim with zero tool_use "
                  "this turn",
@@ -1024,6 +1105,7 @@ def screen_capability_claims(text, *, tool_use_count, channel_name: str = "", us
     mode = _sentinel_mode()
     emit = log.error if mode == "enforce" else log.warning
     out = text
+    memo = _SnippetMemo(text)
 
     # (2) internal tool symbols -- any count, non-developer surfaces only
     if not is_developer_surface(channel_name):
@@ -1039,7 +1121,7 @@ def screen_capability_claims(text, *, tool_use_count, channel_name: str = "", us
             ref = _record_rail_hit(rail=CAPABILITY_LOG_KEY, kind="toolname", phrase=sym, text=text,
                                    locate=_locate_text(sym), mode=mode,
                                    channel_name=channel_name, user_id=user_id,
-                                   tool_use_count=count, rail_context=rail_context)
+                                   tool_use_count=count, rail_context=rail_context, memo=memo)
             emit("%s kind=toolname symbol=%s mode=%s channel=#%s user=%s tool_use=%s "
                  "response_chars=%d ref=%s -- an "
                  "internal tool name reached a non-developer surface",
@@ -1084,7 +1166,7 @@ def screen_capability_claims(text, *, tool_use_count, channel_name: str = "", us
                                        phrase=m.group(0).strip(), text=text,
                                        locate=_locate_text(m.group(0).strip()), mode=mode,
                                        channel_name=channel_name, user_id=user_id,
-                                       tool_use_count=count, rail_context=rail_context)
+                                       tool_use_count=count, rail_context=rail_context, memo=memo)
                 emit("%s kind=denial phrase=%r term=%r mode=%s channel=#%s user=%s "
                      "response_chars=%d tool_use=%s ref=%s -- a capability "
                      "denial with zero tool_use about a capability the bot has in this channel",

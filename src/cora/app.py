@@ -991,6 +991,31 @@ def _rail_context(channel_id: str, user_id: str | None, entity: str, retrieval_g
     return ctx
 
 
+# Tools whose result is OWNER-PRIVATE content the asker alone may see: personal notes
+# (D-049) and the asker's own mailbox (D-043 Tier-2 door).
+_OWNER_PRIVATE_TOOLS = frozenset({"cora_my_notes", "cora_remember", "cora_forget_note", "gmail_inbox"})
+
+
+def _rail_context_for_reply(rail_ctx: dict, kb_meta: dict | None, gen_meta: dict | None) -> dict:
+    """S3 (Code #14 D-051 honesty-rails-11): the rail scope for the FINAL reply. The
+    pre-cache _rail_context cannot see what the turn loaded: a reply built on
+    UNSTRIPPED owner-private content (kb_meta['unstripped_personal'] -- own-mailbox
+    Tier-1 chunks, personal-note co-retrieval) or on an owner-private tool result
+    withholds its snippet exactly like the Tier-2 grant turn of the same data class.
+    An existing withhold (LEX / grant) is kept; never raises (an error withholds)."""
+    try:
+        if rail_ctx.get("snippet_withheld"):
+            return rail_ctx
+        used = set((gen_meta or {}).get("tool_names") or ())
+        if (kb_meta or {}).get("unstripped_personal") or used & _OWNER_PRIVATE_TOOLS:
+            return {**rail_ctx, "snippet_withheld": slack_egress.RAIL_SNIPPET_WITHHELD_PERSONAL}
+        return rail_ctx
+    except Exception:  # noqa: BLE001
+        log.warning("rail reply context failed -- snippet withheld", exc_info=True)
+        return {**(rail_ctx if isinstance(rail_ctx, dict) else {}),
+                "snippet_withheld": slack_egress.RAIL_SNIPPET_WITHHELD_PERSONAL}
+
+
 def _prior_user_texts(prior_messages: list[dict] | None) -> list[str]:
     """The last six USER turns' text (never assistant text), for the phantom-write
     screen's echo mask (R14-9(b)): words the user wrote are not Cora's claims."""
@@ -2088,6 +2113,8 @@ def _dispatch_qa(
         # built from it (Slack renders blocks over text). Observe mode logs the
         # `phantom-write-claim` key and returns the text byte-identical; enforce
         # prepends the honest line. The count is the turn's measured tool ledger.
+        # S3 (honesty-rails-11): the scope now knows what the turn LOADED.
+        rail_ctx = _rail_context_for_reply(rail_ctx, kb_meta, gen_meta)
         response_text = slack_egress.screen_phantom_write_claims(
             response_text, tool_use_count=_turn_tool_use_count(gen_meta),
             channel_name=channel_name, user_id=user_id or "",
@@ -2235,6 +2262,8 @@ def _dispatch_qa(
     # built from it (Slack renders blocks over text). Observe mode logs the
     # `phantom-write-claim` key and returns the text byte-identical; enforce
     # prepends the honest line. The count is the turn's measured tool ledger.
+    # S3 (honesty-rails-11): the scope now knows what the turn LOADED.
+    rail_ctx = _rail_context_for_reply(rail_ctx, kb_meta, gen_meta)
     response_text = slack_egress.screen_phantom_write_claims(
         response_text, tool_use_count=_turn_tool_use_count(gen_meta),
         channel_name=channel_name, user_id=user_id or "",

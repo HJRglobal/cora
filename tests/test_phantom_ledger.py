@@ -248,6 +248,222 @@ class TestCounterAnchor:
         assert counts == {er.RAIL_SENTINEL: 0, er.RAIL_PHANTOM: 1, er.RAIL_CAPABILITY: 0}
 
 
+def _best_of_3(fn) -> float:
+    runs = []
+    for _ in range(3):
+        t0 = time.perf_counter()
+        fn()
+        runs.append(time.perf_counter() - t0)
+    return min(runs)
+
+
+FOUNDER_CTX = {**CTX_OPEN, "entity": "FNDR", "founder_belt": True}
+
+
+class TestCode14FounderBeltFullText:
+    """honesty-rails-3: the founder-DM belt reads the FULL scrubbed reply, not the
+    +/-60 window -- a LEX program cue far from the hit must still withhold."""
+
+    @pytest.mark.parametrize("text", [
+        ("Re the Lexington DDD member intake (see the thread for the full notes). Quick recap below, "
+         "nothing else pending on your side. I updated the notes for Maria Lopez and moved her "
+         "follow-up to Thursday."),
+        ("The AHCCCS renewal packet went out yesterday, see the thread above for the details and "
+         "the owner. Separately -- I created the follow-up task for Daniel Reyes and his mother."),
+    ], ids=["lexington-ddd", "ahcccs"])
+    def test_a_cue_outside_the_window_withholds(self, ledger, text):
+        from cora import phi_guard
+        i = text.index(" I ") if " I " in text else text.index("I created")
+        window = text[max(0, i - 60):i + 60]
+        assert not phi_guard.is_lex_program_context(window)      # the window alone would pass
+        assert phi_guard.is_lex_program_context(text)            # the reply does not
+        _pw(text, ctx=FOUNDER_CTX, channel="dm")
+        row = _rows(ledger)[0]
+        assert row["snippet"] == se.RAIL_SNIPPET_WITHHELD_PHI
+        assert "Lopez" not in json.dumps(row) and "Reyes" not in json.dumps(row)
+
+    def test_a_clean_founder_reply_keeps_its_snippet(self, ledger):
+        _pw("Quick recap: the Kroger reorder went out. I updated the sheet with the new case counts.",
+            ctx=FOUNDER_CTX, channel="dm")
+        assert "I updated the sheet" in _rows(ledger)[0]["snippet"]
+
+
+class TestCode14LocateTheFiredClaim:
+    """honesty-rails-10 / redos-slack-surfaces-6: the snippet centres on the claim the
+    screen FIRED on, found with the same echo rule -- not the first claim of the text."""
+
+    def test_the_snippet_holds_the_fired_claim_not_the_user_echo(self, ledger):
+        user = 'Cowork told me "all three locked in and ready for Monday" -- true?'
+        text = ('You quoted "all three locked in and ready for Monday" from the Cowork thread, which '
+                'I did not write myself, and nothing on my side confirms it yet today. Separately, I '
+                'updated the Kroger reorder sheet with the new case counts.')
+        se.screen_phantom_write_claims(text, tool_use_count=0, channel_name="dm", user_id=HARRISON,
+                                       user_text=user, rail_context=CTX_OPEN)
+        row = _rows(ledger)[0]
+        assert row["phrase"] == "updated" and row["form"] == "first_person"
+        assert "I updated the Kroger" in row["snippet"]
+
+    def test_locate_prefers_the_fired_verb_and_form(self):
+        clean = "Deleted. And later: I updated the sheet."
+        assert se._locate_write_claim(clean, (), ("updated", "first_person")) == (
+            clean.index("I updated"), clean.index("I updated") + len("I updated"))
+        assert se._locate_write_claim(clean, (), ("nope", "first_person"))[0] == 0   # falls back to the first
+
+
+class TestCode14ScrubOncePerCall:
+    """redos-slack-surfaces-2 / honesty-rails-12: one scrub per screen call, however
+    many rows it writes."""
+
+    def _ids_reply(self, n: int) -> str:
+        import random
+        rnd = random.Random(7)
+        return " ".join("cq-%012x" % rnd.getrandbits(48) for _ in range(n))
+
+    def test_one_scrub_for_many_fabricated_ids(self, ledger, monkeypatch):
+        monkeypatch.setattr(se, "_ID_LEDGERS", tuple(
+            (label, rx, (lambda: frozenset())) for label, rx, _r in se._ID_LEDGERS))
+        calls = []
+        real = se._scrub_for_snippet
+        monkeypatch.setattr(se, "_scrub_for_snippet", lambda t: calls.append(1) or real(t))
+        _pw(self._ids_reply(50), count=1)
+        assert len(_rows(ledger)) == 50 and len(calls) == 1
+
+    def test_one_scrub_and_one_full_belt_for_the_founder_dm(self, ledger, monkeypatch):
+        monkeypatch.setattr(se, "_ID_LEDGERS", tuple(
+            (label, rx, (lambda: frozenset())) for label, rx, _r in se._ID_LEDGERS))
+        calls = []
+        real = se._founder_belt_passes
+        monkeypatch.setattr(se, "_founder_belt_passes", lambda s: calls.append(len(s)) or real(s))
+        text = self._ids_reply(20)
+        _pw(text, ctx=FOUNDER_CTX, count=1, channel="dm")
+        full = [n for n in calls if n > 250]
+        assert len(full) == 1                                     # the full-text belt ran ONCE
+        assert len(_rows(ledger)) == 20
+
+    def test_500_unknown_ids_are_linear(self, ledger, monkeypatch):
+        monkeypatch.setattr(se, "_ID_LEDGERS", tuple(
+            (label, rx, (lambda: frozenset())) for label, rx, _r in se._ID_LEDGERS))
+        text = self._ids_reply(500)
+        path = ledger
+
+        def run():
+            path.unlink(missing_ok=True)
+            _pw(text, count=1)
+        assert _best_of_3(run) < 1.5                              # was ~1.5-2.5 s of pure re-scrubbing
+
+    def test_the_capability_screen_shares_one_scrub_too(self, ledger, monkeypatch):
+        from cora import capability_set as cs
+        monkeypatch.setattr(cs, "LADDER_REGISTRY_PATH", Path("no-registry.yaml"))
+        calls = []
+        real = se._scrub_for_snippet
+        monkeypatch.setattr(se, "_scrub_for_snippet", lambda t: calls.append(1) or real(t))
+        se.screen_capability_claims(
+            "I don't have direct read access to the card ledger. Try cora_self_inventory or cora_my_notes.",
+            tool_use_count=0, channel_name="dm", user_id=HARRISON, entity="FNDR",
+            cross_entity=True, founder=True, rail_context={**CTX_OPEN, "entity": "FNDR"})
+        assert len(_rows(ledger)) == 3 and len(calls) == 1
+
+
+class TestCode14EmptyMdLinkLinear:
+    """redos-slack-surfaces-3: `[label]()` cleanup admitted '[' in the label class --
+    O(n^2) on a '['-heavy reply (8.9 s at 40k), run on EVERY reply and per snippet."""
+
+    @pytest.mark.parametrize("shape", ["[" * 40000, "[a" * 20000, "[" + "a" * 40000, "[a](" + " " * 40000,
+                                       "[]( " * 10000, "[x]() " * 6600],
+                             ids=["brackets", "bracket_a", "open", "open_paren", "shells", "real_shells"])
+    def test_linear_at_40k(self, shape):
+        from cora import reply_formatter as rf
+        assert _best_of_3(lambda: rf.redact_links_and_ids(shape)) < 0.5
+        assert _best_of_3(lambda: se._scrub_for_snippet(shape)) < 0.5
+        assert _best_of_3(lambda: list(rf._EMPTY_MD_LINK_RE.finditer(shape))) < 0.2
+
+    def test_the_same_shells_still_clean(self):
+        from cora import reply_formatter as rf
+        assert rf.redact_links_and_ids("see [the doc]() now") == "see the doc now"
+        assert rf.redact_links_and_ids("[a [b]()") == "[a b"
+        assert rf.format_reply("Open [the tracker](https://docs.google.com/spreadsheets/d/"
+                               "1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789/edit).") == "Open the tracker."
+
+    def test_a_bracket_heavy_reply_screens_fast_with_the_ledger_armed(self, ledger):
+        assert _best_of_3(lambda: _pw("[" * 16000 + " I staged it.")) < 0.5
+
+
+class TestCode14CannotCheckLinesAreLedgered:
+    """integration-tests-8: the ABSENT / UNAVAILABLE lines are COUNTED phantom lines
+    (`phantom-write-claim kind=`), so each now carries a ledger row and its ref."""
+
+    def test_absent_gets_a_row_and_a_ref(self, ledger, caplog, monkeypatch):
+        monkeypatch.setattr(se, "_ID_LEDGERS", (("dw", se._ID_LEDGERS[1][1], lambda: None),))
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        _pw("Your job dw-0123456789ab is running.", count=1)
+        rows = _rows(ledger)
+        warns = _warns(caplog, se.PHANTOM_LOG_KEY)
+        assert len(rows) == 1 and len(warns) == 1
+        assert rows[0]["kind"] == "fabricated-id" and rows[0]["phrase"] == "ledger=dw ABSENT"
+        assert "dw-0123456789ab" in rows[0]["snippet"] and f"ref={rows[0]['ref']}" in warns[0]
+        assert warns[0].startswith("phantom-write-claim kind=fabricated-id ledger=dw ABSENT")
+
+    def test_unavailable_gets_a_row_and_a_ref(self, ledger, caplog, monkeypatch):
+        def _boom():
+            raise PermissionError("locked")
+        monkeypatch.setattr(se, "_ID_LEDGERS", (("cq", se._ID_LEDGERS[0][1], _boom),))
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        _pw("see cq-e7f2a4c91b2e", count=1)
+        rows = _rows(ledger)
+        warns = _warns(caplog, se.PHANTOM_LOG_KEY)
+        assert len(rows) == 1 and rows[0]["phrase"] == "ledger=cq UNAVAILABLE"
+        assert len(warns) == 1 and f"ref={rows[0]['ref']}" in warns[0]
+
+
+class TestCode14OwnerPrivateTurns:
+    """honesty-rails-11: a reply built on owner-private unstripped content withholds
+    its snippet like the Tier-2 grant turn of the same class."""
+
+    @pytest.fixture
+    def app(self):
+        import cora.app as app
+        return app
+
+    def test_unstripped_personal_withholds(self, app):
+        ctx = app._rail_context_for_reply(dict(CTX_OPEN), {"unstripped_personal": True}, {})
+        assert ctx["snippet_withheld"] == se.RAIL_SNIPPET_WITHHELD_PERSONAL
+
+    @pytest.mark.parametrize("tool", ["cora_my_notes", "cora_remember", "cora_forget_note", "gmail_inbox"])
+    def test_an_owner_private_tool_withholds(self, app, tool):
+        ctx = app._rail_context_for_reply(dict(CTX_OPEN), {}, {"tool_names": ["asana_get_my_tasks", tool]})
+        assert ctx["snippet_withheld"] == se.RAIL_SNIPPET_WITHHELD_PERSONAL
+
+    def test_an_ordinary_turn_keeps_its_scope(self, app):
+        base = dict(CTX_OPEN)
+        assert app._rail_context_for_reply(base, {}, {"tool_names": ["asana_get_my_tasks"]}) is base
+
+    def test_an_existing_lex_withhold_is_kept(self, app):
+        ctx = {**CTX_OPEN, "snippet_withheld": se.RAIL_SNIPPET_WITHHELD_LEX}
+        out = app._rail_context_for_reply(ctx, {"unstripped_personal": True}, {})
+        assert out["snippet_withheld"] == se.RAIL_SNIPPET_WITHHELD_LEX
+
+    def test_an_error_withholds(self, app):
+        out = app._rail_context_for_reply(dict(CTX_OPEN), {"unstripped_personal": True}, object())
+        assert out["snippet_withheld"] == se.RAIL_SNIPPET_WITHHELD_PERSONAL
+
+    def test_the_row_carries_the_marker_not_the_note(self, ledger):
+        import cora.app as app
+        ctx = app._rail_context_for_reply(dict(CTX_OPEN), {"unstripped_personal": True}, {})
+        _pw("Your note says the Tucson vendor is Apex, and I updated it this morning.", ctx=ctx, count=0)
+        rows = _rows(ledger)
+        assert rows and all(r["snippet"] == se.RAIL_SNIPPET_WITHHELD_PERSONAL for r in rows)
+        assert "Apex" not in json.dumps(rows)
+
+    def test_both_final_reply_sites_refresh_the_scope_before_screening(self, app):
+        import inspect
+        src = inspect.getsource(app._dispatch_qa)
+        assert src.count("rail_ctx = _rail_context_for_reply(rail_ctx, kb_meta, gen_meta)") == 2
+        for site in [i for i in range(len(src)) if src.startswith("rail_ctx = _rail_context_for_reply(", i)]:
+            nxt = src.index("slack_egress.screen_phantom_write_claims(", site)
+            assert src.index("slack_egress.screen_capability_claims(", site) > nxt
+            assert nxt - site < 300
+
+
 def test_snippet_path_is_linear_on_a_200kb_adversarial_reply(ledger):
     text = ("I updated " + "Routing Number: 021000021 " * 2000 + "https://x.com/" + "a" * 40000 + " ") * 2
     t0 = time.perf_counter()
