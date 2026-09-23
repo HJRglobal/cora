@@ -522,20 +522,24 @@ def _inside(spans: list[tuple[int, int]], start: int, end: int) -> bool:
 
 def _find_write_claim_span(text: str, user_texts: Any = (),
                            spans: list[tuple[int, int]] | None = None,
-                           want: tuple[str, str] | None = None) -> tuple[int, int, str, str] | None:
-    """(start, end, verb, form) of the FIRST completion claim in *text*, else None.
+                           want: tuple[str, str] | None = None,
+                           pos: int = 0) -> tuple[int, int, str, str] | None:
+    """(start, end, verb, form) of the FIRST completion claim in *text* at or after
+    ``pos``, else None.
 
     A hit whose span lies entirely inside a user-typed quoted span (``spans``, or
     computed from ``user_texts``) is skipped unless it is first-person. ``want`` =
     (verb, form): return the first unsuppressed hit of THAT form and verb (the S3
-    ledger locates the claim that actually fired), falling back to the first hit."""
+    ledger locates the claim that actually fired), falling back to the first hit.
+    ``pos`` searches with ``finditer(text, pos)``, so ``^`` / look-behind anchors keep
+    their whole-text meaning."""
     if spans is None:
         spans = _user_quote_spans(text, user_texts) if user_texts else []
     best: tuple[int, int, str, str] | None = None
     for label, rx in _WRITE_CLAIM_FORMS:
         if want is not None and label != want[1]:
             continue
-        for m in rx.finditer(text):
+        for m in rx.finditer(text, pos):
             if best is not None and m.start() >= best[0]:
                 break
             if spans and label not in _WC_FIRST_PERSON_FORMS and _inside(spans, m.start(), m.end()):
@@ -546,7 +550,7 @@ def _find_write_claim_span(text: str, user_texts: Any = (),
             best = (m.start(), m.end(), verb, label)
             break
     if want is None or want[1] == "receipt":
-        for m in _WC_RECEIPT_RE.finditer(text):
+        for m in _WC_RECEIPT_RE.finditer(text, pos):
             if best is not None and m.start() >= best[0]:
                 break
             if not _receipt_subject_ok(m):
@@ -558,8 +562,61 @@ def _find_write_claim_span(text: str, user_texts: Any = (),
             best = (m.start(), m.end(), m.group("v"), "receipt")
             break
     if best is None:
-        return _find_write_claim_span(text, spans=spans) if want is not None else None
+        return _find_write_claim_span(text, spans=spans, pos=pos) if want is not None else None
     return best[0], best[1], " ".join(best[2].split()).lower(), best[3]
+
+
+_WC_PREFER_MAX_HOPS = 16
+_WC_ECHO_TAIL_TOKENS = 3
+_WC_ECHO_TAIL_BREAK_RE = re.compile(r"[.!?;\n]")
+
+
+def _is_echo_hit(text: str, hit: tuple[int, int, str, str], spans: list[tuple[int, int]],
+                 joined_user: str) -> bool:
+    """A hit whose words the USER wrote: inside a user-typed quoted span (first-person
+    included -- it still COUNTS, it is just not the likeliest phantom), or an unquoted
+    run -- the hit plus up to three following tokens of its sentence, >= 2 tokens in
+    all -- that appears verbatim in the user's own text. The tail is what tells the
+    pasted "Task created: Pay the invoice" from a later "Task created: Reorder Kroger
+    cases" (a receipt match ends at its ':')."""
+    if spans and _inside(spans, hit[0], hit[1]):
+        return True
+    if not joined_user:
+        return False
+    tail = text[hit[1]:hit[1] + 80]
+    cut = _WC_ECHO_TAIL_BREAK_RE.search(tail)
+    if cut:
+        tail = tail[:cut.start()]
+    toks = list(_WC_TOKEN_RE.finditer(tail))[:_WC_ECHO_TAIL_TOKENS]
+    norm = _echo_norm(text[hit[0]:hit[1]] + (tail[:toks[-1].end()] if toks else ""))
+    return len(_WC_TOKEN_RE.findall(norm)) >= 2 and norm in joined_user
+
+
+def _preferred_write_claim_span(text: str, users: Any = (),
+                                spans: list[tuple[int, int]] | None = None
+                                ) -> tuple[int, int, str, str] | None:
+    """The claim the ONE ledger row / WARN of a reply records (Code #14 D-051 round 2,
+    honesty-rails-10 / redos-slack-surfaces-6): the FIRST hit whose words the user did
+    not write, falling back to the first hit. The FIRE decision is unchanged -- any hit
+    fires -- but a reply that opens by echoing the user ("Task created: Pay the
+    invoice -- that line is the portal notice you pasted", 'You said "I filed the Cox
+    invoice ..."') must not hide the real phantom later in it ("I updated the Kroger
+    reorder sheet", "all three queued"). Bounded: at most _WC_PREFER_MAX_HOPS extra
+    searches, each linear."""
+    if spans is None:
+        spans = _user_quote_spans(text, users) if users else []
+    first = _find_write_claim_span(text, spans=spans)
+    if first is None or not users:
+        return first
+    joined = _echo_norm(" ".join(str(u) for u in users if u)[:_WC_ECHO_MAX_CHARS])
+    hit: tuple[int, int, str, str] | None = first
+    for _ in range(_WC_PREFER_MAX_HOPS):
+        if hit is None or not _is_echo_hit(text, hit, spans, joined):
+            break
+        hit = _find_write_claim_span(text, spans=spans, pos=hit[0] + 1)
+    else:
+        return first
+    return hit if hit is not None else first
 
 
 def _find_write_claim(text: str, user_texts: Any = ()) -> tuple[str, str] | None:
@@ -774,11 +831,21 @@ def _locate_regex(rx: re.Pattern[str]) -> Callable[[str], tuple[int, int] | None
 
 def _locate_write_claim(clean: str, users: Any = (),
                         want: tuple[str, str] | None = None) -> tuple[int, int] | None:
-    """The span of the claim the screen FIRED on, found on the scrubbed reply with
-    the same echo rule and the fired (verb, form) (honesty-rails-10 /
+    """The span of the claim the screen RECORDED, found on the scrubbed reply with
+    the same echo rule and the same preference (honesty-rails-10 /
     redos-slack-surfaces-6: locating the FIRST claim of the unmasked text could
-    centre the snippet on a user-echo the screen had excluded)."""
-    hit = _find_write_claim_span(clean, users, want=want)
+    centre the snippet on a user-echo the screen had excluded; round 2: the recorded
+    claim is the first NON-echo hit, so an earlier echo with the same verb and form
+    must not win the snippet either). Falls back to the first hit of the wanted
+    (verb, form), then to the first hit."""
+    try:
+        spans = _user_quote_spans(clean, users) if users else []
+    except Exception:  # noqa: BLE001 -- the locator never raises
+        spans = []
+    pref = _preferred_write_claim_span(clean, users, spans)
+    if pref is not None and (want is None or (pref[2], pref[3]) == tuple(want)):
+        return pref[0], pref[1]
+    hit = _find_write_claim_span(clean, spans=spans, want=want)
     return (hit[0], hit[1]) if hit else None
 
 
@@ -1007,9 +1074,15 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
                 spans = []
         hit = _find_write_claim_span(masked, spans=spans)
         if hit:
-            verb, form = hit[2], hit[3]
+            # ONE line per reply (the count is per turn); it RECORDS the first hit whose
+            # words the user did not write (round 2, honesty-rails-10).
+            try:
+                rec = _preferred_write_claim_span(masked, users, spans) or hit
+            except Exception:  # noqa: BLE001 -- a preference failure records the first hit
+                rec = hit
+            verb, form = rec[2], rec[3]
             ref = _record_rail_hit(rail=PHANTOM_LOG_KEY, kind="lexicon", phrase=verb, text=text,
-                                   locate=_write_claim_locator(users if spans else (), verb, form),
+                                   locate=_write_claim_locator(users, verb, form),
                                    mode=mode, channel_name=channel_name, user_id=user_id,
                                    tool_use_count=count, rail_context=rail_context, form=form,
                                    memo=memo)

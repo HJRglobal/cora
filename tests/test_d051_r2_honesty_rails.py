@@ -316,3 +316,90 @@ class TestDeflectionFrontNamedR2:
     ], ids=["long_head", "many_deflections", "deflect_rep"])
     def test_the_head_search_is_linear_at_40k(self, shape):
         assert _best_of_3(lambda: _cap(shape)) < 0.5
+
+
+# ── honesty-rails-10 / redos-slack-surfaces-6: the row records the first NON-echo hit ─
+CTX_OPEN = {"channel_id": "C0TEST", "entity": "F3E", "snippet_withheld": None, "founder_belt": False}
+
+
+@pytest.fixture
+def ledger(tmp_path, monkeypatch):
+    path = tmp_path / "phantom-write-claims.jsonl"
+    monkeypatch.setattr(se, "PHANTOM_CLAIMS_LEDGER", path)
+    monkeypatch.setattr(se, "_RAIL_LEDGER_ARMED", True)
+    return path
+
+
+def _rows(path):
+    import json
+    return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()] \
+        if path.exists() else []
+
+
+def _pw(text, user, prior=()):
+    return se.screen_phantom_write_claims(text, tool_use_count=0, channel_name="dm", user_id=HARRISON,
+                                          user_text=user, prior_user_texts=list(prior),
+                                          rail_context=CTX_OPEN)
+
+
+# the two findings' OWN repros (the user text is unquoted in the hr-10 one)
+HR10_USER = "Quick check: the vendor portal says Task created: Pay the invoice -- is that ours?"
+HR10_REPLY = ("Task created: Pay the invoice -- that line is the vendor portal notification you pasted, "
+              "not mine, and nothing on my side confirms it yet today. Separately, I updated the Kroger "
+              "reorder sheet with the new case counts.")
+RS6_USER = "I filed the Cox invoice with the bookkeeper on Tuesday afternoon"
+RS6_REPLY = ('You said "I filed the Cox invoice with the bookkeeper on Tuesday afternoon", so that one is '
+             "yours and already handled on your side as far as I can tell. The rest: all three queued: the "
+             "Mesa reorder, the Kroger PO and the Tucson invoice.")
+
+
+class TestRowRecordsTheRealPhantomR2:
+    def test_hr10_the_unquoted_echo_does_not_hide_the_later_phantom(self, ledger, caplog):
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        assert _pw(HR10_REPLY, HR10_USER) == HR10_REPLY
+        rows = _rows(ledger)
+        assert len(rows) == 1                                           # still ONE row per reply
+        assert rows[0]["phrase"] == "updated" and rows[0]["form"] == "first_person"
+        assert "I updated the Kroger reorder sheet" in rows[0]["snippet"]
+        hits = _msgs(caplog, se.PHANTOM_LOG_KEY, "lexicon")
+        assert len(hits) == 1 and "phrase='updated'" in hits[0] and "form=first_person" in hits[0]
+
+    def test_rs6_a_quoted_first_person_echo_does_not_hide_the_later_phantom(self, ledger):
+        _pw(RS6_REPLY, RS6_USER)
+        row = _rows(ledger)[0]
+        assert row["phrase"] == "queued" and row["form"] == "quantifier"
+        assert "all three queued" in row["snippet"]
+
+    def test_the_same_verb_and_form_twice_centres_on_the_non_echo_one(self, ledger):
+        user = "title it Task created: Pay the invoice"
+        reply = ("Task created: Pay the invoice -- that is the portal line you pasted, and it came from the "
+                 "vendor, not from me at any point today.\nTask created: Reorder Kroger cases")
+        _pw(reply, user)
+        row = _rows(ledger)[0]
+        assert row["form"] == "receipt" and "Reorder Kroger cases" in row["snippet"]
+
+    def test_an_all_echo_reply_still_fires_and_records_the_first_hit(self, ledger, caplog):
+        """The FIRE decision is unchanged: unquoted echoes count by design."""
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        _pw("Task created: Pay the invoice", "Task created: Pay the invoice")
+        assert len(_msgs(caplog, se.PHANTOM_LOG_KEY, "lexicon")) == 1
+        assert _rows(ledger)[0]["snippet"].startswith("Task created: Pay the invoice")
+
+    def test_a_reply_with_no_user_text_records_its_first_hit(self, ledger):
+        _pw("Deleted. And later: I updated the sheet.", "")
+        assert _rows(ledger)[0]["phrase"] == "deleted"
+
+    def test_a_preference_failure_records_the_first_hit(self, ledger, monkeypatch):
+        monkeypatch.setattr(se, "_preferred_write_claim_span",
+                            lambda *a, **k: (_ for _ in ()).throw(ValueError()), raising=False)
+        _pw(HR10_REPLY, HR10_USER)
+        assert _rows(ledger)[0]["phrase"] == "created"
+
+    @pytest.mark.parametrize("shape", [
+        ("Task created: Pay the invoice\n" * 1300), ("I staged it. " * 3000),
+        'You said "I filed the Cox invoice with the bookkeeper" -- ' * 700,
+    ], ids=["echo_receipts", "first_person_run", "quoted_echo_run"])
+    def test_the_preference_is_bounded_at_40k(self, ledger, shape):
+        user = "Task created: Pay the invoice. I staged it. I filed the Cox invoice with the bookkeeper"
+        assert _best_of_3(lambda: se._preferred_write_claim_span(shape, [user])) < 0.5
+        assert _best_of_3(lambda: _pw(shape, user)) < 1.0
