@@ -732,6 +732,19 @@ def test_the_prompt_good_example_passes_and_its_rejected_example_trips_r2():
     assert "R2" in bad.tripped_rail_ids
 
 
+def test_the_prompt_states_the_pronoun_rule_and_the_rail_agrees():
+    """D-051 round 2 (F3-R1): the rail carries a line across a sentence boundary, so
+    the prompt must tell the model to NAME the line in a clean-word sentence. Its
+    own example agrees with the rail: the pronoun form trips after the good
+    example's Energy sentence, the named form passes."""
+    prompt = _prompt_text()
+    assert "never point to it with it, its, they or" in prompt
+    assert '"F3 Pure is clean-sweetened.", never "It is clean-sweetened."' in prompt
+    energy = drafting.RAIL2_GOOD_EXAMPLE.split(". ")[0] + "."
+    assert "R2" in _run(energy + " It is clean-sweetened.").tripped_rail_ids
+    assert _run(energy + " F3 Pure is clean-sweetened.").passed
+
+
 def test_each_cleared_phrase_passes_the_rail_in_an_energy_sentence_and_trips_with_mood():
     for phrase in drafting.RAIL2_CLEARED_PHRASES:
         ok = _run("F3 Energy runs on %s." % phrase)

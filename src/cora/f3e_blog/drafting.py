@@ -70,7 +70,10 @@ have, leave that point out entirely rather than estimating it.
   or F3 Mood, and never in a clause that names F3 Pure together with F3 Energy or
   F3 Mood: "{rail2_rejected}" is rejected. A quote is never an exemption.
   When a sentence would link two lines, split it: "{rail2_good}"
-  Two sentences, one line each, is the preferred style.
+  Two sentences, one line each, is the preferred style. In a sentence that uses
+  one of those words, name the line; never point to it with it, its, they or
+  this, which a reader (and the check) takes as the line the sentence before
+  named: write "F3 Pure is clean-sweetened.", never "It is clean-sweetened."
   Two exact phrases are cleared and nothing else, no variant: "natural caffeine
   from green tea" (F3 Energy) and "cleaner fuel" / "cleaner fuel source" (F3 Pure
   and F3 Energy). Never use either one in a sentence that names F3 Mood.

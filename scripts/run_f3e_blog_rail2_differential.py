@@ -67,6 +67,7 @@ def corpus_sentences(fetch, indexes=BLOG_INDEXES, *, max_articles: int = 200) ->
     sents: list[str] = []
     fetched = 0
     per_article: dict[str, int] = {}
+    prose_by_article: list[str] = []
     for u in urls:
         status, html = fetch(u)
         if status != 200 or not html:
@@ -76,8 +77,12 @@ def corpus_sentences(fetch, indexes=BLOG_INDEXES, *, max_articles: int = 200) ->
         ss = pf.sentences(prose)
         per_article[u] = len(ss)
         sents.extend(ss)
+        prose_by_article.append(prose)
+    # prose_by_article: D-051 round 2 (F3-R1) -- each article is ALSO walked in
+    # reading order with the cross-sentence carry, so the live FP read covers it.
     return sents, {"index_pages": list(indexes), "articles_linked": len(urls),
-                   "articles_fetched": fetched, "per_article": per_article}
+                   "articles_fetched": fetched, "per_article": per_article,
+                   "prose_by_article": prose_by_article}
 
 
 def main(argv: list[str] | None = None, *, fetch=None) -> int:
@@ -113,13 +118,20 @@ def main(argv: list[str] | None = None, *, fetch=None) -> int:
         lg = "TRIP" if not rh.legacy_preflight(s).passed else "pass"
         at = "TRIP" if not rh.new_preflight(s).passed else "pass"
         lines.append(f"{'release':<30} {lg:<5} {at:<5} {s}")
+    lines.append("")
+    lines.append("== article-level carry probes (D-051 round 2; release must pass, holes must trip) ==")
+    for kind, table in (("carry_release", rh.CARRY_RELEASE_PROBES), ("carry_hole", rh.CARRY_HOLE_PROBES)):
+        for label, kw in table:
+            lg = "TRIP" if not rh.legacy_run(**kw).passed else "pass"
+            at = "TRIP" if not pf.run_preflight(**kw).passed else "pass"
+            lines.append(f"{kind:<30} {lg:<5} {at:<5} {label}")
 
     if args.live:
         if fetch is None:
             from cora.connectors import shopify_client  # noqa: PLC0415
             fetch = shopify_client.fetch_public_page
         sents, meta = corpus_sentences(fetch, max_articles=args.max_articles)
-        diff = rh.differential(sents)
+        diff = rh.differential(sents, articles=meta["prose_by_article"])
         lines.append("")
         lines.append("== LIVE corpus (public f3energy.com/blogs/news + /blogs/learn) ==")
         lines.append(f"articles linked {meta['articles_linked']} | fetched {meta['articles_fetched']}")
@@ -128,6 +140,8 @@ def main(argv: list[str] | None = None, *, fetch=None) -> int:
             lines.append("  released (legacy-only trip): " + s[:220])
         for s in diff.attribution_trips:
             lines.append("  still trips under attribution: " + s[:220])
+        for s in diff.carry_only:
+            lines.append("  trips only through the cross-sentence carry: " + s[:220])
     report = "\n".join(lines) + "\n"
     print(report)
     if args.out:

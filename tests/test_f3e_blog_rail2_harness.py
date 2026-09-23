@@ -1423,3 +1423,360 @@ class TestRound2EnvironmentalPunctuation:
             return _best_of_3(lambda: pf.rail2_attribution_hit(text))
         base, dbl = run(1200), run(2400)
         assert dbl < base * 2.6 + 0.05, "superlinear: %.4fs -> %.4fs" % (base, dbl)
+
+
+def _article_kw(title="Post", summary="", body_html="<p>x</p>"):
+    return {"title": title, "summary": summary, "body_html": body_html}
+
+
+def _r2_sentence_trips(**kw):
+    return [t for t in pf.run_preflight(**kw).trips if t.rail_id == "R2"]
+
+
+class TestRound2CarryDecay:
+    """F3-R1 (MEDIUM): the round-1 carry never decayed and read every it/its/they,
+    so ingredient paragraphs, idioms and a Pure sentence's own "its" tripped "near
+    ENERGY" long after the only Energy mention -- invisible to the single-sentence
+    gate. THE RULE (Rail2Carry): the next sentence, or the one after a single
+    brand-less sentence in the naming sentence's block; a new block's first
+    sentence may point back, its second may not; a pronoun chain renews; the title
+    stays in view for each later field's first sentence."""
+
+    @pytest.mark.parametrize("label,kw", rh.CARRY_RELEASE_PROBES, ids=range(len(rh.CARRY_RELEASE_PROBES)))
+    def test_article_copy_the_carry_re_tripped_now_passes(self, label, kw):
+        r = pf.run_preflight(**kw)
+        assert r.passed, (label, r.render())
+        assert rh.rail2_article_walk(pf.rail_fields(**kw)) == [], label   # not one sentence, not only the first
+        if not label.startswith("queued row"):
+            # the frozen baseline never tripped the carry shapes (the queued-row drafts
+            # also carry the ruled green-tea phrase, which legacy trips by design)
+            assert rh.legacy_run(**kw).passed, label
+
+    @pytest.mark.parametrize("label,kw", rh.CARRY_HOLE_PROBES, ids=range(len(rh.CARRY_HOLE_PROBES)))
+    def test_the_carry_still_catches_a_pronoun_in_reach(self, label, kw):
+        assert _r2_sentence_trips(**kw), label
+
+    @pytest.mark.parametrize("text", TestCrossSentenceReference.MUST_TRIP)
+    def test_every_round_one_must_trip_probe_still_trips(self, text):
+        assert "R2" in _pf(text).tripped_rail_ids, text
+
+    def test_both_article_sets_are_gated(self):
+        v = rh.evaluate()
+        assert v.ship is True and v.carry_release_tripping == [] and v.carry_holes_missed == []
+        assert ("article-level carry probes (D-051 round 2): release trips 0/%d, holes missed 0/%d"
+                % (len(rh.CARRY_RELEASE_PROBES), len(rh.CARRY_HOLE_PROBES))) in v.summary_lines()
+
+    def test_a_carry_regression_in_either_direction_closes_the_gate(self, monkeypatch):
+        bad_release = rh.CARRY_RELEASE_PROBES + (("x", _article_kw(body_html="<p>F3 Energy is clean.</p>")),)
+        monkeypatch.setattr(rh, "CARRY_RELEASE_PROBES", bad_release)
+        assert rh.evaluate().ship is False
+        monkeypatch.setattr(rh, "CARRY_RELEASE_PROBES", rh.CARRY_RELEASE_PROBES[:-1])
+        bad_hole = rh.CARRY_HOLE_PROBES + (("y", _article_kw(body_html="<p>A plain sentence.</p>")),)
+        monkeypatch.setattr(rh, "CARRY_HOLE_PROBES", bad_hole)
+        v = rh.evaluate()
+        assert v.ship is False and v.carry_holes_missed == ["y"]
+
+    def test_the_decay_rule_state_by_state(self):
+        mood = frozenset({"MOOD"})
+        c = pf.Rail2Carry().enter_field("body")
+        c = c.after("F3 Mood is our evening can.", c.visible(),
+                    pf.rail2_context_after("F3 Mood is our evening can.", frozenset()), True)
+        assert c.visible() == mood                                   # the next sentence
+        same = c.after("We love the flavor.", c.visible(), mood, False)
+        assert same.visible() == mood                                # one brand-less, same block
+        assert same.after("Pick one.", same.visible(), mood, False).visible() == frozenset()   # two: gone
+        opened = c.after("L-theanine is an amino acid.", c.visible(), mood, True)
+        assert opened.visible() == frozenset()                       # the intervening one opened a block
+        chain = same.after("It keeps you calm.", same.visible(), mood, False)
+        assert chain.visible() == mood and chain.age == 0            # a pronoun chain renews
+        assert pf.RAIL2_CARRY_REACH == 2
+
+    def test_the_title_anchor_covers_the_first_sentence_of_each_later_field(self):
+        body = "<p>A plain opener. It is all-natural.</p>"
+        assert pf.run_preflight(title="F3 Mood Tonight", summary="", body_html=body).passed
+        assert "R2" in pf.run_preflight(title="F3 Mood Tonight", summary="",
+                                         body_html="<p>It is all-natural.</p>").tripped_rail_ids
+        # the summary's first sentence too (a listing shows it under the title)
+        assert "R2" in pf.run_preflight(title="F3 Mood Tonight", summary="It is all-natural.",
+                                         body_html="<p>x</p>").tripped_rail_ids
+
+    def test_rail2_sentences_split_exactly_like_sentences(self):
+        evasions, cleared = _load_preflight_corpora()
+        texts = []
+        for kw in [e[2] for e in evasions] + [c[1] for c in cleared]:
+            k = {"title": kw.get("title", "Test Title"), "summary": kw.get("summary", ""),
+                 "body_html": kw.get("body", "<p>Body copy.</p>")}
+            texts += [t for _, t in pf.rail_fields(**k)]
+        for _, kw in rh.CARRY_RELEASE_PROBES + rh.CARRY_HOLE_PROBES:
+            texts += [t for _, t in pf.rail_fields(**kw)]
+        texts += ["Dr.\nRuiz says hi.", "etc.\nNext. And more.", "a etc.\n" * 50, "", "\n\n", "One.\n\nTwo. Three.",
+                  'He said "clean." Next one.', "Mg.\nx", "  spaced  .  out  "]
+        for t in texts:
+            assert [s for s, _ in pf.rail2_sentences(t)] == pf.sentences(t), t[:80]
+        assert pf.rail2_sentences("A. B.\nC. D.") == [("A.", True), ("B.", False), ("C.", True), ("D.", False)]
+
+    def test_the_article_walk_is_run_preflights_loop(self):
+        """rail2_article_walk(first_per_field=True) must equal run_preflight's R2 trips
+        on every article corpus -- the harness can never measure a different loop."""
+        evasions, cleared = _load_preflight_corpora()
+        articles = [kw for _, kw in rh.CARRY_RELEASE_PROBES + rh.CARRY_HOLE_PROBES]
+        for kw in [e[2] for e in evasions] + [c[1] for c in cleared]:
+            articles.append({"title": kw.get("title", "Test Title"), "summary": kw.get("summary", ""),
+                             "body_html": kw.get("body", "<p>Body copy.</p>")})
+        for s in TestCrossSentenceReference.MUST_TRIP + TestCrossSentenceReference.STILL_PASS:
+            articles.append(_article_kw(body_html="<p>%s</p>" % s))
+        for kw in articles:
+            walk = rh.rail2_article_walk(pf.rail_fields(**kw), first_per_field=True)
+            got = [(name, "%r near %s: %s" % (hit[0], hit[1], sent)) for name, sent, hit, _ in walk]
+            want = [(t.field_name, t.excerpt) for t in _r2_sentence_trips(**kw)]
+            assert [(n, pf._excerpt(e)) for n, e in got] == want, kw
+
+    def test_the_differential_now_measures_the_carry(self):
+        prose = [pf.html_to_text("<p>F3 Mood is our evening can.</p><p>It is all-natural.</p>"),
+                 pf.html_to_text(rh.CARRY_RELEASE_PROBES[0][1]["body_html"])]
+        sents = [s for p in prose for s in pf.sentences(p)]
+        d = rh.differential(sents, articles=prose)
+        assert d.articles == 2 and d.carry_only == ["It is all-natural."]
+        assert "tripped only through the cross-sentence carry (2 article(s) walked in reading order): 1" \
+            in d.summary_lines()
+        plain = rh.differential(sents)           # sentence-by-sentence callers are unchanged
+        assert plain.articles == 0 and plain.carry_only == [] and len(plain.summary_lines()) == 4
+
+    def test_the_live_script_walks_each_article_with_the_carry(self, capsys):
+        mod = TestScript()._load()
+        pages = {
+            "https://f3energy.com/blogs/news": (200, '<a href="/blogs/news/a-post">a</a>'),
+            "https://f3energy.com/blogs/learn": (404, ""),
+            "https://f3energy.com/blogs/news/a-post": (200, "<p>F3 Mood is our evening can.</p><p>It is all-natural.</p>"),
+        }
+        rc = mod.main(["--live"], fetch=lambda u: pages.get(u, (404, "")))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "tripped only through the cross-sentence carry (1 article(s) walked in reading order): 1" in out
+        assert "trips only through the cross-sentence carry: It is all-natural." in out
+
+    def test_d171_the_carry_walk_is_linear(self):
+        def run(n, unit):
+            body = "<p>" + unit * n + "</p>"
+            return _best_of_3(lambda: pf.run_preflight(title="F3 Mood", summary="", body_html=body))
+        for unit in ("F3 Mood is calm. It keeps you calm. It is great. ",   # a renewing pronoun chain
+                     "A plain sentence. Another one. ",
+                     "Keep it simple. It's worth noting this. They say so. "):
+            base, dbl = run(300, unit), run(600, unit)
+            assert dbl < base * 2.6 + 0.05, "%r superlinear: %.4fs -> %.4fs" % (unit, base, dbl)
+
+    @pytest.mark.parametrize("text", ["x. " * 13000, "x.\n" * 13000, " " * 40000, "\n" * 40000,
+                                      "Dr. " * 10000, "a etc.\n" * 5700, "e.g. " * 8000], ids=range(7))
+    def test_d171_rail2_sentences_is_fast_at_40k(self, text):
+        """D-171 found by this remediation: the pre-existing sentences() re-searched
+        and re-joined the GROWING merged sentence on every abbreviation merge --
+        9 s per call on "Dr. " * 10000, 53 s through run_preflight."""
+        for fn in (pf.rail2_sentences, pf.sentences):
+            dt = _best_of_3(lambda: fn(text))
+            assert dt < 0.2, "%s %r...: %.3fs" % (fn.__name__, text[:10], dt)
+
+    def test_d171_an_abbreviation_run_through_run_preflight(self):
+        body = "<p>" + "Dr. " * 10000 + "</p>"
+        assert _best_of_3(lambda: pf.run_preflight(title="t", summary="", body_html=body)) < 1.0
+
+    @pytest.mark.parametrize("unit", ["Dr. ", "a etc.\n", "x. "])
+    def test_d171_sentences_scales_linearly(self, unit):
+        base, dbl = (_best_of_3(lambda: pf.sentences(unit * n)) for n in (5000, 10000))
+        assert dbl < base * 2.6 + 0.02, "superlinear: %.4fs -> %.4fs" % (base, dbl)
+
+    @staticmethod
+    def _frozen_sentences(text):
+        """The pre-round-2 sentences() verbatim (quadratic on abbreviation runs):
+        the linear rewrite must return exactly this."""
+        raw = [s.strip() for s in pf._SENT_SPLIT_RE.split(text or "") if s.strip()]
+        out = []
+        for part in raw:
+            if out and pf._ABBREV_TAIL_RE.search(out[-1]):
+                out[-1] = out[-1] + " " + part
+            else:
+                out.append(part)
+        return out
+
+    def test_the_linear_splitter_is_the_old_splitter(self):
+        import random
+        rng = random.Random(20260923)
+        alpha = ["Dr.", "dr.", "etc.", "e.g.", "i.e.", "x.", "Hello", "world.", "\n", "  ", ".", "!", "?",
+                 '"', "mg.", "U.S.", "no.", "a", "St.", "vs.", "Mr. ", "(", ")", " ", "Approx.", "oz."]
+        for _ in range(4000):
+            s = "".join(rng.choice(alpha) + rng.choice([" ", "", "\n", " \n"])
+                        for _ in range(rng.randint(0, 25)))
+            assert pf.sentences(s) == self._frozen_sentences(s), repr(s)
+        evasions, cleared = _load_preflight_corpora()
+        for kw in [e[2] for e in evasions] + [c[1] for c in cleared]:
+            k = {"title": kw.get("title", "Test Title"), "summary": kw.get("summary", ""),
+                 "body_html": kw.get("body", "<p>Body copy.</p>")}
+            for _, t in pf.rail_fields(**k):
+                assert pf.sentences(t) == self._frozen_sentences(t), t[:80]
+
+
+class TestRound2PronounResolution:
+    """F3-R1 (idioms, same-sentence resolution) + r143-claims-5 PARTIAL (the Mood guard
+    on the ruled phrases): what counts as a back-reference, one occurrence at a time."""
+
+    def _refs(self, clause, **kw):
+        return pf._back_reference_tokens(pf._words(clause), **kw)
+
+    NONREFERENTIAL = (
+        "It's worth noting that natural caffeine is the same molecule",
+        "it is worth knowing",
+        "It's time to reset",
+        "It's no secret that caffeine works",
+        "It is important to hydrate",
+        "It is true that caffeine is caffeine",
+        "It turns out caffeine is caffeine",
+        "it seems that",
+        "It depends on your goals",
+        "It helps to hydrate",
+        "It makes sense",
+        "It goes without saying",
+        "They say green tea is smoother",
+        "Rinse your shaker and clean it weekly",
+        "clean it after every session",
+        "It’s worth noting that",                         # a curly apostrophe splits it + s
+    )
+    REFERENTIAL = (
+        "It is all-natural",
+        "It's worth a try",
+        "It's worth trying",                              # worth + a non-information verb: the can is
+        "It is natural to want more",                     # a clean word is never an extraposition adjective
+        "It is easy to love",                             # tough-movement: the "it" IS the can
+        "It is important to us",
+        "It helps to know it",                            # the second "it"
+        "It's time-tested",
+        "It helps you unwind",
+        "It seems natural",
+        "They are all-natural",
+        "Keep it natural",
+        "Keep it simple",                                 # object idioms stay referential (fail closed)
+        "Take it easy",
+        "That's it",
+        "This is it",
+        "We break it down",
+        "We cleaned it up",
+        "We clean it out",
+        "We clean it with monk fruit",
+        "We cleaned it",
+        "We made it all-natural",
+        "Fans call it the cleanest can",
+        "Its formula is clean",
+        "This is the clean way",
+        "Both are clean",
+    )
+
+    @pytest.mark.parametrize("clause", NONREFERENTIAL)
+    def test_expletive_and_idiomatic_pronouns_refer_to_nothing(self, clause):
+        assert self._refs(clause) == [], clause
+
+    @pytest.mark.parametrize("clause", REFERENTIAL)
+    def test_their_referential_twins_still_refer_back(self, clause):
+        assert self._refs(clause), clause
+
+    def test_exclusion_is_per_occurrence(self):
+        assert self._refs("It's worth noting it is all-natural") == ["it"]
+        assert self._refs("They say it is clean") == ["it"]
+
+    def test_an_expletive_before_a_colon_is_void(self):
+        """Whatever follows a colon is the content of the pronoun, so nothing is
+        excluded in a clause that ends with one."""
+        assert self._refs("It's worth noting", colon_after=True) == ["it's"]
+        assert self._refs("They say", colon_after=True) == ["they"]
+        assert pf._rail2_backref_flags("It's worth noting: clean fuel, all day.") == [True, False, False]
+        assert pf._rail2_backref_flags("It's worth noting that clean fuel matters, and water too.") == [False, False]
+        assert pf._rail2_backref_flags("Keep it simple: clean fuel, all day.") == [True, False, False]
+
+    def test_an_energy_mood_clause_resolves_its_own_pronouns_unless_coordinated(self):
+        assert self._refs("F3 Energy keeps its edge", coordinated_only=True) == []
+        assert self._refs("F3 Pure and F3 Energy both carry it", coordinated_only=True) == []
+        assert self._refs("F3 Energy and it both run", coordinated_only=True) == ["it"]
+        assert self._refs("It and F3 Energy share", coordinated_only=True) == ["it"]
+
+    RESOLVED = (   # a Pure-SUBJECT sentence's own possessive
+        "F3 Pure uses organic cane sugar, monk fruit and stevia as its clean-sweetened base.",
+        "F3 Pure keeps the stack, with monk fruit and stevia in its clean-sweetened base.",
+        "In the cooler, F3 Pure is the pick, and its base is clean-sweetened.",
+        "F3 Pure keeps its clean-sweetened base.",
+    )
+    UNRESOLVED = (
+        "Unlike F3 Pure, its base is all-natural.",                  # Pure is not the subject
+        "F3 Pure is clean-sweetened, and its sibling is too.",       # a relation in the clause
+        "F3 Pure is clean-sweetened, and it is all-natural too.",
+        "Its base, like F3 Pure, is clean.",                         # the possessive precedes the antecedent
+        "F3 Pure is clean, and we made it that way.",                # not a possessive
+        "F3 Pure is clean, and that goes for it.",
+    )
+
+    @pytest.mark.parametrize("sentence", RESOLVED)
+    def test_a_pure_subject_sentence_resolves_its_own_possessive(self, sentence):
+        assert not any(pf._rail2_backref_flags(sentence)), sentence
+        for ctx in (frozenset({"ENERGY"}), frozenset({"MOOD"}), frozenset({"ENERGY", "MOOD"})):
+            assert pf.rail2_attribution_hit(sentence, context_lines=ctx) is None, (sentence, ctx)
+
+    @pytest.mark.parametrize("sentence", UNRESOLVED)
+    def test_anything_else_still_refers_back(self, sentence):
+        assert any(pf._rail2_backref_flags(sentence)), sentence
+
+    def test_unresolved_clean_copy_still_trips_through_the_carry(self):
+        for s in self.UNRESOLVED[:4]:
+            assert pf.rail2_attribution_hit(s, context_lines=frozenset({"MOOD"})) is not None, s
+
+    CLAIMS_5 = (
+        "F3 Mood is our evening can. It, like F3 Energy, runs on a cleaner fuel source.",
+        "F3 Mood is our evening can. It, like F3 Energy, runs on natural caffeine from green tea.",
+        "F3 Mood is our evening can. It runs, like F3 Energy, on natural caffeine from green tea.",
+        "F3 Mood is our evening can. F3 Energy runs on a cleaner fuel source, and so does it.",
+        "F3 Mood is our evening can. F3 Energy runs on a cleaner fuel source, and it does too.",
+        "F3 Mood is our evening can. F3 Energy and it both run on a cleaner fuel source.",
+        "F3 Mood is our evening can. It and F3 Energy share natural caffeine from green tea.",
+    )
+
+    @pytest.mark.parametrize("text", CLAIMS_5)
+    def test_a_pronoun_one_clause_away_cannot_launder_a_ruled_phrase_onto_mood(self, text):
+        assert "R2" in _pf(text).tripped_rail_ids, text
+        first, second = pf.sentences(text)
+        assert pf.rail2_attribution_hit(second) is None                       # plain: cleared for Energy
+        assert pf.rail2_attribution_hit(second, context_lines=frozenset({"MOOD"})) is not None
+        assert text in rh.CLAIMS_HOLE_PROBES["clean_natural_on_energy_mood"]
+
+    def test_the_cross_field_version_trips(self):
+        assert "R2" in pf.run_preflight(title="F3 Mood: Our Evening Can", summary="",
+                                        body_html="<p>It, like F3 Energy, runs on a cleaner fuel source.</p>"
+                                        ).tripped_rail_ids
+
+    def test_scope_widening_rule(self):
+        segs = pf._clause_split("F3 Energy carries natural caffeine from green tea, and its L-theanine keeps it smooth.")
+        assert not pf._phrase_scope_widens(segs, [False, True])       # after the phrase, no relation
+        segs = pf._clause_split("It runs, like F3 Energy, on natural caffeine from green tea.")
+        assert pf._phrase_scope_widens(segs, [True, False, False])    # (ii) precedes the phrase
+        segs = pf._clause_split("F3 Energy runs on a cleaner fuel source, and so does it.")
+        assert pf._phrase_scope_widens(segs, [False, True])           # (iii) relates to it
+        segs = pf._clause_split("It runs on a cleaner fuel source.")
+        assert pf._phrase_scope_widens(segs, [True])                  # (i) holds it
+        assert not pf._phrase_scope_widens(pf._clause_split("It is great."), [True])   # no phrase at all
+
+    def test_the_round_one_still_pass_rows_still_pass(self):
+        for text in TestCrossSentenceReference.STILL_PASS:
+            assert _pf(text).passed, text
+
+    @pytest.mark.parametrize("text", ["it's worth noting " * 2300, "keep it simple " * 2600,
+                                      "they say " * 4400, "it " * 13000, "that's it " * 4000,
+                                      "clean it " * 4400, "It, " * 10000 + "cleaner fuel source"],
+                             ids=range(7))
+    def test_d171_the_pronoun_scan_is_fast_at_40k(self, text):
+        dt = _best_of_3(lambda: pf._rail2_backref_flags(text))
+        assert dt < 0.5, "%r...: %.3fs" % (text[:12], dt)
+        dt = _best_of_3(lambda: pf.rail2_attribution_hit("F3 Energy " + text + " clean.",
+                                                         context_lines=frozenset({"MOOD"})))
+        assert dt < 1.0, "%r...: %.3fs" % (text[:12], dt)
+
+    @pytest.mark.parametrize("unit", ["it's worth noting ", "F3 Pure keeps its base, ", "It, like it, "])
+    def test_d171_the_pronoun_scan_scales_linearly(self, unit):
+        def run(n):
+            sent = unit * n + "cleaner fuel source."
+            return _best_of_3(lambda: pf.rail2_attribution_hit(sent, context_lines=frozenset({"MOOD"})))
+        base, dbl = run(1500), run(3000)
+        assert dbl < base * 2.6 + 0.05, "superlinear: %.4fs -> %.4fs" % (base, dbl)

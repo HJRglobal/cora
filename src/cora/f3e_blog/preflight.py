@@ -292,14 +292,51 @@ def sentences(text: str) -> list[str]:
     tokens into one window, adding trips); splitting one real sentence is the
     dangerous direction, because it can put the two halves of a violation into
     different windows. So this errs toward merging.
+
+    D-171 (found in D-051 round 2): the first cut re-ran _ABBREV_TAIL_RE over the
+    whole GROWING merged sentence and re-concatenated it on every merge, so a run
+    of abbreviations was quadratic -- "Dr. " * 10000 (40 KB) took 9 s per call and
+    53 s through run_preflight. rail2_sentences now does the merge in one linear
+    pass, testing only the last PART (equivalent: parts are whitespace-stripped, so
+    the join space before a part is the regex's "^"), and this is its projection.
     """
-    raw = [s.strip() for s in _SENT_SPLIT_RE.split(text or "") if s.strip()]
-    out: list[str] = []
-    for part in raw:
-        if out and _ABBREV_TAIL_RE.search(out[-1]):
-            out[-1] = out[-1] + " " + part
-        else:
-            out.append(part)
+    return [s for s, _ in rail2_sentences(text)]
+
+
+def rail2_sentences(text: str) -> list[tuple[str, bool]]:
+    """sentences(text), each paired with whether it OPENS a block (a paragraph,
+    heading or list item, per html_to_text's block marks; the first sentence of a
+    field opens one). sentences() is this list's projection, so rail 2 splits
+    exactly where every other rail does. Linear: one finditer pass with the same
+    splitter; a merged sentence is built from a parts list and joined once."""
+    src = text or ""
+    out: list[tuple[str, bool]] = []
+    cur: list[str] = []          # the parts of the sentence being built
+    cur_opens = False
+    opens = True
+    pos = 0
+
+    def feed(part: str, newline_after: bool) -> None:
+        nonlocal cur_opens, opens
+        s = part.strip()
+        if s:
+            if cur and _ABBREV_TAIL_RE.search(cur[-1]):
+                cur.append(s)            # rejoin after an abbreviation ("Dr." / "e.g.")
+            else:
+                if cur:
+                    out.append((" ".join(cur), cur_opens))
+                cur[:] = [s]
+                cur_opens = opens
+            opens = False
+        if newline_after:
+            opens = True
+
+    for m in _SENT_SPLIT_RE.finditer(src):
+        feed(src[pos:m.start()], "\n" in m.group(0))
+        pos = m.end()
+    feed(src[pos:], False)
+    if cur:
+        out.append((" ".join(cur), cur_opens))
     return out
 
 
@@ -1137,36 +1174,267 @@ _BACKREF_PRONOUNS = frozenset({
 _BACKREF_DEMONSTRATIVES = frozenset({"this", "that", "that's", "these", "those"})
 
 
-def _has_back_reference(words: list[str]) -> bool:
+#: D-051 round 2 (F3-R1): pronouns that point at NOTHING, and so can never carry a
+#: line across a sentence. Matched on exact token sequences, never on a single
+#: word, and each exclusion removes only that one occurrence: "It's worth noting
+#: it is all-natural." still refers back through its second "it". DELIBERATELY
+#: NARROW -- the first cut of this list also excluded object idioms ("keep it
+#: simple", "break it down", "that's it") and every "it is <adjective> to", and
+#: adversarial probing found each one laundering: "Keep it simple and natural.",
+#: "That's it: all-natural.", "It is easy to love: all-natural." (tough-movement:
+#: the "it" IS the can), "It's worth trying: all-natural." Those stay referential
+#: (fail closed); an over-trip costs one bounded revision. What is excluded:
+#:   * expletive "it" ahead of a clause, never before a COLON (whatever follows a
+#:     colon is the content of "it"): "it's worth noting / mentioning / knowing
+#:     ...", "it's time to", "it's no secret / wonder / surprise", "it is
+#:     <important / true / clear / likely / ...> that / whether / how / why / what
+#:     / if / when", "it is <important / essential / crucial / vital / necessary>
+#:     to <a verb>" (not "to us" / "to you"), "it turns out", "it seems / appears
+#:     that", "it depends", "it helps / pays to", "it makes sense", "it goes
+#:     without saying";
+#:   * generic "they": "they say / said / call" (an "it" after it still counts);
+#:   * the object of a clean VERB in a household-care frame ("rinse your shaker
+#:     and clean it weekly"): followed by a closed list of frequency / manner words
+#:     (weekly, daily, regularly, thoroughly, after, before, every ...). "We cleaned
+#:     it up.", "We cleaned it: no junk." and "We clean it with monk fruit." still
+#:     refer back -- a reformulation claim.
+_WORTH_INFO_VERBS = frozenset({
+    "noting", "mentioning", "remembering", "knowing", "asking", "considering", "repeating",
+    "saying", "stressing", "emphasizing", "emphasising", "highlighting", "pointing",
+    "understanding", "recalling",
+})
+_EXTRAPOSITION_THAT_ADJ = frozenset({
+    "important", "essential", "crucial", "vital", "true", "clear", "obvious", "possible",
+    "impossible", "likely", "unlikely", "surprising", "common", "normal", "notable",
+    "worth", "evident", "certain", "unclear",
+})
+_EXTRAPOSITION_THAT_COMP = frozenset({"that", "whether", "if", "when", "how", "why", "what"})
+_EXTRAPOSITION_TO_ADJ = frozenset({"important", "essential", "crucial", "vital", "necessary"})
+#: after "it is important to": a pronoun / determiner means "important TO someone"
+#: (referential: the can is important to us), not an infinitive.
+_NOT_AN_INFINITIVE = frozenset({
+    "us", "me", "you", "them", "him", "her", "our", "your", "their", "my", "his", "its", "the",
+    "a", "an", "everyone", "anyone", "everybody", "anybody", "people", "fans", "athletes",
+})
+_COPULA_AFTER_IT = frozenset({"is", "was", "s"})   # "it is", "it was", curly "it’s" -> it + s
+_CLEAN_VERB_FORMS = frozenset({"clean", "cleans", "cleaned", "cleaning", "cleanse", "cleanses",
+                               "cleansed", "cleansing"})
+_HOUSEHOLD_CARE_AFTER = frozenset({
+    "weekly", "daily", "nightly", "regularly", "often", "thoroughly", "properly", "well", "after",
+    "before", "every", "each", "once", "twice", "between",
+})
+_BACKREF_COORDINATORS = frozenset({"and", "or", "nor", "plus", "&"})
+
+
+def _nonreferential_positions(t: list[str], *, colon_after: bool) -> set[int]:
+    """Indices of pronoun tokens in `t` (lower-cased clause tokens) that refer to
+    nothing, per the list above. Linear: a constant look-around per token."""
+    n = len(t)
+    out: set[int] = set()
+    if colon_after:
+        return out   # a colon makes what follows the content of the pronoun
+
+    def at(k: int) -> str:
+        return t[k] if 0 <= k < n else ""
+
+    for i, w in enumerate(t):
+        if w in ("it", "it's"):
+            k = i + 1
+            if w == "it" and at(k) in _COPULA_AFTER_IT:
+                k += 1
+            copula = w == "it's" or k == i + 2
+            nxt, nxt2, nxt3 = at(k), at(k + 1), at(k + 2)
+            if copula and ((nxt == "worth" and nxt2 in _WORTH_INFO_VERBS)
+                           or (nxt == "time" and nxt2 == "to")
+                           or (nxt == "no" and nxt2 in ("secret", "wonder", "surprise"))
+                           or (nxt in _EXTRAPOSITION_THAT_ADJ and nxt2 in _EXTRAPOSITION_THAT_COMP)
+                           or (nxt in _EXTRAPOSITION_TO_ADJ and nxt2 == "to" and nxt3
+                               and nxt3 not in _NOT_AN_INFINITIVE)):
+                out.add(i)
+                continue
+            if w == "it" and ((at(i + 1) in ("turns", "turned") and at(i + 2) == "out")
+                              or (at(i + 1) in ("seems", "seemed", "appears", "appeared")
+                                  and at(i + 2) == "that")
+                              or at(i + 1) in ("depends", "depended")
+                              or (at(i + 1) in ("helps", "pays") and at(i + 2) == "to"
+                                  and at(i + 3) not in _NOT_AN_INFINITIVE)
+                              or (at(i + 1) in ("makes", "made") and at(i + 2) == "sense")
+                              or (at(i + 1) == "goes" and at(i + 2) == "without" and at(i + 3) == "saying")):
+                out.add(i)
+                continue
+        if w == "they" and at(i + 1) in ("say", "said", "says", "call"):
+            out.add(i)
+            continue
+        if w == "it" and at(i - 1) in _CLEAN_VERB_FORMS and at(i + 1) in _HOUSEHOLD_CARE_AFTER:
+            out.add(i)
+    return out
+
+
+def _back_reference_tokens(words: list[str], *, coordinated_only: bool = False,
+                           colon_after: bool = False) -> list[str]:
+    """The back-referring tokens of one clause (see _BACKREF_PRONOUNS and the
+    non-referential list above). With `coordinated_only` -- a clause that names an
+    Energy/Mood line itself -- a pronoun counts only when it is COORDINATED with a
+    brand ("F3 Energy and it both run on ...", "It and F3 Energy share ..."): any
+    other pronoun there resolves to the clause's own line (D-051 round 2,
+    r143-claims-5: the blanket exemption let "F3 Energy and it" launder the ruled
+    phrase onto Mood)."""
     t = _lower_tokens(words)
-    if set(t) & _BACKREF_PRONOUNS:
-        return True
+    skip = _nonreferential_positions(t, colon_after=colon_after)
+    found: list[str] = []
+    for i, w in enumerate(t):
+        if i in skip or w not in _BACKREF_PRONOUNS:
+            continue
+        if coordinated_only and not ((i > 0 and t[i - 1] in _BACKREF_COORDINATORS)
+                                     or (i + 1 < len(t) and t[i + 1] in _BACKREF_COORDINATORS)):
+            continue
+        found.append(w)
+    if coordinated_only:
+        return found
     i = 0
     while i < len(t) and t[i] in _LEAD_FILLERS:
         i += 1
-    return i < len(t) and t[i] in _BACKREF_DEMONSTRATIVES
+    if i < len(t) and t[i] in _BACKREF_DEMONSTRATIVES and i not in skip:
+        found.append(t[i])
+    return found
+
+
+def _has_back_reference(words: list[str]) -> bool:
+    return bool(_back_reference_tokens(words))
+
+
+#: Possessives a Pure-SUBJECT sentence resolves to Pure itself ("F3 Pure uses
+#: organic cane sugar, monk fruit and stevia as ITS clean-sweetened base").
+#: Singular only: a plural "their" is not a single line's.
+_SELF_POSSESSIVES = frozenset({"its", "itself"})
 
 
 def _rail2_backref_flags(sentence: str) -> list[bool]:
-    """Per _clause_split segment: True when the segment names NO Energy/Mood line of
-    its own and carries a back-reference, i.e. its subject may be a line named in
-    an earlier sentence. A segment that names Energy/Mood itself resolves its own
-    pronouns ("F3 Pure and F3 Energy both ...")."""
-    return [bool(w) and _has_back_reference(w) and not (brand_lines_in(seg) & _RAIL2_EM)
-            for seg, _ in _clause_split(sentence or "") for w in (_words(seg),)]
+    """Per _clause_split segment: True when the segment carries a back-reference,
+    i.e. may point at a line named in an EARLIER sentence. A segment that names an
+    Energy/Mood line itself resolves its own pronouns ("F3 Pure and F3 Energy both
+    ..."), unless a pronoun is coordinated with the brand ("F3 Energy and it").
+
+    SAME-SENTENCE RESOLUTION (D-051 round 2, F3-R1): when the first clause that
+    names a line has F3 Pure as its SUBJECT (P1), a possessive in that clause or a
+    later one resolves to Pure -- unless that clause relates two lines, or holds
+    any other back-reference. The canonical lineup sentence "F3 Pure uses organic
+    cane sugar, monk fruit and stevia as its clean-sweetened base." tripped "near
+    ENERGY" after any Energy sentence, title or field, because the sweetener-list
+    comma put its "its" in a brand-less segment -- including Harrison's ruled
+    two-sentence remedy for the 9/1 UNDECIDED shape."""
+    segs = _clause_split(sentence or "")
+    words = [_words(seg) for seg, _ in segs]
+    toks: list[list[str]] = []
+    for (seg, delim), w in zip(segs, words):
+        em = bool(w) and bool(brand_lines_in(seg) & _RAIL2_EM)
+        toks.append(_back_reference_tokens(w, coordinated_only=em, colon_after=delim == ":")
+                    if w else [])
+    flags = [bool(tk) for tk in toks]
+    k = next((i for i, (seg, _) in enumerate(segs) if brand_lines_in(seg)), -1)
+    if k >= 0 and not any(flags[:k]) and brand_lines_in(segs[k][0]) == {"PURE"} \
+            and _pure_is_subject(words[k]):
+        for j in range(k, len(segs)):
+            if (flags[j] and set(toks[j]) <= _SELF_POSSESSIVES and not _has_relation(words[j])
+                    and not (brand_lines_in(segs[j][0]) & _RAIL2_EM)):
+                flags[j] = False
+    return flags
+
+
+def _phrase_scope_widens(segs: list[tuple[str, str]], pron) -> bool:
+    """True when a back-referring clause can take a ruled phrase, so the carried
+    lines must join the exemption scope (a phrase is never cleared for Mood through
+    a pronoun). D-051 round 2 (r143-claims-5 PARTIAL): round 1 widened the scope
+    only when the phrase sat INSIDE the pronoun's own clause, so moving the pronoun
+    one clause away redacted the phrase again ("F3 Mood is our evening can. It, like
+    F3 Energy, runs on a cleaner fuel source."; "..., and so does it."). Now it
+    widens when a back-referring clause
+      (i)   holds the phrase;
+      (ii)  comes BEFORE the first clause that holds it (a sentence-initial "It"
+            is the subject the phrase is predicated of);
+      (iii) relates to it -- a relation / ellipsis token ("so does it", "it does
+            too", "like it").
+    A pronoun AFTER the phrase with no relation ("F3 Energy carries 120 mg of
+    natural caffeine from green tea, and its L-theanine keeps it smooth.") does
+    not: that pronoun is the sentence's own subject."""
+    flagged = [i for i, p in enumerate(pron) if p]
+    if not flagged:
+        return False
+    holds = {i for i, (seg, _) in enumerate(segs)
+             if any(pat.search(seg) for pat, _ in _RAIL2_PHRASE_EXEMPTIONS)}
+    if not holds:
+        return False
+    first = min(holds)
+    return any(i in holds or i < first or _has_relation(_words(segs[i][0])) for i in flagged)
 
 
 def rail2_context_after(sentence: str, context: frozenset[str]) -> frozenset[str]:
     """The lines a LATER sentence's pronoun may refer to, once this sentence is read.
     It holds the sentence's own lines, plus the carried context when this sentence
-    itself refers back. It never empties: a brand-less sentence keeps the carried
-    lines, which fails closed."""
+    itself refers back. A brand-less sentence keeps the carried lines here; how
+    long they stay in VIEW is Rail2Carry's decay rule (D-051 round 2, F3-R1)."""
     own = brand_lines_in(sentence or "")
     if not own:
         return context
     if any(_rail2_backref_flags(sentence)):
         own = own | context
     return frozenset(own)
+
+
+#: D-051 round 2 (F3-R1): how far a pronoun reaches back. Round 1 carried the lines
+#: of the last line-naming sentence forever -- across any number of brand-less
+#: sentences, paragraphs and fields -- so "It is a natural component of green tea."
+#: in an L-theanine paragraph tripped "near ENERGY" because a paragraph earlier
+#: said "F3 Energy pairs caffeine with L-theanine." THE RULE (pinned by tests):
+#:   * a pronoun sentence sees the lines named by the sentence before it, or by the
+#:     one before that when the sentence between them is brand-less and stays in
+#:     the naming sentence's block (paragraph / heading / list item);
+#:   * a block boundary that falls BEFORE an intervening sentence ends the reach: a
+#:     new paragraph's first sentence may still point back ("F3 Mood is our evening
+#:     can.</p><p>It is all-natural."), its second may not ("...</p><p>L-theanine is
+#:     an amino acid. It is a natural component of green tea.");
+#:   * a brand-less sentence that itself points back while the lines are in view
+#:     RENEWS them -- a pronoun chain keeps its referent ("It keeps you calm. It
+#:     tastes like citrus. It is all-natural.");
+#:   * the article TITLE stays in view for the first sentence of every later field
+#:     (the summary in a listing, the body on the page), whatever sits between.
+RAIL2_CARRY_REACH = 2
+
+
+@dataclass(frozen=True)
+class Rail2Carry:
+    """The cross-sentence state run_preflight threads through rail 2 (immutable)."""
+
+    lines: frozenset[str] = frozenset()   # lines the last naming sentence left in view
+    age: int = 0                          # sentences read since then
+    crossed: bool = False                 # an intervening sentence opened a new block
+    title: frozenset[str] = frozenset()   # the title field's lines (anchor)
+    field_start: bool = False             # the next sentence opens a non-title field
+
+    def visible(self) -> frozenset[str]:
+        """The lines a back-reference in the NEXT sentence may point at."""
+        seen = self.lines if (self.lines and not self.crossed
+                              and self.age + 1 <= RAIL2_CARRY_REACH) else frozenset()
+        if self.field_start:
+            seen = seen | self.title
+        return frozenset(seen)
+
+    def enter_field(self, name: str) -> "Rail2Carry":
+        return Rail2Carry(self.lines, self.age, self.crossed, self.title, name != "title")
+
+    def leave_field(self, name: str, text: str) -> "Rail2Carry":
+        title = frozenset(brand_lines_in(text or "")) if name == "title" else self.title
+        return Rail2Carry(self.lines, self.age, self.crossed, title, False)
+
+    def after(self, sentence: str, seen: frozenset[str], lines_after: frozenset[str],
+              opens_block: bool) -> "Rail2Carry":
+        """The state once `sentence` is read. `seen` is what visible() returned for
+        it; `lines_after` is rail2_context_after(sentence, seen)."""
+        if brand_lines_in(sentence or ""):
+            return Rail2Carry(frozenset(lines_after), 0, False, self.title, False)
+        if seen and any(_rail2_backref_flags(sentence)):
+            return Rail2Carry(seen, 0, False, self.title, False)   # a pronoun chain renews
+        return Rail2Carry(self.lines, self.age + 1, self.crossed or opens_block, self.title, False)
 
 
 def rail2_attribution_hit(sentence: str, *, context_lines: frozenset[str] = frozenset()
@@ -1211,13 +1479,17 @@ def rail2_attribution_hit(sentence: str, *, context_lines: frozenset[str] = froz
     brand-less host picked up only Pure (r143-claims-3).
 
     CROSS-SENTENCE REFERENCE (r143-claims-5). `context_lines` are the lines an
-    earlier sentence named (see rail2_context_after). They apply only when a
-    clause here that names no Energy/Mood line of its own carries a back-reference
-    ("F3 Mood is our evening can. It is all-natural.", "... Like F3 Energy, it runs
-    on a cleaner fuel source."). Then they:
+    earlier sentence left in view (run_preflight's decaying Rail2Carry, fed by
+    rail2_context_after). They apply only when a clause here carries a
+    back-reference (_rail2_backref_flags: never an expletive or idiomatic pronoun,
+    never a Pure-subject sentence's own possessive, and in a clause that names
+    Energy/Mood only a pronoun coordinated with the brand) -- "F3 Mood is our
+    evening can. It is all-natural.", "... Like F3 Energy, it runs on a cleaner
+    fuel source.". Then they:
       * count for the Energy/Mood gate;
-      * widen the exemption scope, but only when the ruled phrase sits in such a
-        clause (so the phrase is never cleared for Mood through a pronoun);
+      * widen the exemption scope when a back-referring clause holds a ruled
+        phrase, precedes it, or relates to it (_phrase_scope_widens), so the
+        phrase is never cleared for Mood through a pronoun;
       * make that clause's relation veto strict ("..., and it is too.").
     With no back-reference, or an empty context, the result is exactly the
     single-sentence result, so the context can only ADD trips.
@@ -1234,10 +1506,8 @@ def rail2_attribution_hit(sentence: str, *, context_lines: frozenset[str] = froz
     if not ((lines | ref) & _RAIL2_EM):
         return None
     scope = set(lines)
-    if ref & _RAIL2_EM:
-        pron_segs = [seg for (seg, _), p in zip(_clause_split(sent), pron or ()) if p]
-        if any(pat.search(seg) for seg in pron_segs for pat, _ in _RAIL2_PHRASE_EXEMPTIONS):
-            scope |= ref
+    if ref & _RAIL2_EM and _phrase_scope_widens(_clause_split(sent), pron or ()):
+        scope |= ref
     scan_sent = _redact_phrase_exemptions(sent, scope)
     scan_sent = _redact(scan_sent, _NATURAL_OCCURRENCE_RES + (_NATURAL_OCCURRENCE_HYPHEN_RE,))
     scan_sent = _redact(scan_sent, _CLEAN_ENVIRONMENT_RES)
@@ -1593,21 +1863,25 @@ def run_preflight(
     # ATTRIBUTION scope since R14-3 (ruling ESC-1 (A) / D-329, 2026-09-19; the
     # rail2_harness gate passes). The pre-R14-3 same-sentence scan survives only
     # as rail2_legacy_hit, the frozen baseline the harness measures against.
-    # D-051 r143-claims-5: the lines each sentence names are carried to the next, so
-    # a pronoun cannot launder a clean word onto Energy/Mood across a sentence
-    # boundary. The carried check only ever ADDS a trip to the plain one. The carry
-    # runs across fields in reading order (title, summary, body, then structured
-    # data / alt text) and across paragraphs: a body that opens "It is all-natural."
-    # under an "F3 Mood Tonight" title refers to the title's line (fail closed).
-    carried: frozenset[str] = frozenset()
+    # D-051 r143-claims-5: the lines a sentence names are carried forward, so a
+    # pronoun cannot launder a clean word onto Energy/Mood across a sentence
+    # boundary. The carried check only ever ADDS a trip to the plain one. D-051
+    # round 2 (F3-R1): the carry DECAYS (Rail2Carry: the next sentence, or the one
+    # after a single brand-less sentence in the same block; the title stays in view
+    # for each later field's first sentence), and expletive / generic pronouns never
+    # carry ("it's worth noting that", "they say").
+    carry = Rail2Carry()
     for name, text in fields:
-        for sent in sentences(text):
+        carry = carry.enter_field(name)
+        for sent, opens_block in rail2_sentences(text):
+            carried = carry.visible()
             hit = rail2_attribution_hit(sent) or (
                 rail2_attribution_hit(sent, context_lines=carried) if carried else None)
             if hit:
                 trips.append(_trip("R2", name, "%r near %s: %s" % (hit[0], hit[1], sent)))
                 break
-            carried = rail2_context_after(sent, carried)
+            carry = carry.after(sent, carried, rail2_context_after(sent, carried), opens_block)
+        carry = carry.leave_field(name, text)
 
     # --- rail 3: sleep-aid language in a doc about a product ---
     # Gated on a PRODUCT reference rather than on the literal token "Mood": an

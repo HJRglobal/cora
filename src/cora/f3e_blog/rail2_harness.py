@@ -29,6 +29,9 @@ WHAT THIS MODULE HOLDS (data + pure functions; no network, no LLM):
   * RELEASE_PROBES     -- D-051 round 2: copy the round-1 remediation re-tripped
                           (F3-R2 quantities / focus particles, F3-R3 CSR tails); gated
                           must-PASS, kept apart from the measured FP set;
+  * CARRY_RELEASE_PROBES / CARRY_HOLE_PROBES -- D-051 round 2 (F3-R1): ARTICLE-level
+                          must-PASS / must-TRIP probes for the cross-sentence carry
+                          (title / summary / body fields, paragraphs), gated;
   * UNDECIDED          -- the 9/1 Pure-attached tail (trips under fail-closed union
                           inheritance, D-051 EF-7): reported, never gated;
   * legacy_preflight() -- the FROZEN pre-R14-3 composition: run_preflight's non-R2
@@ -37,7 +40,9 @@ WHAT THIS MODULE HOLDS (data + pure functions; no network, no LLM):
                           function, never a composition of it;
   * evaluate() / gate() -- the ship decision, and WHY;
   * differential()     -- legacy vs shipping rail 2 over any sentence corpus (the
-                          live News/Learn read the differential script performs).
+                          live News/Learn read the differential script performs);
+                          with `articles=` it also walks each article WITH the carry
+                          (rail2_article_walk, run_preflight's own loop).
 """
 from __future__ import annotations
 
@@ -123,6 +128,17 @@ CLAIMS_HOLE_PROBES: dict[str, tuple[str, ...]] = {
         "F3 Energy is our training can. We love it because it is all-natural.",
         "F3 Energy is great. It is F3 Pure's clean sibling.",
         "F3 Mood is calm. F3 Pure is clean-sweetened, and it is too.",
+        # D-051 round 2 (r143-claims-5 PARTIAL): the Mood guard on the ruled phrases
+        # widened only when the phrase sat in the PRONOUN'S OWN clause, and a
+        # pronoun coordinated with a brand ("F3 Energy and it") was never a
+        # back-reference at all (legacy TRIP / round-1 PASS)
+        "F3 Mood is our evening can. It, like F3 Energy, runs on a cleaner fuel source.",
+        "F3 Mood is our evening can. It, like F3 Energy, runs on natural caffeine from green tea.",
+        "F3 Mood is our evening can. It runs, like F3 Energy, on natural caffeine from green tea.",
+        "F3 Mood is our evening can. F3 Energy runs on a cleaner fuel source, and so does it.",
+        "F3 Mood is our evening can. F3 Energy runs on a cleaner fuel source, and it does too.",
+        "F3 Mood is our evening can. F3 Energy and it both run on a cleaner fuel source.",
+        "F3 Mood is our evening can. It and F3 Energy share natural caffeine from green tea.",
         # D-051 r143-claims-3: the bare-brand fold REPLACED the host clause's
         # inheritance instead of joining it
         "F3 Energy: all-natural, F3 Pure too.",
@@ -295,6 +311,134 @@ RELEASE_PROBES: tuple[str, ...] = (
     "F3 Energy helps build a cleaner planet, one can at a time.",
 )
 
+
+def _article(body: str, title: str = "Post", summary: str = "") -> dict[str, str]:
+    return {"title": title, "summary": summary, "body_html": body}
+
+
+#: D-051 round 2 (F3-R1): ARTICLE-level copy the round-1 cross-sentence carry
+#: re-tripped -- invisible to every single-sentence set above, which is why the
+#: "FP 0/6" gate never saw it. Each passed legacy AND the pre-remediation rail.
+#: (label, run_preflight fields). Gated must-PASS.
+CARRY_RELEASE_PROBES: tuple[tuple[str, dict[str, str]], ...] = (
+    ("an ingredient paragraph after an Energy paragraph",
+     _article("<p>F3 Energy pairs caffeine with L-theanine.</p><p>L-theanine is an amino acid found in "
+              "tea leaves. It is a natural component of green tea.</p>", "What Is L-Theanine?")),
+    ("a sweetener paragraph after a Mood paragraph",
+     _article("<p>F3 Mood is our caffeine-free evening can.</p><p>Monk fruit is a small melon grown in "
+              "southern China. Its sweetness is entirely natural.</p>", "Monk Fruit, Explained")),
+    ("green tea's caffeine, a paragraph on",
+     _article("<p>F3 Energy gets its caffeine from green tea.</p><p>Tea has been brewed for thousands of "
+              "years. Its caffeine is natural and arrives with L-theanine.</p>", "Why Green Tea Caffeine")),
+    ("coffee beans: they",
+     _article("<p>We built F3 Energy for training days.</p><p>Coffee beans are roasted seeds. They are a "
+              "natural source of caffeine.</p>", "Coffee vs Energy Drinks")),
+    ("an Energy title, then a sleep paragraph's second sentence",
+     _article("<p>Sleep matters more than any can. It is the most natural recovery tool you have.</p>",
+              "How F3 Energy Fits Your Morning")),
+    ("a Mood title, then a stretching paragraph's second sentence",
+     _article("<p>Start with ten minutes of stretching. It is a natural way to wind down.</p>",
+              "An Evening Routine With F3 Mood")),
+    ("five brand-less sentences after the only Energy mention",
+     _article("<p>F3 Energy is our training can.</p><p>Find a gym near you. Pick one with good lighting. "
+              "Check the locker rooms. Ask about classes. Make sure it is clean.</p>", "Training Tips")),
+    ("the object of a clean verb (gear care)",
+     _article("<p>Pack a can of F3 Energy in your gym bag.</p><p>Rinse your shaker bottle after every "
+              "session and clean it weekly.</p>", "Gear Care")),
+    ("a pronoun two sentences into the next paragraph (the reviewer's idiom row)",
+     _article("<p>F3 Energy is built for training days.</p><p>Recovery is simple. Keep it simple: water, "
+              "sleep, and natural food.</p>")),
+    ("expletive it: it's worth noting that",
+     _article("<p>F3 Energy is our training can. It's worth noting that natural caffeine and synthetic "
+              "caffeine are the same molecule.</p>")),
+    ("generic they: they say",
+     _article("<p>F3 Energy is our training can. They say natural caffeine hits smoother.</p>")),
+    ("Harrison's ruled two-sentence remedy for the 9/1 UNDECIDED shape",
+     _article("<p>If caffeine plus L-theanine is what you are after, F3 Pure and F3 Energy are both built "
+              "around that pairing. F3 Pure uses organic cane sugar, monk fruit and stevia as its "
+              "clean-sweetened base.</p>")),
+    ("the prompt's good example, then Pure's own possessive after the sweetener list",
+     _article("<p>F3 Energy carries the full stack. F3 Pure uses organic cane sugar, monk fruit and stevia "
+              "as its clean-sweetened base.</p>")),
+    ("Pure's own possessive under an Energy title",
+     _article("<p>F3 Pure uses organic cane sugar, monk fruit and stevia as its clean-sweetened base.</p>",
+              "F3 Pure vs F3 Energy: What Changed")),
+    ("Pure's own possessive after a Mood sentence",
+     _article("<p>F3 Mood is caffeine-free. F3 Pure keeps the stack, with monk fruit and stevia in its "
+              "clean-sweetened base.</p>")),
+    # the refuter's realistic drafts of the NEXT queued Learn rows (8, 13, 12): 2, 3
+    # and 3 sentences tripped in one body under round 1 -- more than the one bounded
+    # revision can fix, so the week's post was lost
+    ("queued row 8: green tea caffeine vs synthetic caffeine",
+     _article("<p>F3 Energy and F3 Pure each carry 120 mg of natural caffeine from green tea. F3 Mood is "
+              "caffeine-free.</p><h2>Green tea caffeine vs synthetic caffeine</h2><p>Most energy drinks use "
+              "synthetic caffeine, which is made in a lab. Natural caffeine comes from plants such as tea "
+              "leaves, coffee beans and guarana. Chemically, they are the same molecule, so natural caffeine "
+              "is not stronger than synthetic caffeine.</p><p>If you are comparing labels, look for the "
+              "caffeine source. Some brands list it as natural caffeine, others simply as caffeine.</p>"
+              "<h2>What about F3 Mood?</h2><p>F3 Mood has 0 mg of caffeine. It is built for calm and focus "
+              "in the evening.</p>",
+              "How Much Caffeine Is in F3? (And How That Compares)",
+              "F3 Energy and F3 Pure each carry 120 mg of caffeine from green tea, and F3 Mood has none.")),
+    ("queued row 13: reading labels, Pure-led",
+     _article("<p>F3 Pure is our clean-sweetened can. F3 Energy is the zero-sugar training can, and F3 Mood "
+              "is caffeine-free.</p><h2>What makes an energy drink healthier?</h2><p>Start with the label. "
+              "If it is short and you recognize every ingredient, that is a good sign. Clean-label drinks "
+              "skip artificial colors and dyes, and they list the caffeine amount per can.</p><p>Next, check "
+              "the sugar. Their sweetness often comes from high-fructose corn syrup rather than natural "
+              "sources.</p><p>F3 Pure uses organic cane sugar, monk fruit and stevia as its clean-sweetened "
+              "base.</p>",
+              "What Are the Healthiest Energy Drinks?",
+              "A plain-English guide to reading energy drink labels, and where F3 Pure fits.")),
+    ("queued row 12: an ingredients glossary under an Energy summary",
+     _article("<p>F3 Energy carries a nootropic-leaning stack. Here is what each term on a label means.</p>"
+              "<h2>L-theanine</h2><p>An amino acid found in tea leaves. It is a natural partner to caffeine."
+              "</p><h2>Stevia</h2><p>A sweetener made from the leaves of a South American plant. Its "
+              "sweetness is natural and calorie-free.</p>",
+              "Energy Drink Ingredients Glossary: 12 Terms, Plain English",
+              "Twelve ingredients you will see on energy drink labels, including the ones in F3 Energy.")),
+)
+
+#: ...and the ARTICLE-level laundering shapes the carry must still catch after it
+#: decays (each passes legacy: the clean sentence names no line). Gated must-TRIP.
+CARRY_HOLE_PROBES: tuple[tuple[str, dict[str, str]], ...] = (
+    ("a pronoun opening the next paragraph", _article("<p>F3 Mood is our evening can.</p><p>It is all-natural.</p>")),
+    ("a pronoun opening the body under the title", _article("<p>It is all-natural.</p>", "F3 Mood Tonight")),
+    ("the title stays in view past a brand-less summary",
+     _article("<p>It is all-natural.</p>", "F3 Mood Tonight", "A calm routine for evenings.")),
+    ("one brand-less sentence between, same paragraph",
+     _article("<p>F3 Mood is the evening can. Our team loves the flavor. It is all-natural.</p>")),
+    ("one brand-less sentence closing the paragraph, the pronoun opening the next",
+     _article("<p>F3 Mood is our evening can. We love the flavor.</p><p>It is all-natural.</p>")),
+    ("a pronoun chain renews the referent",
+     _article("<p>F3 Mood is our evening can. It keeps you calm. It tastes like citrus. It is all-natural.</p>")),
+    ("a pronoun chain across a paragraph",
+     _article("<p>F3 Mood is our evening can.</p><p>It keeps you calm. It is all-natural.</p>")),
+    ("an object pronoun", _article("<p>F3 Mood is our evening can. We made it all-natural.</p>")),
+    ("an object pronoun opening the body under the title",
+     _article("<p>We made it all-natural.</p>", "F3 Mood Tonight")),
+    ("an idiom that opens an elaboration (colon)",
+     _article("<p>F3 Energy is our training can. Keep it simple: clean fuel, all day.</p>")),
+    ("an object idiom is referential", _article("<p>F3 Mood is our evening can. Keep it simple and natural.</p>")),
+    ("that's it, then a colon", _article("<p>F3 Mood is our evening can. That's it: all-natural.</p>")),
+    ("tough-movement it is the can", _article("<p>F3 Mood is our evening can. It is easy to love: all-natural.</p>")),
+    ("worth + a non-information verb", _article("<p>F3 Mood is our evening can. It's worth trying, all-natural.</p>")),
+    ("important TO us is referential",
+     _article("<p>F3 Mood is our evening can. It is important to us and all-natural.</p>")),
+    ("an expletive before a colon is void",
+     _article("<p>F3 Mood is our evening can. It's worth noting: all-natural and calm.</p>")),
+    ("expletive exclusion is per occurrence",
+     _article("<p>F3 Mood is our evening can. It's worth noting it is all-natural.</p>")),
+    ("generic they, then a referential it", _article("<p>F3 Mood is our evening can. They say it is all-natural.</p>")),
+    ("a clean verb with up / out still refers back", _article("<p>F3 Mood is our evening can. We cleaned it up.</p>")),
+    ("a clean verb outside the household-care frame",
+     _article("<p>F3 Mood is our evening can. We clean it with monk fruit.</p>")),
+    ("Pure possessive resolution needs Pure as the subject",
+     _article("<p>F3 Mood is our evening can. Unlike F3 Pure, its base is all-natural.</p>")),
+    ("the Mood guard across a field (r143-claims-5)",
+     _article("<p>It, like F3 Energy, runs on a cleaner fuel source.</p>", "F3 Mood: Our Evening Can")),
+)
+
 # ── reported, never gated: needs a Harrison ruling ──────────────────────────────
 UNDECIDED: tuple[str, ...] = (
     # (the 9/14 green-tea sentence moved to FALSE_POSITIVE_SET: ruled 2026-09-19)
@@ -350,6 +494,8 @@ class Verdict:
     pinned_missed: list[str] = field(default_factory=list)
     undecided: dict[str, dict[str, bool]] = field(default_factory=dict)
     release_tripping: list[str] = field(default_factory=list)               # round-2 must-PASS rows
+    carry_release_tripping: list[str] = field(default_factory=list)         # article-level must-PASS
+    carry_holes_missed: list[str] = field(default_factory=list)             # article-level must-TRIP
 
     def summary_lines(self) -> list[str]:
         out = [f"SHIP: {'YES' if self.ship else 'NO'}"]
@@ -381,6 +527,13 @@ class Verdict:
                    f"{len(self.release_tripping)}/{len(RELEASE_PROBES)}")
         for s in self.release_tripping:
             out.append("  release probe still tripping: " + s)
+        out.append(f"article-level carry probes (D-051 round 2): release trips "
+                   f"{len(self.carry_release_tripping)}/{len(CARRY_RELEASE_PROBES)}, holes missed "
+                   f"{len(self.carry_holes_missed)}/{len(CARRY_HOLE_PROBES)}")
+        for s in self.carry_release_tripping:
+            out.append("  carry release probe still tripping: " + s)
+        for s in self.carry_holes_missed:
+            out.append("  carry hole probe PASSES the shipping preflight: " + s)
         for s, res in self.undecided.items():
             out.append(f"UNDECIDED (Harrison ruling): legacy={'TRIP' if res['legacy'] else 'pass'} "
                        f"attribution={'TRIP' if res['attribution'] else 'pass'} -- {s}")
@@ -403,11 +556,15 @@ def evaluate() -> Verdict:
     undecided = {s: {"legacy": not legacy_preflight(s).passed, "attribution": not new_preflight(s).passed}
                  for s in UNDECIDED}
     release = [s for s in RELEASE_PROBES if not new_preflight(s).passed]
+    carry_release = [label for label, kw in CARRY_RELEASE_PROBES if not pf.run_preflight(**kw).passed]
+    carry_missed = [label for label, kw in CARRY_HOLE_PROBES if pf.run_preflight(**kw).passed]
     gated_uncaught = [s for cls, missed in uncaught.items() if cls not in RULED_OUT_CLASSES for s in missed]
-    ship = not pinned_missed and not gated_uncaught and not fp_new and not release
+    ship = (not pinned_missed and not gated_uncaught and not fp_new and not release
+            and not carry_release and not carry_missed)
     return Verdict(ship=ship, uncaught_by_class=uncaught, uncaught_legacy_by_class=uncaught_legacy,
                    fp_still_tripping=fp_new, fp_legacy_tripping=fp_legacy,
-                   pinned_missed=pinned_missed, undecided=undecided, release_tripping=release)
+                   pinned_missed=pinned_missed, undecided=undecided, release_tripping=release,
+                   carry_release_tripping=carry_release, carry_holes_missed=carry_missed)
 
 
 @dataclass
@@ -417,28 +574,65 @@ class Differential:
     attribution_trips: list[str]
     only_legacy: list[str]        # the false-positive candidates the attribution scope releases
     only_attribution: list[str]   # new catches: the R14-3 hole closures (verb forms, hyphen compounds)
+    articles: int = 0             # articles walked WITH the cross-sentence carry (D-051 round 2)
+    carry_only: list[str] = field(default_factory=list)   # sentences that trip ONLY through the carry
 
     def summary_lines(self) -> list[str]:
-        return [
+        out = [
             f"sentences scanned: {self.sentences}",
             f"rail-2 trips: legacy {len(self.legacy_trips)} | attribution {len(self.attribution_trips)}",
             f"released by attribution scope (legacy-only trips = the measured FP candidates): {len(self.only_legacy)}",
             f"caught only by the shipping rail (R14-3 hole closures: verb forms, hyphen compounds): "
             f"{len(self.only_attribution)}",
         ]
+        if self.articles:
+            out.append(f"tripped only through the cross-sentence carry ({self.articles} article(s) walked "
+                       f"in reading order): {len(self.carry_only)}")
+        return out
 
 
-def differential(sentences_iter) -> Differential:
+def rail2_article_walk(fields, *, first_per_field: bool = False) -> list[tuple[str, str, tuple[str, str], bool]]:
+    """run_preflight's rail-2 loop over (field_name, text) views, reporting EVERY
+    tripping sentence as (field, sentence, hit, via_carry): via_carry is True when
+    the plain single-sentence check passed and only the carried context tripped it.
+    With first_per_field=True it stops each field at its first trip exactly as
+    run_preflight does (a test pins the two loops equal on the article corpora)."""
+    out: list[tuple[str, str, tuple[str, str], bool]] = []
+    carry = pf.Rail2Carry()
+    for name, text in fields:
+        carry = carry.enter_field(name)
+        for sent, opens_block in pf.rail2_sentences(text):
+            carried = carry.visible()
+            plain = pf.rail2_attribution_hit(sent)
+            hit = plain or (pf.rail2_attribution_hit(sent, context_lines=carried) if carried else None)
+            if hit:
+                out.append((name, sent, hit, plain is None))
+                if first_per_field:
+                    break
+            carry = carry.after(sent, carried, pf.rail2_context_after(sent, carried), opens_block)
+        carry = carry.leave_field(name, text)
+    return out
+
+
+def differential(sentences_iter, *, articles=None) -> Differential:
     """Frozen legacy vs SHIPPING rail-2 over any sentence corpus (pure; no other rail).
 
-    Sentence by sentence, so the shipping rail's cross-sentence carry (D-051
-    r143-claims-5, run_preflight + rail2_context_after) is NOT in these counts. It
-    only adds trips, and the gate measures it through new_preflight."""
+    The sentence counts are sentence by sentence. D-051 round 2 (F3-R1): they
+    cannot see the shipping rail's cross-sentence carry, so a carry false positive
+    was invisible to the live read. Pass `articles` (each one article's prose, as
+    html_to_text returns it) and every article is also walked in reading order with
+    the carry; `carry_only` lists the sentences that trip only through it."""
     sents = [s for s in sentences_iter if s and s.strip()]
     legacy = [s for s in sents if pf.rail2_legacy_hit(s)]
     attrib = [s for s in sents if pf.rail2_attribution_hit(s)]
     la = set(attrib)
     ll = set(legacy)
+    carry_only: list[str] = []
+    n_articles = 0
+    for prose in articles or ():
+        n_articles += 1
+        carry_only += [s for _, s, _, via in rail2_article_walk((("body", prose or ""),)) if via]
     return Differential(sentences=len(sents), legacy_trips=legacy, attribution_trips=attrib,
                         only_legacy=[s for s in legacy if s not in la],
-                        only_attribution=[s for s in attrib if s not in ll])
+                        only_attribution=[s for s in attrib if s not in ll],
+                        articles=n_articles, carry_only=carry_only)
