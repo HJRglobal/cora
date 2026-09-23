@@ -73,9 +73,21 @@ class TestShippedRegistry:
                 assert r["evidence_monitor"]["failing_capable"] is True, r["lane"]
                 assert r["audit_surface"].strip(), r["lane"]
 
-    def test_every_row_awaits_harrisons_batch_confirm_at_seed(self):
+    def test_every_row_is_pending_or_carries_harrisons_confirm_event(self):
+        """At seed every row was `pending-Harrison`; his ONE batch confirm (RULED
+        2026-09-19, applied 2026-09-20) flips `confirmed_by` AND appends a `confirmed`
+        event by Harrison. A row may be in either state -- never confirmed_by without
+        the event, never the event without confirmed_by (the two must agree)."""
         reg = lr.load(_REAL)
-        assert set(lr.pending_confirmation(reg)) == set(lr.KNOWN_LANES)
+        pending = set(lr.pending_confirmation(reg))
+        for r in lr.lanes(reg):
+            confirmed_events = [e for e in r["events"]
+                                if e.get("event") == "confirmed" and str(e.get("by", "")).startswith("Harrison")]
+            if r["lane"] in pending:
+                assert not confirmed_events, r["lane"]
+            else:
+                assert str(r["confirmed_by"]).startswith("Harrison"), r["lane"]
+                assert confirmed_events and all(e.get("evidence") for e in confirmed_events), r["lane"]
 
     def test_bespoke_rows_carried_verbatim(self):
         """The Code #12 / ingest-report / mirror rows keep their VALUES (the key
@@ -92,7 +104,9 @@ class TestShippedRegistry:
     def test_lifecycle_is_a_status_not_a_tier(self):
         reg = lr.load(_REAL)
         assert lr.row_for("revops-send", reg)["status"] == "dark"
-        assert lr.row_for("task-estate-manifest", reg)["status"] == "unbuilt"
+        # BUILT 2026-09-23 (DR/VM step-1 M1): the lane flipped unbuilt -> live WITH a note event
+        assert lr.row_for("task-estate-manifest", reg)["status"] == "live"
+        assert lr.row_for("task-estate-manifest", reg)["evidence_monitor"]["failing_capable"] is True
         assert lr.row_for("email-triage-tier1", reg)["status"] == "cowork-estate"
         assert lr.row_for("f3e-blog-one-tap", reg)["tier"] == "CAP-T1"
 
@@ -261,7 +275,13 @@ class TestValidate:
         reg = lr.load(_REAL)
         for r in lr.lanes(reg):
             seeded = [e for e in r["events"] if e.get("event") == "seeded"]
-            assert seeded and all(e.get("tier") == r["tier"] for e in seeded), r["lane"]
+            assert seeded and all(e.get("tier") for e in seeded), r["lane"]
+            # the LAST tier-bearing event is the row's tier (a ruled demotion after the
+            # seed -- nightly-catchup T2 -> T1, 2026-09-19 -- moves the row WITH an event)
+            tiered = [e for e in r["events"] if e.get("tier")]
+            assert tiered[-1]["tier"] == r["tier"], r["lane"]
+            if len(tiered) == 1:
+                assert seeded[0].get("tier") == r["tier"], r["lane"]
         import copy
         edited = copy.deepcopy(reg)
         lr.row_for("s2-phantom-write-screen", edited)["tier"] = "T3"
@@ -355,7 +375,8 @@ class TestRender:
         assert s["available"] and s["lanes"] == len(lr.KNOWN_LANES)
         assert s["schema_problems"] == []
         assert set(s["by_tier"]) == set(lr.TIERS)
-        assert len(s["pending_confirmation"]) == len(lr.KNOWN_LANES)
+        # pending == whatever the file says (all 21 at seed; 0 after the 2026-09-19 batch confirm)
+        assert sorted(s["pending_confirmation"]) == sorted(lr.pending_confirmation(lr.load(_REAL)))
 
 
 # ── the readers: nightly health check + Monday digest ─────────────────────────

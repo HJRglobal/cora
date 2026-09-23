@@ -671,6 +671,28 @@ def missed_nightly_section(days: int = 7) -> dict:
         return {"available": False, "reason": str(exc)}
 
 
+def task_estate_section() -> dict:
+    """DR/VM step 1 slice M1 (cq-a296aa8e0a2e): the LIVE Task Scheduler registry vs the
+    committed task-estate manifest (deployment/manifest/task-estate.json). Read-only --
+    it never rewrites the manifest; drift is REPORTED here and fixed by a Code session
+    regenerating the manifest (or by reverting the host change). Fail-soft."""
+    try:
+        import generate_task_estate_manifest as tem  # noqa: PLC0415
+        return tem.diff_against_committed()
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "reason": str(exc)}
+
+
+def _task_estate_digest_line(te: dict) -> str:
+    """One Monday-digest line: live vs manifest counts, drift kinds when present."""
+    if not isinstance(te, dict) or not te.get("available"):
+        return f"*Task estate:* manifest check unavailable ({(te or {}).get('reason', 'n/a')})"
+    n = len(te.get("warn_lines") or [])
+    kinds = ", ".join(f"{k} {v}" for k, v in (te.get("drift") or {}).items() if v)
+    return (f"*Task estate:* {te.get('live_count')} live / {te.get('manifest_count')} manifest"
+            + (f" | {n} drift line(s): {kinds}" if n else " | drift none"))
+
+
 def _fmt_bytes(n: int) -> str:
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024 or unit == "GB":
@@ -811,6 +833,22 @@ def threshold_alarms(report: dict) -> list[str]:
     elif "ladder_registry" in report:
         alarms.append(f"LADDER REGISTRY unavailable: {lad.get('reason')} -- absence IS drift.")
     # Code #13 slice 2: a trigger that keeps missing is a scheduler problem, not a
+    # DR/VM step 1 (M1): the live Task Scheduler registry vs the committed manifest.
+    # Drift = a task added / removed / re-scheduled / re-enabled / re-pointed / re-principaled
+    # on the host without the manifest (and so the DR docs) following. Absence of the
+    # check itself is also reported -- a blind manifest reads as "no drift" otherwise.
+    te = report.get("task_estate", {})
+    if te.get("available"):
+        tl = te.get("warn_lines") or []
+        if tl:
+            alarms.append(f"TASK-ESTATE DRIFT: {len(tl)} line(s) vs deployment/manifest/task-estate.json "
+                          f"({te.get('live_count')} live / {te.get('manifest_count')} manifest) -- "
+                          + "; ".join(line.replace("task-estate-drift: ", "") for line in tl[:6])
+                          + (" ..." if len(tl) > 6 else "")
+                          + ". Regenerate: scripts/generate_task_estate_manifest.py --update-docs (Code session).")
+    elif "task_estate" in report:
+        alarms.append(f"TASK-ESTATE manifest check unavailable: {te.get('reason')}.")
+
     # catch-up problem; a lane that stops deciding is itself the missed fire.
     mn = report.get("missed_nightly", {})
     if mn.get("available"):
@@ -962,6 +1000,8 @@ def format_slack(report: dict) -> str:
             f"cannot-check {tot.get('cannot_check', 0)}"
             + (" | replayed: " + ", ".join(f"{t} x{n}" for t, n in sorted(rep.items())) if rep else "")
         )
+    if "task_estate" in report:
+        lines.append(_task_estate_digest_line(report.get("task_estate") or {}))
     lines.append(f"_token method: {report.get('token_method')}_")
     return "\n".join(lines)
 
@@ -1167,6 +1207,7 @@ def build_report(log_days: int, use_api: bool) -> dict:
         "missed_nightly": missed_nightly_section(),
         "claude_mirror": claude_mirror_section(),
         "egress_rails": egress_rails_section(),
+        "task_estate": task_estate_section(),
     }
     report["alarms"] = threshold_alarms(report)
     return report

@@ -2,15 +2,116 @@
 
 ## Scheduled Tasks Registry
 
-| Task Name | Schedule | Script | Notes |
-|---|---|---|---|
-| `cowork-cora-service` | AtLogon + RestartOnFailure | `cora.main` (bot process) | Main Slack bot |
-| `cowork-cora-channel-sweep` | Daily 01:30 AZ (08:30 UTC) | `scripts/run_channel_sweep.py` | Nightly org-wide channel sweep |
-| `cowork-cora-knowledge-review` | Mon-Fri 07:00 AZ (14:00 UTC) | `scripts/run_knowledge_review.py` | Send Harrison pending knowledge-review DMs |
-| `cowork-cora-daily-briefing` | Daily (see PS1) | `scripts/run_daily_briefing.py` | Morning digest |
-| `cowork-cora-backup` | Daily 04:30 AZ | `scripts/backup_logs.py` | Backup KB + logs to Drive |
-| `cowork-cora-influencer-scan` | Every 2 hours | `scripts/run_influencer_scan.py` | Posts to #f3-sales |
-| `Cora - Email Attachment Filer` | Every 4 hours | `scripts/run_attachment_filer.py` | Files attachments to Drive |
+The registry is GENERATED from the live Task Scheduler by
+`scripts/generate_task_estate_manifest.py --update-docs` (DR/VM step 1, M1). The
+machine-readable manifest is `deployment/manifest/task-estate.json`; full columns
+(run-as, StartWhenAvailable, last result, run marker, log path, intent, setup script)
+are in `deployment/manifest/task-estate.md`. The Monday digest
+(`cora_health_report.py --slack`) diffs the live registry against the committed
+manifest and prints `task-estate-drift:` lines. Do not hand-edit inside the markers.
+
+<!-- BEGIN GENERATED: task-registry -->
+_Generated 2026-09-23 by `scripts/generate_task_estate_manifest.py --update-docs` from the live registry (96 tasks, 78 enabled). Full columns: `deployment/manifest/task-estate.md`. Do not hand-edit._
+
+| Task Name | Schedule | Script | State | Run level | Notes |
+|---|---|---|---|---|---|
+| `Cora - Asana Hygiene Nudges` | daily 06:40 | `scripts/run_asana_hygiene_nudges.py` | Ready | Highest |  |
+| `Cora - Cash Flow Pulse` | daily 15:30 | `scripts/run_cashflow_pulse.py` | Disabled | Highest | intent: disabled; console action (not run_hidden-wrapped) |
+| `Cora - Cash Snapshot` | daily 06:45 | `scripts/write_cashflow_snapshot.py` | Ready | Limited |  |
+| `Cora - Channel Health Monitor` | weekly Sun 04:15 | `scripts/run_channel_health_monitor.py` | Ready | Highest |  |
+| `Cora - Daily Briefing` | weekly Mon,Tue,Wed,Thu,Fri 07:30 | `scripts/run_daily_briefing.py` | Ready | Limited |  |
+| `Cora - Daily Synthesis (BDM)` | daily 06:52 | `scripts/run_entity_synthesis.py` | Ready | Limited |  |
+| `Cora - Daily Synthesis (F3C)` | daily 06:58 | `scripts/run_entity_synthesis.py` | Ready | Limited |  |
+| `Cora - Daily Synthesis (F3E)` | daily 06:33 | `scripts/run_entity_synthesis.py` | Ready | Limited |  |
+| `Cora - Daily Synthesis (HJRP)` | daily 06:35 | `scripts/run_entity_synthesis.py` | Ready | Limited |  |
+| `Cora - Daily Synthesis (HJRPROD)` | daily 06:56 | `scripts/run_entity_synthesis.py` | Ready | Limited |  |
+| `Cora - Daily Synthesis (LEX)` | daily 06:39 | `scripts/run_entity_synthesis.py` | Ready | Limited |  |
+| `Cora - Daily Synthesis (OSN)` | daily 06:37 | `scripts/run_entity_synthesis.py` | Ready | Limited |  |
+| `Cora - Daily Synthesis (Portfolio)` | daily 06:31 | `scripts/run_portfolio_synthesis.py` | Ready | Limited |  |
+| `Cora - Daily Synthesis (UFL)` | daily 06:54 | `scripts/run_entity_synthesis.py` | Ready | Limited |  |
+| `Cora - Deal Aging Alerts` | daily 15:00 | `scripts/run_deal_aging_alerts.py` | Disabled | Limited | intent: disabled; console action (not run_hidden-wrapped) |
+| `Cora - Drive Materialization` | daily 05:45 | `scripts/run_drive_materialization.py` | Ready | Limited |  |
+| `Cora - Drive Sweep` | daily 06:00 | `scripts/run_drive_sweep.py` | Ready | Limited |  |
+| `Cora - Due Date Escalation` | daily 14:00 | `scripts/run_due_date_escalation.py` | Ready | Limited |  |
+| `Cora - Email Attachment Filer` | every PT4H (from 2026-05-27T22:00) | `scripts/run_attachment_filer.py` | Ready | Limited |  |
+| `Cora - Expected Invoice Check` | monthly day 9 09:38 | `scripts/run_expected_invoice_check.py` | Ready | Limited | SWA=false |
+| `Cora - F3E Blog Pipeline` | weekly Mon 08:50 | `scripts/run_f3e_blog_pipeline.py` | Ready | Limited | SWA=false |
+| `Cora - F3E Daily Ecom Brief` | daily 07:10 | `scripts/run_f3e_ecom_brief.py` | Disabled | Limited | intent: disabled; console action (not run_hidden-wrapped) |
+| `Cora - False Deflection Watch` | weekly Mon 08:00 | `scripts/run_false_deflection_watch.py` | Ready | Highest |  |
+| `Cora - Friction Mining` | weekly Sun 17:30 | `scripts/run_friction_mining.py` | Ready | Limited |  |
+| `Cora - HubSpot Deal Monitor` | every PT1H (from 2026-06-03T16:00) | `scripts/run_hubspot_deal_monitor.py` | Disabled | Limited | intent: disabled; console action (not run_hidden-wrapped) |
+| `Cora - Inventory Alerts` | daily 16:00 | `scripts/run_inventory_alerts.py` | Disabled | Limited | intent: disabled; console action (not run_hidden-wrapped) |
+| `Cora - KB Evals` | weekly Mon 09:05 | `scripts/run_kb_evals.py` | Ready | Limited |  |
+| `Cora - Klaviyo Billing Audit` | monthly day 9 09:53 | `scripts/run_klaviyo_billing_audit.py` | Ready | Limited | SWA=false |
+| `Cora - Knowledge Check` | weekly Mon,Tue,Wed,Thu,Fri 08:05 | `scripts/run_knowledge_check.py` | Ready | Limited |  |
+| `Cora - LEX Dump Folder Sync` | daily 04:45 | `scripts/run_lex_dump_folder_sync.py` | Ready | Limited |  |
+| `Cora - LEX Swept PHI Check` | daily 07:06 | `scripts/run_lex_swept_phi_check.py` | Ready | Limited |  |
+| `Cora - Log Compaction` | monthly day 1 14:00 | `scripts/compact_logs.py` | Ready | Limited | SWA=false |
+| `Cora - Meeting Action Capture` | every PT1H (from 2026-06-05T11:00) | `scripts/run_meeting_action_capture.py` | Disabled | Limited | intent: disabled; console action (not run_hidden-wrapped) |
+| `Cora - Meeting Ask Capture` | every PT15M (daily 07:08) | `scripts/run_meeting_ask_capture.py` | Ready | Limited | SWA=false |
+| `Cora - Missed Nightly Catch-Up` | daily 08:30 | `scripts/check_missed_nightly.py` | Ready | Limited |  |
+| `Cora - OSN Metrics Digest` | weekly Mon 15:00 | `scripts/run_osn_metrics_digest.py` | Ready | Highest |  |
+| `Cora - QBO Monthly Reports` | monthly day 2 07:45 | `scripts/run_qbo_monthly_reports.py` | Ready | Limited | SWA=false |
+| `Cora - QBO Token Monitor` | daily 06:50 | `scripts/qbo_token_status.py` | Ready | Limited |  |
+| `Cora - Revops Sweep` | daily 10:15 | `scripts/run_revops_sweep.py` | Ready | Limited | SWA=false |
+| `Cora - Shopify DTC Summary` | daily 15:00 | `scripts/run_shopify_dtc_summary.py` | Disabled | Limited | intent: disabled; console action (not run_hidden-wrapped) |
+| `Cora - Strategy Memo` | weekly Sun 18:30 | `scripts/run_strategy_memo.py` | Ready | Limited |  |
+| `Cora - Weekly Health Metrics` | weekly Mon 09:30 | `scripts/cora_health_report.py` | Ready | Highest |  |
+| `Cora - Weekly Pipeline Digest` | weekly Mon 15:00 | `scripts/run_pipeline_digest.py` | Disabled | Limited | intent: disabled; console action (not run_hidden-wrapped) |
+| `cora-watchdog` | every PT5M (from 2026-07-16T10:27) | `deployment/cora-watchdog.ps1` | Ready | Highest |  |
+| `cowork-cora-ai-visibility-scan` | weekly Mon 10:15 | `scripts/run_ai_visibility_scan.py` | Ready | Limited |  |
+| `cowork-cora-asana-email-sync` | every PT1H (from 2026-06-01T00:10) | `scripts/run_asana_email_sync.py` | Disabled | Limited | intent: disabled; SWA=false; console action (not run_hidden-wrapped) |
+| `cowork-cora-autowrite-digest` | weekly Mon 11:00 | `scripts/run_autowrite_digest.py` | Ready | Limited | SWA=false |
+| `cowork-cora-backup` | daily 20:30 | `scripts/backup_logs.py` | Ready | Limited |  |
+| `cowork-cora-bank-snapshot` | daily 07:05 | `scripts/run_qbo_bank_snapshot.py` | Ready | Limited |  |
+| `cowork-cora-cashflow-actuals` | weekly Mon 06:25 | `scripts/run_cashflow_actuals.py` | Ready | Limited |  |
+| `cowork-cora-cashflow-forecast-snapshot` | weekly Mon 06:15 | `scripts/run_cashflow_forecast_snapshot.py` | Ready | Limited |  |
+| `cowork-cora-channel-sweep` | daily 08:40 | `scripts/run_channel_sweep.py` | Ready | Limited |  |
+| `cowork-cora-claude-mirror` | daily 03:45 + daily 12:15 | `scripts/mirror_claude_workspace.py` | Ready | Limited |  |
+| `cowork-cora-completion-sweep` | daily 14:00 | `scripts/run_completion_sweep.py` | Ready | Limited | SWA=false |
+| `cowork-cora-decision-capture` | daily 07:15 | `scripts/capture_decisions.py` | Ready | Limited | SWA=false |
+| `cowork-cora-delegated-work` | every PT15M (from 2026-08-01T00:00) | `scripts/run_delegated_work_runner.py` | Ready | Limited |  |
+| `cowork-cora-digest` | daily 05:20 | `scripts/generate_knowledge_gaps_digest.py` | Disabled | Limited | intent: disabled; console action (not run_hidden-wrapped) |
+| `cowork-cora-feedback-health` | weekly Mon 08:30 | `scripts/run_feedback_health_report.py` | Ready | Limited | SWA=false |
+| `cowork-cora-finance-adherence` | weekly Mon 08:15 | `scripts/run_finance_adherence_check.py` | Ready | Limited |  |
+| `cowork-cora-finance-close-pack` | weekly Mon 09:00 | `scripts/run_finance_close_pack.py` | Ready | Limited |  |
+| `cowork-cora-finance-receipt-digest` | weekly Mon 10:30 | `scripts/run_finance_receipt_digest.py` | Ready | Limited | SWA=false |
+| `cowork-cora-finance-weekly` | weekly Mon 14:30 | `scripts/run_finance_weekly_recap.py` | Ready | Limited |  |
+| `cowork-cora-fireflies-coverage` | weekly Mon 08:10 | `scripts/run_fireflies_coverage.py` | Ready | Limited |  |
+| `cowork-cora-founders-os-sweep` | daily 06:30 | `scripts/ingest_founders_os.py` | Ready | Highest |  |
+| `cowork-cora-gap-autofill` | daily 06:10 | `scripts/run_gap_autofill.py` | Ready | Limited |  |
+| `cowork-cora-gap-digest` | weekly Mon 08:00 | `scripts/post_gap_digest_slack.py` | Disabled | Limited | intent: disabled; SWA=false; console action (not run_hidden-wrapped) |
+| `cowork-cora-health-check` | daily 08:45 | `scripts/nightly_health_check.py` | Ready | Limited | SWA=false |
+| `cowork-cora-hubspot-email-sync` | every PT1H (from 2026-05-31T23:23) | `scripts/run_hubspot_email_sync.py` | Disabled | Limited | intent: disabled; SWA=false; console action (not run_hidden-wrapped) |
+| `cowork-cora-influencer-digest` | weekly Mon 08:20 | `scripts/run_influencer_digest.py` | Disabled | Limited | intent: disabled; console action (not run_hidden-wrapped) |
+| `cowork-cora-influencer-overdue-alerts` | daily 09:10 | `scripts/run_influencer_overdue_alerts.py` | Disabled | Limited | intent: disabled; console action (not run_hidden-wrapped) |
+| `cowork-cora-influencer-scan` | every PT2H (from 2026-05-27T22:00) | `scripts/run_influencer_scan.py` | Disabled | Limited | intent: disabled; console action (not run_hidden-wrapped) |
+| `cowork-cora-info-for-cora-sweep` | daily 06:05 | `scripts/run_info_for_cora_sweep.py` | Ready | Limited |  |
+| `cowork-cora-inventory-state-sync` | daily 06:20 | `scripts/run_inventory_state_sync.py` | Ready | Limited |  |
+| `cowork-cora-kb-hygiene` | monthly day 1 15:00 | `scripts/kb_hygiene_sweep.py` | Ready | Limited | SWA=false |
+| `cowork-cora-kb-sync-asana` | daily 03:00 | `scripts/incremental_sync_asana.py` | Ready | Limited |  |
+| `cowork-cora-kb-sync-drive` | daily 04:30 | `scripts/incremental_sync_drive.py` | Ready | Limited |  |
+| `cowork-cora-kb-sync-fireflies` | daily 03:30 | `scripts/incremental_sync_fireflies.py` | Ready | Limited |  |
+| `cowork-cora-kb-sync-gmail` | daily 02:30 | `scripts/gmail_threaded_sweep.py` | Ready | Limited |  |
+| `cowork-cora-kb-sync-notion` | daily 05:00 | `scripts/incremental_sync_notion.py` | Ready | Limited |  |
+| `cowork-cora-kb-sync-slack` | daily 02:00 | `scripts/incremental_sync_slack.py` | Ready | Limited |  |
+| `cowork-cora-kb-sync-static` | daily 04:00 + daily 12:20 | `scripts/incremental_sync_static.py` | Ready | Limited |  |
+| `cowork-cora-knowledge-check-report` | weekly Mon 07:20 | `scripts/run_knowledge_check_report.py` | Ready | Limited | SWA=false |
+| `cowork-cora-knowledge-review` | weekly Mon,Tue,Wed,Thu,Fri 07:00 | `scripts/run_knowledge_review.py` | Ready | Limited |  |
+| `cowork-cora-lexicon-mining` | weekly Sun 17:50 | `scripts/run_lexicon_mining.py` | Ready | Limited |  |
+| `cowork-cora-meeting-capture-audit` | daily 07:22 | `scripts/run_meeting_capture_audit.py` | Ready | Limited |  |
+| `cowork-cora-meeting-capture-ensure` | every PT15M (daily 06:07) | `scripts/run_meeting_capture_ensure.py` | Ready | Limited |  |
+| `cowork-cora-monthly-deliverables` | monthly day 1 09:00 | `scripts/generate_monthly_deliverables.py` | Disabled | Limited | intent: disabled; SWA=false; console action (not run_hidden-wrapped) |
+| `cowork-cora-person-dossier-refresh` | weekly Sun 16:30 | `scripts/run_person_dossier_refresh.py` | Ready | Limited |  |
+| `cowork-cora-pm-adoption-digest` | weekly Mon 08:20 | `scripts/run_pm_adoption_digest.py` | Ready | Limited | SWA=false |
+| `cowork-cora-proactive-gaps` | daily 06:00 | `scripts/run_proactive_gaps.py` | Disabled | Limited | intent: disabled; SWA=false; console action (not run_hidden-wrapped) |
+| `cowork-cora-project-channel-sync` | daily 16:00 | `scripts/run_project_channel_sync.py` | Disabled | Limited | intent: disabled; console action (not run_hidden-wrapped) |
+| `cowork-cora-qbo-token-refresh` | daily 02:00 | `scripts/qbo_oauth_flow.py` | Ready | Highest |  |
+| `cowork-cora-reconciliation` | daily 05:30 | `scripts/run_reconciliation.py` | Ready | Limited |  |
+| `cowork-cora-security-monitor` | every PT15M (from 2026-05-27T22:33) | `scripts/security_monitor.py` | Ready | Limited |  |
+| `cowork-cora-service` | at logon | `cora.main` | Running | Limited |  |
+| `cowork-cora-session-capture` | daily 05:15 + daily 12:30 | `scripts/run_session_capture.py` | Ready | Limited |  |
+<!-- END GENERATED: task-registry -->
 **LinkedIn Spy — RETIRED (Phase 1.8, gate G-C / D-027).** The Python Apollo
 writer (`run_linkedin_spy.py` + `apollo_client.py` + `linkedin_spy_client.py` +
 `linkedin-spy-search-config.yaml`) was removed; **Make scenario 4769263 is the

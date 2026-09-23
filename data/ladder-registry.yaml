@@ -16,7 +16,9 @@
 #
 # WRITTEN ONLY BY A CODE/COWORK COMMIT. The bot never writes this file. Every row
 # is `confirmed_by: pending-Harrison` until his ONE batch confirm (Code #13 report
-# ask block) flips it. The rendered markdown rides ZONE-X via the claude-workspace
+# ask block) flips it -- FLIPPED 2026-09-20 by Cowork on Harrison's 2026-09-19 ruling
+# (all lanes confirmed as seeded except nightly-catchup: ruled T1, `demoted` event).
+# The rendered markdown rides ZONE-X via the claude-workspace
 # mirror as cora-mirror-LADDER-REGISTRY.md (KB-excluded by folder pin + title belt).
 #
 # Rows carried VERBATIM (values) from their bespoke sources: s2-phantom-write-screen
@@ -37,7 +39,7 @@ lanes:
       failing_capable: true
     audit_surface: "log key phantom-write-claim kind=... mode=... channel= user= (bot format, cora.slack_egress)"
     authority: Harrison
-    confirmed_by: pending-Harrison
+    confirmed_by: Harrison 2026-09-19
     acting_probe: sentinel_mode
     events:
       - ts: 2026-09-19
@@ -45,6 +47,10 @@ lanes:
         tier: T0
         by: code-13
         evidence: "_shared/projects/cora/2026-09-09_fndr_cora-code-12-queue-metabolism-CASCADE-REPORT.md section 4 (T0 OBSERVE, verbatim)"
+      - ts: 2026-09-19
+        event: confirmed
+        by: Harrison
+        evidence: "batch confirm: Code #13 ask block RULED 2026-09-19 (_shared/projects/cora/_notes/2026-09-19_fndr_RULINGS-code-13-ask-batch.md: registry confirmed as seeded except nightly-catchup); applied to this file by Cowork 2026-09-20 (decisions.md 2026-09-20 [FNDR/ORG+CORA])"
 
   - lane: c2-mechanical-batch-expiry
     title: "C2 run_knowledge_review._expire_low_risk_mechanical + the weekly mechanical batch card"
@@ -57,13 +63,17 @@ lanes:
       failing_capable: true
     audit_surface: "resolved_reason=expired_low_risk + surfaced on the ledger row; the card text"
     authority: Harrison
-    confirmed_by: pending-Harrison
+    confirmed_by: Harrison 2026-09-19
     events:
       - ts: 2026-09-19
         event: seeded
         tier: T1
         by: code-13
         evidence: "Code #12 report section 4 ('T1-class named terminal, bounded to 3 types x 2 entities x 14d, content-screened; the card is propose-only'). NOTE: the expiry ACTS without a tap, bounded by ruled constants -- within-tier by ruling, not drift."
+      - ts: 2026-09-19
+        event: confirmed
+        by: Harrison
+        evidence: "batch confirm: Code #13 ask block RULED 2026-09-19 (_shared/projects/cora/_notes/2026-09-19_fndr_RULINGS-code-13-ask-batch.md: registry confirmed as seeded except nightly-catchup); applied to this file by Cowork 2026-09-20 (decisions.md 2026-09-20 [FNDR/ORG+CORA])"
 
   - lane: claude-workspace-mirror
     title: "claude-workspace mirror (scripts/mirror_claude_workspace.py) -- permanent T0 cap"
@@ -76,13 +86,17 @@ lanes:
       failing_capable: true
     audit_surface: "PARITY-REPORT.md + the Monday cora_health_report digest line"
     authority: "Harrison (allowlist yaml is Harrison-edited; Cowork proposes)"
-    confirmed_by: pending-Harrison
+    confirmed_by: Harrison 2026-09-19
     events:
       - ts: 2026-09-19
         event: seeded
         tier: T0
         by: code-13
         evidence: "_shared/projects/cora/_mirror/cora-mirror-LADDER-ROW.md (verbatim; superseded by this registry's rendered file)"
+      - ts: 2026-09-19
+        event: confirmed
+        by: Harrison
+        evidence: "batch confirm: Code #13 ask block RULED 2026-09-19 (_shared/projects/cora/_notes/2026-09-19_fndr_RULINGS-code-13-ask-batch.md: registry confirmed as seeded except nightly-catchup); applied to this file by Cowork 2026-09-20 (decisions.md 2026-09-20 [FNDR/ORG+CORA])"
 
   - lane: cora-self-inventory
     title: "cora_self_inventory tool (deterministic self-inventory; I4)"
@@ -95,32 +109,44 @@ lanes:
       failing_capable: true
     audit_surface: "tool log line cora_self_inventory actor= entity= detail=; self-inventory intent -> forcing tool log line"
     authority: Harrison
-    confirmed_by: pending-Harrison
+    confirmed_by: Harrison 2026-09-19
     events:
       - ts: 2026-09-19
         event: seeded
         tier: T0
         by: code-13
         evidence: "_shared/projects/cora/2026-09-08_fndr_cora-ingest-integrity-bundle-CASCADE-REPORT.md section 4 (verbatim)"
+      - ts: 2026-09-19
+        event: confirmed
+        by: Harrison
+        evidence: "batch confirm: Code #13 ask block RULED 2026-09-19 (_shared/projects/cora/_notes/2026-09-19_fndr_RULINGS-code-13-ask-batch.md: registry confirmed as seeded except nightly-catchup); applied to this file by Cowork 2026-09-20 (decisions.md 2026-09-20 [FNDR/ORG+CORA])"
 
   - lane: task-estate-manifest
-    title: "task-estate manifest generator (DR/VM step 1, M1) -- NOT BUILT on main"
+    title: "task-estate manifest generator + drift monitor (scripts/generate_task_estate_manifest.py; DR/VM step 1, M1) -- permanent READ-ONLY T0 cap"
     tier: T0
-    status: unbuilt
-    promotion_criteria: "none sought -- permanent read-only cap once built"
-    demotion_triggers: "n/a"
+    status: live
+    promotion_criteria: "none sought -- permanent read-only cap: the lane enumerates and diffs the Task Scheduler estate and never registers, edits, enables or disables a task"
+    demotion_triggers: "any write to the registry, a doc block outside its markers, or a secret shape in an emitted file -> the lane is broken, not demoted (T0 is the floor)"
     evidence_monitor:
-      description: "the --diff WARN (planned); no lane exists on main as of 2026-09-19 (DR/VM step-1 parked to wk 9/28)"
-      failing_capable: false
-    audit_surface: "DR-MANIFEST.md + Monday digest line (planned)"
+      description: "the task-estate-drift WARN lines (added / removed / cron_changed / enabled_changed / action_changed / principal_changed) diffed live-vs-committed by cora_health_report.task_estate_section on the Monday digest; tests/test_task_estate_manifest.py injects one fake + removes one real task and requires EXACTLY those two lines"
+      failing_capable: true
+    audit_surface: "deployment/manifest/task-estate.{json,md} + deployment/DR-MANIFEST.md probe baseline + the Monday digest 'Task estate' line / TASK-ESTATE DRIFT alarm"
     authority: Harrison
-    confirmed_by: pending-Harrison
+    confirmed_by: Harrison 2026-09-19
     events:
       - ts: 2026-09-19
         event: seeded
         tier: T0
         by: code-13
         evidence: "_shared/projects/cora/_notes/2026-09-08_fndr_cora-code-prompt-dr-manifest-vm-step1-KICKOFF.md line 39 (row fields); lane absent on main"
+      - ts: 2026-09-19
+        event: confirmed
+        by: Harrison
+        evidence: "batch confirm: Code #13 ask block RULED 2026-09-19 (_shared/projects/cora/_notes/2026-09-19_fndr_RULINGS-code-13-ask-batch.md: registry confirmed as seeded except nightly-catchup); applied to this file by Cowork 2026-09-20 (decisions.md 2026-09-20 [FNDR/ORG+CORA])"
+      - ts: 2026-09-23
+        event: note
+        by: code-dr-vm-1
+        evidence: "BUILT (status unbuilt -> live, monitor failing_capable false -> true): DR/VM step-1 session M1, branch claude/dr-manifest-vm-step1-2026-09-22; live count 96 across three enumerations; fail-capable diff test in tests/test_task_estate_manifest.py; tier unchanged (T0)"
 
   - lane: f3e-blog-one-tap
     title: "F3E blog publish lane: auto-draft -> Harrison one-tap -> publish (publish_cards.process_tap)"
@@ -133,13 +159,17 @@ lanes:
       failing_capable: true
     audit_surface: "publish ledger row + the note to #f3-marketing + the Monday 08:50 pipeline log"
     authority: Harrison
-    confirmed_by: pending-Harrison
+    confirmed_by: Harrison 2026-09-19
     events:
       - ts: 2026-09-19
         event: seeded
         tier: CAP-T1
         by: code-13
         evidence: "charter v1 section 1 line 23 ('the blog one-tap lane = permanent T1'); code: publish_cards.process_tap Harrison-only gate"
+      - ts: 2026-09-19
+        event: confirmed
+        by: Harrison
+        evidence: "batch confirm: Code #13 ask block RULED 2026-09-19 (_shared/projects/cora/_notes/2026-09-19_fndr_RULINGS-code-13-ask-batch.md: registry confirmed as seeded except nightly-catchup); applied to this file by Cowork 2026-09-20 (decisions.md 2026-09-20 [FNDR/ORG+CORA])"
 
   - lane: inventory-adjust-g1
     title: "F3E inventory adjust (f3e_shopify_set_inventory) under G1 HYBRID authorization"
@@ -152,13 +182,17 @@ lanes:
       failing_capable: false
     audit_surface: "the write channel post + logs/shopify-inventory-writes.jsonl"
     authority: Harrison
-    confirmed_by: pending-Harrison
+    confirmed_by: Harrison 2026-09-19
     events:
       - ts: 2026-09-19
         event: seeded
         tier: T1
         by: code-13
         evidence: "HONEST tier by code: tool_dispatch runs the F-23 two-call preview->confirm even in-channel (the G1 grant is an ENTITY grant, commit 5e5822c) = requester-approve-then-act. The kickoff wrote T2; seeded T1 pending Harrison's ruling."
+      - ts: 2026-09-19
+        event: confirmed
+        by: Harrison
+        evidence: "batch confirm: Code #13 ask block RULED 2026-09-19 (_shared/projects/cora/_notes/2026-09-19_fndr_RULINGS-code-13-ask-batch.md: registry confirmed as seeded except nightly-catchup); applied to this file by Cowork 2026-09-20 (decisions.md 2026-09-20 [FNDR/ORG+CORA])"
 
   - lane: delegated-work-phase1
     title: "cora_delegate_work Phase 1 (four archetypes; CORA_DELEGATED_WORK flag)"
@@ -171,7 +205,7 @@ lanes:
       failing_capable: true
     audit_surface: "the threaded summary + the Drive artifact + the delegated-work ledger"
     authority: Harrison
-    confirmed_by: pending-Harrison
+    confirmed_by: Harrison 2026-09-19
     acting_probe: delegated_level
     events:
       - ts: 2026-09-19
@@ -179,6 +213,10 @@ lanes:
         tier: T1
         by: code-13
         evidence: "code: two-call staged write (requester confirm) behind delegated_work.delegated_level(); memory project_cora_delegated_work_phase1"
+      - ts: 2026-09-19
+        event: confirmed
+        by: Harrison
+        evidence: "batch confirm: Code #13 ask block RULED 2026-09-19 (_shared/projects/cora/_notes/2026-09-19_fndr_RULINGS-code-13-ask-batch.md: registry confirmed as seeded except nightly-catchup); applied to this file by Cowork 2026-09-20 (decisions.md 2026-09-20 [FNDR/ORG+CORA])"
 
   - lane: email-triage-tier1
     title: "fndr-email-triage-twice-daily (Cowork-estate task, Sonnet) -- Tier 1 packet"
@@ -191,13 +229,17 @@ lanes:
       failing_capable: false
     audit_surface: "the packet file in the Founder OS + the ZONE-X mirror body of the task"
     authority: Harrison
-    confirmed_by: pending-Harrison
+    confirmed_by: Harrison 2026-09-19
     events:
       - ts: 2026-09-19
         event: seeded
         tier: T0
         by: code-13
         evidence: "_shared/projects/cora/_mirror/cowork-scheduled-tasks/cora-mirror-fndr-email-triage-twice-daily.md; cq-8324caf8fa08 = the evidence_monitor gap"
+      - ts: 2026-09-19
+        event: confirmed
+        by: Harrison
+        evidence: "batch confirm: Code #13 ask block RULED 2026-09-19 (_shared/projects/cora/_notes/2026-09-19_fndr_RULINGS-code-13-ask-batch.md: registry confirmed as seeded except nightly-catchup); applied to this file by Cowork 2026-09-20 (decisions.md 2026-09-20 [FNDR/ORG+CORA])"
 
   - lane: email-triage-tier2
     title: "fndr-email-triage Tier 2 (Fable subagent leg staging Gmail DRAFTS; never sends)"
@@ -210,13 +252,17 @@ lanes:
       failing_capable: false
     audit_surface: "Gmail Drafts + the packet file"
     authority: Harrison
-    confirmed_by: pending-Harrison
+    confirmed_by: Harrison 2026-09-19
     events:
       - ts: 2026-09-19
         event: seeded
         tier: T0
         by: code-13
         evidence: "the ZONE-X mirror body line 8 ('NEVER sends, D-137')"
+      - ts: 2026-09-19
+        event: confirmed
+        by: Harrison
+        evidence: "batch confirm: Code #13 ask block RULED 2026-09-19 (_shared/projects/cora/_notes/2026-09-19_fndr_RULINGS-code-13-ask-batch.md: registry confirmed as seeded except nightly-catchup); applied to this file by Cowork 2026-09-20 (decisions.md 2026-09-20 [FNDR/ORG+CORA])"
 
   - lane: revops-send
     title: "Revenue-ops send path (revops.send_trust; CORA_SEND_LIVE) -- DARK"
@@ -229,7 +275,7 @@ lanes:
       failing_capable: true
     audit_surface: "the revops ledger + the threaded Tier-0 draft"
     authority: Harrison
-    confirmed_by: pending-Harrison
+    confirmed_by: Harrison 2026-09-19
     acting_probe: send_live_mode
     events:
       - ts: 2026-09-19
@@ -237,6 +283,10 @@ lanes:
         tier: T0
         by: code-13
         evidence: ".env carries no CORA_SEND_LIVE key (name check) -> Tier 0 forced for every playbook (send_trust.send_live_mode)"
+      - ts: 2026-09-19
+        event: confirmed
+        by: Harrison
+        evidence: "batch confirm: Code #13 ask block RULED 2026-09-19 (_shared/projects/cora/_notes/2026-09-19_fndr_RULINGS-code-13-ask-batch.md: registry confirmed as seeded except nightly-catchup); applied to this file by Cowork 2026-09-20 (decisions.md 2026-09-20 [FNDR/ORG+CORA])"
 
   - lane: one-cora-ensure
     title: "One-Cora ensure lane (meeting_capture.execute_ensure: guest-add / copy cora@ onto qualifying meetings)"
@@ -249,7 +299,7 @@ lanes:
       failing_capable: true
     audit_surface: "logs/meeting-capture-ledger.jsonl (ensure rows) + the 07:22 audit post to #founder-operations"
     authority: Harrison
-    confirmed_by: pending-Harrison
+    confirmed_by: Harrison 2026-09-19
     acting_probe: ensure_mode
     events:
       - ts: 2026-09-19
@@ -257,6 +307,10 @@ lanes:
         tier: T2
         by: code-13
         evidence: "decisions.md 2026-09-08 'One Cora Notetaker' (live flip); .env carries CORA_ONECORA_ENSURE (name check); history before this registry is not reconstructed"
+      - ts: 2026-09-19
+        event: confirmed
+        by: Harrison
+        evidence: "batch confirm: Code #13 ask block RULED 2026-09-19 (_shared/projects/cora/_notes/2026-09-19_fndr_RULINGS-code-13-ask-batch.md: registry confirmed as seeded except nightly-catchup); applied to this file by Cowork 2026-09-20 (decisions.md 2026-09-20 [FNDR/ORG+CORA])"
 
   - lane: honesty-rail-capability-screen
     title: "Honesty rail: capability-denial + internal-tool-name screen (slack_egress.screen_capability_claims; Code #13 slice 1)"
@@ -269,7 +323,7 @@ lanes:
       failing_capable: true
     audit_surface: "log key phantom-capability-claim kind=denial|toolname ... (bot format, cora.slack_egress)"
     authority: Harrison
-    confirmed_by: pending-Harrison
+    confirmed_by: Harrison 2026-09-19
     acting_probe: sentinel_mode
     events:
       - ts: 2026-09-19
@@ -277,6 +331,10 @@ lanes:
         tier: T0
         by: code-13
         evidence: "Code #13 kickoff section 1 slice 1 (cq-2a88e32a75ea); born T0 OBSERVE"
+      - ts: 2026-09-19
+        event: confirmed
+        by: Harrison
+        evidence: "batch confirm: Code #13 ask block RULED 2026-09-19 (_shared/projects/cora/_notes/2026-09-19_fndr_RULINGS-code-13-ask-batch.md: registry confirmed as seeded except nightly-catchup); applied to this file by Cowork 2026-09-20 (decisions.md 2026-09-20 [FNDR/ORG+CORA])"
 
   - lane: founder-dm-queue-verbs
     title: "Founder-DM typed queue verbs (S1' + RIDER 2 normalizer/refusal; code_queue.match_queue_verb)"
@@ -289,32 +347,45 @@ lanes:
       failing_capable: true
     audit_surface: "data/state/code-session-queue.jsonl events + logs/cora-*.log founder-dm lines"
     authority: Harrison
-    confirmed_by: pending-Harrison
+    confirmed_by: Harrison 2026-09-19
     events:
       - ts: 2026-09-19
         event: seeded
         tier: T1
         by: code-13
         evidence: "Code #12 S1' (cq-554184feb53b) + Code #13 RIDER 2 (cq-70d7b203f7ad)"
+      - ts: 2026-09-19
+        event: confirmed
+        by: Harrison
+        evidence: "batch confirm: Code #13 ask block RULED 2026-09-19 (_shared/projects/cora/_notes/2026-09-19_fndr_RULINGS-code-13-ask-batch.md: registry confirmed as seeded except nightly-catchup); applied to this file by Cowork 2026-09-20 (decisions.md 2026-09-20 [FNDR/ORG+CORA])"
 
   - lane: nightly-catchup
     title: "Missed-start catch-up for the nightly ingest set (scripts/check_missed_nightly.py; Code #13 slice 2)"
-    tier: T2
+    tier: T1
     status: live
-    promotion_criteria: "n/a -- an internal-only re-run of Cora's own tasks; the kickoff asks Harrison to confirm T2 act-with-audit or demote to T0 (propose card only)"
+    promotion_criteria: "RULED T1 2026-09-19 (dry-run: the replay PLAN is written, nothing re-fired; --apply absent). T2 act-with-audit needs: the ladder validator able to compare declared tier to the actual run mode (cq-102349d5e55f) + the dry-run ledger row (Code #14 R14-7) so the 08:45 check reads a decision row + one clean observed week of plans (logs/tasks/Cora-Missed-Nightly-Catch-Up-<date>.log) -> Harrison's tap"
     demotion_triggers: "a task run twice for one window, a run outside 06:00-12:00 AZ, or a run while Task Scheduler reports the task Running -> the lane is demoted to dry-run (propose) until reviewed"
     evidence_monitor:
       description: "logs/nightly-catchup.jsonl (plan + per-task rows) read by nightly_health_check.check_missed_nightly_catchup (WARNs on ran / cannot_check / no decision row) + the Monday digest"
       failing_capable: true
     audit_surface: "logs/nightly-catchup.jsonl + run markers (catch_up: true) + logs/tasks/<slug>-<date>.log headers of the replayed runs"
     authority: Harrison
-    confirmed_by: pending-Harrison
+    confirmed_by: Harrison 2026-09-19
     events:
       - ts: 2026-09-19
         event: seeded
         tier: T2
         by: code-13
         evidence: "Code #13 kickoff section 1 slice 2 (cq-fb50c9e6c911); the 9/9 host outage lost 13 nightly fires and nothing noticed"
+      - ts: 2026-09-19
+        event: demoted
+        tier: T1
+        by: Harrison
+        evidence: "ask 9.2 RULED T1 (R-A: a new lane is born T0/T1, never T2; D-326); the task was registered 2026-09-19 WITHOUT --apply (chore f65b7fc) = dry-run in practice; the 2026-09-20 08:45 check_ladder_registry was silent on the T2-declared/T1-actual mismatch -> validator gap seeded cq-102349d5e55f"
+      - ts: 2026-09-19
+        event: confirmed
+        by: Harrison
+        evidence: "batch confirm: Code #13 ask block RULED 2026-09-19 (_shared/projects/cora/_notes/2026-09-19_fndr_RULINGS-code-13-ask-batch.md: registry confirmed as seeded except nightly-catchup); applied to this file by Cowork 2026-09-20 (decisions.md 2026-09-20 [FNDR/ORG+CORA])"
 
   - lane: one-cora-rsvp-accept
     title: "One-Cora RSVP-accept as cora@ after a guest-add (calendar_client.set_own_response; Code #13 slice 3)"
@@ -327,7 +398,7 @@ lanes:
       failing_capable: true
     audit_surface: "logs/meeting-capture-ledger.jsonl action=rsvp-accept rows + the 07:22 audit post"
     authority: Harrison
-    confirmed_by: pending-Harrison
+    confirmed_by: Harrison 2026-09-19
     acting_probe: ensure_mode
     events:
       - ts: 2026-09-19
@@ -335,6 +406,10 @@ lanes:
         tier: T2
         by: code-13
         evidence: "decisions.md 2026-09-08 R1 ruling (RSVP-accept as cora@ = THE fix); cq-19b0298cf5be; Code #13 slice 3"
+      - ts: 2026-09-19
+        event: confirmed
+        by: Harrison
+        evidence: "batch confirm: Code #13 ask block RULED 2026-09-19 (_shared/projects/cora/_notes/2026-09-19_fndr_RULINGS-code-13-ask-batch.md: registry confirmed as seeded except nightly-catchup); applied to this file by Cowork 2026-09-20 (decisions.md 2026-09-20 [FNDR/ORG+CORA])"
 
   - lane: meeting-recap-card
     title: "Meeting recap card -> organizer confirm -> internal attendees' DMs (meeting_recap; Code #13 slice 5)"
@@ -347,7 +422,7 @@ lanes:
       failing_capable: true
     audit_surface: "the organizer card + the send ledger"
     authority: Harrison
-    confirmed_by: pending-Harrison
+    confirmed_by: Harrison 2026-09-19
     capability_terms: ["recap card", "meeting recap", "recap"]
     ask_hint: "after a captured meeting the organizer gets a card; tap 'send recap to internal attendees'"
     events:
@@ -356,6 +431,10 @@ lanes:
         tier: T0
         by: code-13
         evidence: "decisions.md 2026-09-08 R2 ruling; cq-7a724ee43964; Code #13 slice 5"
+      - ts: 2026-09-19
+        event: confirmed
+        by: Harrison
+        evidence: "batch confirm: Code #13 ask block RULED 2026-09-19 (_shared/projects/cora/_notes/2026-09-19_fndr_RULINGS-code-13-ask-batch.md: registry confirmed as seeded except nightly-catchup); applied to this file by Cowork 2026-09-20 (decisions.md 2026-09-20 [FNDR/ORG+CORA])"
 
   - lane: drive-sweep-allowlist
     title: "Harrison's per-user Drive sweep in ALLOWLIST-BY-FOLDER mode (D-303; drive_sweep; Code #13 slice 8)"
@@ -368,13 +447,17 @@ lanes:
       failing_capable: true
     audit_surface: "logs/drive-sweep-<date>.log sweep line + the purge manifest (Harrison-run, stop window)"
     authority: Harrison
-    confirmed_by: pending-Harrison
+    confirmed_by: Harrison 2026-09-19
     events:
       - ts: 2026-09-19
         event: seeded
         tier: T2
         by: code-13
         evidence: "D-303 ruled 2026-09-10 (allowlist-by-folder, v1 = HJR-Founder-OS root); cq-c5ed06e1f0bf; Code #13 slice 8"
+      - ts: 2026-09-19
+        event: confirmed
+        by: Harrison
+        evidence: "batch confirm: Code #13 ask block RULED 2026-09-19 (_shared/projects/cora/_notes/2026-09-19_fndr_RULINGS-code-13-ask-batch.md: registry confirmed as seeded except nightly-catchup); applied to this file by Cowork 2026-09-20 (decisions.md 2026-09-20 [FNDR/ORG+CORA])"
 
   - lane: repeat-signal-escalation
     title: "Repeat-signal escalation (G3, D-302): consecutive unacked signals change surface/owner; 3rd -> ONE propose-only card + suppression"
@@ -387,13 +470,17 @@ lanes:
       failing_capable: true
     audit_surface: "the escalation ledger + the briefing line + the decisions-pending card"
     authority: Harrison
-    confirmed_by: pending-Harrison
+    confirmed_by: Harrison 2026-09-19
     events:
       - ts: 2026-09-19
         event: seeded
         tier: T0
         by: code-13
         evidence: "D-302 ruled 2026-09-10; audit 2026-09-19 section 3 (decision gates re-alarm every 8-9 d and self-clear); Code #13 slice 9"
+      - ts: 2026-09-19
+        event: confirmed
+        by: Harrison
+        evidence: "batch confirm: Code #13 ask block RULED 2026-09-19 (_shared/projects/cora/_notes/2026-09-19_fndr_RULINGS-code-13-ask-batch.md: registry confirmed as seeded except nightly-catchup); applied to this file by Cowork 2026-09-20 (decisions.md 2026-09-20 [FNDR/ORG+CORA])"
 
   - lane: expected-invoice-owner-nudge
     title: "Expected Invoice Check: portal-only vendor MISSING -> T0 nudge DM to the named owner (expected_invoices; Code #13 slice 9a)"
@@ -406,13 +493,17 @@ lanes:
       failing_capable: true
     audit_surface: "the owner DM + the check's log"
     authority: Harrison
-    confirmed_by: pending-Harrison
+    confirmed_by: Harrison 2026-09-19
     events:
       - ts: 2026-09-19
         event: seeded
         tier: T0
         by: code-13
         evidence: "D-302 ruled 2026-09-10 (day ~9 + owner-DM nudge); cq-21207e34a954"
+      - ts: 2026-09-19
+        event: confirmed
+        by: Harrison
+        evidence: "batch confirm: Code #13 ask block RULED 2026-09-19 (_shared/projects/cora/_notes/2026-09-19_fndr_RULINGS-code-13-ask-batch.md: registry confirmed as seeded except nightly-catchup); applied to this file by Cowork 2026-09-20 (decisions.md 2026-09-20 [FNDR/ORG+CORA])"
 
   - lane: cowork-run-marker-contract
     title: "Cowork-estate file-drop run markers (_runs/<task>/<date>.json) read into the mirror parity report (Code #13 slice 9c)"
@@ -425,10 +516,14 @@ lanes:
       failing_capable: true
     audit_surface: "PARITY-REPORT.md + the Monday digest line"
     authority: Harrison
-    confirmed_by: pending-Harrison
+    confirmed_by: Harrison 2026-09-19
     events:
       - ts: 2026-09-19
         event: seeded
         tier: T0
         by: code-13
         evidence: "cq-06045f418bd2; coverage re-measured 2026-09-19: 0 of 109 Cowork tasks write the contract (the 4 self-loggers write ad-hoc jsonl to three other Drive paths -- the 9/8 '4 of 74' read counted those); a task that fires and writes nothing == one that never fired"
+      - ts: 2026-09-19
+        event: confirmed
+        by: Harrison
+        evidence: "batch confirm: Code #13 ask block RULED 2026-09-19 (_shared/projects/cora/_notes/2026-09-19_fndr_RULINGS-code-13-ask-batch.md: registry confirmed as seeded except nightly-catchup); applied to this file by Cowork 2026-09-20 (decisions.md 2026-09-20 [FNDR/ORG+CORA])"
