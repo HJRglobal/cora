@@ -387,7 +387,10 @@ def test_raw_command_line_is_none_off_windows(monkeypatch):
 def test_retention_prunes_only_logs_older_than_the_window(logs):
     logs.mkdir(parents=True)
     old = logs / "old-2020-01-01.log"
-    fresh = logs / "fresh-2026-09-01.log"
+    # the FILENAME date is pruned too, so "fresh" must be dated today -- a hard-coded
+    # date rotted on 2026-09-15, 14 days after it was written (time-rot class)
+    from datetime import datetime, timezone
+    fresh = logs / f"fresh-{datetime.now(timezone.utc):%Y-%m-%d}.log"
     for f in (old, fresh):
         f.write_text("x", encoding="utf-8")
     stale = time.time() - 20 * 86400
