@@ -72,21 +72,29 @@ def test_the_quota_is_global_not_granted_per_person():
     assert delegated_work.quota_remaining(JERRY) <= delegated_work.user_daily_quota()
 
 
-def test_jerry_reaches_his_own_entities_and_not_others():
-    """The real boundary: unlisted in user-permissions.yaml means FNDR + HJRG."""
-    assert user_access.is_authorized(JERRY, "HJRG") is True
-    assert user_access.is_authorized(JERRY, "FNDR") is True
-    for entity in ("LEX", "LEX-LLC", "F3E", "OSN"):
+# RULED 2026-09-19 (ask 9.14; Harrison commit f65b7fc): Jerry now HAS a
+# user-permissions row -- FNDR/HJRG/F3E/OSN/HJRP, with phi/hr/legal/cap_table
+# blocked. Re-pinned 2026-09-22 (Code #14); these two tests pinned the pre-ruling
+# "unlisted -> FNDR+HJRG only" state. The ruling's draft row was HJRG-only with
+# "entity lists are yours to trim"; the committed row is wider (it matches
+# Tessa's). Flagged in the Code #14 cascade report for Harrison to confirm.
+JERRY_ENTITIES = ("FNDR", "HJRG", "F3E", "OSN", "HJRP")
+
+
+def test_jerry_reaches_his_ruled_entities_and_not_others():
+    for entity in JERRY_ENTITIES:
+        assert user_access.is_authorized(JERRY, entity) is True, entity
+    for entity in ("LEX", "LEX-LLC", "LEX-LTS", "UFL", "BDM"):
         assert user_access.is_authorized(JERRY, entity) is False, entity
 
 
-def test_widening_him_without_a_phi_block_would_be_a_regression():
-    """Documents the trap in an executable form. An unlisted user has NO topic
-    blocks, so `check_access` short-circuits topic screening entirely -- which is
-    harmless only while entity scope keeps him out of LEX."""
-    assert user_access.blocked_topics(JERRY) == []
-    # If someone adds a permissions entry that reaches LEX, it MUST carry the
-    # phi block. This asserts the current, safe state.
+def test_his_row_carries_the_phi_block_and_never_reaches_lex():
+    """The trap this file documented: an unlisted user has NO topic blocks, so
+    check_access short-circuits topic screening. His ruled row now carries the
+    blocks, and it still does not reach LEX; if it is ever widened to LEX, the phi
+    block is what keeps that safe."""
+    blocked = user_access.blocked_topics(JERRY)
+    for topic in ("phi", "hr", "legal", "cap_table"):
+        assert topic in blocked, topic
     assert user_access.is_authorized(JERRY, "LEX") is False, (
-        "Jerry now reaches LEX -- his user-permissions entry must carry "
-        "sensitive_topics_blocked: [phi, cap_table] (copy Hannah's row)")
+        "Jerry now reaches LEX -- confirm with Harrison; the phi block must stay")

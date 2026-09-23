@@ -54,6 +54,18 @@ ENABLED_TWELVE = [
 ]
 CANDIDATES_FOUR = ["cowork-cora-qbo-token-refresh", "cowork-cora-reconciliation",
                    "cowork-cora-info-for-cora-sweep", "cowork-cora-gap-autofill"]
+# RULED 2026-09-19 (ask 9.7, Harrison commit f65b7fc): all four candidates ENABLED.
+# Under T1 (no --apply) this only widens what the dry-run REPORTS. The shipped set
+# is therefore sixteen enabled, in trigger order (the four interleave by trigger).
+ENABLED_SIXTEEN = [
+    "cowork-cora-kb-sync-slack", "cowork-cora-qbo-token-refresh", "cowork-cora-kb-sync-gmail",
+    "cowork-cora-kb-sync-asana", "cowork-cora-kb-sync-fireflies", "cowork-cora-claude-mirror",
+    "cowork-cora-kb-sync-static", "cowork-cora-kb-sync-drive", "Cora - LEX Dump Folder Sync",
+    "cowork-cora-kb-sync-notion", "cowork-cora-session-capture", "cowork-cora-reconciliation",
+    "Cora - Drive Materialization", "Cora - Drive Sweep", "cowork-cora-info-for-cora-sweep",
+    "cowork-cora-gap-autofill",
+]
+assert sorted(ENABLED_SIXTEEN) == sorted(ENABLED_TWELVE + CANDIDATES_FOUR)
 
 
 def _az(day: date, hh: int, mm: int, ss: int = 0) -> datetime:
@@ -171,12 +183,14 @@ class TestSlugAndSet:
         assert nc.effective_slug(t, nc.TaskState(state="Ready")) == "Cora-Drive-Sweep"
         assert nc.effective_slug(t, None) == "Cora-Drive-Sweep"
 
-    def test_shipped_set_loads_sorted_with_twelve_enabled_and_four_candidates(self):
+    def test_shipped_set_loads_sorted_with_all_sixteen_enabled_as_ruled(self):
+        """Re-pinned 2026-09-22 (Code #14): the four candidates were enabled by the
+        9.7 ruling (f65b7fc); this test pinned the pre-ruling twelve-plus-four."""
         window, tasks = nc.load_set(_REAL_SET)
         assert window.start_az == "06:00" and window.end_az == "12:00"
         names = [t.name for t in tasks]
-        assert [t.name for t in tasks if t.enabled] == ENABLED_TWELVE
-        assert sorted(t.name for t in tasks if not t.enabled) == sorted(CANDIDATES_FOUR)
+        assert [t.name for t in tasks if t.enabled] == ENABLED_SIXTEEN
+        assert [t.name for t in tasks if not t.enabled] == []
         triggers = [t.trigger_dt(DAY_0909) for t in tasks]
         assert triggers == sorted(triggers)
         assert all(t.command for t in tasks) and all(t.max_minutes > 0 for t in tasks)
@@ -268,8 +282,10 @@ class TestReplayFixture:
                    {"task": "cowork-cora-meeting-capture-audit", "ts": "2026-09-09T14:22:19+00:00", "ok": True}]
         decisions = _decide(tasks, window, DAY_0909, _az(DAY_0909, 8, 45), tmp_path, markers, _ready(tasks))
         runs = [d.task.name for d in decisions if d.action == "run"]
-        assert runs == ENABLED_TWELVE
-        assert {d.task.name for d in decisions if d.action == "skipped_disabled_in_set"} == set(CANDIDATES_FOUR)
+        # With the ruled set every enabled task with no in-window evidence is a run,
+        # the four ex-candidates included (their 9/9 logs are absent from the shape).
+        assert runs == ENABLED_SIXTEEN
+        assert {d.task.name for d in decisions if d.action == "skipped_disabled_in_set"} == set()
         assert not [d for d in decisions if d.action == "fired"]
 
     def test_0910_selects_nothing(self, tmp_path):
@@ -277,7 +293,7 @@ class TestReplayFixture:
         _shape_0910(tmp_path, tasks)
         decisions = _decide(tasks, window, DAY_0910, _az(DAY_0910, 8, 45), tmp_path, [], _ready(tasks))
         assert [d.task.name for d in decisions if d.action == "run"] == []
-        assert sorted(d.task.name for d in decisions if d.action == "fired") == sorted(ENABLED_TWELVE)
+        assert sorted(d.task.name for d in decisions if d.action == "fired") == sorted(ENABLED_SIXTEEN)
 
     def test_0910_with_only_the_hand_refire_still_reads_fired(self, tmp_path):
         window, tasks = nc.load_set(_REAL_SET)
@@ -575,14 +591,16 @@ class TestB1UnverifiedNightReadsWarn:
         fired on schedule'. Nine ingest tasks were lost for the day."""
         window, tasks = nc.load_set(_REAL_SET)
         decisions = _decide(tasks, window, DAY_0910, _az(DAY_0910, 12, 35), tmp_path, [], _ready(tasks))
-        assert nc.counts(decisions) == {"skipped_window": 12, "skipped_disabled_in_set": 4}
+        assert nc.counts(decisions) == {"skipped_window": 16}      # ruled 9.7: no candidates left
         nc.append_ledger(nc.plan_row(DAY_0910, _az(DAY_0910, 12, 35), "apply", decisions), ledger)
         r = nhc.check_missed_nightly_catchup(now=_az(DAY_0910, 12, 35))
         assert r.status == "warn", r.detail
         assert "every task fired" not in r.detail
         assert "cowork-cora-kb-sync-gmail skipped_window (not verified)" in r.detail
         assert "Cora - Drive Sweep skipped_window (not verified)" in r.detail
-        assert "cowork-cora-qbo-token-refresh" not in r.detail          # disabled-in-set is not an alarm
+        # 9.7 enabled the ex-candidates, so they are now unverified misses too (the
+        # disabled-in-set-is-not-an-alarm property is pinned by test_ok_tail_is_derived_from_counts).
+        assert "cowork-cora-qbo-token-refresh skipped_window (not verified)" in r.detail
 
     @pytest.mark.parametrize("action", ["skipped_not_due", "skipped_disabled", "cannot_check"])
     def test_an_enabled_task_with_no_evidence_is_never_ok(self, ledger, action):
@@ -685,7 +703,7 @@ class TestB3PastDayDryRun:
         out = capsys.readouterr().out
         assert rc == 0 and spawned == [] and not ledger.exists()
         assert "evaluated as of 11:59:59 AZ on 2026-09-09" in out
-        assert "run=12" in out.split("counts:")[1] and "skipped_window" not in out.split("counts:")[1]
+        assert "run=16" in out.split("counts:")[1] and "skipped_window" not in out.split("counts:")[1]
 
     def test_now_override_pins_the_clock_for_a_dry_run(self, ledger, tmp_path, capsys, monkeypatch):
         mod = _load_script()
@@ -694,7 +712,7 @@ class TestB3PastDayDryRun:
                       now_az=_az(date(2026, 9, 19), 19, 37))
         out = capsys.readouterr().out
         assert rc == 0 and "evaluated as of 03:00:00 AZ on 2026-09-09 (--now)" in out
-        assert "skipped_not_due=12" in out.split("counts:")[1]       # slack's 04:30 deadline is the earliest
+        assert "skipped_not_due=16" in out.split("counts:")[1]       # nothing's deadline has passed at 03:00
         assert mod.main(["--day", "2026-09-09", "--now", "25:00", "--no-scheduler"], now_az=_az(date(2026, 9, 19), 19, 37)) == 2
 
     def test_apply_refusals_stay_on_the_real_clock(self, ledger, tmp_path):
