@@ -247,17 +247,18 @@ def draft_until_clean(row, *, template: str, faq: str, lineup: str, lane: str,
     """(draft, preflight_result). draft is None if no usable draft came back.
 
     Why a revision pass exists at all: the claims rails are deliberately strict
-    on a claims surface -- rail 2 trips on "clean" sharing a SENTENCE with the
-    Energy line even when the word plainly attaches to Pure. That is the right
-    direction for a fail-closed guard, but the first live draft tripped exactly
-    that construction ("the full stack in F3 Energy or the clean-sweetened
-    version in F3 Pure"), which a model writes naturally whenever an article
-    links both lines. Left alone, the lane would jam on the same sentence shape
-    every week.
+    on a claims surface, and a fail-closed guard will reject sentences a model
+    writes naturally. Rail 2 used to trip on "clean" sharing a SENTENCE with the
+    Energy line even when the word plainly attached to Pure ("the full stack in
+    F3 Energy or the clean-sweetened version in F3 Pure", the first live
+    rejection), and the lane jammed on that shape.
 
-    So the guard stays strict and the LOOP gets smarter: the tripped rail and the
-    offending sentence go back to the model once. Loosening the rail instead would
-    have traded a productivity problem for a claims hole.
+    Since R14-3 rail 2 is ATTRIBUTION-scoped (the clean word must be predicated
+    of Energy/Mood to trip) with two exact ruled phrases cleared -- a loosening
+    shipped only because the rail2_harness differential gate passed under
+    Harrison's 2026-09-19 ruling (ESC-1 (A), D-329), never on anecdote. The loop
+    stays anyway: the tripped rail and the offending sentence go back to the
+    model once, which still unjams every other rail without loosening any.
     """
     revision = ""
     draft = None

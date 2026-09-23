@@ -1,41 +1,40 @@
-"""Rail-2 differential harness (Code #13 slice 6, cq-85b35413b020).
+"""Rail-2 differential harness (Code #13 slice 6; the ship gate for R14-3, cq-85b35413b020).
 
-THE RULING (decisions.md 2026-09-01, C6): the blog-preflight false-positive fix is
-(b) an ATTRIBUTION-scoped rail 2 + drafting.py in the same commit, CONDITIONED on a
-purpose-built differential suite in the same slice -- the #11 S7 attempt loosened
-the rail three ways and the D-051 differential (main=TRIP -> branch=PASS on five
-sentences) reverted it. So the harness, not anecdote, decides: the five pinned
-probes + the ruled claims-hole set must FAIL the new rail (be caught) and the
-measured false-positive set must PASS it before the loosened rail may ship.
+THE RULINGS. 2026-09-01 (C6): the blog-preflight false-positive fix is (b) an
+ATTRIBUTION-scoped rail 2 + drafting.py in the same commit, CONDITIONED on a
+purpose-built differential suite -- the #11 S7 attempt loosened the rail three ways
+and the D-051 differential (main=TRIP -> branch=PASS on five sentences) reverted it.
+So the harness, not anecdote, decides. 2026-09-19 (ESC-1 (A), ESC 3(i)/(ii), D-329):
+the sugar-free-on-Pure and comparative-category classes -- which pass BOTH rails
+because no mechanical rail exists for either -- are RULED OUT of rail 2's ship
+condition (still probed, still reported, seeded as rails of their own), and two
+exact phrases are cleared. Under those rulings the gate passes and R14-3 wired the
+attribution rail into run_preflight.
 
 WHAT THIS MODULE HOLDS (data + pure functions; no network, no LLM):
   * PINNED_D051        -- the five S7 hole sentences, verbatim from
                           tests/test_d051_remediation.py (a rail must replay its
                           own incident; edit that module and this one together);
-  * CLAIMS_HOLE_PROBES -- the ruled classes: clean/natural on Energy/Mood, NSF on
+  * CLAIMS_HOLE_PROBES -- the ruled classes: clean/natural on Energy/Mood (incl. the
+                          R14-3 no-widening probes for the two exemptions and the
+                          environmental-predicate / hyphen-compound holes), NSF on
                           Pure/Mood, sleep on Mood, sugar-free on Pure, comparative
                           category claims;
-  * FALSE_POSITIVE_SET -- the measured FP shapes (the 8/26 and 9/1 live rejections,
-                          the CleanHub environmental sentences, the chemistry
-                          sentence) that a correct attribution rail must PASS;
-  * UNDECIDED          -- the 9/14 jam sentence ('natural caffeine' on Energy) and
-                          the 9/1 Pure-attached tail (trips again under fail-closed
-                          union inheritance, D-051 EF-7): reported, never gated --
-                          each needs Harrison's ruling;
-  * new_preflight()    -- run_preflight with rail 2 swapped for the attribution
-                          sibling (every OTHER rail unchanged), composed here so
-                          run_preflight keeps its four parameters and no caller can
-                          ever pass a rail off (fail-closed pin);
+  * RULED_OUT_CLASSES  -- the two classes with no rail, excluded from the ship
+                          condition by ruling and reported as such on every run;
+  * FALSE_POSITIVE_SET -- the measured FP shapes (the 8/26 live rejection, the
+                          CleanHub environmental sentences, the chemistry sentence,
+                          the 9/14 green-tea jam and the Pure-launch "cleaner fuel
+                          source" line) that the shipping rail must PASS;
+  * UNDECIDED          -- the 9/1 Pure-attached tail (trips under fail-closed union
+                          inheritance, D-051 EF-7): reported, never gated;
+  * legacy_preflight() -- the FROZEN pre-R14-3 composition: run_preflight's non-R2
+                          trips + rail2_legacy_hit over the same fields;
+  * new_preflight()    -- run_preflight itself: the gate measures the SHIPPING
+                          function, never a composition of it;
   * evaluate() / gate() -- the ship decision, and WHY;
-  * differential()     -- legacy vs attribution over any sentence corpus (the live
-                          News/Learn read the Monday script performs).
-
-THE FINDING THIS HARNESS PRODUCES ON 2026-09-19: the sugar-free-on-Pure and the
-comparative-category classes pass BOTH rails -- no mechanical rail exists for
-either (rail 9 'product facts from cleared sources' is human judgment by design).
-The ship condition 'ALL caught' is therefore unreachable by any rail-2 change
-alone; the attribution rail stays unwired and the finding goes to Harrison as an
-ESCALATION note (Code #13 kickoff section 8), never a mid-build redesign.
+  * differential()     -- legacy vs shipping rail 2 over any sentence corpus (the
+                          live News/Learn read the differential script performs).
 """
 from __future__ import annotations
 
@@ -52,7 +51,8 @@ PINNED_D051: tuple[str, ...] = (
     "No one denies that F3 Energy cures fatigue.",
 )
 
-# ── the ruled claims-hole classes (must ALL be caught for the rail to ship) ─────
+# ── the ruled claims-hole classes (every class outside RULED_OUT_CLASSES must be
+#    fully caught for the rail to ship; the ruled-out two are probed + reported) ──
 CLAIMS_HOLE_PROBES: dict[str, tuple[str, ...]] = {
     "clean_natural_on_energy_mood": (
         "F3 Energy is Clean Energy.",
@@ -75,6 +75,36 @@ CLAIMS_HOLE_PROBES: dict[str, tuple[str, ...]] = {
         # D-051 EF-7: a disjunction of brands attaches the clean word to BOTH
         "Clean energy from F3 Pure or F3 Energy.",
         "F3 Energy or F3 Pure: clean, natural energy.",
+        # R14-3 NO-WIDENING: the two ruled phrases are EXACT. Every variant, every
+        # bare use, and either phrase in a sentence that names Mood still trips.
+        "F3 Energy has natural caffeine.",
+        "F3 Energy is naturally caffeinated.",
+        "F3 Energy runs on clean fuel.",
+        "F3 Energy is the cleanest fuel source.",
+        "F3 Energy: natural caffeine from green tea and clean energy all day.",
+        "F3 Energy is a cleaner fuel for a natural high.",
+        "F3 Mood is a cleaner fuel source for your evening.",
+        "F3 Mood has natural caffeine from green tea.",
+        "F3 Energy and F3 Mood both run on natural caffeine from green tea.",
+        "F3 Energy runs on cleaner-fuel.",
+        # R14-3 NEW HOLES the Code #13 environmental redaction opened (it cleared a
+        # PREDICATE of the brand, not only an environmental object): legacy TRIP,
+        # pre-R14-3 attribution PASS
+        "F3 Energy is clean air in a can.",
+        "F3 Energy is a cleaner future.",
+        "F3 Energy is a clean world of flavor.",
+        "F3 Energy delivers clean water-like hydration.",
+        # ...and the metaphorical environmental object (the R14-3 position check's
+        # own first-cut gap: an action verb + environmental noun used as a figure)
+        "F3 Energy builds a cleaner world of flavor.",
+        "F3 Energy protects clean water in every can.",
+        # R14-3 holes that passed BOTH rails (verb form + hyphenated compounds)
+        "F3 Energy cleans up your afternoon.",
+        "F3 Energy is the clean-up crew for your afternoon slump.",
+        "F3 Energy is clean-energy in a can.",
+        "F3 Mood is a clean-energy calm.",
+        "F3 Energy is naturally-caffeinated.",
+        "F3 Energy is the natural-energy pick.",
     ),
     "nsf_on_pure_mood": (
         "F3 Pure is NSF Certified for Sport.",
@@ -98,9 +128,16 @@ CLAIMS_HOLE_PROBES: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# ── the measured false-positive shapes (must PASS the attribution rail) ─────────
+#: Classes with NO mechanical rail, ruled OUT of rail 2's ship condition by
+#: Harrison 2026-09-19 (ESC-1 (A), D-329). Still probed and reported on every run
+#: ("no rail exists -- ruled out ... seeded") so the gap is never silent. Adding a
+#: class here is a RULING, never a fix: tests pin this set exactly.
+RULED_OUT_CLASSES: frozenset[str] = frozenset({"sugar_free_on_pure", "comparative_category"})
+RULED_OUT_NOTE = "no rail exists -- ruled out of rail-2's condition 2026-09-19 (ESC-1 (A), D-329); seeded"
+
+# ── the measured false-positive shapes (must PASS the shipping rail) ────────────
 FALSE_POSITIVE_SET: tuple[str, ...] = (
-    # 8/26: the first live rejection, quoted in drafting.py
+    # 8/26: the first live rejection (drafting.py quoted it as REJECTED until R14-3)
     "Explore the full stack in F3 Energy or the clean-sweetened version in F3 Pure.",
     # (the 9/1 attempt-1 shape moved to UNDECIDED -- D-051 EF-7, see below)
     # CleanHub: the object is the environment, not the product
@@ -108,15 +145,19 @@ FALSE_POSITIVE_SET: tuple[str, ...] = (
     "Every F3 Energy purchase supports a cleaner future for the oceans.",
     # chemistry, already cleared by the natural-occurrence redaction
     "L-theanine occurs naturally in green tea, which is where F3 Energy gets its caffeine.",
+    # 2026-09-14 attempt 1 (the lane jammed): 'natural caffeine from green tea' as an
+    # ingredient descriptor on Energy -- RULED CLEARED 2026-09-19 (ESC 3(i), D-329)
+    "F3 Energy carries 120 mg of natural caffeine from green tea plus a nootropic-leaning stack "
+    "for training and competition.",
+    # the Pure launch copy (9/19 --live read): 'cleaner fuel source' -- RULED CLEARED
+    # 2026-09-19 for Pure AND Energy (ESC 3(ii), D-329); names only Energy
+    "Every can carries the same formula philosophy: the functional stack you know from F3 Energy, "
+    "with a cleaner fuel source.",
 )
 
 # ── reported, never gated: needs a Harrison ruling ──────────────────────────────
 UNDECIDED: tuple[str, ...] = (
-    # 2026-09-14 attempt 1 (the lane jammed): 'natural' as an INGREDIENT descriptor
-    # on Energy. The checklist's letter says trip; the canonical lineup never says
-    # 'natural caffeine'; the live FAQ may.
-    "F3 Energy carries 120 mg of natural caffeine from green tea plus a nootropic-leaning stack "
-    "for training and competition.",
+    # (the 9/14 green-tea sentence moved to FALSE_POSITIVE_SET: ruled 2026-09-19)
     # 9/1 attempt 1: the Pure-attached tail after a clause naming Pure AND Energy.
     # Was in FALSE_POSITIVE_SET under nearest-clause inheritance; D-051 EF-7 made
     # inheritance the UNION of every brand named earlier (fail-closed), so it trips
@@ -132,31 +173,31 @@ def _body(sentence: str) -> str:
     return "<p>%s</p>" % (sentence or "")
 
 
-def legacy_preflight(sentence: str) -> pf.PreflightResult:
-    """The shipping preflight over one sentence (all rails, legacy rail 2)."""
-    return pf.run_preflight(title="Post", summary="", body_html=_body(sentence))
-
-
-def new_preflight(sentence: str) -> pf.PreflightResult:
-    """run_preflight with rail 2 swapped for rail2_attribution_hit; every other rail
-    exactly as shipped. Composed here (not a run_preflight kwarg) so the fail-closed
-    signature pin stands and no caller can turn a rail off."""
-    base = legacy_preflight(sentence)
+def legacy_run(*, title: str = "Post", summary: str = "", body_html: str = "") -> pf.PreflightResult:
+    """The FROZEN pre-R14-3 preflight: every non-R2 trip of the shipping
+    run_preflight, plus rail 2 as the frozen rail2_legacy_hit over the same fields
+    (pf.rail_fields -- the one definition run_preflight reads). Composed here, never
+    a run_preflight kwarg, so the fail-closed signature pin stands and no caller can
+    turn a rail off."""
+    base = pf.run_preflight(title=title, summary=summary, body_html=body_html)
     trips = [t for t in base.trips if t.rail_id != "R2"]
-    title = "Post"
-    fields = (
-        ("title", pf.unescaped(title)),
-        ("summary", pf.html_to_text("")),
-        ("body", pf.html_to_text(_body(sentence))),
-        ("body(structured data / alt text)", pf.hidden_text(_body(sentence))),
-    )
-    for name, text in fields:
+    for name, text in pf.rail_fields(title=title, summary=summary, body_html=body_html):
         for sent in pf.sentences(text):
-            hit = pf.rail2_attribution_hit(sent)
+            hit = pf.rail2_legacy_hit(sent)
             if hit:
                 trips.append(pf._trip("R2", name, "%r near %s: %s" % (hit[0], hit[1], sent)))
                 break
     return pf.PreflightResult(passed=not trips, trips=trips, rails_checked=base.rails_checked)
+
+
+def legacy_preflight(sentence: str) -> pf.PreflightResult:
+    """The frozen pre-R14-3 preflight over one sentence (see legacy_run)."""
+    return legacy_run(title="Post", summary="", body_html=_body(sentence))
+
+
+def new_preflight(sentence: str) -> pf.PreflightResult:
+    """The SHIPPING preflight over one sentence: run_preflight itself."""
+    return pf.run_preflight(title="Post", summary="", body_html=_body(sentence))
 
 
 @dataclass
@@ -174,12 +215,23 @@ class Verdict:
         if self.pinned_missed:
             out.append("pinned D-051 holes MISSED by the new preflight: " + " | ".join(self.pinned_missed))
         for cls, missed in sorted(self.uncaught_by_class.items()):
-            if missed:
-                out.append(f"class {cls}: {len(missed)} probe(s) pass the NEW preflight (uncaught) -- "
+            if not missed:
+                continue
+            if cls in RULED_OUT_CLASSES:
+                out.append(f"class {cls}: {len(missed)} probe(s) pass the shipping preflight -- "
+                           f"{RULED_OUT_NOTE} -- " + " | ".join(missed))
+            else:
+                out.append(f"class {cls}: {len(missed)} probe(s) pass the SHIPPING preflight (uncaught) -- "
                            + " | ".join(missed))
         for cls, missed in sorted(self.uncaught_legacy_by_class.items()):
-            if missed:
+            if not missed:
+                continue
+            if cls in RULED_OUT_CLASSES:
                 out.append(f"class {cls}: {len(missed)} probe(s) ALSO pass the LEGACY preflight (no rail exists)")
+            else:
+                closed = [s for s in missed if s not in self.uncaught_by_class.get(cls, [])]
+                out.append(f"class {cls}: {len(missed)} probe(s) pass the LEGACY preflight; "
+                           f"{len(closed)} of them closed by the shipping rail (R14-3)")
         out.append(f"false positives: legacy trips {len(self.fp_legacy_tripping)}/{len(FALSE_POSITIVE_SET)}, "
                    f"attribution trips {len(self.fp_still_tripping)}/{len(FALSE_POSITIVE_SET)}")
         for s in self.fp_still_tripping:
@@ -192,8 +244,9 @@ class Verdict:
 
 def evaluate() -> Verdict:
     """Run every probe through BOTH preflights and decide the gate: ship iff every
-    pinned hole and every claims-hole probe is caught by the NEW preflight AND every
-    measured false-positive sentence PASSES it."""
+    pinned hole and every claims-hole probe OUTSIDE RULED_OUT_CLASSES is caught by
+    the SHIPPING preflight AND every measured false-positive sentence PASSES it. The
+    ruled-out classes are still run and reported (uncaught_by_class), never hidden."""
     pinned_missed = [s for s in PINNED_D051 if new_preflight(s).passed]
     uncaught: dict[str, list[str]] = {}
     uncaught_legacy: dict[str, list[str]] = {}
@@ -204,7 +257,8 @@ def evaluate() -> Verdict:
     fp_legacy = [s for s in FALSE_POSITIVE_SET if not legacy_preflight(s).passed]
     undecided = {s: {"legacy": not legacy_preflight(s).passed, "attribution": not new_preflight(s).passed}
                  for s in UNDECIDED}
-    ship = not pinned_missed and not any(uncaught.values()) and not fp_new
+    gated_uncaught = [s for cls, missed in uncaught.items() if cls not in RULED_OUT_CLASSES for s in missed]
+    ship = not pinned_missed and not gated_uncaught and not fp_new
     return Verdict(ship=ship, uncaught_by_class=uncaught, uncaught_legacy_by_class=uncaught_legacy,
                    fp_still_tripping=fp_new, fp_legacy_tripping=fp_legacy,
                    pinned_missed=pinned_missed, undecided=undecided)
@@ -215,20 +269,21 @@ class Differential:
     sentences: int
     legacy_trips: list[str]
     attribution_trips: list[str]
-    only_legacy: list[str]        # the false-positive candidates the loosening would release
-    only_attribution: list[str]   # new catches (should be empty; the scope is narrower)
+    only_legacy: list[str]        # the false-positive candidates the attribution scope releases
+    only_attribution: list[str]   # new catches: the R14-3 hole closures (verb forms, hyphen compounds)
 
     def summary_lines(self) -> list[str]:
         return [
             f"sentences scanned: {self.sentences}",
             f"rail-2 trips: legacy {len(self.legacy_trips)} | attribution {len(self.attribution_trips)}",
             f"released by attribution scope (legacy-only trips = the measured FP candidates): {len(self.only_legacy)}",
-            f"caught only by attribution (unexpected; scope is narrower): {len(self.only_attribution)}",
+            f"caught only by the shipping rail (R14-3 hole closures: verb forms, hyphen compounds): "
+            f"{len(self.only_attribution)}",
         ]
 
 
 def differential(sentences_iter) -> Differential:
-    """Legacy vs attribution rail-2 over any sentence corpus (pure; no other rail)."""
+    """Frozen legacy vs SHIPPING rail-2 over any sentence corpus (pure; no other rail)."""
     sents = [s for s in sentences_iter if s and s.strip()]
     legacy = [s for s in sents if pf.rail2_legacy_hit(s)]
     attrib = [s for s in sents if pf.rail2_attribution_hit(s)]

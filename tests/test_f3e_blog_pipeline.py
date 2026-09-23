@@ -688,3 +688,61 @@ def test_the_revision_note_asks_for_the_same_envelope():
                                    revision_trips="R2 (...) in body: ...")
     assert "marker sections" in prompt
     assert "JSON object" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# R14-3: the drafting rule and the shipping rail must agree. A prompt STRICTER
+# than the rail is safe (the model splits sentences the rail would allow); a
+# prompt LOOSER than the rail is a lane jam, and a prompt that quotes a
+# "rejected" sentence the rail now passes teaches the wrong rule.
+# ---------------------------------------------------------------------------
+
+
+def _prompt_text():
+    row = operating_files.parse_backlog(BACKLOG)[1]
+    return " ".join(drafting.build_prompt(row, template="t", faq="f", lineup="l").split())
+
+
+def _run(sentence):
+    return preflight.run_preflight(title="t", summary="", body_html="<p>%s</p>" % sentence)
+
+
+def test_the_prompt_states_the_attribution_rule_and_the_two_cleared_phrases():
+    prompt = _prompt_text()
+    for phrase in drafting.RAIL2_CLEARED_PHRASES:
+        assert '"%s"' % phrase in prompt, phrase
+    assert "SAME SENTENCE" not in prompt
+    assert "A quote is never an exemption." in prompt
+    assert "names F3 Mood" in prompt
+    # the 8/26 sentence now PASSES the rail, so it must not be quoted as rejected
+    assert "the clean-sweetened version in F3 Pure" not in prompt
+
+
+def test_the_prompt_quotes_its_examples_verbatim():
+    prompt = _prompt_text()
+    assert '"%s"' % drafting.RAIL2_GOOD_EXAMPLE in prompt
+    assert '"%s" is rejected' % drafting.RAIL2_REJECTED_EXAMPLE in prompt
+    assert "split it" in prompt
+
+
+def test_the_prompt_good_example_passes_and_its_rejected_example_trips_r2():
+    good = _run(drafting.RAIL2_GOOD_EXAMPLE)
+    assert good.passed, good.render()
+    bad = _run(drafting.RAIL2_REJECTED_EXAMPLE)
+    assert "R2" in bad.tripped_rail_ids
+
+
+def test_each_cleared_phrase_passes_the_rail_in_an_energy_sentence_and_trips_with_mood():
+    for phrase in drafting.RAIL2_CLEARED_PHRASES:
+        ok = _run("F3 Energy runs on %s." % phrase)
+        assert ok.passed, (phrase, ok.render())
+        mood = _run("F3 Mood runs on %s." % phrase)
+        assert "R2" in mood.tripped_rail_ids, phrase
+
+
+def test_the_prompt_has_no_stray_format_fields():
+    """_PROMPT goes through str.format: a literal brace would raise or leak."""
+    import string
+    fields = {f for _, f, _, _ in string.Formatter().parse(drafting._PROMPT) if f}
+    assert fields == {"title", "lane_pillar", "target_prompt", "notes", "template", "faq",
+                      "lineup", "rail2_good", "rail2_rejected"}

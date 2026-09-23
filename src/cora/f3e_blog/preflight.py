@@ -47,9 +47,11 @@ import re
 from dataclasses import dataclass, field
 from typing import Iterable
 
-# Bumped when the rail SET changes (not on wording tweaks). Recorded in the
-# pipeline log so a past run's report can be read against the rails it ran.
-CHECKLIST_MIRROR_VERSION = "1.0"
+# Bumped when the rail SET or a rail's SCOPE changes (not on wording tweaks).
+# Recorded in the pipeline log so a past run's report can be read against the
+# rails it ran. 1.1 (R14-3, 2026-09-19 ruling ESC-1 (A) / D-329): rail 2 ships
+# attribution-scoped with the two exact-phrase exemptions.
+CHECKLIST_MIRROR_VERSION = "1.1"
 
 UNENFORCED_RAILS: tuple[str, ...] = (
     "rail 7 (verified quotes)",
@@ -482,39 +484,138 @@ _NATURAL_OCCURRENCE_RES = (
     re.compile(r"\bnaturally\s{1,3}in\b", re.IGNORECASE),
 )
 
-# rail 2, ATTRIBUTION SCOPE (Code #13 slice 6, cq-85b35413b020; C6 (b) ruled
-# 2026-09-01 CONDITIONED on a differential harness). NOT WIRED into run_preflight:
-# the ruling lets the loosened rail ship only when the harness (rail2_harness)
-# shows every ruled claims-hole probe caught, and two of the ruled classes
-# (sugar-free on Pure, comparative category claims) have NO mechanical rail today,
-# so the gate cannot pass and the legacy same-sentence scan stays the shipping
-# rail. Both hit functions are exported so the harness, its pinned test module and
-# the Monday differential script measure them side by side on the same corpus.
+# rail 2, ATTRIBUTION SCOPE -- THE SHIPPING RAIL since R14-3 (Code #14, closes
+# cq-85b35413b020). History: Code #13 slice 6 built it under the 2026-09-01 C6 (b)
+# ruling CONDITIONED on a differential harness, and left it unwired because the
+# harness gate could not pass (two ruled classes -- sugar-free on Pure, comparative
+# category claims -- have no mechanical rail at all). Harrison's 2026-09-19 ruling
+# ESC-1 (A) / D-329 took those two classes OUT of rail 2's ship condition (they
+# are still probed and reported by rail2_harness, and seeded as rails of their
+# own), ruled the two exact-phrase exemptions below (ESC 3(i)/(ii)), and the gate
+# now passes: run_preflight calls rail2_attribution_hit. rail2_legacy_hit stays
+# exported, byte-identical, as the FROZEN measurement baseline the harness and the
+# differential script compare against -- run_preflight never calls it.
 #
 # WHAT "ATTRIBUTION" MEANS HERE: the clean word is predicated OF the Energy or Mood
-# line. A clean token is exempt only in two positive, narrow shapes -- (1) it sits
+# line. A clean token is exempt only in these positive, narrow shapes -- (1) it sits
 # in a clause segment that names F3 Pure and NOT Energy/Mood ("... or the clean-
-# sweetened version in F3 Pure": the 8/26 and 9/1 live rejections); (2) its object
-# is the ENVIRONMENT, not a product ("a cleaner planet", the CleanHub article).
-# Who said it is never an exemption (the Earthbar attributed quote is a TRUE
-# positive), an ALL-CAPS or Title-Case clean word is not an exemption, and a clause
-# that names Pure AND Energy is ambiguous -> trips (fail closed). Segments split on
-# , ; : and "or / while / whereas / versus" -- deliberately NOT on "and": "F3 Pure
-# is clean-sweetened and F3 Energy is too" attaches clean to Energy across "and".
+# sweetened version in F3 Pure": the 8/26 live rejection); (2) its object is the
+# ENVIRONMENT as the object of an environmental ACTION ("fund a cleaner planet",
+# "clean up the beaches": the CleanHub article), never a predicate of the brand;
+# (3) one of the two ruled exact phrases in _RAIL2_PHRASE_EXEMPTIONS. Who said it is
+# never an exemption (the Earthbar attributed quote is a TRUE positive), an ALL-CAPS
+# or Title-Case clean word is not an exemption, and a clause that names Pure AND
+# Energy is ambiguous -> trips (fail closed). Segments split on , ; : and "or /
+# while / whereas / versus" -- deliberately NOT on "and": "F3 Pure is clean-
+# sweetened and F3 Energy is too" attaches clean to Energy across "and".
+#
+# ENVIRONMENTAL REDACTION IS POSITION-CHECKED (R14-3). The Code #13 cut redacted
+# "clean(er) <environmental noun>" wherever it sat, so the redaction could clear a
+# PREDICATE: "F3 Energy is clean air in a can.", "F3 Energy is a cleaner future.",
+# "F3 Energy is a clean world of flavor." all tripped the legacy rail and PASSED
+# the attribution rail -- dormant holes while unwired, live ones the moment it
+# shipped. Now the environmental phrase is redacted only as the OBJECT of a closed
+# list of environmental-action verbs (fund / support / build / protect / restore /
+# toward), "a cleaner future" only when it is FOR an environmental noun, and "clean
+# up" only when its object is an environmental noun ("clean up your afternoon"
+# trips). A copula ("is", "delivers") never introduces a redaction.
+_ENV_NOUNS = (r"(?:planet|oceans?|waters?|beaches|coast(?:line)?s?|environment|earth|world|"
+              r"air|grid|rivers?|streets?|communit(?:y|ies))")
+_ENV_ACTION_VERBS = (r"(?:fund|funds|funded|funding|support|supports|supported|supporting|"
+                     r"build|builds|building|protect|protects|protecting|restore|restores|"
+                     r"restoring|toward|towards)")
+_ENV_DETERMINER = r"(?:(?:a|an|the|our)\s{1,3})?"
+_CLEANUP_OBJECTS = (r"(?:beach|beaches|oceans?|coast(?:line)?s?|parks?|rivers?|streets?|"
+                    r"shorelines?|waterways?|trails?|litter|trash|plastic|neighbou?rhoods?|"
+                    r"communit(?:y|ies))")
+# A metaphorical environmental noun is a product claim wearing the environment's
+# clothes: "builds a cleaner world of flavor", "protects clean water in every
+# can". An environmental object followed by of / in / inside / within is never
+# redacted (fail closed: "supports clean communities in Mesa" trips too).
+_ENV_NOT_METAPHOR = r"(?!\s{1,3}(?:of|in|inside|within)\b)"
 _CLEAN_ENVIRONMENT_RES = (
-    re.compile(r"\bclean(?:er|est)?\s{1,3}(?:planet|oceans?|future|water|beaches|coast(?:line)?s?|"
-               r"environment|earth|world|air|grid|rivers?|streets?|communit(?:y|ies))\b",
+    # "fund a cleaner planet", "supports clean water"
+    re.compile(r"\b" + _ENV_ACTION_VERBS + r"\s{1,3}" + _ENV_DETERMINER
+               + r"clean(?:er|est)?\s{1,3}" + _ENV_NOUNS + r"\b" + _ENV_NOT_METAPHOR,
                re.IGNORECASE),
-    re.compile(r"\bclean(?:ed|ing|s)?[\s-]{1,3}ups?\b", re.IGNORECASE),
+    # "supports a cleaner future for the oceans" -- "future" alone is a predicate
+    re.compile(r"\b" + _ENV_ACTION_VERBS + r"\s{1,3}" + _ENV_DETERMINER
+               + r"clean(?:er|est)?\s{1,3}future\s{1,3}for\s{1,3}(?:(?:the|our)\s{1,3})?"
+               + _ENV_NOUNS + r"\b" + _ENV_NOT_METAPHOR, re.IGNORECASE),
+    # "helps clean up the beaches" -- the activity, with an environmental object
+    re.compile(r"\bclean(?:ed|ing|s)?[\s-]{1,3}ups?\s{1,3}(?:(?:the|our|local)\s{1,3})?"
+               + _CLEANUP_OBJECTS + r"\b" + _ENV_NOT_METAPHOR, re.IGNORECASE),
+    # "a beach clean-up" -- the noun form
+    re.compile(r"\b(?:beach|ocean|coastal|river|park|shoreline|community|neighbou?rhood|"
+               r"litter|trash|plastic)\s{1,3}clean[\s-]{0,3}ups?\b", re.IGNORECASE),
 )
+
+# The two EXACT phrases Harrison cleared on 2026-09-19 (ESC 3(i)/(ii), D-329) --
+# (pattern, the rail-2-scoped lines the phrase may be said of). Nothing else is
+# cleared: no variant, no bare "natural"/"clean", no hyphenated form. Whitespace
+# between the words is bounded (\s{1,3}); case is ignored (a sentence-initial or
+# headline capital is the same phrase). FAIL-CLOSED on brand scope: a phrase is
+# redacted only when every rail-2-scoped line the SENTENCE names is inside its
+# allowed set -- so neither is ever redacted in a sentence that names F3 Mood.
+_RAIL2_PHRASE_EXEMPTIONS: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
+    # the ingredient descriptor on Energy (the 9/14 lane jam)
+    (re.compile(r"\bnatural\s{1,3}caffeine\s{1,3}from\s{1,3}green\s{1,3}tea\b", re.IGNORECASE),
+     frozenset({"ENERGY"})),
+    # the canonical lineup's Pure-vs-Energy line ("same flavor, cleaner fuel")
+    (re.compile(r"\bcleaner\s{1,3}fuel(?:\s{1,3}source)?\b", re.IGNORECASE),
+     frozenset({"ENERGY", "PURE"})),
+)
+
+# Shipping-rail-only additions (legacy's _CLEAN_TOKENS is frozen): the verb forms
+# ("F3 Energy cleans up your afternoon" passed BOTH rails) and the cores a
+# hyphenated compound is split into ("clean-energy", "cleaner-fuel",
+# "naturally-caffeinated" were single tokens outside the set and passed BOTH rails).
+_ATTRIBUTION_CLEAN_TOKENS = _CLEAN_TOKENS | frozenset({
+    "cleans", "cleaned", "cleaning", "cleanse", "cleanses", "cleansing",
+})
+# ...with the chemistry exemption kept for the hyphenated spelling too, so the
+# compound split cannot turn "a naturally-occurring amino acid" into a trip.
+_NATURAL_OCCURRENCE_HYPHEN_RE = re.compile(
+    r"\bnaturally-(?:present|occurring|occurs|found|sourced|derived)\b", re.IGNORECASE)
 _CLAUSE_SPLIT_RE = re.compile(r"[,;:]|\b(?:or|while|whereas|versus|vs\.?)\b", re.IGNORECASE)
 
 
+def _attribution_clean_hits(seg: str) -> set[str]:
+    """Clean tokens in one clause segment: whole tokens, plus every part of a
+    hyphen/slash compound ("clean-energy" -> 'clean'). Linear: each token is split
+    once."""
+    hit: set[str] = set()
+    for w in _words(seg):
+        tok = w.lower().strip("'&/-")
+        if tok in _ATTRIBUTION_CLEAN_TOKENS:
+            hit.add(tok)
+            continue
+        if "-" in tok or "/" in tok:
+            for part in tok.replace("/", "-").split("-"):
+                if part in _ATTRIBUTION_CLEAN_TOKENS:
+                    hit.add(tok)
+                    break
+    return hit
+
+
+def _redact_phrase_exemptions(sentence: str, lines: set[str]) -> str:
+    """Blank the ruled exact phrases, brand-scoped and fail-closed (see above)."""
+    scoped = lines & {"ENERGY", "MOOD"}
+    out = sentence
+    for pat, allowed in _RAIL2_PHRASE_EXEMPTIONS:
+        if scoped <= allowed:
+            out = pat.sub(" ", out)
+    return out
+
+
 def rail2_legacy_hit(sentence: str) -> tuple[str, str] | None:
-    """The SHIPPING rail-2 test for one sentence: (clean_token, 'ENERGY/MOOD') when
-    any clean token shares the sentence with the Energy or Mood LINE (natural-
-    occurrence phrasings redacted first); None otherwise. Extracted verbatim from
-    run_preflight so the harness can call it in isolation."""
+    """The pre-R14-3 shipping rail; never called by run_preflight.
+
+    FROZEN measurement baseline (keep byte-identical): (clean_token, 'ENERGY/MOOD')
+    when any clean token shares the sentence with the Energy or Mood LINE (natural-
+    occurrence phrasings redacted first); None otherwise. rail2_harness and the
+    differential script compare the shipping rail (rail2_attribution_hit) against
+    it, so every input the R14-3 wiring releases stays measurable."""
     sent = sentence or ""
     lines = brand_lines_in(sent)
     if not (lines & {"ENERGY", "MOOD"}):
@@ -550,10 +651,17 @@ def _bare_brand_segment(seg: str) -> bool:
 
 
 def rail2_attribution_hit(sentence: str) -> tuple[str, str] | None:
-    """The ATTRIBUTION-scoped rail-2 test (see the block comment above): trips when
+    """The SHIPPING rail-2 test since R14-3 (see the block comment above): trips when
     a clean token is predicated of Energy/Mood -- i.e. it is neither Pure-attached
-    within its own clause segment nor an environmental object. NOT the shipping
-    rail; measured by rail2_harness.
+    within its own clause segment, nor an environmental object of an environmental
+    action, nor inside one of the two ruled exact phrases (redacted BEFORE clause
+    segmentation, never in a sentence that names Mood). Gated by rail2_harness
+    against the frozen rail2_legacy_hit baseline.
+
+    A clean token also counts when it is one part of a hyphen/slash compound
+    ("clean-energy", "cleaner-fuel") or a verb form ("cleans up your afternoon"):
+    both passed the legacy rail too, and a narrowing that ships must not keep a
+    hole the tokenizer happened to leave open.
 
     INHERITANCE IS FAIL-CLOSED (D-051 EF-7). The first cut let a brand-less clause
     inherit only the NEAREST preceding brand clause, so "F3 Energy, like F3 Pure,
@@ -576,7 +684,9 @@ def rail2_attribution_hit(sentence: str) -> tuple[str, str] | None:
     lines = brand_lines_in(sent)
     if not (lines & {"ENERGY", "MOOD"}):
         return None
-    scan_sent = _redact(_redact(sent, _NATURAL_OCCURRENCE_RES), _CLEAN_ENVIRONMENT_RES)
+    scan_sent = _redact_phrase_exemptions(sent, lines)
+    scan_sent = _redact(scan_sent, _NATURAL_OCCURRENCE_RES + (_NATURAL_OCCURRENCE_HYPHEN_RE,))
+    scan_sent = _redact(scan_sent, _CLEAN_ENVIRONMENT_RES)
     # Segment, folding a bare coordinated brand into the clause before it. Parts
     # are kept as lists and joined once per segment so a long run of ", F3 Pure"
     # coordinations stays linear (no repeated string growth).
@@ -594,8 +704,7 @@ def rail2_attribution_hit(sentence: str) -> tuple[str, str] | None:
         # far (the union), never just the nearest one
         seg_lines = own or set(carry)
         carry |= own
-        toks = {w.lower().strip("'&/-") for w in _words(seg)}
-        hit = toks & _CLEAN_TOKENS
+        hit = _attribution_clean_hits(seg)
         if not hit:
             continue
         if "PURE" in seg_lines and not (seg_lines & {"ENERGY", "MOOD"}):
@@ -822,6 +931,19 @@ def _currency_trips(field_name: str, text: str) -> list[Trip]:
     return []
 
 
+def rail_fields(*, title: str, summary: str, body_html: str) -> tuple[tuple[str, str], ...]:
+    """The (field_name, text) views every SEMANTIC rail scans -- one definition,
+    shared by run_preflight and rail2_harness's frozen legacy composition so the
+    baseline can never drift from the fields the shipping preflight reads."""
+    body_html = body_html or ""
+    return (
+        ("title", unescaped(title or "")),
+        ("summary", html_to_text(summary or "")),
+        ("body", html_to_text(body_html)),
+        ("body(structured data / alt text)", hidden_text(body_html)),
+    )
+
+
 def run_preflight(
     *,
     title: str,
@@ -853,15 +975,7 @@ def run_preflight(
     #           5 and 6 completely blind to the entity spelling.
     #
     # Every rail now scans all three. There is no rail-specific view any more.
-    prose = html_to_text(body_html)
-    hidden = hidden_text(body_html)
-
-    fields = (
-        ("title", unescaped(title)),
-        ("summary", html_to_text(summary)),
-        ("body", prose),
-        ("body(structured data / alt text)", hidden),
-    )
+    fields = rail_fields(title=title, summary=summary, body_html=body_html)
     raw_fields = (
         ("title", unescaped(title)),
         ("summary", unescaped(summary)),
@@ -918,13 +1032,13 @@ def run_preflight(
                 trips.append(_trip("R10", name, sent))
                 break
 
-    # --- rail 2: clean/natural in the same sentence as the Energy or Mood LINE ---
-    # The LEGACY same-sentence scan is the shipping rail (Code #13 slice 6: the
-    # attribution-scoped sibling rail2_attribution_hit is measured by rail2_harness
-    # and stays unwired until its gate passes -- see the rail-2 block above).
+    # --- rail 2: clean/natural PREDICATED OF the Energy or Mood LINE ---
+    # ATTRIBUTION scope since R14-3 (ruling ESC-1 (A) / D-329, 2026-09-19; the
+    # rail2_harness gate passes). The pre-R14-3 same-sentence scan survives only
+    # as rail2_legacy_hit, the frozen baseline the harness measures against.
     for name, text in fields:
         for sent in sentences(text):
-            hit = rail2_legacy_hit(sent)
+            hit = rail2_attribution_hit(sent)
             if hit:
                 trips.append(_trip("R2", name, "%r near %s: %s" % (hit[0], hit[1], sent)))
                 break

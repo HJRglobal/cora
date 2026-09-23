@@ -31,6 +31,14 @@ log = logging.getLogger(__name__)
 _THINKING_DISABLED = {"type": "disabled"}
 _MAX_TOKENS = 8000
 
+#: The rail-2 examples the prompt quotes. Kept as constants so a test can prove the
+#: prompt and the rail agree: the good example PASSES run_preflight and the rejected
+#: one trips R2. A prompt stricter than the rail is safe; one looser is not.
+RAIL2_GOOD_EXAMPLE = "F3 Energy carries the full stack. F3 Pure is the clean-sweetened version."
+RAIL2_REJECTED_EXAMPLE = "F3 Pure and F3 Energy are both clean-sweetened."
+#: The two exact phrases ruled cleared 2026-09-19 (ESC 3(i)/(ii), D-329).
+RAIL2_CLEARED_PHRASES = ("natural caffeine from green tea", "cleaner fuel", "cleaner fuel source")
+
 _PROMPT = """You are drafting one article for f3energy.com. Write it as the F3 Energy
 team would: direct, confident, community-rooted; not bro-y, not corporate.
 
@@ -57,13 +65,15 @@ have, leave that point out entirely rather than estimating it.
 ## Hard copy rules (a draft breaking any of these is discarded, so do not)
 - No em-dashes anywhere. Use a comma, a colon, or a full stop.
 - No prices, no MSRP, no cost figures of any kind.
-- "clean", "cleaner", "clean-label", "clean-sweetened", "natural" may be used ONLY
-  about F3 Pure, and never in the SAME SENTENCE as F3 Energy or F3 Mood, even when
-  the sentence is contrasting them and even when the clean word plainly attaches
-  to Pure. This one is measured, not theoretical: a real draft was rejected for
-  "Explore the full stack in F3 Energy or the clean-sweetened version in F3 Pure".
-  Split it: "F3 Energy carries the full stack. F3 Pure is the clean-sweetened
-  version." Two sentences, one line each.
+- "clean", "cleaner", "clean-label", "clean-sweetened", "natural" (and any form or
+  hyphenated compound of them) describe F3 Pure ONLY. Never say them of F3 Energy
+  or F3 Mood, and never in a clause that names F3 Pure together with F3 Energy or
+  F3 Mood: "{rail2_rejected}" is rejected. A quote is never an exemption.
+  When a sentence would link two lines, split it: "{rail2_good}"
+  Two sentences, one line each, is the preferred style.
+  Two exact phrases are cleared and nothing else, no variant: "natural caffeine
+  from green tea" (F3 Energy) and "cleaner fuel" / "cleaner fuel source" (F3 Pure
+  and F3 Energy). Never use either one in a sentence that names F3 Mood.
 - F3 Mood is never a sleep aid and never makes anyone drowsy. Cleared framing is
   "calm and focus", "composure, not sedation".
 - "NSF Certified for Sport" may be said of F3 Energy only. Name F3 Energy
@@ -138,6 +148,8 @@ def build_prompt(row, *, template: str, faq: str, lineup: str,
         template=template[:9000],
         faq=faq,
         lineup=lineup[:9000],
+        rail2_good=RAIL2_GOOD_EXAMPLE,
+        rail2_rejected=RAIL2_REJECTED_EXAMPLE,
     )
     if revision_trips:
         prompt += _REVISION_NOTE.format(trips=revision_trips[:3000])

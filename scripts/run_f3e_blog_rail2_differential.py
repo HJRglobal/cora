@@ -1,5 +1,10 @@
 """Rail-2 differential over the ruled probe sets and (optionally) the LIVE News/Learn
-corpus (Code #13 slice 6, cq-85b35413b020).
+corpus (Code #13 slice 6; the R14-3 ship gate, cq-85b35413b020).
+
+Columns: "legacy" = the FROZEN pre-R14-3 same-sentence rail (rail2_legacy_hit, the
+measurement baseline); "attribution" = the SHIPPING rail (run_preflight since R14-3).
+Exit 0 when the gate passes (ship), 3 when it is closed -- a regression that re-opens
+a gated claims hole or re-trips a measured false positive turns this red again.
 
     .venv\\Scripts\\python.exe scripts\\run_f3e_blog_rail2_differential.py            # probes only: the SHIP gate
     .venv\\Scripts\\python.exe scripts\\run_f3e_blog_rail2_differential.py --live     # + public f3energy.com/blogs read
@@ -87,14 +92,17 @@ def main(argv: list[str] | None = None, *, fetch=None) -> int:
     lines.append("== SHIP GATE over the ruled probe sets ==")
     lines += verdict.summary_lines()
     lines.append("")
-    lines.append("== probe table (class | probe | legacy | attribution) ==")
+    lines.append("ruled out of rail-2's ship condition (probed + reported, never gated): "
+                 + ", ".join(sorted(rh.RULED_OUT_CLASSES)))
+    lines.append("")
+    lines.append("== probe table (class | legacy=frozen baseline | attribution=shipping | probe) ==")
     for cls, probes in rh.CLAIMS_HOLE_PROBES.items():
         for s in probes:
             lg = "TRIP" if not rh.legacy_preflight(s).passed else "pass"
             at = "TRIP" if not rh.new_preflight(s).passed else "pass"
             lines.append(f"{cls:<30} {lg:<5} {at:<5} {s}")
     lines.append("")
-    lines.append("== false-positive set (must pass attribution) ==")
+    lines.append("== false-positive set (must pass the shipping rail) ==")
     for s in rh.FALSE_POSITIVE_SET:
         lg = "TRIP" if not rh.legacy_preflight(s).passed else "pass"
         at = "TRIP" if not rh.new_preflight(s).passed else "pass"
