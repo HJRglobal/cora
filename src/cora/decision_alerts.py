@@ -219,6 +219,43 @@ def answered_topic_keys(now: datetime | None = None) -> set[str]:
     return out
 
 
+def _parse_resolved_at(raw) -> datetime | None:
+    """ISO resolved_at -> aware UTC datetime; naive reads as UTC (mark_state
+    always writes aware UTC). Anything unparseable -> None."""
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw))
+    except (TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def answered_at_by_topic_key() -> dict[str, datetime | None]:
+    """{topic_key: the LATEST parseable resolved_at} for every ANSWERED alert.
+
+    Code #14 R14-5 (ruling 9.10(ii)): the nightly decision-gate check treats an
+    answered alert as a human ack for ONE window only, so it needs WHEN the answer
+    landed. A topic whose ANSWERED record(s) carry no parseable resolved_at maps
+    to None -- the consumer reads that as NOT sticky (it alarms). ADDITIVE:
+    answered_topic_keys() is unchanged, because run_due_date_escalation's pass-2
+    re-alert suppression is deliberately permanent and is not what the ruling
+    addresses. Fail-soft: an absent or malformed state file reads as {}."""
+    out: dict[str, datetime | None] = {}
+    for rec in _load().values():
+        if not isinstance(rec, dict) or rec.get("state") != STATE_ANSWERED:
+            continue
+        tk = str(rec.get("topic_key") or "")
+        if not tk:
+            continue
+        ts = _parse_resolved_at(rec.get("resolved_at"))
+        if tk not in out:
+            out[tk] = ts
+        elif ts is not None and (out[tk] is None or ts > out[tk]):
+            out[tk] = ts
+    return out
+
+
 def build_close_preview(rec: dict, answer: str) -> str:
     """The confirm card's text. Names the decision, the answer, and EXACTLY what
     Confirm does -- which is not "close the decision", because nothing in Cora

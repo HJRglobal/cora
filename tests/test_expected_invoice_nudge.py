@@ -334,22 +334,59 @@ def test_the_same_period_re_run_is_idempotent_and_consecutive_months_escalate(
     assert rs.state(key)["consecutive"] == 1
     runner.main(["--post", "--period", "2026-08"])
     assert rs.state(key)["consecutive"] == 2
+    def _dms():
+        return sum(1 for c in client.chat_postMessage.call_args_list
+                   if c.kwargs["channel"] == "D0MARIGOLD")
+    before_tier3 = _dms()
     runner.main(["--post", "--period", "2026-09"])
     st = rs.state(key)
     assert st["consecutive"] == 3 and st["suppressed"] is True and st["card_update_id"]
-    # tier 3: the owner DM (the original surface) is suppressed pending Harrison's ack
-    dm_count_before = sum(1 for c in client.chat_postMessage.call_args_list
-                          if c.kwargs["channel"] == "D0MARIGOLD")
+    # DELIBERATE FLIP (Code #14 R14-5, ruled 9.10(iii) "keep nudging the owner;
+    # suppress only the Harrison-facing escalation"). This used to assert the
+    # tier-3 owner DM was SUPPRESSED pending Harrison's ack; the owner now keeps
+    # getting the nudge at tier 3 and every month after.
+    assert _dms() == before_tier3 + 1
     runner.main(["--post", "--period", "2026-10"])
-    dm_count_after = sum(1 for c in client.chat_postMessage.call_args_list
-                         if c.kwargs["channel"] == "D0MARIGOLD")
-    assert dm_count_after == dm_count_before
+    assert _dms() == before_tier3 + 2
     ads_rows = [r for r in rs.read_rows() if r["signal_key"] == key]
     assert ads_rows[-1]["event"] == rs.EVENT_SUPPRESSED and ads_rows[-1]["fire_id"] == "2026-10"
     # the Workspace row (filed only in July in this fixture) escalated on its OWN
     # key -- two signals, two independent ladders
     ws_key = "expected-invoice|Marigold Workspace invoice|HJRG"
     assert rs.state(ws_key)["consecutive"] == 3
+
+
+def test_tier_three_keeps_nudging_the_owner_but_mints_no_second_card_and_no_briefing_line(
+        fixture_paths, monkeypatch, capsys):
+    """R14-5 / ruling 9.10(iii): the Harrison-facing escalation stays suppressed
+    at tier 3+ -- ONE card per cycle, no tier-2 briefing line, the non-nudge
+    #hjrg-finance line keeps its quiet form -- while the owner DM keeps firing."""
+    client = _fake_client()
+    monkeypatch.setattr(runner, "_client", lambda: client)
+    key = "expected-invoice|Marigold Ads invoice|F3E"
+    for p in ("2026-07", "2026-08", "2026-09", "2026-10", "2026-11"):
+        runner.main(["--post", "--period", p])
+    out = capsys.readouterr().out
+    assert f"[signal] {key} -> tier 3" in out and "SUPPRESSED card" in out
+    dms = [c.kwargs["text"] for c in client.chat_postMessage.call_args_list
+           if c.kwargs["channel"] == "D0MARIGOLD"]
+    assert [p for p in ("2026-07", "2026-08", "2026-09", "2026-10", "2026-11")
+            if any(p in t for t in dms)] == ["2026-07", "2026-08", "2026-09",
+                                             "2026-10", "2026-11"]
+    from cora import knowledge_review as kr
+    cards = [u for u in kr.load_proposed_updates()
+             if u.get("update_type") == kr.UPDATE_TYPE_DECISION
+             and (u.get("payload") or {}).get("signal_key") == key]
+    assert len(cards) == 1 and cards[0]["state"] == "PENDING"
+    assert rs.state(key)["suppressed"] is True
+    assert key not in {s.get("signal_key") for s in rs.tier2_signals()}
+    # the Workspace row is a CHANNEL-surface signal: its #hjrg-finance line stays
+    # quiet at tier 3, and now names whose ack it waits on (readers of that
+    # channel cannot tap Harrison's card)
+    finance = [c.kwargs["text"] for c in client.chat_postMessage.call_args_list
+               if c.kwargs["channel"] == runner.HJRG_FINANCE_CHANNEL]
+    assert "pending Harrison's ack on card" in finance[-1]
+    assert "pending your ack" not in finance[-1]
 
 
 def test_a_present_month_clears_the_signal_so_non_consecutive_misses_never_climb(

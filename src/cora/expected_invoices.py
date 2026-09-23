@@ -431,7 +431,7 @@ def format_report(result: dict[str, Any], *,
         tag = f" [{r['entity']}]" if r.get("entity") else ""
         if r.get("name") in suppressed:
             lines.append(f"• :no_bell: *{r['name']}*{tag} — still not filed; alarm "
-                         f"suppressed pending your ack on card {suppressed[r['name']]}")
+                         f"suppressed pending Harrison's ack on card {suppressed[r['name']]}")
             continue
         # A vendor we ALREADY KNOW does not deliver to a monitored mailbox is a
         # standing configuration gap, not a new surprise. Saying so keeps the

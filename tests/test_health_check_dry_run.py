@@ -20,7 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -34,7 +34,7 @@ from cora import decision_alerts as da  # noqa: E402
 from cora import knowledge_review as kr  # noqa: E402
 from cora import repeat_signal as rs  # noqa: E402
 from test_decision_gate_escalation import (  # noqa: E402
-    TODAY, TOPIC, _cards, _entry, _file, _gate_key, _hc,
+    TODAY, TOPIC, _cards, _entry, _file, _gate_key, _hc, _pin_resolved_at,
     _isolated, ledger,  # noqa: F401 -- fixtures re-exported for this module
 )
 
@@ -102,6 +102,9 @@ def test_dry_run_never_acks_but_classifies_the_row_as_acked(monkeypatch, tmp_pat
                     surfaced="2026-08-10", dm_channel_id="D1",
                     alert_message_ts="1.1", target_user_id=kr.HARRISON_SLACK_USER_ID)
     da.mark_state("1.1", da.STATE_ANSWERED, answer="cut over on the 1st")
+    # R14-5: the ack is bounded to one window after resolved_at, which mark_state
+    # stamps from the WALL clock -- pin it to the pinned TODAY (clock-collision rule).
+    _pin_resolved_at("1.1", datetime(2026, 8, 19, 18, tzinfo=timezone.utc))
     before = _snapshot(tmp_path, ledger)
     # the preview reads the answer (same verdict as a real run) ...
     r = hc.check_decision_gates(today=TODAY + timedelta(days=1), dry_run=True)

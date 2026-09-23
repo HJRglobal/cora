@@ -953,9 +953,12 @@ def check_decision_gates(today: date | None = None, *, dry_run: bool = False) ->
                 f"[{row.get('severity') or 'P?'}] {row.get('topic')} ({row.get('entity')}), "
                 f"{row.get('gate_overdue_days')}d overdue")
         for row in acked:
+            # row['topic'] is the REDACTED heading (never raw_topic) -- D-145.
             notes.append(
-                f"acknowledged by a human reply -- [{row.get('severity') or 'P?'}] "
-                f"{row.get('topic')} ({row.get('entity')}); not re-alarmed")
+                f"acknowledged by a human reply on {row.get('_answered_on')} -- "
+                f"[{row.get('severity') or 'P?'}] {row.get('topic')} ({row.get('entity')}); "
+                f"alarm paused until {row.get('_alarm_paused_until')}, then the ladder "
+                "restarts at tier 1")
         if alarmed:
             detail = decision_lane.format_alarm(alarmed)
             if notes:
@@ -1023,6 +1026,25 @@ def _gate_reconcile_clears(overdue: list[dict], *, dry_run: bool = False) -> lis
     return cleared
 
 
+def _sticky_answer_day(resolved_at: datetime | None, today_az: date,
+                       window_days: int) -> date | None:
+    """The AZ date of an answer that still counts as an ack today, else None.
+
+    Sticky iff -1 <= (today_az - answered_day).days <= window_days. None (missing
+    or unparseable resolved_at) and anything further in the future than one day of
+    skew are NOT sticky -- the fail-closed read is "alarm"."""
+    if not isinstance(resolved_at, datetime):
+        return None
+    try:
+        aware = resolved_at if resolved_at.tzinfo is not None else \
+            resolved_at.replace(tzinfo=timezone.utc)
+        answered_day = aware.astimezone(_AZ).date()
+    except Exception:  # noqa: BLE001
+        return None
+    age = (today_az - answered_day).days
+    return answered_day if -1 <= age <= window_days else None
+
+
 def _gate_escalate(overdue: list[dict], *, today: date | None, dry_run: bool = False
                    ) -> tuple[list[dict], list[dict], list[dict]]:
     """Route each overdue row through repeat_signal.fire (fire_id = today).
@@ -1035,17 +1057,30 @@ def _gate_escalate(overdue: list[dict], *, today: date | None, dry_run: bool = F
     alarms (the ladder row's demotion posture).
 
     `dry_run` classifies exactly as a real run would and writes nothing: the ack
-    is skipped (the row still counts as acked) and fire() previews."""
+    is skipped (the row still counts as acked) and fire() previews.
+
+    THE ACK IS BOUNDED (Code #14 R14-5, ruling 9.10(ii): "sticky for ONE 8-day
+    window, then the ladder restarts at tier 1"). It used to be permanent -- any
+    ANSWERED alert on the topic, at any age, silenced the gate forever, including
+    an answer recorded weeks BEFORE the gate blew. Now the answer counts only while
+    -1 <= (today_az - resolved_at_az) <= decision_lane.DELIVERY_WINDOW_DAYS days
+    (the -1 is clock skew, the decision_lane lower-bound posture). A missing,
+    unparseable or further-future resolved_at is NOT sticky: the gate alarms. Past
+    the window the row falls through to fire(); the first in-window ack reset the
+    ledger (consecutive 0, cycle + 1), so the ladder restarts at tier 1 and a later
+    tier-3 card carries the cycle-suffixed id."""
     try:
-        from cora import decision_alerts, repeat_signal
+        from cora import decision_alerts, decision_lane, repeat_signal
     except Exception:  # noqa: BLE001
         log.warning("check_decision_gates: repeat_signal unavailable -- pass-through",
                     exc_info=True)
         return list(overdue), [], []
     try:
-        answered = decision_alerts.answered_topic_keys()
+        answered_at = decision_alerts.answered_at_by_topic_key()
     except Exception:  # noqa: BLE001
-        answered = set()
+        answered_at = {}
+    today_az = today or datetime.now(_AZ).date()
+    window_days = decision_lane.DELIVERY_WINDOW_DAYS
     fire_id = (today or date.today()).isoformat()
     alarmed: list[dict] = []
     suppressed: list[dict] = []
@@ -1054,10 +1089,17 @@ def _gate_escalate(overdue: list[dict], *, today: date | None, dry_run: bool = F
         key = _gate_signal_key(row)
         try:
             raw_topic = str(row.get("raw_topic") or row.get("topic") or "")
-            if decision_alerts.topic_key(raw_topic) in answered:
+            answered_day = _sticky_answer_day(
+                answered_at.get(decision_alerts.topic_key(raw_topic)),
+                today_az, window_days)
+            if answered_day is not None:
                 if not dry_run:
                     repeat_signal.ack(key, via="decision-alert-reply")
-                acked.append(row)
+                item = dict(row)
+                item["_answered_on"] = answered_day.isoformat()
+                item["_alarm_paused_until"] = (
+                    answered_day + timedelta(days=window_days)).isoformat()
+                acked.append(item)
                 continue
             owner_id, owner_name = _gate_owner(row)
             outcome = repeat_signal.fire(

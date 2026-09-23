@@ -95,6 +95,39 @@ def _cards():
             if u.get("update_type") == kr.UPDATE_TYPE_DECISION]
 
 
+def _pin_resolved_at(alert_ts: str, when: datetime | None) -> None:
+    """mark_state stamps the WALL-CLOCK now; these tests run on a pinned TODAY,
+    so the answer's time must be pinned too (feedback_test_clock_collision: never
+    compare a pinned date against the real clock). None deletes the field."""
+    import os
+    p = Path(os.environ["DECISION_ALERT_STATE_PATH"])
+    data = json.loads(p.read_text(encoding="utf-8"))
+    if when is None:
+        data[alert_ts].pop("resolved_at", None)
+    else:
+        data[alert_ts]["resolved_at"] = when.isoformat()
+    p.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _answer(alert_ts: str = "1.1", *, topic: str = TOPIC,
+            resolved_at: datetime | None = None, raw: str | None = None) -> dict:
+    """Record a decision alert and mark it ANSWERED with a PINNED resolved_at
+    (default: TODAY 18:00Z = 11:00 AZ on TODAY). `raw` writes a literal
+    resolved_at string instead (the unparseable case)."""
+    rec = da.record_alert(topic=topic, severity="P2", entity="OSN", owner="Harrison",
+                          surfaced="2026-08-10", dm_channel_id="D1",
+                          alert_message_ts=alert_ts, target_user_id=kr.HARRISON_SLACK_USER_ID)
+    da.mark_state(alert_ts, da.STATE_ANSWERED, answer="cut over on the 1st")
+    _pin_resolved_at(alert_ts, resolved_at or datetime(2026, 8, 19, 18, tzinfo=timezone.utc))
+    if raw is not None:
+        import os
+        p = Path(os.environ["DECISION_ALERT_STATE_PATH"])
+        data = json.loads(p.read_text(encoding="utf-8"))
+        data[alert_ts]["resolved_at"] = raw
+        p.write_text(json.dumps(data), encoding="utf-8")
+    return rec
+
+
 # ── the D-310 pin ────────────────────────────────────────────────────────────
 
 def test_two_consecutive_days_on_a_blown_gate_are_both_critical_with_no_ack(
@@ -205,6 +238,11 @@ def test_a_threaded_reply_on_the_decision_alert_is_an_ack(monkeypatch, tmp_path,
                           surfaced="2026-08-10", dm_channel_id="D1",
                           alert_message_ts="1.1", target_user_id=kr.HARRISON_SLACK_USER_ID)
     da.mark_state("1.1", da.STATE_ANSWERED, answer="cut over on the 1st")
+    # DELIBERATE (Code #14 R14-5): pin resolved_at to TODAY. The ack is now
+    # bounded to one window after resolved_at, and mark_state stamps the WALL
+    # clock -- against the pinned TODAY that read as ~a month in the future, i.e.
+    # not sticky. The assertions below are unchanged.
+    _pin_resolved_at("1.1", datetime(2026, 8, 19, 18, tzinfo=timezone.utc))
     assert rec["topic_key"] in da.answered_topic_keys()
     day2 = hc.check_decision_gates(today=TODAY + timedelta(days=1))
     assert day2.status == "warn" and "acknowledged by a human reply" in day2.detail
@@ -298,3 +336,95 @@ def test_two_blown_gates_escalate_independently(monkeypatch, tmp_path, ledger):
     assert len(_cards()) == 2
     keys = {c["payload"]["signal_key"] for c in _cards()}
     assert keys == {_gate_key(TOPIC), _gate_key("Heron budget lock", "F3E")}
+
+
+# ── Code #14 R14-5: the answered-alert ack is bounded (ruling 9.10(ii)) ──────
+#
+# "Sticky for ONE 8-day window, then the ladder restarts at tier 1." Before, any
+# ANSWERED alert on the topic -- at any age, even one answered weeks before the
+# gate blew -- silenced the gate forever.
+
+
+def _acks(key):
+    return [r for r in rs.read_rows() if r["signal_key"] == key and r["event"] == rs.EVENT_ACK]
+
+
+def test_an_answered_alert_is_sticky_for_one_window_then_the_ladder_restarts_at_tier_one(
+        monkeypatch, tmp_path, ledger):
+    import hashlib
+    hc = _hc(monkeypatch, tmp_path, _file(_entry(TOPIC)))
+    key = _gate_key(TOPIC)
+    assert hc.check_decision_gates(today=TODAY).status == "critical"
+    _answer()                                            # 2026-08-19 18:00Z = 11:00 AZ
+    for d in range(1, 9):                                # days 1..8: inside the window
+        r = hc.check_decision_gates(today=TODAY + timedelta(days=d))
+        assert r.status == "warn", d
+        assert "acknowledged by a human reply on 2026-08-19" in r.detail
+        assert ("alarm paused until 2026-08-27, then the ladder restarts at tier 1"
+                in r.detail)
+    assert len(_acks(key)) == 1                          # re-acks are no-ops
+    assert _acks(key)[0]["via"] == "decision-alert-reply"
+    assert rs.state(key)["consecutive"] == 0
+    day9 = hc.check_decision_gates(today=TODAY + timedelta(days=9))
+    assert day9.status == "critical" and TOPIC in day9.detail
+    st = rs.state(key)
+    assert st["consecutive"] == 1 and st["tier"] == 1
+    assert hc.check_decision_gates(today=TODAY + timedelta(days=10)).status == "critical"
+    day11 = hc.check_decision_gates(today=TODAY + timedelta(days=11))
+    assert day11.status == "warn" and "gate alarm suppressed pending ack" in day11.detail
+    cards = _cards()
+    assert len(cards) == 1
+    base = "rs-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+    assert cards[0]["update_id"] == base + "-1"          # the post-ack cycle id
+
+
+def test_an_answer_older_than_the_window_never_silences_a_gate_that_blows_later(
+        monkeypatch, tmp_path, ledger):
+    """The hole the unbounded set left open: an answer recorded BEFORE the gate
+    blew silenced it forever."""
+    hc = _hc(monkeypatch, tmp_path, _file(_entry(TOPIC)))
+    _answer(resolved_at=datetime(2026, 7, 30, 18, tzinfo=timezone.utc))   # TODAY-20d
+    r = hc.check_decision_gates(today=TODAY)
+    assert r.status == "critical" and "acknowledged" not in r.detail
+    assert _acks(_gate_key(TOPIC)) == []
+
+
+def test_an_answered_record_without_a_resolved_at_is_not_sticky(monkeypatch, tmp_path, ledger):
+    hc = _hc(monkeypatch, tmp_path, _file(_entry(TOPIC)))
+    _answer()
+    _pin_resolved_at("1.1", None)
+    assert hc.check_decision_gates(today=TODAY).status == "critical"
+
+
+def test_an_unparseable_resolved_at_is_not_sticky(monkeypatch, tmp_path, ledger):
+    hc = _hc(monkeypatch, tmp_path, _file(_entry(TOPIC)))
+    _answer(raw="soon")
+    assert hc.check_decision_gates(today=TODAY).status == "critical"
+
+
+def test_a_future_dated_answer_beyond_skew_is_not_sticky_but_one_day_of_skew_is(
+        monkeypatch, tmp_path, ledger):
+    hc = _hc(monkeypatch, tmp_path, _file(_entry(TOPIC)))
+    _answer(resolved_at=datetime(2026, 8, 24, 18, tzinfo=timezone.utc))   # TODAY+5d
+    assert hc.check_decision_gates(today=TODAY).status == "critical"
+    _pin_resolved_at("1.1", datetime(2026, 8, 20, 18, tzinfo=timezone.utc))  # TODAY+1d
+    r = hc.check_decision_gates(today=TODAY + timedelta(days=0))
+    assert r.status == "warn" and "acknowledged by a human reply on 2026-08-20" in r.detail
+
+
+@pytest.mark.parametrize("resolved,today,sticky", [
+    (datetime(2026, 8, 19, 18, tzinfo=timezone.utc), date(2026, 8, 19), True),   # age 0
+    (datetime(2026, 8, 19, 18, tzinfo=timezone.utc), date(2026, 8, 27), True),   # age 8: edge in
+    (datetime(2026, 8, 19, 18, tzinfo=timezone.utc), date(2026, 8, 28), False),  # age 9: edge out
+    (datetime(2026, 8, 19, 18, tzinfo=timezone.utc), date(2026, 8, 18), True),   # age -1: skew
+    (datetime(2026, 8, 19, 18, tzinfo=timezone.utc), date(2026, 8, 17), False),  # age -2
+    # the day is the ARIZONA date: 03:00Z on 8/20 is 20:00 AZ on 8/19
+    (datetime(2026, 8, 20, 3, tzinfo=timezone.utc), date(2026, 8, 28), False),
+    (datetime(2026, 8, 20, 3, tzinfo=timezone.utc), date(2026, 8, 27), True),
+    (datetime(2026, 8, 19, 18), date(2026, 8, 19), True),                        # naive = UTC
+    (None, date(2026, 8, 19), False),
+])
+def test_sticky_answer_day_window_edges(resolved, today, sticky):
+    import nightly_health_check as hc
+    got = hc._sticky_answer_day(resolved, today, dl.DELIVERY_WINDOW_DAYS)
+    assert (got is not None) is sticky

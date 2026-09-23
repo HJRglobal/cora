@@ -19,8 +19,14 @@ repeating:
   2nd       -> the owner + ONE line in Harrison's daily briefing (tier2_signals)
   3rd       -> ONE propose-only decision card (Accept / Dismiss on the existing
                decision_capture card; the options are TEXT: keep with owner /
-               retire the signal / re-scope it) and SUPPRESSION at the original
-               surface until acknowledged
+               retire the signal / re-scope it) and SUPPRESSION of the
+               HARRISON-FACING escalation until acknowledged (no second card, no
+               tier-2 briefing line, and the #cora-health gate alarm drops to one
+               warn line). An OWNER nudge is NOT suppressed: it keeps firing at
+               tier 3 and beyond (ruled 2026-09-19, 9.10(iii); Code #14 R14-5 --
+               the expected-invoice owner DM). `outcome.suppressed` tells a
+               consumer the card is pending; what it silences is the consumer's
+               call, and only Harrison-facing surfaces may be silenced.
   ack/clear -> reset; the next fire is tier 1 again
 
 "Consecutive" counts DISTINCT fire_ids (a period for the monthly invoice check, a
@@ -30,6 +36,10 @@ idempotent -- same tier, no new row -- so a re-run inside one fire never escalat
 ACKS. (a) Harrison's Accept OR Dismiss tap on the tier-3 card
 (knowledge_review.process_decision_tap reads payload.signal_key and calls ack());
 (b) a caller-observed human ack (a threaded reply on a decision alert) via ack();
+the decision-gate consumer honours that reply for ONE decision_lane.
+DELIVERY_WINDOW_DAYS window after its resolved_at only, then fires again from
+tier 1 (ruled 9.10(ii); Code #14 R14-5) -- a human reply pauses the alarm, it
+does not retire it;
 (c) the underlying fact clearing via clear(); (d) the tier-3 card reaching a
 terminal state by ANY other path (emoji-reaction executor, render-time LEX/PHI
 dismiss, self-heal, hand edit) -- fire() re-reads the card on every suppressed

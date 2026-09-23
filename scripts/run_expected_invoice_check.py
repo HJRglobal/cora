@@ -25,9 +25,12 @@ CODE #13 SLICE 9 (D-302 + D-310; cq-21207e34a954). Two additions:
   (b) REPEAT SIGNAL. Every MISSING row is a signal (expected-invoice|vendor|
       entity, fire_id = the period). Consecutive missing months escalate by
       changing surface (owner nudge -> Harrison briefing line -> ONE propose-only
-      decision card + suppression at the original surface until his ack). A
-      known_undelivered row's original surface is the owner DM; an un-flagged
-      row's is the channel line. A PRESENT month CLEARS the vendor's signal
+      decision card + suppression of the Harrison-facing escalation until his
+      ack). A known_undelivered row's original surface is the owner DM -- which
+      is NOT suppressed: the owner keeps being nudged at tier 3 and beyond
+      (ruled 9.10(iii), Code #14 R14-5). An un-flagged row's surface is the
+      channel line, which keeps its quiet "suppressed pending Harrison's ack"
+      form at tier 3. A PRESENT month CLEARS the vendor's signal
       (misses that are not consecutive never climb), and a fire is RECORDED only
       after its surface delivered (a Slack-down run never counts as an
       unacknowledged alarm) -- tier 3 excepted, where the card is the surface.
@@ -269,11 +272,22 @@ def reconcile_clears(result: dict[str, Any], *, post: bool) -> list[tuple[str, s
 
 def send_nudges(result: dict[str, Any], signals: dict[str, Any], *,
                 post: bool, client=None, delivered: set[str] | None = None) -> int:
-    """One owner DM per nudge candidate whose signal is not suppressed. Returns
-    the number of DMs sent (0 in dry-run); `delivered`, when given, is filled
-    with the vendor names whose DM actually posted (record_signals reads it).
-    PHI-screened: a nudge whose rendered text trips phi_guard.is_any_phi is
-    refused and logged, never sent."""
+    """One owner DM per nudge candidate -- at EVERY tier, including tier 3 and
+    beyond. Returns the number of DMs sent (0 in dry-run); `delivered`, when
+    given, is filled with the vendor names whose DM actually posted
+    (record_signals reads it). PHI-screened: a nudge whose rendered text trips
+    phi_guard.is_any_phi is refused and logged, never sent.
+
+    TIER 3 KEEPS NUDGING THE OWNER (ruled 2026-09-19, 9.10(iii): "keep nudging
+    the owner; suppress only the Harrison-facing escalation"; Code #14 R14-5).
+    The old code skipped the owner DM whenever outcome.suppressed, so from the
+    third missed month on the one person who could file the invoice heard
+    nothing until Harrison tapped the card. The Harrison-facing escalation stays
+    suppressed: the card is minted once per cycle (plan_signals), the tier-2
+    briefing line drops out at tier 3 (tier2_signals needs consecutive == 2),
+    and the non-nudge #hjrg-finance line still renders its quiet form (main's
+    `suppressed` dict). record_signals skips tier >= 3, so a tier-3 DM never
+    double-records."""
     from cora.phi_guard import is_any_phi  # noqa: PLC0415
     period = str(result.get("period") or "")
     sent = 0
@@ -282,9 +296,9 @@ def send_nudges(result: dict[str, Any], signals: dict[str, Any], *,
         sig = signals.get(name) or {}
         outcome = sig.get("outcome")
         if outcome is not None and outcome.suppressed:
-            log.info("nudge for %s suppressed pending ack (card %s)", name,
-                     outcome.card_update_id)
-            continue
+            log.info("nudge for %s still sent at tier %s (Harrison card %s pending; "
+                     "only the Harrison-facing escalation is suppressed)", name,
+                     outcome.tier, outcome.card_update_id)
         text = expected_invoices.format_owner_nudge(
             row, period, owner_name=str(sig.get("owner_name") or ""))
         if is_any_phi(text):

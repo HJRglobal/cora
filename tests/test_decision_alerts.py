@@ -240,3 +240,60 @@ def test_the_executor_is_wired_into_the_shared_dispatch():
     import inspect
     src = inspect.getsource(td._execute_claimed_stash)
     assert 'if kind == "decision_close":' in src
+
+
+# ── Code #14 R14-5: WHEN an alert was answered (ruling 9.10(ii)) ─────────────
+
+def _set(state, ts, **fields):
+    data = json.loads(state.read_text(encoding="utf-8"))
+    data[ts].update(fields)
+    state.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_answered_at_returns_the_latest_parseable_resolved_at_per_topic(state):
+    _alert("1.1")
+    _alert("2.2")
+    _alert("3.3", topic="A different decision")
+    for ts in ("1.1", "2.2", "3.3"):
+        da.mark_state(ts, da.STATE_ANSWERED, answer="HJR productions")
+    _set(state, "1.1", resolved_at="2026-09-01T10:00:00+00:00")
+    _set(state, "2.2", resolved_at="2026-09-05T10:00:00+00:00")
+    _set(state, "3.3", resolved_at="2026-08-01T10:00:00")          # naive -> UTC
+    got = da.answered_at_by_topic_key()
+    assert got[da.topic_key(TOPIC)] == datetime(2026, 9, 5, 10, tzinfo=timezone.utc)
+    assert got[da.topic_key("A different decision")] == datetime(2026, 8, 1, 10, tzinfo=timezone.utc)
+
+
+def test_answered_at_ignores_pending_and_declined_and_maps_bad_stamps_to_none(state):
+    _alert("1.1")
+    _alert("2.2", topic="Declined one")
+    _alert("3.3", topic="Unstamped one")
+    da.mark_state("2.2", da.STATE_DECLINED)
+    da.mark_state("3.3", da.STATE_ANSWERED, answer="yes, HJRP")
+    _set(state, "3.3", resolved_at="soon")
+    got = da.answered_at_by_topic_key()
+    assert da.topic_key(TOPIC) not in got                          # still PENDING
+    assert da.topic_key("Declined one") not in got
+    assert got == {da.topic_key("Unstamped one"): None}
+    # a parseable sibling beats an unparseable one
+    _alert("4.4", topic="Unstamped one")
+    da.mark_state("4.4", da.STATE_ANSWERED, answer="yes, HJRP")
+    _set(state, "4.4", resolved_at="2026-09-02T00:00:00+00:00")
+    assert da.answered_at_by_topic_key()[da.topic_key("Unstamped one")] == \
+        datetime(2026, 9, 2, tzinfo=timezone.utc)
+
+
+def test_answered_topic_keys_is_unchanged_by_the_additive_reader(state):
+    """run_due_date_escalation's pass-2 suppression stays PERMANENT: an answer of
+    any age keeps the topic in answered_topic_keys."""
+    _alert()
+    da.mark_state("1787173218.141609", da.STATE_ANSWERED, answer="HJR productions")
+    _set(state, "1787173218.141609", resolved_at="2025-01-01T00:00:00+00:00")
+    assert da.topic_key(TOPIC) in da.answered_topic_keys()
+    assert da.answered_at_by_topic_key() == {
+        da.topic_key(TOPIC): datetime(2025, 1, 1, tzinfo=timezone.utc)}
+
+
+def test_answered_at_is_fail_soft_on_a_corrupt_state_file(state):
+    state.write_text("{not json", encoding="utf-8")
+    assert da.answered_at_by_topic_key() == {}
