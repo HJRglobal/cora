@@ -117,11 +117,13 @@ def main() -> int:
     print("\n" + text + "\n")
     log.info(
         "audit %s: scheduled=%d captured=%d missed=%d unconvened=%d dup=%d unmatched=%d "
-        "skipped=%d failed_calendars=%d rsvp_accepted=%d rsvp_accepted_lex=%d rsvp_errors=%d",
+        "skipped=%d failed_calendars=%d rsvp_accepted=%d rsvp_accepted_lex=%d rsvp_errors=%d "
+        "meet_audit_state=%s meet_events_read=%d",
         day, report.scheduled, report.captured, len(report.misses),
         len(report.unconvened), len(report.duplicates), len(report.unmatched_transcripts),
         len(report.skipped), len(report.failed_calendars),
         rsvp["accepted"], rsvp["accepted_lex"], rsvp["errors"],
+        report.meet_audit_state or "none", report.meet_events_read,
     )
 
     mc.write_ledger([{
@@ -156,6 +158,16 @@ def main() -> int:
         "rsvp_accepted_lex": rsvp["accepted_lex"],
         "rsvp_errors": rsvp["errors"],
         "rsvp_counts_available": rsvp["available"],
+        # Meet join audit lane (R14-8; ships dark). The state + a fixed reason
+        # class + event ids ONLY -- never titles, participant addresses, display
+        # names or meeting codes. nightly_health_check.check_meet_join_audit reads
+        # meet_audit_state (the failing-capable monitor).
+        "meet_audit_state": report.meet_audit_state,
+        "meet_audit_reason": report.meet_audit_reason,
+        "meet_events_read": report.meet_events_read,
+        "convened_event_ids": [m.event_id for m in report.convened_misses],
+        "unconvened_confirmed_event_ids": [m.event_id for m in report.unconvened_confirmed],
+        "unconvened_presumed_event_ids": [m.event_id for m in report.unconvened_presumed],
     }])
 
     if args.post:

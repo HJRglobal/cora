@@ -1149,6 +1149,36 @@ GROUP_CALENDAR_ORGANIZER_SUFFIX = "@group.calendar.google.com"
 #: "presumed" everywhere it surfaces and why the ids stay in the ledger.
 UNCONVENED_BASIS_GROUP_CALENDAR = "group-calendar-organizer"
 
+#: MEET JOIN AUDIT (Code #14 R14-8, ruled 2026-09-19 ask 9.6 -- a LOCKED LANE that
+#: SHIPS DARK). When the Reports-API read (connectors/meet_audit) is live, the
+#: presumption above can be upgraded to evidence. NARROW FIRST RUNG: ONLY meetings
+#: that are PRESUMED unconvened today (group-calendar blocks) are ever
+#: re-bucketed; a person-organised MISS is never touched in v1.
+#:   0 human join endpoints -> confirmed unconvened (UNCONVENED_BASIS_MEET_NO_JOIN)
+#:   1 human endpoint       -> confirmed unconvened, solo (UNCONVENED_BASIS_MEET_SOLO)
+#:  >=2 human endpoints     -> a MISS (CONVENED_BASIS_MEET): people met, nothing
+#:                             captured it -- stricter than today, never looser.
+UNCONVENED_BASIS_MEET_NO_JOIN = "meet-audit:no-join"
+UNCONVENED_BASIS_MEET_SOLO = "meet-audit:solo-join"
+CONVENED_BASIS_MEET = "meet-audit:joined"
+
+#: The read may DECIDE only after the audit log has had time to land. The 07:22
+#: fire audits a day that ended ~7h earlier; a manual earlier run reads "lag".
+MEET_AUDIT_LAG_FLOOR_H = 6
+#: Read window around the audited AZ day (a meeting can end after midnight and its
+#: call_ended event lands after it ends).
+_MEET_READ_BEFORE_H = 1
+_MEET_READ_AFTER_H = 6
+#: A join matches a meeting when its [start, end] overlaps [event start - 30m,
+#: event end + 60m]. Recurring series REUSE one meeting code, so the code alone is
+#: never an identity -- (code, time window) is (feedback: a meeting is not a
+#: calendar event).
+_MEET_MATCH_BEFORE_S = 30 * 60
+_MEET_MATCH_AFTER_S = 60 * 60
+#: States in which the read decided nothing and the report says so in one line.
+MEET_AUDIT_WARN_STATES = ("error", "partial", "contradiction", "lag")
+_INSTANCE_SUFFIX = re.compile(r"_\d{8}T\d{6}Z$")
+
 
 @dataclass
 class AuditedMeeting:
@@ -1167,6 +1197,9 @@ class AuditedMeeting:
     #: (see UNCONVENED_BASIS_GROUP_CALENDAR). Empty on every other meeting. Every
     #: re-bucketing carries its reason, exactly as every qualify_event skip does.
     unconvened_basis: str = ""
+    #: Set only on a MISS the Meet join log proved convened (CONVENED_BASIS_MEET):
+    #: a presumed-unconvened block that >=2 people actually joined.
+    convened_basis: str = ""
 
 
 @dataclass
@@ -1194,6 +1227,24 @@ class AuditReport:
     #: after audit_day returns -- audit_day itself never reads the ensure ledger.
     #: None = not attached, and render_report then prints nothing for it.
     rsvp: dict[str, Any] | None = None
+    #: Meet join audit lane (R14-8): the read's state after the eligibility checks
+    #: (live | dark:* | error | partial | contradiction | lag), a fixed reason
+    #: class, and how many call_ended events it read. "" = never consulted.
+    meet_audit_state: str = ""
+    meet_audit_reason: str = ""
+    meet_events_read: int = 0
+
+    @property
+    def unconvened_confirmed(self) -> list[AuditedMeeting]:
+        return [m for m in self.unconvened if m.unconvened_basis.startswith("meet-audit:")]
+
+    @property
+    def unconvened_presumed(self) -> list[AuditedMeeting]:
+        return [m for m in self.unconvened if not m.unconvened_basis.startswith("meet-audit:")]
+
+    @property
+    def convened_misses(self) -> list[AuditedMeeting]:
+        return [m for m in self.misses if m.convened_basis]
 
 
 #: Marks an index key claimed by more than one meeting. Such a key can never
@@ -1274,6 +1325,187 @@ def presumed_unconvened_basis(
     return UNCONVENED_BASIS_GROUP_CALENDAR
 
 
+# ── Meet join audit consumer (R14-8) ─────────────────────────────────────────
+
+def _event_end_ts(event: dict[str, Any]) -> int:
+    end = (event.get("end") or {}).get("dateTime")
+    if not end:
+        return event_start_ts(event)
+    try:
+        dt = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+    except ValueError:
+        return event_start_ts(event)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp())
+
+
+def _meet_code(event: dict[str, Any]) -> str:
+    """The normalized Google Meet code of an event, or "" for a Zoom / Teams /
+    link-less meeting (those are never evaluated by the Meet join log)."""
+    from cora.tools.calendar_client import extract_meeting_link
+
+    link = (extract_meeting_link(event) or "").strip().lower()
+    if "meet.google.com/" not in link:
+        return ""
+    from cora.connectors.meet_audit import normalize_meeting_code
+
+    return normalize_meeting_code(link)
+
+
+def _base_event_id(eid: str) -> str:
+    return _INSTANCE_SUFFIX.sub("", (eid or "").strip())
+
+
+def meet_joins_for(
+    event: dict[str, Any],
+    event_ids: list[str] | tuple[str, ...],
+    joins: Any,
+) -> list[Any]:
+    """The MeetJoins that belong to ONE meeting: same Meet code (or the same
+    calendar event id, instance suffix stripped) AND a join interval overlapping
+    [event start - 30m, event end + 60m]. Keyed on (code, time window) -- a
+    recurring series reuses one code, so yesterday's join never counts today."""
+    code = _meet_code(event)
+    if not code:
+        return []
+    start = event_start_ts(event)
+    end = _event_end_ts(event)
+    if not start:
+        return []
+    lo, hi = start - _MEET_MATCH_BEFORE_S, max(end, start) + _MEET_MATCH_AFTER_S
+    bases = {_base_event_id(e) for e in (event_ids or ()) if e}
+    out = []
+    for j in (joins or ()):
+        same = (j.meeting_code and j.meeting_code == code) or (
+            j.calendar_event_id and _base_event_id(j.calendar_event_id) in bases)
+        if not same:
+            continue
+        j_lo = j.start_ts or j.end_ts
+        j_hi = j.end_ts or j.start_ts
+        if not j_lo or j_hi < lo or j_lo > hi:
+            continue
+        out.append(j)
+    return out
+
+
+def classify_convened(joins: Any) -> tuple[str, str]:
+    """(bucket, basis) from one meeting's matched joins, counting DISTINCT HUMAN
+    endpoints (a bot alone in the room is not a meeting):
+      >=2 -> ("convened", CONVENED_BASIS_MEET)
+        1 -> ("unconvened", UNCONVENED_BASIS_MEET_SOLO)
+        0 -> ("unconvened", UNCONVENED_BASIS_MEET_NO_JOIN)"""
+    humans = {j.endpoint_key for j in (joins or ()) if getattr(j, "is_human", False)
+              and getattr(j, "endpoint_key", "")}
+    if len(humans) >= 2:
+        return "convened", CONVENED_BASIS_MEET
+    if len(humans) == 1:
+        return "unconvened", UNCONVENED_BASIS_MEET_SOLO
+    return "unconvened", UNCONVENED_BASIS_MEET_NO_JOIN
+
+
+def _creator_in_domain(event: dict[str, Any]) -> bool:
+    creator = event.get("creator") if isinstance(event.get("creator"), dict) else {}
+    return _is_dwd_domain(((creator or {}).get("email") or "").strip().lower())
+
+
+def _apply_meet_audit(
+    report: AuditReport,
+    day: str,
+    meetings: dict[tuple, AuditedMeeting],
+    raw_events: dict[tuple, dict[str, Any]],
+    by_meeting: dict[tuple, list[dict[str, Any]]],
+    *,
+    fetch_meet_joins: Callable[[datetime, datetime], Any] | None,
+    clock: Callable[[], datetime] | None,
+) -> None:
+    """Upgrade PRESUMED-unconvened meetings to evidence, or change nothing.
+
+    FAIL CLOSED. The read decides only when ALL hold: the lane is `live` (a
+    complete, un-capped read -- never dark / error / partial); the lag floor has
+    elapsed; and the CONTRADICTION CHECK passed -- every CAPTURED Meet meeting on
+    the day has >=1 matched join (a captured meeting with no join means the log
+    is missing events, so its silence proves nothing). Otherwise every bucket is
+    exactly what the structural logic decided and only report.meet_audit_state
+    records why (a dark state renders byte-identically to the pre-R14-8 report).
+
+    When it decides, it touches ONLY report.unconvened (the narrow first rung):
+    >=2 human endpoints moves the meeting to report.misses (stricter); one human
+    confirms it unconvened (solo); zero confirms it unconvened ONLY when the
+    evidence can reach it -- a same-day captured Meet meeting proved the log
+    present (a control) AND the event's creator is in the Workspace domains
+    (whose Meet activity the org's audit log records). Without those the zero
+    stays a presumption. A person-organised MISS is never re-bucketed in v1.
+    """
+    if fetch_meet_joins is None:
+        def fetch_meet_joins(start: datetime, end: datetime) -> Any:
+            from cora.connectors.meet_audit import read_call_ended
+
+            return read_call_ended(start, end)
+
+    day_start = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=_AZ)
+    day_end = day_start + timedelta(days=1)
+    start_utc = (day_start - timedelta(hours=_MEET_READ_BEFORE_H)).astimezone(timezone.utc)
+    end_utc = (day_end + timedelta(hours=_MEET_READ_AFTER_H)).astimezone(timezone.utc)
+    try:
+        read = fetch_meet_joins(start_utc, end_utc)
+        state = str(getattr(read, "state", "") or "error")
+        report.meet_audit_reason = str(getattr(read, "reason", "") or "")
+        report.meet_events_read = int(getattr(read, "events_read", 0) or 0)
+        joins = tuple(getattr(read, "joins", ()) or ())
+    except Exception as exc:  # noqa: BLE001 -- a broken read never breaks the audit
+        report.meet_audit_state = "error"
+        report.meet_audit_reason = type(exc).__name__
+        log.warning("audit: Meet join read failed (%s) -- presumptions stand", type(exc).__name__)
+        return
+    report.meet_audit_state = state
+    if state != "live":
+        return
+
+    now = clock() if clock is not None else datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    if now < day_end + timedelta(hours=MEET_AUDIT_LAG_FLOOR_H):
+        report.meet_audit_state = "lag"
+        report.meet_audit_reason = f"lag floor {MEET_AUDIT_LAG_FLOOR_H}h not elapsed"
+        return
+
+    # CONTRADICTION CHECK: the failing-capable cross-check. Every captured Meet
+    # meeting must show >=1 join; one that does not means the log is incomplete.
+    controls = 0
+    for key, meeting in meetings.items():
+        if not by_meeting.get(key):
+            continue
+        ev = raw_events.get(key) or {}
+        if not _meet_code(ev):
+            continue
+        if not meet_joins_for(ev, meeting.event_ids, joins):
+            report.meet_audit_state = "contradiction"
+            report.meet_audit_reason = "a captured Meet meeting has no join event"
+            return
+        controls += 1
+
+    keep: list[AuditedMeeting] = []
+    for meeting in report.unconvened:
+        key = next((k for k, m in meetings.items() if m is meeting), None)
+        ev = raw_events.get(key) if key is not None else None
+        if not ev or not _meet_code(ev):
+            keep.append(meeting)          # Zoom / Teams / link-less: not evaluable
+            continue
+        bucket, basis = classify_convened(meet_joins_for(ev, meeting.event_ids, joins))
+        if bucket == "convened":
+            meeting.convened_basis = basis
+            meeting.unconvened_basis = ""
+            report.misses.append(meeting)
+            continue
+        if basis == UNCONVENED_BASIS_MEET_NO_JOIN and not (controls and _creator_in_domain(ev)):
+            keep.append(meeting)          # silence the evidence cannot reach
+            continue
+        meeting.unconvened_basis = basis
+        keep.append(meeting)
+    report.unconvened = keep
+
+
 def audit_day(
     day: str,
     cfg: CaptureConfig,
@@ -1281,6 +1513,8 @@ def audit_day(
     list_events: Callable[[str, str], list[dict[str, Any]]] | None = None,
     fetch_transcripts: Callable[[str, str], list[dict[str, Any]]] | None = None,
     fetch_seats: Callable[[], list[dict[str, Any]]] | None = None,
+    fetch_meet_joins: Callable[[datetime, datetime], Any] | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> AuditReport:
     """Diff one day's scheduled roster meetings against Fireflies transcripts.
 
@@ -1289,6 +1523,11 @@ def audit_day(
     in the report rather than silently shrinking the denominator, because "0 misses"
     computed from a half-read roster is the single most dangerous output this thing
     could produce.
+
+    `fetch_meet_joins(start_utc, end_utc) -> meet_audit.MeetAuditRead` is the Meet
+    join audit read (R14-8; default connectors.meet_audit.read_call_ended, DARK
+    until the Reports scope is granted); `clock` is injectable for the lag floor.
+    See _apply_meet_audit for when that read may decide anything.
     """
     report = AuditReport(day=day)
 
@@ -1489,6 +1728,12 @@ def audit_day(
             report.captured += 1
             if len(hits) > 1:
                 report.duplicates.append(meeting)
+
+    # ── 3a. Meet join audit (R14-8): may upgrade a PRESUMPTION to evidence ──
+    _apply_meet_audit(
+        report, day, meetings, raw_events, by_meeting,
+        fetch_meet_joins=fetch_meet_joins, clock=clock,
+    )
 
     # ── 3b. was anything captured that a carve-out excluded? ──
     # Dropping carved meetings from the diff entirely would hide this: a bot
@@ -1693,9 +1938,15 @@ def render_report(report: AuditReport) -> str:
         who = ", ".join(f"{_esc(e)} ({_esc(err[:60])})" for e, err in report.failed_calendars)
         lines.append(f":warning: *{len(report.failed_calendars)} calendar(s) unreadable* -- {who}")
 
+    # R14-8: `confirmed` is non-empty only when the Meet join log decided (live
+    # lane); with the lane dark every line below is byte-identical to before.
+    confirmed = report.unconvened_confirmed
+    presumed = report.unconvened_presumed
     lines.append(
         f"{report.scheduled} scheduled, {report.captured} captured, "
-        f"{len(report.misses)} missed, {len(report.unconvened)} presumed unconvened, "
+        f"{len(report.misses)} missed, "
+        + (f"{len(confirmed)} not convened (Meet join log), " if confirmed else "")
+        + f"{len(presumed)} presumed unconvened, "
         f"{len(report.duplicates)} duplicated"
         + (" _(partial -- see above)_" if degraded else "")
     )
@@ -1715,7 +1966,8 @@ def render_report(report: AuditReport) -> str:
         # Chronological. Meetings are collected per roster member, so insertion
         # order interleaves each person's day and reads as scrambled times.
         for m in sorted(report.misses, key=lambda x: x.start_label)[:15]:
-            lines.append(f"  - {m.start_label}  {_esc(m.title)}  _(organizer {_esc(m.organizer)})_")
+            joined = "  _[people joined per the Meet join log]_" if m.convened_basis else ""
+            lines.append(f"  - {m.start_label}  {_esc(m.title)}  _(organizer {_esc(m.organizer)})_{joined}")
         if len(report.misses) > 15:
             lines.append(f"  _...and {len(report.misses) - 15} more_")
 
@@ -1744,20 +1996,42 @@ def render_report(report: AuditReport) -> str:
         if len(report.skipped) > 10:
             lines.append(f"  _...and {len(report.skipped) - 10} more_")
 
-    if report.unconvened:
+    if confirmed:
+        # R14-8, live lane only: the Meet join log PROVED these group-calendar
+        # blocks unconvened (no human joined, or only one person did). Same LEX
+        # rail as every other line (title + organiser already display-safe).
+        lines.append(
+            f"\n*:white_circle: Not convened (Meet join log) ({len(confirmed)})* "
+            "-- group-calendar blocks nobody met in"
+        )
+        for m in sorted(confirmed, key=lambda x: x.start_label)[:15]:
+            solo = "  _[one person joined]_" if m.unconvened_basis == UNCONVENED_BASIS_MEET_SOLO else ""
+            lines.append(f"  - {m.start_label}  {_esc(m.title)}  _(organizer {_esc(m.organizer)})_{solo}")
+        if len(confirmed) > 15:
+            lines.append(f"  _...and {len(confirmed) - 15} more_")
+
+    if presumed:
         # Informational, below every alarm. These are standing group-calendar
         # blocks nobody joined -- a presumption (no Meet/Zoom audit-log read exists
         # today), so the heading says so. Title + organiser go through the same
         # LEX rail as a miss: display_title already redacted, and the organiser
         # was set to "withheld" alongside it.
         lines.append(
-            f"\n*:white_circle: Presumed unconvened ({len(report.unconvened)})* "
+            f"\n*:white_circle: Presumed unconvened ({len(presumed)})* "
             "-- group-calendar blocks, no join evidence"
         )
-        for m in sorted(report.unconvened, key=lambda x: x.start_label)[:15]:
+        for m in sorted(presumed, key=lambda x: x.start_label)[:15]:
             lines.append(f"  - {m.start_label}  {_esc(m.title)}  _(organizer {_esc(m.organizer)})_")
-        if len(report.unconvened) > 15:
-            lines.append(f"  _...and {len(report.unconvened) - 15} more_")
+        if len(presumed) > 15:
+            lines.append(f"  _...and {len(presumed) - 15} more_")
+
+    if report.meet_audit_state in MEET_AUDIT_WARN_STATES:
+        # The lane is provisioned but its read could not decide today. One line,
+        # never an alarm of its own (the nightly health check WARNs on it).
+        lines.append(
+            f"\n:warning: Meet join log read {report.meet_audit_state} -- "
+            "unconvened remain presumptions today"
+        )
 
     # CLEAN-DAY CRITERION. Unconvened is deliberately NOT in this veto: a presumed
     # placeholder nobody joined is not a capture failure. Misses, duplicates,
@@ -1768,14 +2042,21 @@ def render_report(report: AuditReport) -> str:
         # of zero reads as a success it did not earn. This report posts every day.
         if report.scheduled == 0:
             lines.append("\n:white_check_mark: No qualifying roster meetings scheduled.")
-        elif report.unconvened:
+        elif presumed:
             # NO checkmark here. "Every convened meeting captured" is a claim the
             # auditor cannot prove: unconvened is a PRESUMPTION (no Meet/Zoom audit
             # log exists), so a day carrying one is reported as unverified, never
             # as clean (D-051 review, Code #13 C-2).
             lines.append(
-                f"\n:white_circle: {len(report.unconvened)} presumed unconvened -- not "
+                f"\n:white_circle: {len(presumed)} presumed unconvened -- not "
                 "verified. Nothing else scheduled was missed or duplicated."
+            )
+        elif confirmed:
+            # R14-8: every unconvened meeting is Meet-join-log EVIDENCE, nothing is
+            # presumed, and nothing was missed -- the claim is now provable.
+            lines.append(
+                "\n:white_check_mark: Every convened meeting captured exactly once "
+                f"({len(confirmed)} not convened, per the Meet join log)."
             )
         else:
             lines.append("\n:white_check_mark: Every scheduled meeting captured exactly once.")

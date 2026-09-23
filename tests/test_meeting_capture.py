@@ -13,6 +13,7 @@ The cases that matter most here are not the happy paths. They are:
 from __future__ import annotations
 
 import json
+import time
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -2244,3 +2245,374 @@ class TestRsvpCounts:
         assert "Vermilion Kestrel" not in json.dumps(row)
         assert any("rsvp_accepted=1 rsvp_accepted_lex=1 rsvp_errors=1" in m for m in logged)
         assert any("_RSVP as cora@: 2 accepted (1 LEX), 1 unresolved error(s)_" in p for p in printed)
+
+
+# ── Meet join audit consumer (Code #14 R14-8, ruled 2026-09-19 ask 9.6) ─────────
+#
+# The Reports read ships DARK: with the lane dark (the conftest default, dark:test,
+# or a real dark:scope) every bucket and every rendered byte is today's. When the
+# read is LIVE, complete, past the lag floor and the contradiction check passes,
+# ONLY presumed-unconvened group-calendar blocks may be re-bucketed (narrow first
+# rung). Fixtures are synthetic (D-145): random-word titles, placeholder addresses.
+
+import hashlib as _hashlib  # noqa: E402
+
+from cora.connectors import meet_audit as ma  # noqa: E402
+
+#: 14:00 AZ the day after DAY: day end + 14h, well past the 6h lag floor.
+_AFTER = datetime(2026, 8, 27, 14, 0, tzinfo=AZ)
+_CTL_LINK = "https://meet.google.com/amb-hero-cmp"
+
+
+def _mj(link_or_code, *, hh=9, mm=35, ep="ep-a", human=True, minutes=20, cal_id="", day=26):
+    start = int(datetime(2026, 8, day, hh, mm, tzinfo=AZ).timestamp())
+    return ma.MeetJoin(
+        meeting_code=ma.normalize_meeting_code(link_or_code), calendar_event_id=cal_id,
+        conference_id="", start_ts=start, end_ts=start + minutes * 60,
+        endpoint_key=_hashlib.sha256(ep.encode()).hexdigest()[:12], is_human=human,
+    )
+
+
+def _read(joins=(), state="live", reason=""):
+    return ma.MeetAuditRead(state=state, joins=tuple(joins), events_read=len(joins), reason=reason)
+
+
+def _with_creator(events, creator="harrison@hjrglobal.com"):
+    for ev in events:
+        ev["creator"] = {"email": creator}
+    return events
+
+
+def _control():
+    """A captured Meet meeting whose join IS in the log -- proves the log present."""
+    return _ev("ctl-1", summary="Amber Heron Compass", hh=13, link=_CTL_LINK,
+               organizer="harrison@hjrglobal.com")
+
+
+def _ctl_join():
+    return _mj(_CTL_LINK, hh=13, mm=2, ep="ctl-a")
+
+
+def _audit_meet(events, transcripts, read, *, clock=_AFTER, cfg=None):
+    return mc.audit_day(
+        DAY, cfg or _cfg(),
+        list_events=_lister(events),
+        fetch_transcripts=lambda a, b: transcripts,
+        fetch_seats=lambda: [{"email": "harrison@hjrglobal.com"}],
+        fetch_meet_joins=lambda s, e: read,
+        clock=lambda: clock,
+    )
+
+
+def _labor_day_with_control():
+    events = _with_creator(_labor_day_events()) + [_control()]
+    return {"harrison@hjrglobal.com": events}, [_t("t-ctl", cal_id="ctl-1", hh=13, link=_CTL_LINK)]
+
+
+class TestMeetJoinAudit:
+    def test_dark_lane_is_byte_identical_to_today(self):
+        """Ships dark: every existing fixture renders and buckets exactly as the
+        pre-R14-8 auditor did, whether the lane is the conftest's dark:test or a
+        real dark:scope/api/subject."""
+        acc = _ev("gc-acc", summary="Velvet Otter Cadence", organizer=_GROUP_CAL,
+                  link="https://meet.google.com/vot-cade-nce",
+                  attendees=["harrison@hjrglobal.com", "hannah@hjrglobal.com"])
+        acc["attendees"][0]["responseStatus"] = "accepted"
+        fixtures = [
+            ({"harrison@hjrglobal.com": _labor_day_events()}, []),
+            ({"harrison@hjrglobal.com": [acc]}, []),
+            ({"harrison@hjrglobal.com": [_ev("evt-1")]}, []),
+            ({"harrison@hjrglobal.com": [_ev("evt-1")]}, [_t("t1", cal_id="evt-1")]),
+        ]
+        for events, transcripts in fixtures:
+            base = _audit(events, transcripts)
+            assert base.meet_audit_state == "dark:test"
+            for state in ("dark:scope", "dark:api", "dark:subject"):
+                r = _audit_meet(events, transcripts, _read(state=state))
+                assert mc.render_report(r) == mc.render_report(base), state
+                assert [m.event_id for m in r.misses] == [m.event_id for m in base.misses]
+                assert [m.event_id for m in r.unconvened] == [m.event_id for m in base.unconvened]
+                assert r.meet_audit_state == state
+        # the pinned Labor-Day headline survives the dark lane byte-for-byte
+        assert "5 scheduled, 0 captured, 0 missed, 5 presumed unconvened, 0 duplicated" in \
+            mc.render_report(_audit({"harrison@hjrglobal.com": _labor_day_events()}, []))
+
+    def test_labor_day_blocks_with_no_joins_become_confirmed_unconvened(self):
+        events, transcripts = _labor_day_with_control()
+        r = _audit_meet(events, transcripts, _read([_ctl_join()]))
+        assert r.meet_audit_state == "live"
+        assert len(r.unconvened) == 5 and r.misses == []
+        assert {m.unconvened_basis for m in r.unconvened} == {mc.UNCONVENED_BASIS_MEET_NO_JOIN}
+        out = mc.render_report(r)
+        assert "6 scheduled, 1 captured, 0 missed, 5 not convened (Meet join log), " \
+               "0 presumed unconvened, 0 duplicated" in out
+        assert "*:white_circle: Not convened (Meet join log) (5)*" in out
+        assert "Presumed unconvened" not in out
+        assert ":white_check_mark: Every convened meeting captured exactly once " \
+               "(5 not convened, per the Meet join log)." in out
+
+    def test_group_calendar_block_people_joined_is_a_miss(self):
+        """Stricter than today: a presumed placeholder that >=2 people joined and
+        nothing captured is a MISS above the alarms."""
+        events, transcripts = _labor_day_with_control()
+        joins = [_ctl_join(),
+                 _mj("https://meet.google.com/vot-cade-nce", ep="p1"),
+                 _mj("VOTCADENCE", ep="p2", mm=40)]
+        r = _audit_meet(events, transcripts, _read(joins))
+        assert [m.event_id for m in r.misses] == ["gc-1_20260826T163000Z"]
+        assert r.misses[0].convened_basis == mc.CONVENED_BASIS_MEET
+        assert r.misses[0].unconvened_basis == ""
+        assert len(r.unconvened) == 4
+        out = mc.render_report(r)
+        assert "*:red_circle: Not captured (1)*" in out
+        assert "_[people joined per the Meet join log]_" in out
+        assert ":white_check_mark:" not in out
+
+    def test_person_organised_miss_is_never_touched_in_v1(self):
+        """Narrow first rung: a meeting a PERSON called stays a MISS even when the
+        log shows nobody joined -- that upgrade is the next rung, not this one."""
+        events = {"harrison@hjrglobal.com": [
+            _ev("evt-1", organizer="harrison@hjrglobal.com", link="https://meet.google.com/abc-defg-hij"),
+            _control()]}
+        r = _audit_meet(events, [_t("t-ctl", cal_id="ctl-1", hh=13, link=_CTL_LINK)],
+                        _read([_ctl_join()]))
+        assert [m.event_id for m in r.misses] == ["evt-1"]
+        assert r.misses[0].convened_basis == "" and r.unconvened == []
+
+    def test_solo_join_is_confirmed_unconvened_solo(self):
+        events, transcripts = _labor_day_with_control()
+        r = _audit_meet(events, transcripts,
+                        _read([_ctl_join(), _mj("https://meet.google.com/vot-cade-nce", ep="p1")]))
+        solo = [m for m in r.unconvened if m.event_id == "gc-1_20260826T163000Z"]
+        assert solo[0].unconvened_basis == mc.UNCONVENED_BASIS_MEET_SOLO
+        assert "_[one person joined]_" in mc.render_report(r)
+
+    def test_bot_only_join_is_not_convened(self):
+        """A notetaker alone in the room is not a meeting: two BOT endpoints never
+        convene it."""
+        events, transcripts = _labor_day_with_control()
+        joins = [_ctl_join(),
+                 _mj("https://meet.google.com/vot-cade-nce", ep="bot1", human=False),
+                 _mj("https://meet.google.com/vot-cade-nce", ep="bot2", human=False)]
+        r = _audit_meet(events, transcripts, _read(joins))
+        assert r.misses == []
+        gc1 = [m for m in r.unconvened if m.event_id == "gc-1_20260826T163000Z"][0]
+        assert gc1.unconvened_basis == mc.UNCONVENED_BASIS_MEET_NO_JOIN
+
+    def test_recurring_code_joined_yesterday_does_not_convene_today(self):
+        """A series reuses one Meet code; the key is (code, time window)."""
+        events, transcripts = _labor_day_with_control()
+        joins = [_ctl_join(),
+                 _mj("https://meet.google.com/vot-cade-nce", ep="p1", day=25),
+                 _mj("https://meet.google.com/vot-cade-nce", ep="p2", day=25)]
+        r = _audit_meet(events, transcripts, _read(joins))
+        assert r.misses == []
+        assert all(m.unconvened_basis == mc.UNCONVENED_BASIS_MEET_NO_JOIN for m in r.unconvened)
+
+    def test_calendar_event_id_is_a_secondary_match_with_the_instance_suffix_stripped(self):
+        events, transcripts = _labor_day_with_control()
+        joins = [_ctl_join(),
+                 _mj("", ep="p1", cal_id="gc-1_20260826T163000Z"),
+                 _mj("", ep="p2", cal_id="gc-1")]
+        r = _audit_meet(events, transcripts, _read(joins))
+        assert [m.event_id for m in r.misses] == ["gc-1_20260826T163000Z"]
+
+    def test_zoom_link_block_is_untouched(self):
+        ev = _ev("gc-zoom", summary="Brass Kite Ledger", organizer=_GROUP_CAL,
+                 link=None, location="https://acme.zoom.us/j/123456789")
+        ev["creator"] = {"email": "harrison@hjrglobal.com"}
+        events = {"harrison@hjrglobal.com": [ev, _control()]}
+        r = _audit_meet(events, [_t("t-ctl", cal_id="ctl-1", hh=13, link=_CTL_LINK)],
+                        _read([_ctl_join()]))
+        zoom = [m for m in r.unconvened if m.event_id == "gc-zoom"]
+        assert zoom and zoom[0].unconvened_basis == mc.UNCONVENED_BASIS_GROUP_CALENDAR
+
+    def test_contradiction_disables_every_decision(self):
+        """The failing-capable cross-check: a CAPTURED Meet meeting with no join in
+        the log means the log is incomplete, so nothing is decided -- not even the
+        stricter MISS -- and the report says so in one line."""
+        events, transcripts = _labor_day_with_control()
+        joins = [_mj("https://meet.google.com/vot-cade-nce", ep="p1"),
+                 _mj("https://meet.google.com/vot-cade-nce", ep="p2")]      # no control join
+        r = _audit_meet(events, transcripts, _read(joins))
+        assert r.meet_audit_state == "contradiction"
+        assert r.misses == [] and len(r.unconvened_presumed) == 5 and r.unconvened_confirmed == []
+        out = mc.render_report(r)
+        assert ":warning: Meet join log read contradiction -- unconvened remain presumptions today" in out
+        assert ":white_check_mark:" not in out
+        assert "5 presumed unconvened -- not verified" in out
+
+    @pytest.mark.parametrize("state", ["partial", "error"])
+    def test_partial_and_error_change_nothing_but_the_warning_line(self, state):
+        events, transcripts = _labor_day_with_control()
+        dark = _audit_meet(events, transcripts, _read(state="dark:scope"))
+        r = _audit_meet(events, transcripts,
+                        _read([_ctl_join(), _mj("https://meet.google.com/vot-cade-nce", ep="p1"),
+                               _mj("https://meet.google.com/vot-cade-nce", ep="p2")], state=state))
+        assert r.meet_audit_state == state
+        warn = f"\n\n:warning: Meet join log read {state} -- unconvened remain presumptions today"
+        out = mc.render_report(r)
+        assert warn in out and out.replace(warn, "") == mc.render_report(dark)
+
+    def test_lag_floor_not_elapsed_changes_nothing(self):
+        """Pinned clock, never a formatted live timestamp: 05:00 AZ the next day is
+        5h after the day ended, inside the 6h floor."""
+        events, transcripts = _labor_day_with_control()
+        early = datetime(2026, 8, 27, 5, 0, tzinfo=AZ)
+        r = _audit_meet(events, transcripts,
+                        _read([_ctl_join(), _mj("https://meet.google.com/vot-cade-nce", ep="p1"),
+                               _mj("https://meet.google.com/vot-cade-nce", ep="p2")]),
+                        clock=early)
+        assert r.meet_audit_state == "lag" and r.misses == [] and len(r.unconvened_presumed) == 5
+        just_past = datetime(2026, 8, 27, 6, 0, tzinfo=AZ)
+        r2 = _audit_meet(events, transcripts,
+                         _read([_ctl_join(), _mj("https://meet.google.com/vot-cade-nce", ep="p1"),
+                                _mj("https://meet.google.com/vot-cade-nce", ep="p2")]),
+                         clock=just_past)
+        assert r2.meet_audit_state == "live" and len(r2.misses) == 1
+
+    def test_no_join_needs_a_control_and_an_in_domain_creator(self):
+        """Silence is evidence only where the log can reach: without a same-day
+        captured Meet control, or with an external creator (the org's log may not
+        record that meeting), zero joins stays a PRESUMPTION. The stricter MISS
+        still applies either way."""
+        no_ctl = {"harrison@hjrglobal.com": _with_creator(_labor_day_events())}
+        r = _audit_meet(no_ctl, [], _read([_mj("https://meet.google.com/bra-kite-ldg", ep="p1"),
+                                            _mj("https://meet.google.com/bra-kite-ldg", ep="p2")]))
+        assert r.meet_audit_state == "live"
+        assert [m.event_id for m in r.misses] == ["gc-2_20260826T163000Z"]
+        assert all(m.unconvened_basis == mc.UNCONVENED_BASIS_GROUP_CALENDAR for m in r.unconvened)
+        ext = {"harrison@hjrglobal.com":
+               _with_creator(_labor_day_events(), creator="host@vendor.example") + [_control()]}
+        r2 = _audit_meet(ext, [_t("t-ctl", cal_id="ctl-1", hh=13, link=_CTL_LINK)],
+                         _read([_ctl_join()]))
+        assert r2.unconvened_confirmed == [] and len(r2.unconvened_presumed) == 5
+
+    def test_a_raising_reader_is_an_error_state_never_a_crash(self):
+        events, transcripts = _labor_day_with_control()
+
+        def boom(s, e):
+            raise RuntimeError("reports down for pal@example.test")
+
+        r = mc.audit_day(DAY, _cfg(), list_events=_lister(events),
+                         fetch_transcripts=lambda a, b: transcripts,
+                         fetch_seats=lambda: [], fetch_meet_joins=boom, clock=lambda: _AFTER)
+        assert r.meet_audit_state == "error" and r.meet_audit_reason == "RuntimeError"
+        assert len(r.unconvened_presumed) == 5
+
+    def test_the_read_window_brackets_the_az_day(self):
+        seen: list = []
+        mc.audit_day(DAY, _cfg(), list_events=_lister({"harrison@hjrglobal.com": []}),
+                     fetch_transcripts=lambda a, b: [], fetch_seats=lambda: [],
+                     fetch_meet_joins=lambda s, e: seen.append((s, e)) or _read(state="dark:scope"))
+        (s, e), = seen
+        assert s == datetime(2026, 8, 25, 23, 0, tzinfo=AZ)
+        assert e == datetime(2026, 8, 27, 6, 0, tzinfo=AZ)
+
+    def test_lex_meeting_rendering_still_redacted_under_a_confirmed_bucket(self):
+        ev = _ev("gc-lex", summary="Quiet Harbor Intake Review", hh=11,
+                 link="https://meet.google.com/qui-harb-int", organizer=_GROUP_CAL,
+                 attendees=["shaun@lexingtonservices.com", "vreese@azdes.gov"])
+        ev["creator"] = {"email": "harrison@hjrglobal.com"}
+        events = {"harrison@hjrglobal.com": [ev, _control()]}
+        r = _audit_meet(events, [_t("t-ctl", cal_id="ctl-1", hh=13, link=_CTL_LINK)],
+                        _read([_ctl_join()]))
+        assert [m.unconvened_basis for m in r.unconvened] == [mc.UNCONVENED_BASIS_MEET_NO_JOIN]
+        out = mc.render_report(r)
+        assert "Not convened (Meet join log) (1)" in out and "LEX/PHI meeting" in out
+        assert "Quiet Harbor" not in out and "azdes.gov" not in out and "withheld" in out
+
+    def test_instance_suffix_regex_is_linear_on_degenerate_inputs(self):
+        """D-171: the one regex this consumer adds."""
+        for s in ("_" * 40_000, "1" * 40_000, "_20260826T163000" * 2_500,
+                  ("_12345678T123456" * 2_500) + "Q"):
+            t = time.perf_counter()
+            mc._base_event_id(s)
+            assert time.perf_counter() - t < 0.2
+        assert mc._base_event_id("gc-1_20260826T163000Z") == "gc-1"
+        assert mc._base_event_id("gc-1") == "gc-1"
+
+    def test_audit_ledger_new_keys_are_ids_only(self, monkeypatch):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "_audit_script_meet", _REPO_ROOT / "scripts" / "run_meeting_capture_audit.py")
+        mod = importlib.util.module_from_spec(spec)
+        monkeypatch.setattr(sys, "argv", ["run_meeting_capture_audit.py", "--day", DAY])
+        spec.loader.exec_module(mod)
+        events, transcripts = _labor_day_with_control()
+        report = _audit_meet(events, transcripts,
+                             _read([_ctl_join(), _mj("https://meet.google.com/vot-cade-nce", ep="p1"),
+                                    _mj("https://meet.google.com/vot-cade-nce", ep="p2")]))
+        monkeypatch.setattr(mod.mc, "load_config", lambda: _cfg())
+        monkeypatch.setattr(mod.mc, "audit_day", lambda day, cfg: report)
+        markers: list[dict] = []
+        monkeypatch.setattr(mod.run_marker, "write", lambda task, **kw: markers.append(kw))
+        assert mod.main() == 0
+        rows = [json.loads(l) for l in mc.ledger_path().read_text(encoding="utf-8").splitlines()]
+        row = [r for r in rows if r.get("lane") == "audit"][-1]
+        assert row["meet_audit_state"] == "live" and row["meet_events_read"] == 3
+        assert row["convened_event_ids"] == ["gc-1_20260826T163000Z"]
+        assert len(row["unconvened_confirmed_event_ids"]) == 4
+        assert row["unconvened_presumed_event_ids"] == []
+        new = {k: row[k] for k in ("meet_audit_state", "meet_audit_reason", "meet_events_read",
+                                   "convened_event_ids", "unconvened_confirmed_event_ids",
+                                   "unconvened_presumed_event_ids")}
+        flat = json.dumps(new)
+        assert "@" not in flat and "meet.google.com" not in flat and "votcadence" not in flat
+        assert "Velvet Otter" not in json.dumps(row)
+        # the run-marker detail pin is untouched
+        assert markers[0]["detail"] == "scheduled=6 captured=1 missed=1 unconvened=4"
+
+
+class TestMeetJoinAuditHealthCheck:
+    @staticmethod
+    def _nhc():
+        sys.path.insert(0, str(_REPO_ROOT / "scripts"))
+        import nightly_health_check as nhc  # noqa: PLC0415
+        return nhc
+
+    def _row(self, **kw):
+        base = {"ts": "2026-08-27T14:22:00+00:00", "lane": "audit", "day": DAY,
+                "scheduled": 1, "captured": 1, "missed": 0}
+        base.update(kw)
+        mc.write_ledger([base])
+
+    def test_no_row_and_pre_lane_row_are_info(self):
+        nhc = self._nhc()
+        r = nhc.check_meet_join_audit()
+        assert r.status == "ok" and r.detail.startswith("INFO")
+        self._row()
+        r = nhc.check_meet_join_audit()
+        assert r.status == "ok" and "predates the lane" in r.detail
+
+    @pytest.mark.parametrize("state", ["dark:scope", "dark:api", "dark:subject", "dark:test"])
+    def test_dark_is_info_not_a_warn(self, state):
+        nhc = self._nhc()
+        self._row(meet_audit_state=state, meet_audit_reason="scope not in the DWD grant")
+        r = nhc.check_meet_join_audit()
+        assert r.status == "ok" and r.detail.startswith("INFO") and state in r.detail
+
+    def test_live_is_ok_with_counts(self):
+        nhc = self._nhc()
+        self._row(meet_audit_state="live", meet_events_read=7,
+                  unconvened_confirmed_event_ids=["a", "b"], convened_event_ids=["c"],
+                  unconvened_presumed_event_ids=[])
+        r = nhc.check_meet_join_audit()
+        assert r.status == "ok" and "live: 7" in r.detail and "2 confirmed unconvened" in r.detail
+
+    @pytest.mark.parametrize("state", ["error", "partial", "contradiction", "weird"])
+    def test_error_partial_contradiction_warn(self, state):
+        nhc = self._nhc()
+        self._row(meet_audit_state="live")
+        self._row(meet_audit_state=state, meet_audit_reason="http 500")
+        r = nhc.check_meet_join_audit()
+        assert r.status == "warn" and state in r.detail and "presumption" in r.detail
+
+    def test_registered_once_right_after_the_catchup_check(self):
+        body = (_REPO_ROOT / "scripts" / "nightly_health_check.py").read_text(encoding="utf-8")
+        a = "all_results.append(check_missed_nightly_catchup())\n"
+        b = "all_results.append(check_meet_join_audit())"
+        assert body.count(b) == 1
+        i = body.index(a) + len(a)
+        assert body[i:].lstrip(" ").startswith(b)

@@ -807,6 +807,68 @@ def check_missed_nightly_catchup(now: datetime | None = None) -> CheckResult:
     return CheckResult(name, "ok", head + tail)
 
 
+def check_meet_join_audit() -> CheckResult:
+    """Code #14 R14-8: READ the latest 07:22 meeting-capture audit row's
+    `meet_audit_state` -- the Meet join audit lane's failing-capable monitor.
+
+    The health vocabulary has no INFO status, so INFO = "ok" with the word in the
+    detail: a DARK lane (dark:scope / dark:api / dark:subject -- the provisioned
+    default until Harrison grants the Reports scope), a row written before the
+    lane shipped (no key), or a `lag` read (run before the lag floor) is INFO.
+    `live` is OK. `error`, `partial` and `contradiction` WARN: the lane is
+    provisioned but could not decide, so every unconvened meeting stayed a
+    presumption. Read-only; writes nothing (holds under --dry-run by construction).
+    """
+    name = "Meet join audit"
+    try:
+        sys.path.insert(0, str(_REPO_ROOT / "src"))
+        from cora import meeting_capture as mc  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(name, "warn", f"meeting_capture module unavailable: {exc}")
+    latest: dict | None = None
+    try:
+        path = mc.ledger_path()
+        if path.exists():
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or '"audit"' not in line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except (ValueError, TypeError):
+                        continue
+                    if isinstance(row, dict) and row.get("lane") == "audit":
+                        latest = row
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(name, "warn", f"meeting-capture ledger unreadable: {type(exc).__name__}")
+    if latest is None:
+        return CheckResult(name, "ok", "INFO: no meeting-capture audit row yet")
+    day = latest.get("day") or "?"
+    if "meet_audit_state" not in latest or not latest.get("meet_audit_state"):
+        return CheckResult(name, "ok", f"INFO: {day} audit row predates the lane (no meet_audit_state)")
+    state = str(latest.get("meet_audit_state"))
+    reason = str(latest.get("meet_audit_reason") or "")
+    if state.startswith("dark:"):
+        return CheckResult(
+            name, "ok",
+            f"INFO: {day} lane dark ({state}{'; ' + reason if reason else ''}) -- presumed-"
+            "unconvened stands; the provisioned default until the Reports scope is granted")
+    if state == "lag":
+        return CheckResult(name, "ok", f"INFO: {day} read ran before the lag floor -- nothing decided")
+    if state == "live":
+        return CheckResult(
+            name, "ok",
+            f"{day} live: {int(latest.get('meet_events_read') or 0)} call_ended event(s) read; "
+            f"{len(latest.get('unconvened_confirmed_event_ids') or [])} confirmed unconvened, "
+            f"{len(latest.get('convened_event_ids') or [])} convened-but-missed, "
+            f"{len(latest.get('unconvened_presumed_event_ids') or [])} still presumed")
+    return CheckResult(
+        name, "warn",
+        f"{day} Meet join log read {state}{' (' + reason + ')' if reason else ''} -- the lane "
+        "decided nothing; every unconvened meeting stayed a presumption")
+
+
 def check_ladder_registry() -> CheckResult:
     """Code #13 slice 7 (cq-6afa86210ba0): the autonomy-ladder REGISTRY
     (data/ladder-registry.yaml) read for drift. WARN when the file is missing or
@@ -2820,6 +2882,7 @@ def main() -> int:
     all_results.append(check_run_markers())
     log.info("Reading the missed-nightly catch-up ledger (Code #13 slice 2)...")
     all_results.append(check_missed_nightly_catchup())
+    all_results.append(check_meet_join_audit())
     all_results.append(check_info_for_cora_watermark())
 
     log.info("Checking dynamic-answers snapshot freshness...")
