@@ -150,8 +150,9 @@ def main() -> int:
     total_errors = 0
     for s in summaries:
         log.info(
-            "%s: scanned=%d filed=%d skipped=%d errors=%d",
+            "%s: scanned=%d filed=%d skipped=%d errors=%d unparseable=%d",
             s["email"], s["messages_scanned"], s["filed"], s["skipped"], s["errors"],
+            s.get("unparseable", 0),
         )
         total_filed += s["filed"]
         total_errors += s["errors"]

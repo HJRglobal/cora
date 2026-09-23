@@ -132,6 +132,37 @@ class AttachmentFilerError(Exception):
     pass
 
 
+class ClassificationUnparseable(AttachmentFilerError):
+    """The classifier's reply was truncated or not valid JSON on BOTH the first
+    attempt and the compact retry. process_email quarantines the message in the
+    message ledger (reason=classification_unparseable) so alias-mailbox copies and
+    later runs never re-pay for it, and the digest surfaces the COUNT."""
+
+
+# Classifier output budget. The 9/18 failure was a 13-attachment email whose
+# pretty-printed reply (~80 output tokens per attachment) hit a flat
+# max_tokens=1024 mid-string. The first attempt scales with attachment count; a
+# truncated / unparseable reply gets ONE retry at a larger cap asking for
+# minified JSON with shorter fields.
+_FIRST_ATTEMPT_BASE_TOKENS = 512
+_FIRST_ATTEMPT_PER_ATTACHMENT = 160
+_FIRST_ATTEMPT_MAX_TOKENS = 4096
+_RETRY_MAX_TOKENS = 8192
+_COMPACT_RETRY_INSTRUCTION = (
+    "\n\nIMPORTANT: reply with MINIFIED single-line JSON only (no indentation, no "
+    "line breaks), same schema, one entry per attachment. Keep \"description\" to "
+    "at most 6 words and \"reason\" to at most 10 words."
+)
+QUARANTINE_REASON_UNPARSEABLE = "classification_unparseable"
+
+
+def _first_attempt_max_tokens(n_attachments: int) -> int:
+    return min(
+        _FIRST_ATTEMPT_MAX_TOKENS,
+        _FIRST_ATTEMPT_BASE_TOKENS + _FIRST_ATTEMPT_PER_ATTACHMENT * max(0, int(n_attachments)),
+    )
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Watermark persistence
 # ────────────────────────────────────────────────────────────────────────────
@@ -278,32 +309,67 @@ def classify_attachments(
         f"Attachments:\n{att_lines}"
     )
 
-    try:
-        response = client.messages.create(
-            model=_CLASSIFIER_MODEL,
-            max_tokens=1024,
-            system=_CLASSIFICATION_SYSTEM,
-            messages=[{"role": "user", "content": user_message}],
-        )
-    except Exception as exc:
-        raise AttachmentFilerError(f"Claude classification failed: {exc}") from exc
-
     from ..llm_usage import log_usage
-    log_usage(response, caller="attachment_filer", model=_CLASSIFIER_MODEL)
-    raw = response.content[0].text.strip()
+
+    attempts = (
+        (_first_attempt_max_tokens(len(attachments)), user_message),
+        (_RETRY_MAX_TOKENS, user_message + _COMPACT_RETRY_INSTRUCTION),
+    )
+    last_problem = ""
+    for attempt, (max_tokens, content) in enumerate(attempts, start=1):
+        try:
+            response = client.messages.create(
+                model=_CLASSIFIER_MODEL,
+                max_tokens=max_tokens,
+                system=_CLASSIFICATION_SYSTEM,
+                messages=[{"role": "user", "content": content}],
+            )
+        except Exception as exc:
+            raise AttachmentFilerError(f"Claude classification failed: {exc}") from exc
+        log_usage(response, caller="attachment_filer", model=_CLASSIFIER_MODEL)
+        decisions, last_problem = _parse_decisions(response)
+        if decisions is not None:
+            return decisions
+        # Shape hint only -- never the raw reply: for a LEX-hinted email it carries
+        # LEX filenames + financial descriptions (D-145).
+        raw_len = len(_response_text(response))
+        log.warning(
+            "Classifier reply unusable (attempt %d/%d, %s, stop_reason=%s, len=%d, max_tokens=%d)",
+            attempt, len(attempts), last_problem, getattr(response, "stop_reason", None),
+            raw_len, max_tokens,
+        )
+    raise ClassificationUnparseable(
+        f"Claude response unparseable after {len(attempts)} attempts ({last_problem})"
+    )
+
+
+def _response_text(response: Any) -> str:
+    try:
+        return str(response.content[0].text or "")
+    except Exception:  # noqa: BLE001 - empty/odd content block
+        return ""
+
+
+def _parse_decisions(response: Any) -> tuple[list[dict[str, Any]] | None, str]:
+    """(decisions, "") on success, else (None, <problem>). A reply that hit the
+    max_tokens stop is treated as unusable even if it happens to parse."""
+    if getattr(response, "stop_reason", None) == "max_tokens":
+        return None, "truncated at max_tokens"
+    raw = _response_text(response).strip()
     # Strip markdown code fences if Claude wrapped the JSON (e.g. ```json ... ```)
     if raw.startswith("```"):
         raw = raw.split("\n", 1)[-1]  # drop opening fence line
         raw = raw.rsplit("```", 1)[0].strip()  # drop closing fence
-
     try:
         parsed = json.loads(raw)
-        decisions = parsed.get("attachments", [])
     except json.JSONDecodeError as exc:
-        log.warning("Claude returned non-JSON for email %r: %s", email_meta["subject"], raw[:200])
-        raise AttachmentFilerError(f"Claude response was not valid JSON: {exc}") from exc
-
-    return decisions
+        return None, f"invalid JSON at char {exc.pos}"
+    if not isinstance(parsed, dict):
+        return None, "JSON is not an object"
+    decisions = parsed.get("attachments", [])
+    if not isinstance(decisions, list):
+        return None, "attachments is not a list"
+    return decisions, ""
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -347,8 +413,14 @@ def process_email(
     entity_hint: str | None = None,
     content_ledger: dict[str, dict[str, Any]] | None = None,
     seen_messages: set[str] | None = None,
+    outcome: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Process one email: classify → download → md5-dedup → upload → index → record.
+
+    ``outcome`` (optional out-param): set to ``{"unparseable": True}`` when the
+    classifier reply was unusable twice -- the message is then QUARANTINED in the
+    message ledger (reason=classification_unparseable; not under dry_run) instead
+    of being silently counted as skipped.
 
     Two idempotency layers (crash-safe, persisted incrementally):
       * message ledger — a fully-processed message is never re-classified
@@ -398,6 +470,23 @@ def process_email(
 
     try:
         decisions = classify_attachments(meta, raw_attachments, entity_hint=entity_hint)
+    except ClassificationUnparseable as exc:
+        # Quarantine: record the message as done (filed=0) so the other
+        # alias-mailbox copies in THIS run and every later run skip it instead of
+        # paying for N more doomed Haiku calls. Its attachments are NOT filed --
+        # the digest's quarantine count is what keeps that loss visible.
+        log.warning("Classification unparseable for %s -- quarantined: %s", message_id, exc)
+        if outcome is not None:
+            outcome["unparseable"] = True
+        if not dry_run:
+            is_lex = bool(entity_hint and entity_hint.upper().startswith("LEX"))
+            filer_ledger.record_message_done(
+                seen_messages, msg_key,
+                filed=0, skipped=len(raw_attachments),
+                subject="" if is_lex else meta["subject"],   # LEX rows by id only (D-145)
+                reason=QUARANTINE_REASON_UNPARSEABLE,
+            )
+        return []
     except AttachmentFilerError as exc:
         log.warning("Classification failed for %s: %s", message_id, exc)
         return []
@@ -625,7 +714,7 @@ def process_account(
     """Run the full filer pipeline for one monitored email account.
 
     Returns a summary dict:
-        {email, messages_scanned, filed, skipped, errors, list_failed, budget_hit}
+        {email, messages_scanned, filed, skipped, errors, unparseable, list_failed, budget_hit}
 
     `list_failed` is True only if the message LISTING itself failed (so the
     caller must NOT advance the watermark). Per-message file errors do NOT set
@@ -648,6 +737,7 @@ def process_account(
         "filed": 0,
         "skipped": 0,
         "errors": 0,
+        "unparseable": 0,
         "filed_items": [],
         "list_failed": False,
         "budget_hit": False,
@@ -672,18 +762,22 @@ def process_account(
             )
             summary["budget_hit"] = True
             break
+        outcome: dict[str, Any] = {}
         try:
             filed = process_email(
                 user_email, msg_id,
                 dry_run=dry_run, kb=kb, entity_hint=entity_hint,
                 content_ledger=content_ledger, seen_messages=seen_messages,
+                outcome=outcome,
             )
         except Exception as exc:
             log.exception("Unexpected error processing %s/%s: %s", user_email, msg_id, exc)
             summary["errors"] += 1
             continue
 
-        if filed:
+        if outcome.get("unparseable"):
+            summary["unparseable"] += 1
+        elif filed:
             summary["filed"] += len(filed)
             summary["filed_items"].extend(filed)
         else:
@@ -851,11 +945,21 @@ def post_slack_summary(summaries: list[dict[str, Any]]) -> bool:
             deduped.append((summary["email"], kept))
 
     total_filed = sum(len(items) for _, items in deduped)
-    if total_filed == 0:
+    # COUNT only -- never subjects/filenames/descriptions (a quarantined message can
+    # be a LEX one; D-145). Posted even when nothing was filed, so a run whose only
+    # event was a quarantine is not silent loss.
+    total_unparseable = sum(int(s.get("unparseable") or 0) for s in summaries)
+    if total_filed == 0 and total_unparseable == 0:
         log.info("No attachments filed this run — skipping Slack notification")
         return True
 
     lines = [f":file_folder: *Email Attachment Filing Summary* — {total_filed} file(s) archived"]
+    if total_unparseable:
+        lines.append(
+            f":warning: {total_unparseable} message(s) quarantined -- classification "
+            f"unparseable (attachments NOT filed; reason={QUARANTINE_REASON_UNPARSEABLE} "
+            "in the filer message ledger)"
+        )
     for email, items in deduped:
         lines.append(f"\n*{email}*")
         for item in items:

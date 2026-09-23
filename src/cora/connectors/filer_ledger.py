@@ -223,8 +223,13 @@ def record_message_done(
     filed: int = 0,
     skipped: int = 0,
     subject: str = "",
+    reason: str | None = None,
 ) -> bool:
-    """Mark a message fully processed: append a durable row + update `seen`."""
+    """Mark a message fully processed: append a durable row + update `seen`.
+
+    ``reason`` (optional) records WHY a message was closed without filing, e.g.
+    ``classification_unparseable`` for a quarantine. Omitted -> the row is
+    byte-identical to before; load_message_ledger reads only msg_key/filed_at."""
     if not msg_key:
         return False
     seen.add(msg_key)
@@ -235,6 +240,8 @@ def record_message_done(
         "subject": subject[:120],
         "filed_at": int(time.time()),
     }
+    if reason:
+        row["reason"] = str(reason)[:64]
     return _append_row(_message_path(), _MESSAGE_SCHEMA, row)
 
 

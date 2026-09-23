@@ -687,3 +687,199 @@ class TestDigestDedup:
         af.post_slack_summary(summaries)
         assert posted["text"].count("F1.pdf") == 1
         assert "1 file(s) archived" in posted["text"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# S6c (Code #14, cq-a5b3e6a2e844): truncated classifier JSON -> scaled budget,
+# ONE compact retry, then a message-ledger quarantine surfaced as a COUNT.
+# Synthetic filenames only (never the live LEX ones from the 9/18 log).
+# ─────────────────────────────────────────────────────────────────────────────
+
+from types import SimpleNamespace  # noqa: E402
+
+_TRUNCATED = ('{\n  "attachments": [\n    {\n      "filename": "a.pdf",\n'
+              '      "action": "file",\n      "description": "end-of-business-statem')
+_GOOD = ('{"attachments":[{"filename":"a.pdf","action":"file","entity":"OSN",'
+         '"subfolder":"reports","description":"monthly report","reason":"a report"}]}')
+
+
+def _resp(text, stop_reason="end_turn"):
+    return SimpleNamespace(content=[SimpleNamespace(text=text)], stop_reason=stop_reason,
+                           usage=SimpleNamespace(input_tokens=1, output_tokens=1))
+
+
+class _FakeAnthropic:
+    """Scripted messages.create; records every call's kwargs."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.calls: list[dict] = []
+        self.messages = SimpleNamespace(create=self._create)
+
+    def _create(self, **kw):
+        self.calls.append(kw)
+        return self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
+
+
+def _install_fake_claude(monkeypatch, replies):
+    fake = _FakeAnthropic(replies)
+    monkeypatch.setattr(af.anthropic, "Anthropic", lambda **_kw: fake)
+    import cora.llm_usage as lu
+    monkeypatch.setattr(lu, "log_usage", lambda *a, **k: None)
+    return fake
+
+
+def _atts(n):
+    return [{"filename": f"file{i}.pdf", "mime_type": "application/pdf", "size": 200000,
+             "attachment_id": f"a{i}", "data": None} for i in range(n)]
+
+
+class TestClassifierRetry:
+    def test_first_attempt_max_tokens_scales_with_attachment_count(self, monkeypatch):
+        fake = _install_fake_claude(monkeypatch, [_resp(_GOOD)])
+        af.classify_attachments(_meta(), _atts(13))
+        assert fake.calls[0]["max_tokens"] >= 2592
+        assert af._first_attempt_max_tokens(1) == 672
+        assert af._first_attempt_max_tokens(40) == 4096          # capped
+
+    def test_truncated_then_compact_retry_succeeds(self, monkeypatch):
+        fake = _install_fake_claude(
+            monkeypatch, [_resp(_TRUNCATED, "max_tokens"), _resp(_GOOD)])
+        decisions = af.classify_attachments(_meta(), _atts(2))
+        assert decisions[0]["description"] == "monthly report"
+        assert len(fake.calls) == 2
+        assert fake.calls[1]["max_tokens"] == 8192 > fake.calls[0]["max_tokens"]
+        retry_text = fake.calls[1]["messages"][0]["content"]
+        assert "MINIFIED" in retry_text and "6 words" in retry_text and "10 words" in retry_text
+        assert "MINIFIED" not in fake.calls[0]["messages"][0]["content"]
+
+    def test_invalid_json_without_truncation_also_retries(self, monkeypatch):
+        fake = _install_fake_claude(monkeypatch, [_resp("not json at all"), _resp(_GOOD)])
+        assert af.classify_attachments(_meta(), _atts(1))
+        assert len(fake.calls) == 2
+
+    def test_two_failures_raise_unparseable(self, monkeypatch):
+        fake = _install_fake_claude(monkeypatch, [_resp(_TRUNCATED, "max_tokens")])
+        import pytest
+        with pytest.raises(af.ClassificationUnparseable) as ei:
+            af.classify_attachments(_meta(), _atts(13))
+        assert isinstance(ei.value, af.AttachmentFilerError)      # old handlers still catch it
+        assert len(fake.calls) == 2                               # exactly ONE retry
+
+    def test_unusable_reply_is_never_logged_raw(self, monkeypatch, caplog):
+        _install_fake_claude(monkeypatch, [_resp('{"SYNTHETIC-RAW-MARKER": ')])
+        import logging
+        import pytest
+        with caplog.at_level(logging.DEBUG, logger="cora.connectors.attachment_filer"):
+            with pytest.raises(af.ClassificationUnparseable):
+                af.classify_attachments(_meta(subject="SYNTHETIC-SUBJECT-MARKER"), _atts(1))
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        assert "SYNTHETIC-RAW-MARKER" not in logged
+        assert "SYNTHETIC-SUBJECT-MARKER" not in logged
+        assert "len=" in logged                                   # shape hint only
+
+
+def _message_rows(tmp_path):
+    p = tmp_path / "message.jsonl"
+    if not p.exists():
+        return []
+    rows = [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+    return [r for r in rows if "msg_key" in r]
+
+
+def _patch_unparseable_pipeline(monkeypatch, meta):
+    """Real process_email + REAL classify_attachments, Claude always truncating."""
+    monkeypatch.setattr(af, "get_message", lambda u, m: {"id": m})
+    monkeypatch.setattr(af, "parse_message_metadata", lambda msg: meta)
+    upload = MagicMock()
+    monkeypatch.setattr(af, "upload_file", upload)
+    fake = _install_fake_claude(monkeypatch, [_resp(_TRUNCATED, "max_tokens")])
+    return fake, upload
+
+
+class TestUnparseableQuarantine:
+    def test_unparseable_quarantined_in_message_ledger(self, tmp_path, monkeypatch):
+        _set_ledger_paths(tmp_path, monkeypatch)
+        _, upload = _patch_unparseable_pipeline(monkeypatch, _meta())
+        outcome: dict = {}
+        res = af.process_email("payables@hjrglobal.com", "m1", content_ledger={},
+                               seen_messages=set(), outcome=outcome)
+        assert res == [] and outcome == {"unparseable": True}
+        assert upload.call_count == 0
+        (row,) = _message_rows(tmp_path)
+        assert row["reason"] == "classification_unparseable"
+        assert row["filed"] == 0 and row["msg_key"] == "<msg1@host>"
+
+    def test_quarantine_lex_row_carries_no_subject(self, tmp_path, monkeypatch):
+        _set_ledger_paths(tmp_path, monkeypatch)
+        _patch_unparseable_pipeline(monkeypatch, _meta(subject="Synthetic statement"))
+        af.process_email("payables@example.com", "m1", entity_hint="LEX",
+                         content_ledger={}, seen_messages=set())
+        (row,) = _message_rows(tmp_path)
+        assert row["subject"] == "" and row["reason"] == "classification_unparseable"
+
+    def test_quarantine_dedups_alias_copies_in_same_run_and_later_runs(self, tmp_path, monkeypatch):
+        _set_ledger_paths(tmp_path, monkeypatch)
+        fake, _ = _patch_unparseable_pipeline(monkeypatch, _meta())   # same rfc id in both boxes
+        seen: set = set()
+        af.process_email("payables@hjrglobal.com", "g1", content_ledger={}, seen_messages=seen)
+        af.process_email("receipts@hjrglobal.com", "g2", content_ledger={}, seen_messages=seen)
+        assert len(fake.calls) == 2                               # not 4
+        from cora.connectors import filer_ledger
+        assert "<msg1@host>" in filer_ledger.load_message_ledger()  # a later run skips too
+
+    def test_quarantine_dry_run_writes_no_ledger_row(self, tmp_path, monkeypatch):
+        _set_ledger_paths(tmp_path, monkeypatch)
+        _patch_unparseable_pipeline(monkeypatch, _meta())
+        seen: set = set()
+        outcome: dict = {}
+        af.process_email("payables@hjrglobal.com", "m1", dry_run=True, content_ledger={},
+                         seen_messages=seen, outcome=outcome)
+        assert outcome == {"unparseable": True}
+        assert _message_rows(tmp_path) == [] and seen == set()
+
+    def test_process_account_counts_unparseable_not_skipped(self, tmp_path, monkeypatch):
+        _set_ledger_paths(tmp_path, monkeypatch)
+        _patch_unparseable_pipeline(monkeypatch, _meta())
+        monkeypatch.setattr(af, "list_messages_with_attachments", lambda u, ts: ["m1"])
+        summary = af.process_account({"email": "payables@hjrglobal.com"}, {},
+                                     content_ledger={}, seen_messages=set())
+        assert summary["unparseable"] == 1 and summary["skipped"] == 0
+
+    def test_record_message_done_without_reason_is_unchanged(self, tmp_path, monkeypatch):
+        _set_ledger_paths(tmp_path, monkeypatch)
+        from cora.connectors import filer_ledger
+        filer_ledger.record_message_done(set(), "<k@h>", filed=1, subject="s")
+        (row,) = _message_rows(tmp_path)
+        assert set(row) == {"msg_key", "filed", "skipped", "subject", "filed_at"}
+
+
+class TestDigestUnparseable:
+    def _fake(self, monkeypatch):
+        posted: dict = {}
+
+        class FakeClient:
+            def __init__(self, token):
+                pass
+
+            def chat_postMessage(self, channel, text):
+                posted["text"] = text
+
+        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+        monkeypatch.setattr(af, "_SlackWebClient", FakeClient)
+        return posted
+
+    def test_digest_surfaces_unparseable_count_even_with_zero_filed(self, monkeypatch):
+        posted = self._fake(monkeypatch)
+        summaries = [{"email": "payables@hjrglobal.com", "filed": 0, "filed_items": [],
+                      "unparseable": 1, "subject": "SYNTHETIC-SUBJECT-MARKER"}]
+        assert af.post_slack_summary(summaries) is True
+        assert "1 message(s) quarantined" in posted["text"]
+        assert "SYNTHETIC-SUBJECT-MARKER" not in posted["text"]
+        assert "payables@hjrglobal.com" not in posted["text"]      # count only, no rows
+
+    def test_digest_nothing_filed_nothing_quarantined_still_skips(self, monkeypatch):
+        posted = self._fake(monkeypatch)
+        assert af.post_slack_summary([{"email": "a@x.com", "filed_items": [],
+                                       "unparseable": 0}]) is True
+        assert posted == {}
