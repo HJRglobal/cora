@@ -3885,35 +3885,58 @@ def seed_item(*, kind: str, severity: str, title: str, summary: str, entity: str
 _AZ = timezone(timedelta(hours=-7))          # Arizona: no DST
 _QS_MAX_CHARS = 500
 # A command, never a status question: the capture / verb / write paths own these.
+# `show me` / `give me` are READ requests, not commands (D-051 forcing-seams-6: the
+# first cut listed show/give here, so "show me which cards are still unresponded?"
+# was rejected while "tell me which ..." forced, and _QS_REQUEST_RE's own `show me`
+# alternative was dead). A bare "show the cards again" / "give Tommy the ..." stays
+# imperative. The lookahead is fixed-position under the \A anchor (D-171).
 _QS_IMPERATIVE_RE = re.compile(
     r"\A[^\w\n]{0,8}(?:(?:hey|hi|ok|okay)[,!]?[ \t]{1,3})?(?:@?cora[,:]?[ \t]{1,3})?"
     r"(?:please[ \t]{1,3})?"
     r"(?:stage|approve|dismiss|ship|queue|park|keep|mark|close|delegate|surface|resend|"
     r"re-?post|send|file|log|create|press|tap|click|re-?stage|re-?queue|draft|dm|remember|"
-    r"do|go|make|add|fix|build|update|delete|remove|move|flag|give|show)\b",
+    r"do|go|make|add|fix|build|update|delete|remove|move|flag|"
+    r"give(?![ \t]{1,3}me\b)|show(?![ \t]{1,3}me\b))\b",
     re.IGNORECASE)
 _QS_REQUEST_RE = re.compile(
     r"\?|\b(?:confirm|check|verify|tell[ \t]+me|let[ \t]+me[ \t]+know|show[ \t]+me|list)\b"
     r"[^.\n]{0,20}?\b(?:if|whether|which|what|how[ \t]+many|that|any|all)\b",
     re.IGNORECASE)
+# Tier A names the CODE-QUEUE object specifically (D-051 forcing-seams-2). A bare
+# `backlog` forced the read for "is the AP backlog still stuck?", and `decision` /
+# `menu` were allowed card prefixes, so the knowledge-review decision cards and
+# OSN's restaurant menu cards read as queue cards. `backlog` now needs a code /
+# queue / build qualifier; a generic `cards` still counts (Q1 is "Have all cards
+# been responded to") unless _QS_CARD_BEFORE_RE names another card surface;
+# `menu cards` counts only as `monday menu cards`.
 _QS_OBJECT_RE = re.compile(
-    r"\b(?:(?:code[\s-]?(?:session[ \t]+)?|build[ \t]+|decision[ \t]+|queue[ \t]+|menu[ \t]+|"
-    r"monday[ \t]+)?cards?\b"
-    r"|(?:card|stage|keep|park|dismiss|queue|approve)[ \t]+(?:press(?:es)?|taps?|clicks?|buttons?)\b"
+    r"\b(?:(?:code[\s-]?(?:session[ \t]+)?|build[ \t]+|queue[ \t]+|capture[ \t]+|"
+    r"monday[ \t]+(?:menu[ \t]+)?)?cards?\b"
+    r"|(?:card|stage|keep|park|dismiss|queue|approve|button)[ \t]+"
+    r"(?:press(?:es)?|taps?|clicks?|buttons?)\b"
+    r"|my[ \t]+presses\b"
     r"|monday[ \t]+menu\b"
     r"|(?:my|the|your)[ \t]+(?:code[\s-]?(?:session[ \t]+)?)?queue\b"
     r"|code[\s-]?(?:session[ \t]+)?queue\b"
-    r"|backlog\b"
+    r"|(?:code[\s-]?(?:session[ \t]+)?|queue[ \t]+|build[ \t]+)backlog\b"
     r"|staged[ \t]+(?:items?|prompts?|kickoffs?|sessions?)\b"
     r"|(?:kickoff|code[\s-]?session)[ \t]+prompts?\b"
     r"|cq-[0-9a-f]{12}\b)",
     re.IGNORECASE)
-# A 'card(s)' hit that is part of an everyday compound is NOT a queue card.
+# A 'card(s)' hit that is part of an everyday compound -- or of ANOTHER Cora card
+# surface (decision-inbox / knowledge-review / confirm / blog-publish / catch-up /
+# meeting-ask cards: other ledgers, not covered by this read) or a retail / menu
+# card (OSN is a restaurant group; F3E ships rack and shelf cards) -- is NOT a
+# queue card. `menu` here is safe for the Monday menu: "monday menu cards" is one
+# _QS_OBJECT_RE hit that starts at "monday", so its before-text never ends in menu.
 _QS_CARD_BEFORE_RE = re.compile(
     r"\b(?:credit|debit|gift|business|amex|visa|mastercard|corporate|company|bank|sim|report|"
     r"rate|playing|trading|greeting|thank[\s-]you|birthday|loyalty|punch|fighter|id|key|wild|"
     r"score|index|recipe|preview|rewards?|membership|insurance|health|sd|memory|graphics|"
-    r"tarot|flash|post|christmas|holiday|wedding)[ \t]+\Z", re.IGNORECASE)
+    r"tarot|flash|post|christmas|holiday|wedding|"
+    r"decisions?|knowledge|review|inbox|confirm(?:ation)?|blog|publish(?:ing)?|catch[\s-]?up|"
+    r"meeting|ask|menu|rack|promo(?:tional)?|shelf|price|pricing|sample|table|tasting)"
+    r"[ \t]+\Z", re.IGNORECASE)
 _QS_CARD_AFTER_RE = re.compile(
     r"\A[ \t]*(?:payments?|statements?|balances?|charges?|numbers?|readers?|terminals?|fees?|"
     r"limits?|transactions?|holders?|swipes?|processing|program|reader|slot)\b", re.IGNORECASE)
@@ -3926,13 +3949,56 @@ _QS_STATUS_RE = re.compile(
     r"waiting[ \t]+on[ \t]+(?:me|a[ \t]+decision|my)|outstanding|"
     r"left[ \t]+to[ \t]+(?:decide|review|respond|answer)|pending[ \t]+(?:a[ \t]+)?(?:decision|my))\b",
     re.IGNORECASE)
-# Follow-up turns ("did they go through?") refer back; only valid when a recent
-# prior user turn was itself a card-status question (Tier A).
+# The queue's OWN outcome words -- status terms only when paired with a cq- id
+# (D-051 forcing-seams-6: "has cq-X been staged yet?", "where does cq-X stand?"
+# never forced although the tool advertises per-id lookups). Past participles and
+# nouns only: a base-form verb next to an id is a command (_QS_VERB_ID_RE).
+_QS_ID_STATUS_RE = re.compile(
+    r"\b(?:staged|approved|dismissed|shipped|parked|kept|snoozed|superseded|blocked|"
+    r"status|stand(?:s|ing)?)\b", re.IGNORECASE)
+# A queue verb NEXT TO an id, anywhere in the message, is a command or a compound
+# command + question ("can you stage cq-X? and did cq-Y land?") -- never force the
+# read on it (D-051 forcing-seams-3). The forced read would make the turn's
+# tool_use_count 1, which switches off S2's zero-tool lexicon screen -- the net the
+# R14-2 start-anchor residual relies on for exactly this shape. Adjacent only
+# (bounded decoration: space, backtick, quote), so "did my stage press on cq-X
+# land?" still forces.
+_QS_VERB_ID_RE = re.compile(
+    r"\b(?:re-?stage|stage|approve|dismiss|ship|un-?park|park|keep|snooze|re-?queue|queue)\b"
+    r"[^\w\n]{0,8}cq-", re.IGNORECASE)
+# Follow-up turns ("did those go through?") refer back; only valid when a recent
+# prior user turn was itself a card-status question (Tier A). The pronoun must be
+# one that REFERS TO PRESSES / CARDS (D-051 forcing-seams-1): the first cut took
+# any / all / it / they / ones / each, so "any outstanding invoices for F3E?", "were
+# all the payroll runs recorded?" and "yes go ahead, did it land?" forced the card
+# read for up to ten DM messages after one card question. Now: `them`; `those` /
+# `these` / `any` only in PRONOUN use (followed by a verb, `of them`, or the end of
+# the clause -- never a determiner in front of a noun: "those invoices", "any open
+# decisions"); `the rest` / `the others`; the press nouns and verbs. Q2 ("confirm
+# if any have not been responded to") and Q3 ("I have pressed them all") keep
+# forcing; "did they go through?" no longer does (accepted recall cost). Every
+# lookahead is bounded and fixed-position (D-171).
 _QS_PRONOUN_RE = re.compile(
-    r"\b(?:them|those|these|any|all|it|they|ones|each|(?:my|the|those|these)[ \t]+"
+    r"\b(?:them"
+    r"|(?:those|these)(?=[ \t]{0,3}(?:[?.!,;:)]|\Z|(?:have|has|had|were|was|are|is|did|do|got|"
+    r"get|went|go|all|still|been|of|ones|not|that|which|i|you)\b))"
+    r"|any(?=[ \t]{0,3}(?:[?.!,;:)]|\Z|(?:have|has|had|were|was|are|is|not|still|been|got|get|"
+    r"did|go|went|left|that|which|of[ \t]{1,3}(?:them|those|these))\b))"
+    r"|the[ \t]+(?:rest|others)"
+    r"|(?:my|the|those|these)[ \t]+"
     r"(?:press(?:es)?|taps?|clicks?)(?![ \t]+(?:release|releases|pipeline|coverage|hits?|kit|"
     r"mentions?|pieces?|tour|list|conference|team|room))|pressed|tapped|clicked)\b",
     re.IGNORECASE)
+# A follow-up that names its OWN non-queue object is not a follow-up about cards:
+# "which of them are still pending my approval in Asana?" (D-051 forcing-seams-1).
+# Tier B only -- a Tier-A message names a queue object explicitly.
+_QS_FOREIGN_RE = re.compile(
+    r"\b(?:asana|tasks?|subtasks?|invoices?|bills?|payments?|payroll|bank|wires?|deposits?|"
+    r"transfers?|emails?|inbox|drafts?|deals?|orders?|pos|shipments?|pallets?|hubspot|qbo|"
+    r"quickbooks|shopify|deposco|calendar|meetings?|invites?|transcripts?|receipts?|"
+    r"statements?|sources|knowledge[ \t]+base|kb|mailboxes?|folders?|files?|docs?|documents?)\b",
+    re.IGNORECASE)
+_QS_CQ_ID_RE = re.compile(r"\bcq-[0-9a-f]{12}\b", re.IGNORECASE)
 _QS_CLAUSE_BREAK = re.compile(r"[.!?\n;]")
 _QS_PAIR_GAP = 60
 
@@ -3965,22 +4031,32 @@ def _qs_tier_a(text: str) -> bool:
     if not objs:
         return False
     stats = [(m.start(), m.end()) for m in _QS_STATUS_RE.finditer(text)]
-    return bool(stats) and _qs_paired(text, objs, stats)
+    if stats and _qs_paired(text, objs, stats):
+        return True
+    ids = [(m.start(), m.end()) for m in _QS_CQ_ID_RE.finditer(text)]
+    if not ids:
+        return False
+    id_stats = [(m.start(), m.end()) for m in _QS_ID_STATUS_RE.finditer(text)]
+    return bool(id_stats) and _qs_paired(text, ids, id_stats)
 
 
 def _qs_gates(text: str) -> bool:
     return (bool(text) and len(text) <= _QS_MAX_CHARS
-            and not _QS_IMPERATIVE_RE.match(text) and bool(_QS_REQUEST_RE.search(text)))
+            and not _QS_IMPERATIVE_RE.match(text) and bool(_QS_REQUEST_RE.search(text))
+            and not _QS_VERB_ID_RE.search(text))
 
 
 def is_queue_status_question(text: str, *, prior_user_texts: Any = ()) -> bool:
     """True when *text* asks about the STATE of Harrison's code-queue cards / presses
-    (Tier A: a queue-card object and a status term in one clause), or is a follow-up
-    ("did they go through?") to such a question in the last three user turns (Tier
-    B). Fail-closed: > 500 chars, an imperative / command opening, or no question /
-    request form -> False. The caller gates on founder + DM; this predicate reads
-    text only. Regex over bounded input plus plain span logic (D-171: re-timed,
-    tests pin the degenerate shapes)."""
+    (Tier A: a code-queue object and a status term in one clause, or a cq- id and
+    one of the queue's own outcome words), or is a follow-up ("did those go
+    through?") to such a question in the last three user turns (Tier B: a
+    press-referring pronoun, no object of its own). Fail-closed: > 500 chars, an
+    imperative / command opening, a queue verb next to a cq- id anywhere, or no
+    question / request form -> False. The caller gates on founder + DM, on no
+    staged write pending and on no verb attempt; this predicate reads text only.
+    Regex over bounded input plus plain span logic (D-171: re-timed, tests pin the
+    degenerate shapes)."""
     t = html.unescape(str(text or "")).strip()
     if not _qs_gates(t):
         return False
@@ -3989,6 +4065,8 @@ def is_queue_status_question(text: str, *, prior_user_texts: Any = ()) -> bool:
     pron = [(m.start(), m.end()) for m in _QS_PRONOUN_RE.finditer(t)]
     stats = [(m.start(), m.end()) for m in _QS_STATUS_RE.finditer(t)]
     if not (pron and stats and _qs_paired(t, pron, stats)):
+        return False
+    if _QS_FOREIGN_RE.search(t):
         return False
     priors = [html.unescape(str(p or "")).strip() for p in list(prior_user_texts or ())[-3:]]
     return any(p and len(p) <= _QS_MAX_CHARS and _qs_tier_a(p) for p in priors)
@@ -4008,6 +4086,13 @@ QUEUE_STATUS_FOOTER = (
     "card can read as unanswered after the press registered -- this ledger is the "
     "source of truth. A repeat press is safe: Approve / Stage / Dismiss / Ship are "
     "no-ops once recorded; a repeat Keep or Later records one more keep / snooze.")
+# D-051 forcing-seams-2: the read states its own scope, so a turn forced onto it by
+# a question about some OTHER card surface cannot relay the Monday-menu tally as
+# that surface's truth.
+QUEUE_STATUS_SCOPE = (
+    "Scope: code-queue cards only (the Monday menu and code-queue capture cards). "
+    "Decision-inbox, knowledge-review, confirm and blog-publish cards are separate "
+    "ledgers this read does not cover.")
 
 
 def _qs_az(ts: Any) -> str:
@@ -4091,6 +4176,7 @@ def render_card_status(cq_ids: Any = None, *, now: datetime | None = None) -> st
             lines.append(_qs_line(cid, safe_by_id.get(cid), raw_by_id.get(cid),
                                   decisions[-1] if decisions else None))
         lines.append("")
+        lines.append(QUEUE_STATUS_SCOPE)
         lines.append(QUEUE_STATUS_FOOTER)
         return "\n".join(lines)
 
@@ -4139,5 +4225,6 @@ def render_card_status(cq_ids: Any = None, *, now: datetime | None = None) -> st
                      "undecided:*")
         lines.extend(pending_capture[:20])
     lines.append("")
+    lines.append(QUEUE_STATUS_SCOPE)
     lines.append(QUEUE_STATUS_FOOTER)
     return "\n".join(lines)

@@ -49,6 +49,76 @@ MUST_FORCE = [
     "Cora, which cards are still awaiting a decision?",
     "check whether my Monday menu presses registered",
     "how many cards are left to decide?",
+    # D-051 forcing-seams-6 (recall): the queue's own outcome words next to an id ...
+    "has cq-f880ce946bb6 been staged yet?",
+    "is cq-f880ce946bb6 approved?",
+    "was cq-f880ce946bb6 shipped?",
+    "what's the status of cq-f880ce946bb6?",
+    "where does cq-f880ce946bb6 stand?",
+    # ... and `show me` / `give me` are read requests, not commands
+    "show me which cards are still unresponded?",
+    "Show me whether my card presses registered",
+    "Cora, show me which cards are still waiting on me",
+    "give me the cards still awaiting a decision?",
+    # the code-queue objects the narrowed Tier A still names
+    "did the monday menu cards register?",
+    "is the code backlog still stuck?",
+    "have my presses registered?",
+    "did my button presses land?",
+]
+
+# D-051 forcing-seams-2: Tier A must name the CODE-QUEUE object. Every row forced
+# the ledger read before the fix (reproduced) and got the Monday-menu tally back.
+OTHER_CARD_AND_BACKLOG_SURFACES = [
+    "is the AP backlog still stuck?",
+    "what's the backlog of outstanding AR at OSN?",
+    "is the invoice backlog still outstanding?",
+    "how big is the backlog of outstanding orders at Deposco?",
+    "is the ticket backlog still stuck at Lexington?",
+    "have my decision cards been responded to?",
+    "have all my knowledge review cards been responded to?",
+    "did my confirm cards land?",
+    "did my blog publish cards register?",
+    "did the catch-up cards land?",
+    "did the meeting ask cards land?",
+    "are the menu cards still showing the old prices?",
+    "have the rack cards landed at Sprouts?",
+]
+
+# D-051 forcing-seams-3: a queue verb NEXT TO an id is a command (or a compound
+# command + question); the forced read would blind S2's zero-tool screen to a
+# narrated "Staged cq-..." on exactly this shape.
+COMPOUND_VERB_AND_STATUS = [
+    "can you stage cq-621dfad586aa? and did cq-9c4e2d8f5f1a land?",
+    "Could you stage cq-621dfad586aa too -- have my other cards registered?",
+    "please dismiss `cq-621dfad586aa` -- did my other presses land?",
+    "did the stage press land? also approve cq-621dfad586aa",
+]
+
+# D-051 forcing-seams-1: follow-up turns that must NOT force even with a card
+# question (Q1) in the priors -- a generic pronoun / determiner, a confirm turn, or
+# a follow-up that names its own non-queue object. Every row forced before the fix.
+TIER_B_NEGATIVES_WITH_A_CARD_PRIOR = [
+    "any outstanding invoices for F3E?",
+    "were all the payroll runs recorded?",
+    "any open decisions still waiting on me?",
+    "which of them are still pending my approval in Asana?",
+    "did it land in the bank?",
+    "what sources do you cover? are they all recorded?",
+    "yes -- confirm that it is recorded",
+    "confirm, and let me know if it landed",
+    "yes go ahead, did it land?",
+    "did those payments go through?",
+    "did those invoices land?",
+    "did they go through?",   # 'they' is not press-referring (accepted recall cost)
+]
+TIER_B_POSITIVES_WITH_A_CARD_PRIOR = [
+    Q2, Q3,
+    "did those go through?",
+    "which of them are still unresponded?",
+    "did the rest go through?",
+    "are these still showing as unresponded?",
+    "have I missed any?",
 ]
 
 # Real founder-DM texts (bot logs, 6/11-9/21; 80-char log cut where it applies) that
@@ -120,13 +190,42 @@ class TestPredicate:
     def test_must_not_force(self, text):
         assert cq.is_queue_status_question(text) is False
 
-    def test_follow_up_needs_a_card_question_among_the_last_three_turns(self):
-        assert cq.is_queue_status_question("did they go through?", prior_user_texts=[Q1]) is True
+    @pytest.mark.parametrize("text", OTHER_CARD_AND_BACKLOG_SURFACES)
+    def test_other_card_surfaces_and_business_backlogs_never_force(self, text):
+        assert cq.is_queue_status_question(text) is False
+        # and a card question in the priors does not rescue them
+        assert cq.is_queue_status_question(text, prior_user_texts=[Q1]) is False
+
+    @pytest.mark.parametrize("text", COMPOUND_VERB_AND_STATUS)
+    def test_a_queue_verb_next_to_an_id_never_forces(self, text):
+        assert cq.is_queue_status_question(text) is False
+        assert cq.is_queue_status_question(text, prior_user_texts=[Q1]) is False
+
+    def test_a_verb_mid_sentence_that_is_not_next_to_an_id_still_forces(self):
+        # the adjacency bound: "stage press on cq-X" is a press noun, not a command
+        assert cq.is_queue_status_question("did my stage press on cq-f880ce946bb6 land?") is True
+        # a past participle next to the id is a status word, not a command
+        assert cq.is_queue_status_question("I staged cq-f880ce946bb6 -- did it land?") is True
+
+    @pytest.mark.parametrize("text", TIER_B_NEGATIVES_WITH_A_CARD_PRIOR)
+    def test_a_generic_follow_up_never_forces_even_after_a_card_question(self, text):
+        assert cq.is_queue_status_question(text, prior_user_texts=[Q1]) is False
         assert cq.is_queue_status_question(
-            "did they go through?", prior_user_texts=["what's our cash position?"]) is False
+            text, prior_user_texts=["have my cards registered?"]) is False
+
+    @pytest.mark.parametrize("text", TIER_B_POSITIVES_WITH_A_CARD_PRIOR)
+    def test_a_press_referring_follow_up_forces_only_after_a_card_question(self, text):
+        assert cq.is_queue_status_question(text, prior_user_texts=[Q1]) is True
+        assert cq.is_queue_status_question(
+            text, prior_user_texts=["what's our cash position?"]) is False
+
+    def test_follow_up_needs_a_card_question_among_the_last_three_turns(self):
+        assert cq.is_queue_status_question("did those go through?", prior_user_texts=[Q1]) is True
+        assert cq.is_queue_status_question(
+            "did those go through?", prior_user_texts=["what's our cash position?"]) is False
         # only the last THREE user turns count
         assert cq.is_queue_status_question(
-            "did they go through?", prior_user_texts=[Q1, "a?", "b?", "c?"]) is False
+            "did those go through?", prior_user_texts=[Q1, "a?", "b?", "c?"]) is False
 
     def test_slack_entities_are_decoded_first(self):
         assert cq.is_queue_status_question("have my cards registered&#63;") is True
@@ -137,7 +236,10 @@ class TestPredicate:
     @pytest.mark.parametrize("shape", [
         " " * 480 + "cards?", "cards " * 80 + "?", "responded to " * 36 + "?",
         "?" + "them all " * 55, ("card still show " * 31)[:499] + "?",
-    ], ids=["spaces", "cards", "responded", "pronouns", "mixed"])
+        ("cq-0123456789ab staged " * 22)[:499] + "?", ("them still pending " * 27)[:499] + "?",
+        ("those have landed " * 28)[:499] + "?", "any " * 124 + "?",
+    ], ids=["spaces", "cards", "responded", "pronouns", "mixed", "id-status", "them-status",
+            "those-landed", "any"])
     def test_predicate_is_fast_on_degenerate_input_at_the_gate(self, shape):
         t0 = time.perf_counter()
         cq.is_queue_status_question(shape, prior_user_texts=[shape, shape, shape])
@@ -146,14 +248,26 @@ class TestPredicate:
     @pytest.mark.parametrize("shape", [
         " " * 40_000 + "x", "card " * 8_000, "responded to " * 3_000, "!" * 40_000,
         "still " * 8_000 + "x", "cq-" * 13_000,
-    ], ids=["spaces", "card", "responded", "bang", "still", "cq"])
+        # D-051 remediation shapes: each edited / new pattern's own tokens
+        "any " * 10_000, "those   " * 5_000, "any \t\t" * 6_000 + "x",
+        "stage " * 6_000 + "cq-", "stage" + " " * 40_000 + "cq-", "re-stage `" * 4_000,
+        "the rest " * 4_000, "monday menu " * 3_000 + "cards", "monday" + "\t" * 40_000,
+        "catch-up " * 4_000 + "cards", "knowledge" + " " * 40_000 + "base",
+        "show me " * 5_000, "give" + " " * 40_000 + "me", "code backlog " * 3_000,
+        "decision " * 4_000 + "cards", "button " * 6_000 + "presses", "staged status " * 3_000,
+    ], ids=["spaces", "card", "responded", "bang", "still", "cq",
+            "any", "those", "any-tabs", "stage-cq", "stage-spaces-cq", "restage-tick",
+            "the-rest", "monday-menu", "monday-tabs", "catch-up", "knowledge-spaces",
+            "show-me", "give-spaces", "code-backlog", "decision-cards", "button-presses",
+            "id-status"])
     def test_raw_regexes_are_linear_past_the_gate(self, shape):
         """D-171: the 500-char gate runs first, but each compiled pattern must stand
         on its own at Slack's 40k cap too. Best of 3: measured ~14ms worst shape on
         an idle host (the bound is ~14x that); a single run flaked once under five
         concurrent full suites -- the minimum is what the pattern costs."""
         rxs = (cq._QS_IMPERATIVE_RE, cq._QS_REQUEST_RE, cq._QS_OBJECT_RE,
-               cq._QS_STATUS_RE, cq._QS_PRONOUN_RE, cq._QS_CARD_BEFORE_RE)
+               cq._QS_STATUS_RE, cq._QS_PRONOUN_RE, cq._QS_CARD_BEFORE_RE,
+               cq._QS_ID_STATUS_RE, cq._QS_VERB_ID_RE, cq._QS_FOREIGN_RE, cq._QS_CQ_ID_RE)
         best = float("inf")
         for _ in range(3):
             t0 = time.perf_counter()
@@ -228,6 +342,15 @@ class TestRenderer:
         # the load_items LEX-safe view: the fixed placeholder, never a raw title
         assert "[LEX build ask -- details withheld]" in line
         assert "no decision recorded" in line
+
+    def test_the_read_states_its_scope(self, qledger):
+        """D-051 forcing-seams-2: a turn mis-forced by a question about another card
+        surface must not relay the Monday-menu tally as that surface's truth."""
+        _seed_menu(qledger)
+        for out in (cq.render_card_status(), cq.render_card_status(["cq-000000000001"])):
+            assert cq.QUEUE_STATUS_SCOPE in out
+            assert "Decision-inbox" in cq.QUEUE_STATUS_SCOPE
+            assert "knowledge-review" in cq.QUEUE_STATUS_SCOPE
 
     def test_per_id_lookup(self, qledger):
         decided, floor_held, _lex = _seed_menu(qledger)
@@ -313,17 +436,66 @@ class TestTool:
 
 # ── the app seam ─────────────────────────────────────────────────────────────
 
-def test_no_existing_forced_row_now_reads_as_a_status_question():
+# D-051 forcing-seams-1: the displacement rows the review reproduced. Each is owned
+# by an EXISTING force (or by the model, for None); the first cut's Tier B forced
+# cora_queue_status on every one of them once a card question sat in the priors.
+_DISPLACEMENT_ROWS_WITH_A_CARD_PRIOR = [
+    ("what sources do you cover? are they all recorded?", "cora_self_inventory"),
+    ("any open decisions still waiting on me?", None),
+    ("which of them are still pending my approval in Asana?", None),
+    ("yes go ahead, did it land?", None),
+]
+
+_TIER_A_PRIORS = [[], [Q1], ["have my cards registered?"], [Q1, Q2, Q3]]
+
+
+def _full_force_for(message: str, prior: list[str]) -> str | None:
+    """_dispatch_qa's force chain, in its precedence order, WITH the queue-status
+    branch (after every command / write force, before self-inventory)."""
+    import cora.app as capp
+    if capp._code_queue_capture_intent(message):
+        return "cora_queue_code_session"
+    if capp._delegate_work_intent(message):
+        return "cora_delegate_work"
+    staged = capp._staged_write_force_tool(message)
+    if staged:
+        return staged
+    asana = capp._asana_destructive_intent(message)
+    if asana:
+        return asana
+    if cq.is_queue_status_question(message, prior_user_texts=prior):
+        return "cora_queue_status"
+    return capp._self_inventory_force(message)
+
+
+@pytest.mark.parametrize("prior", _TIER_A_PRIORS, ids=["no-prior", "q1", "short-tier-a", "q1-q3"])
+def test_no_existing_forced_row_now_reads_as_a_status_question(prior, monkeypatch):
     """Displacement guard (D-158): every row the phantom-preview + inventory tables
-    pin to an EXISTING force must stay non-status (47 rows at build time, 0 flips)."""
+    pin to an EXISTING force must stay non-status -- with NO priors (47 rows at
+    build time, 0 flips) and, since Tier B reads the priors, WITH a Tier-A card
+    question in them (D-051 forcing-seams-1: the first cut only ever ran the tables
+    with no priors, so Tier B was never tested against them)."""
     import test_phantom_preview_force as ppf
+    monkeypatch.setenv("CORA_LEXICON", "resolve")
     rows = []
     for name in ("_MUST_FORCE", "_MUST_STAY_WITH_EXISTING", "_MUST_FORCE_INVENTORY",
                  "_MUST_STAY_WITH_EXISTING_INVENTORY"):
         for row in getattr(ppf, name):
             rows.append(row[0] if isinstance(row, (list, tuple)) else row)
     assert len(rows) >= 30
-    assert [r for r in rows if cq.is_queue_status_question(r)] == []
+    assert [r for r in rows if cq.is_queue_status_question(r, prior_user_texts=prior)] == []
+    for row in ppf._MUST_FORCE + ppf._MUST_STAY_WITH_EXISTING + ppf._MUST_FORCE_INVENTORY \
+            + ppf._MUST_STAY_WITH_EXISTING_INVENTORY:
+        assert _full_force_for(row[0], prior) == row[1], row[0]
+    for msg in ppf._MUST_NOT_FORCE:
+        assert _full_force_for(msg, prior) is None, msg
+
+
+@pytest.mark.parametrize("message,expected", _DISPLACEMENT_ROWS_WITH_A_CARD_PRIOR)
+def test_the_reproduced_displacements_stay_with_their_owner(message, expected, monkeypatch):
+    monkeypatch.setenv("CORA_LEXICON", "resolve")
+    for prior in _TIER_A_PRIORS:
+        assert _full_force_for(message, prior) == expected, (message, prior)
 
 
 class TestAppSeam:
@@ -345,6 +517,47 @@ class TestAppSeam:
         # assistant text never counts as a prior user turn
         assert app._queue_status_turn(HARRISON, "dm", None, Q2,
                                       [{"role": "assistant", "content": Q1}]) is False
+
+    @pytest.mark.parametrize("text", [Q1, Q2, "have my cards registered?",
+                                      "yes go ahead -- have my cards registered?"])
+    def test_a_pending_staged_write_is_never_pre_empted(self, text, monkeypatch):
+        """D-051 forcing-seams-1: a deferred confirm reaches the model with no forced
+        read on iteration 0 -- the read's tool_use would switch off the S2' zero-tool
+        screen for the very turn that confirms a write."""
+        import cora.app as app
+        monkeypatch.setattr(cq, "HARRISON_ID", HARRISON)
+        prior = [{"role": "user", "content": Q1}, {"role": "assistant", "content": "..."}]
+        assert app._queue_status_turn(HARRISON, "dm", None, text, prior) is True
+        assert app._queue_status_turn(HARRISON, "dm", None, text, prior, pending=True) is False
+
+    @pytest.mark.parametrize("text", [
+        "stage cq-621dfad586aa", "• `stage cq-621dfad586aa`", "stage cq-<id>?",
+        "<@U0B44MDGC5R> `stage cq-621dfad586aa` -- did my other cards register?",
+        "approve cq-621dfad586aa -- did my other cards register?",
+    ])
+    def test_a_verb_attempt_is_never_forced(self, text, monkeypatch):
+        import cora.app as app
+        monkeypatch.setattr(cq, "HARRISON_ID", HARRISON)
+        prior = [{"role": "user", "content": Q1}]
+        assert app._queue_status_turn(HARRISON, "dm", None, text, prior) is False
+
+    def test_the_verb_attempt_gate_is_its_own_belt(self, monkeypatch):
+        """The seam refuses a verb attempt even if the predicate would not (the
+        predicate's own verb-next-to-id screen is a second, independent rail)."""
+        import cora.app as app
+        monkeypatch.setattr(cq, "HARRISON_ID", HARRISON)
+        monkeypatch.setattr(cq, "is_queue_status_question", lambda *a, **k: True)
+        assert app._queue_status_turn(HARRISON, "dm", None, "stage cq-<the id>", []) is False
+        assert app._queue_status_turn(HARRISON, "dm", None, "have my cards registered?", []) is True
+
+    def test_the_call_site_passes_the_pending_note(self):
+        import inspect
+        import cora.app as app
+        body = inspect.getsource(app._dispatch_qa)
+        i_note = body.index("pending_note = _tool_dispatch.describe_live_pendings(")
+        i_calc = body.index("queue_status_turn = _queue_status_turn(")
+        assert i_note < i_calc
+        assert "pending=bool(pending_note))" in body[i_calc:i_calc + 300]
 
     def test_a_detector_error_never_steals_the_turn(self, monkeypatch):
         import cora.app as app
@@ -369,3 +582,4 @@ class TestAppSeam:
         t = "queue a code session: cards don't refresh after a press -- they still show as unresponded"
         assert app._code_queue_capture_intent(t) is True
         assert cq.is_queue_status_question(t) is False
+

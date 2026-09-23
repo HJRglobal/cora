@@ -1025,10 +1025,24 @@ def _prior_user_texts(prior_messages: list[dict] | None) -> list[str]:
 
 
 def _queue_status_turn(user_id: str | None, channel_name: str, retrieval_grant: object,
-                       user_message: str, prior_messages: list[dict] | None) -> bool:
+                       user_message: str, prior_messages: list[dict] | None,
+                       *, pending: bool = False) -> bool:
     """R14-9(a): True when this turn is Harrison, in his DM, asking about the STATE
     of his code-queue cards (code_queue.is_queue_status_question, Tier A, or a
-    follow-up to one in his last three turns). Never on a Tier-2 grant turn."""
+    follow-up to one in his last three turns). Never on a Tier-2 grant turn.
+
+    Never while a staged write is pending for this (user, channel) -- *pending* is
+    the caller's describe_live_pendings line, which covers every stash kind
+    (D-051 forcing-seams-1): a deferred confirm ("yes go ahead, did it land?")
+    must reach the model with no forced read on iteration 0, or the read's
+    tool_use switches off the S2' zero-tool screen for the very turn that
+    confirms a write. Never on a queue-verb attempt either: the verb path owns it.
+
+    The follow-up window is the last three USER turns of prior_messages. It is
+    NOT time-bounded: _fetch_dm_history / _fetch_thread_history carry only
+    {role, content} (no Slack ts), and the dicts go straight into the model's
+    messages array, so a ts cannot ride them without a strip at every consumer.
+    The pronoun narrowing in code_queue is what bounds the window's reach."""
     # One combined guard (never a second `if retrieval_grant ...` line: a web_guard
     # source pin locates _dispatch_qa's own grant branch by that exact text).
     if (not user_id or user_id != code_queue.HARRISON_ID or channel_name != "dm"
@@ -1038,10 +1052,20 @@ def _queue_status_turn(user_id: str | None, channel_name: str, retrieval_grant: 
               if isinstance(m, dict) and m.get("role") == "user"
               and isinstance(m.get("content"), str)][-3:]
     try:
-        return code_queue.is_queue_status_question(user_message, prior_user_texts=priors)
+        # looks_like_queue_verb_attempt already tolerates the paste decorations
+        # (list marker, one mention token, backticks, a "Cora," vocative).
+        if (code_queue.match_queue_verb(user_message or "")
+                or code_queue.looks_like_queue_verb_attempt(user_message or "")):
+            return False
+        hit = code_queue.is_queue_status_question(user_message, prior_user_texts=priors)
     except Exception:  # noqa: BLE001 -- a detector error never steals a turn
         log.warning("queue-status intent detector failed", exc_info=True)
         return False
+    if hit and pending:
+        log.info("queue-status force SUPPRESSED: a staged write is pending (confirm turn "
+                 "is never pre-empted) user=%s", user_id)
+        return False
+    return hit
 
 
 def _staged_write_force_tool(text: str) -> str | None:
@@ -1544,7 +1568,8 @@ def _dispatch_qa(
     # answer composed without the ledger. Founder + DM only (the read renders
     # cross-entity build titles); the tool re-checks both.
     queue_status_turn = _queue_status_turn(user_id, channel_name, retrieval_grant,
-                                           user_message, prior_messages)
+                                           user_message, prior_messages,
+                                           pending=bool(pending_note))
     # S3 (cq-439d89a84de4): the rail ledger's scope for this turn -- computed ONCE,
     # before the cache read, so the cached-serve screens carry it too.
     rail_ctx = _rail_context(channel_id, user_id, entity, retrieval_grant, is_dm, is_founder)
