@@ -1,0 +1,261 @@
+{
+  "schema_version": 1,
+  "generated_at_utc": "2026-09-23T16:09:44Z",
+  "generated_at_az": "2026-09-23 09:09 AZ",
+  "host": "H-REMOTE",
+  "live_root": "C:\\Users\\Harri\\code\\cora",
+  "summary": {
+    "PASS": 19,
+    "FAIL": 0,
+    "MANUAL": 2,
+    "UNMEASURED": 1,
+    "INFO": 2
+  },
+  "kb_rto": {
+    "a_snapshot": "UNMEASURED",
+    "b_connector_rebuild": "UNMEASURED",
+    "b_historical_bound": "~20 calendar days via nightly windows (full re-ingest 2026-05-28..06-17, TOM 2026-06-17); no single-window measurement exists"
+  },
+  "items": [
+    {
+      "id": "D01",
+      "item": "Repo + branch (`main`) + remote",
+      "source_of_truth": "GitHub HJRglobal/cora; local `C:\\Users\\Harri\\code\\cora`",
+      "restore_step": "`git clone <origin> C:\\Users\\Harri\\code\\cora`; checkout `main` at the recorded hash",
+      "owner": "Harrison",
+      "rto": "~5 min",
+      "status": "PASS",
+      "detail": "live checkout HEAD e46bd61 on claude/deposco-push-write-path-2026-09-22; origin set"
+    },
+    {
+      "id": "D02",
+      "item": "Dependency lock (`uv.lock` incl. `mcp`)",
+      "source_of_truth": "`pyproject.toml` + `uv.lock` in the repo",
+      "restore_step": "`uv sync` (dev: `uv sync --group dev`); the MCP server deps ride the lock since M2",
+      "owner": "Harrison",
+      "rto": "~10 min",
+      "status": "PASS",
+      "detail": "uv.lock present; mcp locked"
+    },
+    {
+      "id": "D03",
+      "item": "Python 3.12 + `.venv` (+ `pythonw.exe`)",
+      "source_of_truth": "`.venv\\Scripts\\python.exe` (uv-managed venv at the repo root)",
+      "restore_step": "install Python 3.12 + uv (bootstrap Phase 1), `uv sync`; every task action hardcodes `.venv\\Scripts\\python.exe`/`pythonw.exe`",
+      "owner": "Harrison",
+      "rto": "~15 min",
+      "status": "PASS",
+      "detail": "Python 3.12.10; pythonw.exe present"
+    },
+    {
+      "id": "D04",
+      "item": "`.env` SCHEMA (key NAMES only, never values)",
+      "source_of_truth": "`.env.example` (every key read under src/, guarded by tests/test_env_example_coverage.py); live `.env` at the repo root (gitignored)",
+      "restore_step": "restore the live `.env` from the encrypted secrets bundle (D05); NEVER retype values from a doc; check for duplicate keys before the first start (2026-06-11 HEALTH_PING_URL incident)",
+      "owner": "Harrison",
+      "rto": "~15 min",
+      "status": "PASS",
+      "detail": "73 keys live; 7 active example keys missing in live (HEALTH_BIND, HEALTH_PING_INTERVAL_S, HEALTH_PORT, POLAR_CLIENT_ID, POLAR_CLIENT_SECRET, POLAR_VIEW_ID); 23 live-only keys (documented as commented in .env.example or undocumented); no duplicate keys"
+    },
+    {
+      "id": "D05",
+      "item": "Encrypted secrets bundle (`secrets-YYYY-MM-DD.enc` = `.env` + the Google SA JSON)",
+      "source_of_truth": "daily `backup_logs.py` -> Drive `backups/<date>/secrets-*.enc`; passphrase `CORA_BACKUP_PASSPHRASE` in the password manager (+ User-scope env var on the old host)",
+      "restore_step": "fetch the passphrase from the password manager FIRST; `restore_secrets.py <secrets-*.enc>` -> `.env` + `cora-calendar-sa.json`",
+      "owner": "Harrison",
+      "rto": "~10 min (after the passphrase)",
+      "status": "PASS",
+      "detail": "newest 2026-09-22/secrets-2026-09-22.enc (27420 B, 12.7 h old); restore_secrets.py present; passphrase env var visible to this process"
+    },
+    {
+      "id": "D06",
+      "item": "WDAC / code-integrity posture",
+      "source_of_truth": "Windows Device Guard policy on the host (policy files under `C:\\Windows\\System32\\CodeIntegrity`); service action `python.exe -m cora.main` (the console-script `cora.exe` is BLOCKED)",
+      "restore_step": "on a new host: either reproduce the policy (export the .cip set) or run without WDAC; either way register the service as `-m cora.main`, never `cora.exe`",
+      "owner": "Harrison",
+      "rto": "MANUAL",
+      "status": "PASS",
+      "detail": "code-integrity policy enforced (kernel 2, user-mode 2); service runs `python.exe -m cora.main`; cora.exe present in the venv but blocked by policy -- never the action"
+    },
+    {
+      "id": "D07",
+      "item": "Service task `cowork-cora-service` (always-on bot)",
+      "source_of_truth": "`deployment/setup-windows-task.ps1` (AtLogon, RestartOnFailure 999 x PT1M, windowless via run_hidden)",
+      "restore_step": "run the setup script (elevated), then `deployment\\restart-cora.ps1`; proof = a NEW pid row in `logs/cora-instances.jsonl`",
+      "owner": "Cora-script (Harrison runs)",
+      "rto": "~5 min",
+      "status": "PASS",
+      "detail": "state Running; child `C:\\Users\\Harri\\code\\cora\\.venv\\Scripts\\python.exe -m cora.main`; windowless True; trigger at logon; restart 999 x PT1M; run-as Interactive/Limited"
+    },
+    {
+      "id": "D08",
+      "item": "Live bot health (heartbeat + instances ledger)",
+      "source_of_truth": "`data/health/heartbeat.txt` (60 s) + `logs/cora-instances.jsonl`",
+      "restore_step": "start the service task; heartbeat must advance within 2 min",
+      "owner": "Cora-script",
+      "rto": "~2 min",
+      "status": "PASS",
+      "detail": "heartbeat 5 s old; pid 5384 started 2026-09-20T05:44:15Z"
+    },
+    {
+      "id": "D09",
+      "item": "`cora-watchdog` (5-min heartbeat watchdog, RunLevel Highest) + `restart-cora.ps1`",
+      "source_of_truth": "`deployment/setup-cora-watchdog-task.ps1` + `deployment/cora-watchdog.ps1`",
+      "restore_step": "run the setup script (elevated); verify a tick line in `logs/tasks/cora-watchdog-<date>.log`",
+      "owner": "Cora-script (Harrison runs)",
+      "rto": "~5 min",
+      "status": "PASS",
+      "detail": "Ready; every PT5M (from 2026-07-16T10:27); run level Highest; restart-cora.ps1 present; last result 0"
+    },
+    {
+      "id": "D10",
+      "item": "healthchecks.io dead-man ping (`HEALTH_PING_URL`)",
+      "source_of_truth": "the ping URL is a SECRET-shaped `.env` key (restored with D05); the check itself lives in the healthchecks.io account",
+      "restore_step": "after D05 + D07 the bot pings every 5 min; confirm the check flips UP in the dashboard (manual read)",
+      "owner": "Harrison",
+      "rto": "~5 min",
+      "status": "PASS",
+      "detail": "HEALTH_PING_URL set (key present; value never read); 'ping failed' lines in the last two bot logs: 0; the healthchecks.io dashboard state is a manual read"
+    },
+    {
+      "id": "D11",
+      "item": "Google Drive for Desktop + the `G:` mount (Founder OS)",
+      "source_of_truth": "Drive for Desktop signed in as harrison@hjrglobal.com, mounted at `G:`; `G:\\My Drive\\HJR-Founder-OS`",
+      "restore_step": "install Drive for Desktop, sign in, set the mount letter to G:, wait for the tree to stream; the bot degrades 14/14 entity contexts without it (9/9 incident)",
+      "owner": "Harrison",
+      "rto": "~30 min + initial sync UNMEASURED",
+      "status": "PASS",
+      "detail": "G:\\My Drive\\HJR-Founder-OS mounted; GoogleDriveFS pid 12012"
+    },
+    {
+      "id": "D12",
+      "item": "Pinned KB-excluded Drive folder ids",
+      "source_of_truth": "`src/cora/kb_exclusions.KB_EXCLUDED_FOLDER_IDS` (code; incl. the `_shared/projects/cora` parent pin, the Computers roots, the personal/finance/LEX pins)",
+      "restore_step": "nothing to restore -- they ship with the repo; re-verify the ids still resolve after any Drive restructure",
+      "owner": "Cora-script",
+      "rto": "n/a",
+      "status": "PASS",
+      "detail": "10 pinned Drive folder ids in cora.kb_exclusions.KB_EXCLUDED_FOLDER_IDS (identifiers only; the doc lists them)"
+    },
+    {
+      "id": "D13",
+      "item": "Scheduled estate (96 tasks) = `deployment/manifest/task-estate.json`",
+      "source_of_truth": "the live Task Scheduler registry, derived by `scripts/generate_task_estate_manifest.py` (M1)",
+      "restore_step": "bootstrap Phase 5: every `setup-*.ps1`, then `rewrap-tasks-hidden.ps1 -Apply`; tasks without a setup script re-register from the manifest JSON; `--diff-only` must print zero drift",
+      "owner": "Harrison (elevated) + Cora-script",
+      "rto": "~30-45 min",
+      "status": "PASS",
+      "detail": "96 live / 96 manifest; 0 task-estate-drift line(s)"
+    },
+    {
+      "id": "D14",
+      "item": "Interactive-logon dependency of the whole estate",
+      "source_of_truth": "every task `LogonType=Interactive` (manifest column `run_as`)",
+      "restore_step": "DECISION: auto-logon on the host/VM or a stored-credential logon type; then the cold-boot drill",
+      "owner": "Harrison",
+      "rto": "MANUAL",
+      "status": "MANUAL",
+      "detail": "96 of 96 tasks run LogonType=Interactive -> nothing fires until a user signs in (the 2026-09-09 dark box, 00:34-06:18 AZ); 21 tasks have StartWhenAvailable=false. Decision owner Harrison: auto-logon on the host / VM, or re-register with a stored-credential logon type. Drill item: cold boot with NO user logged on -> does the estate come up?"
+    },
+    {
+      "id": "D15",
+      "item": "Backups landing folder + offsite verify",
+      "source_of_truth": "`backup_logs.py` daily 20:30 AZ -> `G:\\...\\_shared\\projects\\cora\\backups\\YYYY-MM-DD\\` (logs, ledgers, feature DBs, snapshots, secrets); log line `Offsite verify: PASS`",
+      "restore_step": "nothing to restore -- this is the SOURCE for D05/D16; after a rebuild, confirm the first nightly run prints `Offsite verify: PASS`",
+      "owner": "Cora-script",
+      "rto": "n/a",
+      "status": "PASS",
+      "detail": "dated folders present: ['2026-09-22']; last backup log offsite verify: PASS (cowork-cora-backup-2026-09-23.log)"
+    },
+    {
+      "id": "D16",
+      "item": "KB restore path (a): snapshot restore",
+      "source_of_truth": "the one-off `--include-kb` copy `backups/2026-09-08/cora_kb.db` (taken inside the 9/8 stop window)",
+      "restore_step": "copy the snapshot to `data/cora_kb.db` with Cora STOPPED; start Cora; the nightly syncs catch up the gap (watermarks are inside the DB)",
+      "owner": "Harrison",
+      "rto": "UNMEASURED (copy ~7.9 GB + catch-up)",
+      "status": "PASS",
+      "detail": "G:\\My Drive\\HJR-Founder-OS\\_shared\\projects\\cora\\backups\\2026-09-08\\cora_kb.db = 7,874,965,504 B (7.87 GB), taken 2026-09-09 00:59Z, 14 days stale; RTO(a) UNMEASURED (copy 7.87 GB from Drive + open + run the nightly syncs to catch up 14 days)"
+    },
+    {
+      "id": "D17",
+      "item": "KB restore path (b): connector rebuild",
+      "source_of_truth": "`deployment/kb-rebuild.md` (fast path: nightly tasks repopulate; full path: the backfill scripts) + the door tasks listed in the probe",
+      "restore_step": "move the DB aside with Cora stopped; start Cora; let the nightly doors run (fast path) or run the backfills in one window (full path)",
+      "owner": "Harrison + Cora-script",
+      "rto": "UNMEASURED",
+      "status": "PASS",
+      "detail": "kb-rebuild.md present; 14/14 doors registered; RTO(b) UNMEASURED -- only bound: ~20 calendar days via nightly windows (full re-ingest 2026-05-28..06-17, TOM 2026-06-17); no single-window measurement exists. Doors: cowork-cora-kb-sync-static: Ready last 2026-09-23T04:00:01 rc 0 | cowork-cora-kb-sync-slack: Ready last 2026-09-23T02:00:01 rc 0 | cowork-cora-kb-sync-gmail: Ready last 2026-09-23T02:30:01 rc 0 | cowork-cora-kb-sync-asana: Ready last 2026-09-23T03:00:01 rc 0 | cowork-cora-kb-sync-fireflies: Ready last 2026-09-23T03:30:01 rc 0 | cowork-cora-kb-sync-notion: Ready last 2026-09-23T05:00:01 rc 0 | cowork-cora-kb-sync-drive: Ready last 2026-09-23T04:30:01 rc 0 | Cora - Drive Sweep: Ready last 2026-09-23T06:00:01 rc 0 | Cora - Drive Materialization: Ready last 2026-09-23T05:45:01 rc 0 | Cora - LEX Dump Folder Sync: Ready last 2026-09-23T04:45:01 rc 0 | cowork-cora-founders-os-sweep: Ready last 2026-09-23T06:30:01 rc 0 | cowork-cora-channel-sweep: Ready last 2026-09-23T08:40:01 rc 0 | cowork-cora-session-capture: Ready last 2026-09-23T05:15:01 rc 0 | cowork-cora-claude-mirror: Ready last 2026-09-23T03:45:01 rc 0"
+    },
+    {
+      "id": "D18",
+      "item": "Live KB integrity",
+      "source_of_truth": "`data/cora_kb.db` (sqlite + sqlite-vec; WAL)",
+      "restore_step": "n/a -- the probe is the read-only sanity check after either restore path",
+      "owner": "Cora-script",
+      "rto": "n/a",
+      "status": "PASS",
+      "detail": "8.15 GB on disk; 685,109 knowledge_chunks (read-only open)"
+    },
+    {
+      "id": "D19",
+      "item": "Slack app (Socket Mode) -- token key names",
+      "source_of_truth": "api.slack.com app config; `.env` keys `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` / `SLACK_SIGNING_SECRET`",
+      "restore_step": "restore from D05, or regenerate in the Slack app config (bootstrap Phase 3) and revoke the old tokens",
+      "owner": "Harrison",
+      "rto": "~15 min",
+      "status": "PASS",
+      "detail": "key names present: SLACK_BOT_TOKEN, SLACK_APP_TOKEN, SLACK_SIGNING_SECRET; Socket Mode (no inbound URL to restore)"
+    },
+    {
+      "id": "D20",
+      "item": "Windowless launcher (`deployment/run_hidden.py` under `pythonw.exe`)",
+      "source_of_truth": "the repo + the venv",
+      "restore_step": "ships with D01/D03; `rewrap-tasks-hidden.ps1 -Apply` after registering tasks",
+      "owner": "Cora-script",
+      "rto": "~2 min",
+      "status": "PASS",
+      "detail": "run_hidden.py present; 78/96 tasks wrapped windowless"
+    },
+    {
+      "id": "D21",
+      "item": "Cowork estate (Claude desktop scheduled tasks) -- cross-reference",
+      "source_of_truth": "`%USERPROFILE%\\OneDrive\\Documents\\Claude\\Scheduled\\*` + `C:\\Users\\Harri\\code\\pin-scheduled-task-models.ps1` (weekly task `cowork-model-pin-weekly`)",
+      "restore_step": "NOT migrated (charter D4): stays on the office machine; revisit at Phase 3",
+      "owner": "Harrison",
+      "rto": "n/a",
+      "status": "INFO",
+      "detail": "111 Cowork task folders under C:\\Users\\Harri\\OneDrive\\Documents\\Claude\\Scheduled; pin task cowork-model-pin-weekly Ready; NOT migrated (charter D4)"
+    },
+    {
+      "id": "D22",
+      "item": "Task XML exports (`deployment/task-backups/<date>`)",
+      "source_of_truth": "local, gitignored exports from `rewrap-tasks-hidden.ps1`",
+      "restore_step": "convenience only; the committed record is the manifest JSON",
+      "owner": "Cora-script",
+      "rto": "n/a",
+      "status": "INFO",
+      "detail": "local XML exports: ['2026-09-02', '2026-09-03'] (gitignored -- the committed record is deployment/manifest/task-estate.json; an XML export is a convenience, not the source of truth)"
+    },
+    {
+      "id": "D23",
+      "item": "Restore drill: cold boot with NO user logged on",
+      "source_of_truth": "this manifest (D14) + the VM at step 2",
+      "restore_step": "power-cycle the VM, do NOT sign in, wait 15 min: does the service start, does the heartbeat advance, do the 02:00-06:10 tasks fire?",
+      "owner": "Harrison",
+      "rto": "MANUAL (step 2)",
+      "status": "MANUAL",
+      "detail": "runs on the VM at step 2; the office host cannot be rebooted for a drill without a stop window"
+    },
+    {
+      "id": "D24",
+      "item": "Full bare-metal RTO",
+      "source_of_truth": "the sum of D01-D19 measured end to end",
+      "restore_step": "measure on the VM at step 2 (the migration IS the drill); record the wall-clock here",
+      "owner": "Harrison + Justin",
+      "rto": "UNMEASURED",
+      "status": "UNMEASURED",
+      "detail": "no measurement exists; every component RTO above is an estimate or UNMEASURED until step 2"
+    }
+  ]
+}
