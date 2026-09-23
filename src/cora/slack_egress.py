@@ -1005,7 +1005,7 @@ _ID_NEG_STATUS = (r"(?:staged|queued|approved|shipped|filed|created|captured|rec
                   r"registered|merged|landed)")
 _ID_NEG_RELAY_RE = re.compile(
     r"\b(?:not|isn['’]t|wasn['’]t|aren['’]t|weren['’]t)[ \t]++(?:in|on)[ \t]++"
-    r"(?:(?:the|our|my|your|any|that)[ \t]++)?(?:[\w-]{1,20}[ \t]++)?" + _ID_LEDGER_NOUN + r"\b"
+    r"(?:(?:the|our|my|your|any|that)[ \t]++)?(?:[\w-]{1,20}[ \t]++){0,2}" + _ID_LEDGER_NOUN + r"\b"
     r"|\b(?:couldn['’]t|could[ \t]++not|can['’]t|cannot|can[ \t]++not|didn['’]t|did[ \t]++not|"
     r"don['’]t|do[ \t]++not)[ \t]++(?:find|locate|see)\b"
     r"|\bno[ \t]++(?:record|trace|entry|entries|row|match)(?:e?s)?[ \t]++(?:of|for)\b"
@@ -1019,16 +1019,20 @@ _ID_NEG_RELAY_RE = re.compile(
     r"[ \t]++(?:yet[ \t]++)?" + _ID_NEG_STATUS + r"\b",
     re.IGNORECASE)
 # A POSITIVE status anywhere in the id's sentence voids the exemption unless that word is
-# itself negated (one of the three tokens before it is a negator). Closed vocabulary.
+# itself negated (one of the three tokens before it, the id's own tokens left out, is a
+# negator: "I couldn't find cq-X in the queue."). Closed vocabulary; "live" before a
+# ledger noun is an adjective ("the live ledger"), not a status.
 _ID_STATUS_WORD_RE = re.compile(
     r"\b(?:staged|queued|approved|shipped|filed|created|updated|deleted|merged|closed|dismissed|"
-    r"parked|kept|live|done|completed?|landed|registered|recorded|captured|logged|confirmed|saved|"
+    r"parked|kept|live(?![ \t]++(?:(?:code|decision|card|session)[ \t-]?)?"
+    r"(?:queue|ledger|backlog|menu|list|records?|system|data)\b)|"
+    r"done|completed?|landed|registered|recorded|captured|logged|confirmed|saved|"
     r"added|posted|scheduled|ready|canonicali[sz]ed|locked[ \t]++in|all[ \t]++set|good[ \t]++to[ \t]++go|"
     r"(?:went|gone|goes|go)[ \t]++through|in[ \t]++the[ \t]++queue|"
     r"on[ \t]++(?:the|monday['’]s|this[ \t]++week['’]s|next[ \t]++week['’]s)[ \t]++menu)\b",
     re.IGNORECASE)
 _ID_NEGATORS = frozenset({"not", "never", "no", "nothing", "none", "nor", "without", "cannot"})
-_ID_NEG_LOOKBACK_CHARS = 40
+_ID_NEG_LOOKBACK_CHARS = 60
 # The NEXT sentence continues the id's sentence when it opens with a pronoun, a status
 # word (a subject-less fragment: "Staged ✅.") or a conjunction.
 _ID_CONTINUATION_RE = re.compile(
@@ -1068,9 +1072,11 @@ def _id_sentence(text: str, start: int, end: int) -> str:
 
 
 def _has_positive_status(sentence: str) -> bool:
-    """A status word in *sentence* none of whose three preceding tokens is a negator."""
+    """A status word in *sentence* none of whose three preceding tokens is a negator.
+    The id itself is not a token of that window (it would spend two of the three)."""
     for m in _ID_STATUS_WORD_RE.finditer(sentence):
-        toks = _WC_TOKEN_RE.findall(sentence[max(0, m.start() - _ID_NEG_LOOKBACK_CHARS):m.start()])[-3:]
+        before = _WC_ID_TOKEN_RE.sub(" ", sentence[max(0, m.start() - _ID_NEG_LOOKBACK_CHARS):m.start()])
+        toks = _WC_TOKEN_RE.findall(before)[-3:]
         if not any(t.lower() in _ID_NEGATORS or t.lower().endswith(("n't", "n’t")) for t in toks):
             return True
     return False

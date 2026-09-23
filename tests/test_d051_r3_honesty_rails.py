@@ -76,6 +76,13 @@ A1_NEGATIVE_RELAYS = [
     f"{FID} doesn't exist in the queue.",
     f"There's no such card as {FID}.",
     f"`{FID}` is not in the code queue ledger, so it has not been staged.",
+    # the negated locative: the id's own tokens do not spend the negator lookback
+    f"I couldn't find {FID} in the queue.",
+    f"No record of `{FID}` in the queue -- it was never captured.",
+    f"I can't find {FID} on Monday's menu.",
+    # "live" before a ledger noun is an adjective, not a status
+    f"I couldn't find `{FID}` in the live ledger.",
+    f"`{FID}` is not in the live decision ledger.",
 ]
 # A negative relay next to a POSITIVE status: the union check counts every one.
 A1_NEGATIVE_PLUS_CLAIM = [
@@ -88,6 +95,9 @@ A1_NEGATIVE_PLUS_CLAIM = [
     f"{FID} hasn't been staged yet -- it's queued for Monday.",
     f"I couldn't find {FID} in the ledger, so I staged it again.",
     f"{FID} is not in the queue ledger -- it's on Monday's menu instead.",
+    f"{FID} isn't in the ledger, but it's in the queue.",
+    f"{FID} isn't in the queue ledger -- it's live.",
+    f"I couldn't find {FID} in the ledger; it's live on the menu now.",
 ]
 # Accepted over-trips (fail toward COUNTING): honest, but outside the allowlist.
 A1_ACCEPTED_OVER_TRIPS = [
@@ -201,8 +211,9 @@ class TestTypedIdAllowlistR3:
         "not in the " * 3700, "isn't in " * 4500, "no record " * 4000, "has not been " * 3100,
         "not staged " * 3700, "staged " * 5800, "in the queue " * 3100, "It staged. " * 3700,
         "not in the " + "x" * 40000, "isn't in the " + "queue-" * 6700,
+        "not in the " + "ab " * 13300, "live " * 8000, "live decision " * 2800,
     ], ids=["not_in_the", "isnt_in", "no_record", "has_not_been", "not_staged", "staged", "in_the_queue",
-            "continuations", "not_in_x", "modifier_run"])
+            "continuations", "not_in_x", "modifier_run", "modifier_words", "live_run", "live_adj_run"])
     def test_the_relay_patterns_are_linear_at_40k(self, shape):
         """D-171: _ID_NEG_RELAY_RE / _ID_STATUS_WORD_RE / _has_positive_status /
         _ID_CONTINUATION_RE, and the whole rule on an id-bearing variant."""
