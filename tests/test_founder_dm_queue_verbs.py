@@ -335,6 +335,11 @@ class TestNormalizeVerbText:
         assert cq.normalize_verb_text("<@U_SOMEONE> stage cq-621dfad586aa", bot_user_id=BOT).startswith("<@U_SOMEONE>")
         assert cq.normalize_verb_text(f"<@{BOT}> stage cq-621dfad586aa", bot_user_id=None).startswith("<@")
         assert cq.match_queue_verb(cq.normalize_verb_text("<@U_SOMEONE> stage cq-621dfad586aa", bot_user_id=BOT)) is None
+        # ...and the anchored attempt rail still refuses both (R14-2 keeps ambiguity refusing)
+        assert cq.looks_like_queue_verb_attempt(
+            cq.normalize_verb_text("<@U_SOMEONE> stage cq-621dfad586aa", bot_user_id=BOT)) == "stage"
+        assert cq.looks_like_queue_verb_attempt(
+            cq.normalize_verb_text(f"<@{BOT}> stage cq-621dfad586aa", bot_user_id=None)) == "stage"
 
     def test_only_one_leading_marker_is_removed(self):
         assert cq.normalize_verb_text("- - stage cq-621dfad586aa", bot_user_id=BOT) == "- stage cq-621dfad586aa"
@@ -344,12 +349,22 @@ class TestVerbAttempt:
     @pytest.mark.parametrize("text,verb", [
         (cq.normalize_verb_text(FIXTURE_0910_PLACEHOLDER), "ship"),
         (cq.normalize_verb_text(FIXTURE_0910_DOUBLED_PREFIX), "ship"),
-        ("please stage cq-621dfad586aa", "stage"),
         ("stage cq-621dfad586aa please", "stage"),
         ("approve cq-621dfad586aa and cq-9c4e2d8f5f1a", "approve"),
         ("stage cq-<12 hex>", "stage"),
         ("stage cq-621dfad586aa\nstage cq-9c4e2d8f5f1a", "stage"),              # multi-line paste keeps refusing
-        ("Cora dismiss cq-621dfad586aa.", "dismiss"),
+        ("Cora dismiss cq-621dfad586aa.", "dismiss"),                            # a leading vocative is still a command
+        ("Cora, stage cq-621dfad586aa!", "stage"),
+        # R14-2: ambiguity still REFUSES under the anchor -- a foreign mention, an
+        # unresolved bot mention, a second list marker, a blockquote, a quote
+        ("<@U_SOMEONE> stage cq-621dfad586aa", "stage"),
+        (cq.normalize_verb_text("<@U0B44MDGC5R> ship cq-cq-5f48f328687b code-12-smoke",
+                                bot_user_id=None), "ship"),
+        (cq.normalize_verb_text("- - stage cq-621dfad586aa", bot_user_id="U0B44MDGC5R"), "stage"),
+        (cq.normalize_verb_text("&gt; ship cq-cq-5f48f328687b code-12-smoke"), "ship"),
+        ("'stage cq-621dfad586aa'", "stage"),
+        # the live 9/21 13:41:38 refusal (Slack's app-attribution suffix) stays refused
+        ("dismiss cq-1a8611487e26 *Sent using* <@U0B3V5RHT3P>", "dismiss"),
     ])
     def test_verb_plus_cq_shape_or_placeholder_is_an_attempt(self, text, verb):
         assert cq.match_queue_verb(text) is None
@@ -363,6 +378,17 @@ class TestVerbAttempt:
         "can we ship <https://example.com|the site> by Friday",                   # a link token is not a placeholder
         "let's stage the launch next week",
         "",
+        # R14-2 (DELIBERATE FLIP -- these two were attempts under the unanchored
+        # .search): a verb word in MID-SENTENCE is a question or a request for the
+        # model, not a typed verb (D-173 stolen turn; the exact-line grammar is
+        # unchanged, D-281). The kickoff's own fixture is the first one.
+        "did Harrison approve cq-1234567890ab yet?",
+        "please stage cq-621dfad586aa",
+        "can you stage cq-621dfad586aa",
+        "should I dismiss cq-621dfad586aa?",
+        "hey cora stage cq-621dfad586aa",
+        "I'll ship cq-621dfad586aa after the review",
+        "Why did you stage cq-621dfad586aa?",
     ])
     def test_prose_is_not_an_attempt(self, text):
         assert cq.looks_like_queue_verb_attempt(text) is None
@@ -382,6 +408,27 @@ class TestVerbAttempt:
         assert time.perf_counter() - t0 < 0.2
         # the quote-alternating shape (already linear) and a real attempt still match
         assert cq.looks_like_queue_verb_attempt("stage " + "' " * 5_000 + "cq-<12 hex>") == "stage"
+
+    @pytest.mark.parametrize("shape", [
+        " " * 40_000 + "stage x",
+        "<@" + "A" * 40_000,
+        "<@U1>" + " " * 40_000 + "stage x",
+        "-" * 40_000 + " stage cq-x",
+        "stage " + "`" * 40_000 + "x",
+        "stage " * 8_000 + "x",
+        "cora " * 8_000 + "stage cq-x",
+        "<@U1|" + "x" * 40_000,
+        "a" * 40_000,
+    ], ids=["lead-spaces", "open-mention", "mention-spaces", "dashes", "ticks",
+            "verb-repeat", "vocative-repeat", "mention-label", "word"])
+    def test_the_anchored_prefix_is_linear_on_degenerate_input(self, shape):
+        """D-171 re-time of the R14-2 prefix atoms, on the DEGENERATE inputs (the
+        7th-ReDoS lesson: seed the pathological character, not a realistic one)."""
+        import time
+        t0 = time.perf_counter()
+        cq.looks_like_queue_verb_attempt(shape)
+        cq._VERB_ATTEMPT_RE.match(shape)
+        assert time.perf_counter() - t0 < 0.2
 
     def test_refusal_carries_zero_write_claim_lexicon(self, caplog):
         """The refusal must not itself trip S2' or be mangled by the sanitizer."""
@@ -406,7 +453,8 @@ class TestRider2Branch:
         branch_mocks.qa.assert_not_called()
 
     @pytest.mark.parametrize("text", [FIXTURE_0910_PLACEHOLDER, FIXTURE_0910_DOUBLED_PREFIX,
-                                      "stage cq-621dfad586aa\nstage cq-9c4e2d8f5f1a"])
+                                      "stage cq-621dfad586aa\nstage cq-9c4e2d8f5f1a",
+                                      "dismiss cq-1a8611487e26 *Sent using* <@U0B3V5RHT3P>"])
     def test_malformed_attempts_are_refused_from_code(self, branch_mocks, qenv, text, caplog):
         import logging
         caplog.set_level(logging.INFO, logger=app_module.log.name)
@@ -431,6 +479,84 @@ class TestRider2Branch:
         with patch.object(app_module, "_resolve_bot_user_id", return_value=BOT) as res:
             app_module.handle_message_event(_event(text="stage cq-621dfad586aa"), client)
         res.assert_not_called()
+
+
+class TestFounderGate:
+    """R14-2 (ruled 2026-09-19 R-1): the refusal rail and the normalized verb view
+    are FOUNDER-ONLY; a member DM and a founder mid-sentence question reach Q&A."""
+
+    NON_FOUNDER_Q = "did Harrison approve cq-1234567890ab yet?"
+
+    def _run(self, user, text, caplog):
+        import logging
+        caplog.set_level(logging.INFO, logger=app_module.log.name)
+        client = MagicMock()
+        with patch.object(app_module.code_queue, "apply_queue_verb") as apply:
+            app_module.handle_message_event(_event(user=user, text=text), client)
+        posted = [c.kwargs.get("text") for c in client.chat_postMessage.call_args_list]
+        refused = any("outcome=parse_refused" in r.getMessage() for r in caplog.records)
+        return apply, posted, refused
+
+    def test_non_founder_verb_mention_routes_to_qa(self, branch_mocks, qenv, caplog):
+        apply, posted, refused = self._run(TOMMY, self.NON_FOUNDER_Q, caplog)
+        apply.assert_not_called()
+        branch_mocks.qa.assert_called_once()
+        assert cq.PARSE_REFUSED_REPLY not in posted and not refused
+
+    @pytest.mark.parametrize("text", [FIXTURE_0910_DOUBLED_PREFIX, FIXTURE_0910_PLACEHOLDER,
+                                      FIXTURE_0915_BULLET_MENTION_TICKS])
+    def test_non_founder_malformed_or_decorated_verb_routes_to_qa_as_before_13(
+            self, branch_mocks, qenv, caplog, text):
+        """Member DMs are byte-identical to pre-#13: no normalization, no refusal."""
+        with patch.object(app_module, "_resolve_bot_user_id") as res:
+            apply, posted, refused = self._run(TOMMY, text, caplog)
+        res.assert_not_called()                     # no auth.test spent on a member DM
+        apply.assert_not_called()
+        branch_mocks.qa.assert_called_once()
+        assert branch_mocks.qa.call_args.args[3] == text   # Q&A sees the text as typed
+        assert cq.PARSE_REFUSED_REPLY not in posted and not refused
+
+    def test_founder_mid_sentence_question_routes_to_qa(self, branch_mocks, qenv, caplog):
+        apply, posted, refused = self._run(HARRISON, self.NON_FOUNDER_Q, caplog)
+        apply.assert_not_called()
+        branch_mocks.qa.assert_called_once()
+        assert cq.PARSE_REFUSED_REPLY not in posted and not refused
+
+    def test_founder_malformed_verb_still_refuses(self, branch_mocks, qenv, caplog):
+        apply, posted, refused = self._run(HARRISON, FIXTURE_0910_DOUBLED_PREFIX, caplog)
+        apply.assert_not_called()
+        branch_mocks.qa.assert_not_called()
+        assert posted == [cq.PARSE_REFUSED_REPLY] and refused
+
+    def test_non_founder_exact_verb_still_gets_not_authorized(self, branch_mocks, qenv):
+        cid = _seed(status="APPROVED")
+        client = MagicMock()
+        app_module.handle_message_event(_event(user=TOMMY, text=f"stage {cid}"), client)
+        branch_mocks.qa.assert_not_called()
+        assert "Harrison" in client.chat_postMessage.call_args.kwargs["text"]
+        assert cq.get_item(cid)["status"] == "APPROVED"
+
+    def test_the_gate_reads_the_queues_own_founder_predicate(self, branch_mocks, qenv,
+                                                            monkeypatch, caplog):
+        """The refusal gate and the queue actor gate share code_queue.HARRISON_ID, so
+        they cannot drift: re-point it and the gate follows."""
+        monkeypatch.setattr(cq, "HARRISON_ID", TOMMY)
+        _a, posted, refused = self._run(TOMMY, FIXTURE_0910_DOUBLED_PREFIX, caplog)
+        assert posted == [cq.PARSE_REFUSED_REPLY] and refused
+        branch_mocks.qa.reset_mock()
+        caplog.clear()
+        _a, posted, refused = self._run(HARRISON, FIXTURE_0910_DOUBLED_PREFIX, caplog)
+        assert cq.PARSE_REFUSED_REPLY not in posted and not refused
+        branch_mocks.qa.assert_called_once()
+
+    def test_source_pins_the_founder_gate_before_the_refusal(self):
+        import inspect
+        src = inspect.getsource(app_module.handle_message_event)
+        i_gate = src.index("user_id == code_queue.HARRISON_ID")
+        i_norm = src.index("code_queue.normalize_verb_text(")
+        i_refuse = src.index("code_queue.looks_like_queue_verb_attempt(_qtext)")
+        assert i_gate < i_norm < i_refuse
+        assert "if _q_founder else None" in src
 
 
 class TestStagedEventProvenance:

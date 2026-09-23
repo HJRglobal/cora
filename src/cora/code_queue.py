@@ -3006,8 +3006,25 @@ _QUEUE_VERBS: tuple[str, ...] = ("stage", "approve", "dismiss", "ship")
 # input -- backtracked QUADRATICALLY on a verb followed by whitespace ('stage' + 40k
 # spaces + 'x' spun ~8.8 s on the bolt worker, ahead of the rate limiter, for ANY DM
 # sender). The GRAMMAR regex behind match_queue_verb is untouched (D-281).
+#
+# START-ANCHORED (R14-2, ruled 2026-09-19 R-1; D-173 stolen turn). The first cut
+# was an unanchored .search, so "did Harrison approve cq-1234567890ab yet?" --
+# a QUESTION that mentions a verb before an id -- was refused from code instead
+# of answered, and the branch ran for EVERY DM sender (the caller now gates on
+# the founder). The anchor still tolerates the decorations an ambiguous paste
+# carries, because ambiguity must keep REFUSING, never reach the model (the 9/15
+# phantom class): a short run of non-word, non-`<` characters (a second list
+# marker "- -", a blockquote "> ", a quote or paren), then at most ONE Slack
+# mention token (a foreign user's, or Cora's own when auth.test could not resolve
+# it -- normalize_verb_text leaves both in place), then an optional leading
+# "Cora," vocative. Every atom is bounded or a single class that cannot overlap
+# its neighbour (`<` is excluded from the prefix class, letters from both
+# prefixes), and .match anchors the scan at position 0 (D-171: re-timed).
 _VERB_ATTEMPT_RE = re.compile(
-    r"\b(stage|approve|dismiss|ship)\b[\s`'\"]*(?:cq-\S*|<(?![@#!]|https?:)[^>\n]{0,80}>)",
+    r"\A[^\w<\n]{0,8}"
+    r"(?:<@[A-Za-z0-9_]{2,24}(?:\|[^>\n]{0,40})?>[^\w<\n]{0,8})?"
+    r"(?:cora[,:]?[ \t]{1,4})?"
+    r"(stage|approve|dismiss|ship)\b[\s`'\"]*(?:cq-\S*|<(?![@#!]|https?:)[^>\n]{0,80}>)",
     re.IGNORECASE)
 PARSE_REFUSED_REPLY = ("I see a queue verb but couldn't parse it. Nothing was changed. "
                        "Send exactly `stage cq-<12 hex>` on its own line.")
@@ -3030,10 +3047,13 @@ def normalize_verb_text(text: str, *, bot_user_id: str | None = None) -> str:
 
 
 def looks_like_queue_verb_attempt(text: str) -> str | None:
-    """The verb when *text* carries a queue verb followed by something cq-shaped or
-    a `<placeholder>` (a paste that failed the grammar); else None. Callers run this
-    ONLY after match_queue_verb returned None."""
-    m = _VERB_ATTEMPT_RE.search(str(text or ""))
+    """The verb when *text* STARTS with a queue verb (after bounded decoration, one
+    mention token, an optional "Cora," vocative) followed by something cq-shaped or
+    a `<placeholder>` -- a paste that failed the grammar; else None. A verb word in
+    mid-sentence ("did Harrison approve cq-... yet?") is a question, not an attempt
+    (R14-2). Callers run this ONLY after match_queue_verb returned None, and ONLY
+    for the founder (app.handle_message_event gates on HARRISON_ID)."""
+    m = _VERB_ATTEMPT_RE.match(str(text or ""))
     return m.group(1).lower() if m else None
 
 

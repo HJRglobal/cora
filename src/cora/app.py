@@ -3276,8 +3276,18 @@ def handle_message_event(event: dict, client) -> None:
             # `• <@BOT> \`stage cq-...\`` carried all three, missed the grammar,
             # reached haiku and came back as a phantom "staged". Every consumer
             # BELOW still sees the un-normalized `text`.
+            #
+            # R14-2 (ruled 2026-09-19 R-1): the normalized view and the refusal
+            # rail are FOUNDER-ONLY. Queue verbs are Harrison's surface; a member's
+            # DM is byte-identical to pre-#13 (exact verb -> the queue's own
+            # not_authorized text; anything else -> Q&A), and no member DM pays for
+            # an auth.test or a regex scan ahead of the rate limiter. The id is
+            # code_queue.HARRISON_ID -- the SAME predicate the queue's own actor
+            # gate uses, so the two can never disagree.
+            _q_founder = bool(user_id) and user_id == code_queue.HARRISON_ID
             _qtext = code_queue.normalize_verb_text(
-                text, bot_user_id=(_resolve_bot_user_id(client) if "<@" in text else None))
+                text, bot_user_id=(_resolve_bot_user_id(client) if "<@" in text else None)
+            ) if _q_founder else text
             _qverb = code_queue.match_queue_verb(_qtext)
             if _qverb is not None:
                 try:
@@ -3304,7 +3314,12 @@ def handle_message_event(event: dict, client) -> None:
             # refused from code with the exact grammar to retype, never handed to
             # the model (D-316; the 9/10 09:35 / 09:36 and 9/15 21:17 phantoms).
             # Nothing is written; the reply carries no write-claim lexicon.
-            _qattempt = code_queue.looks_like_queue_verb_attempt(_qtext)
+            # R14-2: FOUNDER-ONLY and START-ANCHORED -- a member's DM, and
+            # Harrison's own mid-sentence question ("did Harrison approve cq-...
+            # yet?"), route to Q&A as they did before #13 (D-173: a false refusal
+            # is a stolen turn). The exact-line grammar above is unchanged (D-281).
+            _qattempt = (code_queue.looks_like_queue_verb_attempt(_qtext)
+                         if _q_founder else None)
             if _qattempt is not None:
                 log.info("founder-dm queue verb=%s user=%s outcome=parse_refused text=%r",
                          _qattempt, user_id, _qtext[:200])
