@@ -305,7 +305,7 @@ _WC_NOT_HAB = (r"(?!\s++(?:weekly|daily|monthly|nightly|hourly|every|each|automa
                r"regularly|whenever|when|by|under|on|in|at|from|for|as|per|with|behind|until)\b)")
 # A pictograph (✅ ✔ ☑ 👍 🎉 ...) with an optional variation selector, or a Slack
 # :shortcode:. Bounded single-char class; never a run.
-_WC_EMOJI = r"(?:[☀-➿⬀-⯿\U0001F000-\U0001FAFF]️?)"
+_WC_EMOJI = r"(?:[\u2600-\u27BF\u2B00-\u2BFF\U0001F000-\U0001FAFF]\uFE0F?)"
 _WC_MARK = r"(?:" + _WC_EMOJI + r"|:[a-z0-9_+-]{1,30}:)"
 _WC_INTERJ = (r"(?:got\s++it|okay|ok|yep|yes|yeah|yup|sure(?:\s++thing)?|alright|all\s++right|perfect|"
               r"great|roger(?:\s++that)?|on\s++it|sounds\s++good|will\s++do|no\s++problem|absolutely|"
