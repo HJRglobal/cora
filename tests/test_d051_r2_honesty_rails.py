@@ -271,3 +271,48 @@ class TestPersonNameTokens:
         assert se._find_write_claim("Tasks Justin created:") is None          # the plural shape still skips
         assert se._find_write_claim("Inventory Adjustment staged: +12") is not None
         monkeypatch.setitem(se._PERSON_NAME_CACHE, "at", None)
+
+
+# ── F1-R5: a deflection reads its own object, then the sentence BEFORE it ──────
+def _cap(text, *, channel="dm", entity="FNDR", founder=True, user=HARRISON):
+    return se.screen_capability_claims(text, tool_use_count=0, channel_name=channel, user_id=user,
+                                       entity=entity, cross_entity=founder, founder=founder)
+
+
+FRONT_NAMED_DEFLECTIONS = [
+    ("On the HubSpot side, that needs a live look at the deal record.", "hubspot"),
+    ("For Asana, that would need a direct check of the task history.", "asana"),
+    ("Whether the invoice posted in QuickBooks -- that needs a direct look at the register.", "quickbooks"),
+    ("For the code queue, that needs a direct check of the backlog, not another tap.", "code queue"),
+]
+
+
+class TestDeflectionFrontNamedR2:
+    @pytest.mark.parametrize("channel,entity,founder,user", [
+        ("dm", "FNDR", True, HARRISON), ("f3e-sales", "F3E", False, "U0B3VGWJTMJ")], ids=["founder_dm", "f3e"])
+    @pytest.mark.parametrize("text,term", FRONT_NAMED_DEFLECTIONS)
+    def test_a_family_named_before_the_deflection_trips(self, caplog, text, term, channel, entity,
+                                                         founder, user):
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        assert _cap(text, channel=channel, entity=entity, founder=founder, user=user) == text
+        hits = _msgs(caplog, se.CAPABILITY_LOG_KEY, "denial")
+        assert len(hits) == 1 and f"term='{term}'" in hits[0], hits
+
+    @pytest.mark.parametrize("text", [
+        "That needs a direct check of the ledger at the bank, not QBO.",
+        "That needs a direct check of the bank statement.",
+        "That would need a look at the contract.",
+        "I pulled QuickBooks already. That needs a direct check of the bank statement.",
+    ])
+    def test_the_tail_and_earlier_sentences_are_never_read(self, caplog, text):
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        _cap(text)
+        assert _msgs(caplog, se.CAPABILITY_LOG_KEY, "denial") == []
+
+    @pytest.mark.parametrize("shape", [
+        "For " + "HubSpot " * 5000 + "that needs a direct check of x.",
+        ("x" * 150 + " that needs a direct check of the backlog. ") * 200,
+        "that needs a direct check of " * 1400,
+    ], ids=["long_head", "many_deflections", "deflect_rep"])
+    def test_the_head_search_is_linear_at_40k(self, shape):
+        assert _best_of_3(lambda: _cap(shape)) < 0.5

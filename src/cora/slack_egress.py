@@ -1122,9 +1122,11 @@ _CAP_USE_INTERFACE = (
 # R14-9(c): a DEFLECTION -- the reply points at a check it will not run itself
 # (9/21 08:46:52 "that needs a direct check of the ledger, not another tap").
 # Trips only when the deflection's OWN OBJECT (the phrase after "check of", up to
-# the next clause break) names a capability the bot HAS -- Code #14 D-051: the
-# whole sentence was searched, so "a direct check of the ledger at the bank, not
-# QBO" read the NEGATED 'QBO' as the object.
+# the next clause break) or the sentence text BEFORE the deflection names a
+# capability the bot HAS -- Code #14 D-051: the whole sentence was searched, so "a
+# direct check of the ledger at the bank, not QBO" read the NEGATED 'QBO' in the
+# TAIL as the object; round 2 (F1-R5) restores the front-named family ("For
+# Asana, that would need a direct check of the task history.").
 _CAP_DEFLECT = (
     r"\b(?:that|this|it|which)\s+(?:needs|requires|would\s+need|would\s+require|takes|calls\s+for)\s+"
     r"(?:a\s+)?(?:(?:direct|manual|live|separate|real)\s+){0,2}(?:check|look|query|read|lookup|pull)\s+"
@@ -1174,17 +1176,20 @@ def is_developer_surface(channel_name: str) -> bool:
     return bool(_DEVELOPER_SURFACE_RE.search(str(channel_name or "")))
 
 
+def _sentence_head(text: str, start: int) -> str:
+    """The part of the sentence BEFORE text[start] (bounded 160 chars back)."""
+    before = text[max(0, start - 160):start]
+    brk = list(_SENTENCE_BREAK_RE.finditer(before))
+    return before[brk[-1].end():] if brk else before
+
+
 def _denial_window(text: str, start: int, end: int) -> str:
     """The sentence the denial sits in (bounded 160 chars back / 220 ahead), so the
     capability term is looked for where the denial's OBJECT lives -- after it
     ("...visibility into the code queue") or before it ("HubSpot isn't connected
     for me")."""
-    lo = max(0, start - 160)
     hi = min(len(text), end + 220)
-    before = text[lo:start]
-    brk = list(_SENTENCE_BREAK_RE.finditer(before))
-    if brk:
-        before = before[brk[-1].end():]
+    before = _sentence_head(text, start)
     after = text[end:hi]
     m = _SENTENCE_BREAK_RE.search(after)
     if m:
@@ -1295,9 +1300,14 @@ def screen_capability_claims(text, *, tool_use_count, channel_name: str = "", us
                 if _RULED_REFUSAL_RE.search(window):
                     continue   # AD-6: a tier / scope refusal the model must voice, not a denial
                 if _DEFLECT_RE.fullmatch(m.group(0)):
+                    # The deflection's OWN object first, then the sentence text BEFORE
+                    # it (round 2 F1-R5: "On the HubSpot side, that needs a live look at
+                    # the deal record." names the family up front) -- never the tail
+                    # after the object's clause break, where a negated "not QBO" lives.
                     obj = masked[m.end():m.end() + 160]
                     brk = _CLAUSE_BREAK_RE.search(obj)
-                    hit = find_capability_term(obj[:brk.start()] if brk else obj, terms)
+                    hit = (find_capability_term(obj[:brk.start()] if brk else obj, terms)
+                           or find_capability_term(_sentence_head(masked, m.start()), terms))
                 else:
                     hit = find_capability_term(window, terms)
                 if hit is None:
