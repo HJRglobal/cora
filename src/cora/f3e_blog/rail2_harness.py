@@ -87,6 +87,20 @@ CLAIMS_HOLE_PROBES: dict[str, tuple[str, ...]] = {
         "F3 Mood has natural caffeine from green tea.",
         "F3 Energy and F3 Mood both run on natural caffeine from green tea.",
         "F3 Energy runs on cleaner-fuel.",
+        # D-051 r143-claims-2: EXACT means exact at both edges -- a modifier or a
+        # fused prefix/suffix on either ruled phrase is not the ruled phrase
+        "F3 Energy is all-natural caffeine from green tea.",
+        "F3 Energy is all natural caffeine from green tea.",
+        "F3 Energy: 100% natural caffeine from green tea.",
+        "F3 Energy has 100 percent natural caffeine from green tea.",
+        "F3 Energy uses only the most natural caffeine from green tea.",
+        "F3 Energy: purely natural caffeine from green tea.",
+        "F3 Energy has totally natural caffeine from green tea.",
+        "F3 Energy is pure and natural caffeine from green tea.",
+        "F3 Energy is the super-cleaner fuel.",
+        "F3 Energy is the super cleaner fuel.",
+        "F3 Energy runs on a much cleaner fuel source.",
+        "F3 Energy runs on cleaner fuel-like energy.",
         # R14-3 NEW HOLES the Code #13 environmental redaction opened (it cleared a
         # PREDICATE of the brand, not only an environmental object): legacy TRIP,
         # pre-R14-3 attribution PASS

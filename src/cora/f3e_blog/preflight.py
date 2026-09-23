@@ -598,13 +598,89 @@ def _attribution_clean_hits(seg: str) -> set[str]:
     return hit
 
 
+#: Words that, directly before a ruled phrase, MODIFY its clean word -- the phrase
+#: is then no longer the exact ruled phrase (D-051 r143-claims-2: "all natural
+#: caffeine from green tea", "the most natural ...", "a much cleaner fuel source"
+#: all cleared because the pattern matched the tail). Adverbs (any "-ly" word),
+#: numbers and percentages, and hyphen/slash-joined prefixes ("all-natural",
+#: "super-cleaner") are refused STRUCTURALLY in _phrase_is_modified; this set
+#: covers the degree words that are none of those.
+_PHRASE_MODIFIERS = frozenset({
+    "all", "most", "more", "much", "very", "so", "super", "ultra", "extra", "pure", "real",
+    "true", "genuine", "whole", "total", "complete", "entire", "full", "absolute",
+    "authentic", "raw", "percent", "cent", "far", "even", "lot", "lots", "ever", "just",
+    "100",
+})
+#: A coordinated modifier ("pure and natural caffeine from green tea") is checked
+#: through ONE coordinator.
+_PHRASE_COORDINATORS = frozenset({"and", "or", "plus", "nor"})
+
+
+def _is_phrase_modifier(word: str) -> bool:
+    w = word.lower().strip("'&/-")
+    if not w:
+        return False
+    if any(ch.isdigit() for ch in w) or (len(w) > 3 and w.endswith("ly")):
+        return True
+    if w in _PHRASE_MODIFIERS or w in _ATTRIBUTION_CLEAN_TOKENS:
+        return True
+    return any(p in _PHRASE_MODIFIERS or p in _ATTRIBUTION_CLEAN_TOKENS
+               for p in w.replace("/", "-").split("-") if p)
+
+
+def _phrase_is_modified(text: str, start: int, end: int) -> bool:
+    """True when the ruled phrase at text[start:end] is not EXACT: something is
+    fused to either edge, or the word before it modifies its clean word. Linear:
+    it reads at most 80 characters before the match."""
+    if start > 0 and (text[start - 1].isalnum() or text[start - 1] in "-/'&%_"):
+        return True   # "all-natural caffeine ...", "super-cleaner fuel", "100%natural"
+    if end < len(text) and text[end] in "-/":
+        return True   # "cleaner fuel-like energy"
+    window = text[max(0, start - 80):start]
+    toks = list(_WORD_RE.finditer(window))
+    cut = len(window)
+    for _ in range(2):   # the word before, and one coordinated word before that
+        if not toks:
+            return False
+        tok = toks.pop()
+        gap = window[tok.end():cut].strip()
+        if "%" in gap:
+            return True   # "100 % natural caffeine ..."
+        if gap in ("&", "+"):
+            return _is_phrase_modifier(tok.group(0))   # "pure & natural ..."
+        if gap:
+            return False  # punctuation between: a list item, not a modifier
+        word = tok.group(0).lower().strip("'&/-")
+        if word in _PHRASE_COORDINATORS:
+            cut = tok.start()
+            continue
+        return _is_phrase_modifier(word)
+    return False
+
+
+def _redact_exact_phrase(pat: re.Pattern[str], text: str) -> str:
+    """pat.sub(" ", text), skipping every match _phrase_is_modified refuses."""
+    out: list[str] = []
+    pos = 0
+    for m in pat.finditer(text):
+        if _phrase_is_modified(text, m.start(), m.end()):
+            continue
+        out.append(text[pos:m.start()])
+        out.append(" ")
+        pos = m.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def _redact_phrase_exemptions(sentence: str, lines: set[str]) -> str:
-    """Blank the ruled exact phrases, brand-scoped and fail-closed (see above)."""
+    """Blank the ruled exact phrases, brand-scoped and fail-closed (see above).
+    EXACT means exact at both edges: a modifier directly before the phrase, or
+    anything fused to it, keeps the phrase in the scan (r143-claims-2)."""
     scoped = lines & {"ENERGY", "MOOD"}
     out = sentence
     for pat, allowed in _RAIL2_PHRASE_EXEMPTIONS:
         if scoped <= allowed:
-            out = pat.sub(" ", out)
+            out = _redact_exact_phrase(pat, out)
     return out
 
 

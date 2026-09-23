@@ -36,6 +36,24 @@ from cora.f3e_blog import rail2_harness as rh
 _REPO = Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO / "scripts" / "run_f3e_blog_rail2_differential.py"
 
+#: D-051 r143 remediation: the gate probes the FROZEN baseline misses (single-sentence
+#: legacy PASS) that the shipping rail now closes. Named one by one -- the differential
+#: pin below stays an EXACT set, it only gains the closures listed here.
+R143_LEGACY_MISSES = frozenset({
+    "F3 Energy is the super-cleaner fuel.",                          # r143-claims-2
+})
+
+
+def _best_of_3(fn) -> float:
+    """D-171: a single timing run flakes under host load; the minimum of three is the
+    measurement."""
+    best = float("inf")
+    for _ in range(3):
+        t0 = time.perf_counter()
+        fn()
+        best = min(best, time.perf_counter() - t0)
+    return best
+
 
 class TestShippingRail:
     def test_run_preflight_ships_the_attribution_rail_and_never_the_legacy_one(self):
@@ -206,7 +224,7 @@ class TestGate:
             "F3 Mood is a clean-energy calm.",
             "F3 Energy is naturally-caffeinated.",
             "F3 Energy is the natural-energy pick.",
-        }
+        } | R143_LEGACY_MISSES
         assert len(d.attribution_trips) == len(rh.CLAIMS_HOLE_PROBES["clean_natural_on_energy_mood"])
 
 
@@ -616,3 +634,91 @@ class TestDifferentialRegressionPin:
 class TestMirrorVersion:
     def test_the_rail_scope_change_bumped_the_mirror_version(self):
         assert pf.CHECKLIST_MIRROR_VERSION == "1.1"
+
+
+# ---------------------------------------------------------------------------
+# D-051 r143 remediation (Code #14 review of R14-3, 29c9735). Every hole below
+# was reproduced as legacy TRIP / shipping PASS (or PASS on both rails where
+# noted); each is also a must-trip probe in rh.CLAIMS_HOLE_PROBES so the ship
+# gate enforces it, not only this module.
+# ---------------------------------------------------------------------------
+
+
+class TestExactPhraseEdges:
+    """r143-claims-2: the ruled exemptions are EXACT phrases. The first cut matched
+    the phrase TAIL, so a modifier or a hyphen-fused prefix before "natural" /
+    "cleaner" was left behind as a non-clean token and the sentence passed."""
+
+    MUST_TRIP = (
+        "F3 Energy is all-natural caffeine from green tea.",
+        "F3 Energy is all natural caffeine from green tea.",
+        "F3 Energy: 100% natural caffeine from green tea.",
+        "F3 Energy has 100 percent natural caffeine from green tea.",
+        "F3 Energy uses only the most natural caffeine from green tea.",
+        "F3 Energy: purely natural caffeine from green tea.",
+        "F3 Energy has totally natural caffeine from green tea.",
+        "F3 Energy is pure and natural caffeine from green tea.",
+        "F3 Energy is the super-cleaner fuel.",
+        "F3 Energy is the super cleaner fuel.",
+        "F3 Energy runs on a much cleaner fuel source.",
+        "F3 Energy runs on cleaner fuel-like energy.",
+    )
+    STILL_PASS = (
+        "F3 Energy has L-theanine plus natural caffeine from green tea.",   # coordinator, no modifier
+        "F3 Energy: natural caffeine from green tea.",                      # punctuation, not a modifier
+        "F3 Energy runs on a cleaner fuel source.",
+        "Same flavor, cleaner fuel: F3 Pure is F3 Energy with a cleaner fuel source.",
+    )
+
+    @pytest.mark.parametrize("sentence", MUST_TRIP)
+    def test_a_modified_or_fused_phrase_is_not_the_ruled_phrase(self, sentence):
+        assert pf.rail2_attribution_hit(sentence) is not None, sentence
+        assert "R2" in _pf(sentence).tripped_rail_ids, sentence
+
+    @pytest.mark.parametrize("sentence", MUST_TRIP)
+    def test_every_edge_probe_is_in_the_gate(self, sentence):
+        assert sentence in rh.CLAIMS_HOLE_PROBES["clean_natural_on_energy_mood"]
+
+    def test_title_and_tag_split_forms_trip_too(self):
+        assert "R2" in pf.run_preflight(title="F3 Energy: All-Natural Caffeine From Green Tea",
+                                        summary="", body_html="<p>x</p>").tripped_rail_ids
+        body = "<p>F3 Energy is <em>all</em>-natural caffeine from green tea.</p>"
+        assert "R2" in pf.run_preflight(title="t", summary="", body_html=body).tripped_rail_ids
+
+    @pytest.mark.parametrize("sentence", STILL_PASS + TestExemptions.PASS + rh.FALSE_POSITIVE_SET[-2:])
+    def test_the_exact_phrase_still_clears(self, sentence):
+        r = _pf(sentence)
+        assert r.passed, r.render()
+
+    def test_modifier_classification(self):
+        for w in ("all", "most", "super", "purely", "100", "100%", "much", "clean", "all-natural"):
+            assert pf._is_phrase_modifier(w), w
+        for w in ("of", "from", "has", "the", "a", "uses", "energy", "l-theanine", "stack"):
+            assert not pf._is_phrase_modifier(w), w
+
+    DEGENERATE = (
+        " " * 40000,
+        "\t" * 40000,
+        "-" * 40000 + "natural caffeine from green tea",
+        "%" * 40000 + " natural caffeine from green tea",
+        "all natural caffeine from green tea " * 1100,
+        "and " * 10000 + "natural caffeine from green tea",
+        "super cleaner fuel " * 2100,
+        "cleaner fuel-" * 3000,
+        "natural caffeine from green te" * 1300,      # near miss: never a full match
+    )
+
+    @pytest.mark.parametrize("text", DEGENERATE, ids=range(len(DEGENERATE)))
+    def test_d171_exact_phrase_redaction_is_fast_at_40k(self, text):
+        for pat, _ in pf._RAIL2_PHRASE_EXEMPTIONS:
+            dt = _best_of_3(lambda: pf._redact_exact_phrase(pat, text))
+            assert dt < 0.2, "%s on %r...: %.3fs" % (pat.pattern[:30], text[:20], dt)
+
+    @pytest.mark.parametrize("unit", ["all natural caffeine from green tea ", "a much cleaner fuel source ",
+                                      "natural caffeine from green tea ", "cleaner fuel "])
+    def test_d171_exact_phrase_redaction_scales_linearly(self, unit):
+        def run(n):
+            text = "F3 Energy " + unit * n
+            return _best_of_3(lambda: pf.rail2_attribution_hit(text))
+        base, dbl = run(1500), run(3000)
+        assert dbl < base * 2.6 + 0.05, "superlinear: %.4fs -> %.4fs" % (base, dbl)
