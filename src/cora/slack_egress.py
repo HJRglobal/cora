@@ -61,10 +61,11 @@ silently bypass the boundary. See the forensic rebuild log.
 from __future__ import annotations
 
 import functools
+import html
 import logging
 import os
 import re
-from typing import Callable
+from typing import Any, Callable
 
 from .reply_formatter import normalize_slack_bold, redact_links_and_ids
 
@@ -219,8 +220,11 @@ def scrub_write_sentinels(text):
 # string; (c) code-authored posts (cards, digests, interceptor replies, scripts)
 # are not model claims and must not inflate the count the enforce flip reads.
 #
-# The lexicon is the ruled list, verbatim (kickoff S2'): staged | queued | locked
-# in | canonicalized | filed | created | updated | deleted | is live | ^done.
+# The lexicon VERBS are the ruled list, verbatim (kickoff S2'): staged | queued |
+# locked in | canonicalized | filed | created | updated | deleted | is live | ^done.
+# SUPERSEDED as a bare-word match by R14-9(b) below: _WRITE_CLAIM_RE is kept only as
+# the documented pre-R14-9 lexicon (no production caller); the screen reads the
+# completion grammar (_find_write_claim).
 # "Referring to a Cora action" is not decidable by regex; the observe week
 # measures the false-positive rate (a KB answer about "the invoice filed on
 # Tuesday" with no tool call will count) and the phrase is logged so the noise can
@@ -232,6 +236,150 @@ _WRITE_CLAIM_RE = re.compile(
 )
 PHANTOM_HONEST_TEMPLATE = "I did not perform any action this turn."
 PHANTOM_LOG_KEY = "phantom-write-claim"
+
+# R14-9(b) (cq-323c8974fa02, ruled 2026-09-21): the lexicon above fired on ANY
+# occurrence of a ruled verb, so a DESCRIPTIVE use ("the nine staged prompts",
+# "staged cards not visually updating") or a phrase QUOTED from the user's own
+# message ("into a staged Cowork session") counted as a phantom write -- four
+# 9/20-9/21 founder-DM hits, zero of them phantoms, each one resetting the D-309
+# observe-week clock. The VERB SET stays exactly the ruled list; what changed is the
+# GRAMMAR around it: only a COMPLETION claim counts --
+#   first_person  "I staged ..." / "I've filed ..." / "I have just created ..."
+#   first_obj     "I've got it staged" / "I have them queued"
+#   done          a sentence that opens "Done." / "Done -- " / "All set,"
+#   initial       a sentence that opens with the participle + an object or a stop
+#                 ("Staged cq-...", "Updated your calendar", "Deleted.")
+#   receipt       a short line-initial noun phrase + participle + "(" or ":" -- the
+#                 telegraphic receipt the 9/15 21:17:52 phantom mimicked
+#                 ("Code-session prompt staged (AUTO-GENERATED DRAFT ...):")
+#   pronoun       "it's created" / "they're queued" / "that has been updated"
+#   quantifier    "All three locked in:" / "both are queued."
+#   arrow         "-> staged" / "=> created"
+#   live          "is now live" / "it's live"
+#   perfect       "has now been staged" / "is just created" (completion adverb req.)
+#   your          "your calendar is updated" / "your note is now queued"
+# with a HABITUAL bail ("is updated weekly / every Monday / by Justin / in QBO").
+# Measured on the five verbatim incident replies (Slack DM D0B4CTD3B09, read
+# 2026-09-23): the four 9/20-9/21 replies read ZERO, the 9/15 phantom reads ONE.
+# Every pattern is a bounded literal alternation (D-171: re-timed at 40k).
+_WC_V = r"(?P<v>staged|queued|locked\s+in|canonicali[sz]ed|filed|created|updated|deleted)"
+_WC_A = r"['’]"
+_WC_NOT_HAB = (r"(?!\s+(?:weekly|daily|monthly|nightly|hourly|every|each|automatically|"
+               r"regularly|whenever|when|by|under|on|in|at|from|for|as|per)\b)")
+_WC_START = r"(?:^|(?<=[.!?]\s))[ \t]*(?:[-*•][ \t]+)?\*?"
+_WRITE_CLAIM_FORMS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (label, re.compile(rx, re.IGNORECASE | re.MULTILINE)) for label, rx in (
+        ("first_person",
+         r"\bI(?:\s+have|\s*" + _WC_A + r"ve)?(?:\s+(?:just|now|also|already|successfully|"
+         r"gone\s+ahead\s+and|went\s+ahead\s+and|went\s+and))?\s+" + _WC_V + r"\b"),
+        ("first_obj",
+         r"\bI(?:\s+have|\s*" + _WC_A + r"ve)\s+(?:got\s+)?(?:it|them|that|this|those|these|both|"
+         r"everything|all\s+of\s+them|all\s+(?:two|three|four|five|six|seven|eight|nine|ten|\d{1,2}))"
+         r"\s+" + _WC_V + r"\b"),
+        ("done",
+         _WC_START + r"(?P<v>done|all\s+set)\*?[ \t]*(?:[.!,:;—–]|-{1,2}(?=\s))"),
+        ("initial",
+         _WC_START + _WC_V + r"\*?(?:[ \t]*[.!:(]|[ \t]+(?:the|a|an|it|them|this|that|these|those|"
+         r"all|both|each|every|your|my|its|their|to|into|cq-|dw-|\d|[`*_]))"),
+        ("pronoun",
+         r"\b(?:it|that|this|they|those|these|everything)(?:\s*" + _WC_A + r"(?:s|re)|\s+(?:is|are|"
+         r"has\s+been|have\s+been))(?:\s+(?:now|just|all|successfully|officially))?\s+" + _WC_V
+         + r"\b" + _WC_NOT_HAB),
+        ("quantifier",
+         r"\b(?:both|each\s+one|all\s+(?:two|three|four|five|six|seven|eight|nine|ten|\d{1,2}|of\s+them))"
+         r"(?:\s+(?:are|have\s+been|got))?(?:\s+(?:now|just|successfully))?\s+" + _WC_V
+         + r"(?=[ \t]*(?:[.!,:;)—–]|$|\s+and\b|\s-))"),
+        ("arrow", r"(?:→|->|=>)[ \t]*(?:[\w'-]+[ \t]+){0,3}" + _WC_V + r"\b"),
+        ("live",
+         r"\b(?:is|are)\s+now\s+(?P<v>live)\b|\b(?:it|that|this)(?:\s*" + _WC_A + r"s|\s+is)\s+"
+         r"(?:now\s+)?(?P<v2>live)\b"),
+        ("perfect",
+         r"\b(?:has|have)\s+(?:now|just|successfully)\s+been\s+" + _WC_V + r"\b" + _WC_NOT_HAB
+         + r"|\b(?:has|have)\s+been\s+(?:now|just|successfully)\s+(?P<v2>staged|queued|filed|created|"
+         r"updated|deleted|canonicali[sz]ed)\b" + _WC_NOT_HAB
+         + r"|\b(?:is|are)\s+(?:now|just)\s+(?P<v3>staged|queued|filed|created|updated|deleted|"
+         r"canonicali[sz]ed)\b" + _WC_NOT_HAB),
+        ("your",
+         r"\byour\s+(?:[\w-]+\s+){0,2}(?:is|are)\s+(?:now\s+|all\s+)?" + _WC_V + r"\b" + _WC_NOT_HAB),
+    ))
+# The receipt form needs a word-level check a regex cannot express cheaply: the
+# token right before the participle must not be a 2nd/3rd-person subject ("the
+# prompts you've staged (see above)" describes Harrison's action, not Cora's).
+_WC_RECEIPT_RE = re.compile(
+    r"^[ \t]*(?:[-*•][ \t]+)?(?::[a-z0-9_+-]{1,30}:[ \t]+)?\*?(?P<np>(?:[\w`'*-]+[ \t]+){1,4})"
+    + _WC_V + r"\*?[ \t]*[(:]",
+    re.IGNORECASE | re.MULTILINE)
+_WC_RECEIPT_NOT_SUBJECT = frozenset({
+    "you", "you've", "youve", "you'd", "you're", "they", "they've", "theyve", "we", "we've",
+    "he", "she", "harrison", "has", "have", "had", "was", "were", "be", "been", "is", "are",
+    "not", "never", "i", "i've", "ive"})
+_WC_TOKEN_RE = re.compile(r"[A-Za-z0-9'’]+")
+_WC_FIRST_PERSON_BEFORE = re.compile(r"\bI(?:\s+have|\s*['’]ve)?(?:\s+just)?\s*\Z", re.IGNORECASE)
+_WC_QUOTED_RE = re.compile(r"\"([^\"\n]{3,200})\"|“([^”\n]{3,200})”|`([^`\n]{3,200})`")
+_WC_ECHO_MAX_CHARS = 8000
+
+
+def _mask_user_echo(text: str, user_texts: Any) -> str:
+    """Blank (same length, offsets kept) every run of >= 3 reply tokens that also
+    occurs as a token trigram in the user's own words (this message + the last few
+    user turns), and any quoted span whose content the user wrote. An explicit
+    first-person claim is NEVER masked ("Yes, I created that category" still
+    counts even when the user said "created that category"). Linear: token lists
+    and a trigram set, no regex backtracking."""
+    joined = " ".join(str(u or "") for u in (user_texts or ()) if u)[:_WC_ECHO_MAX_CHARS]
+    if not joined.strip():
+        return text
+    user_norm = html.unescape(joined).lower().replace("’", "'")
+    user_toks = [m.group(0) for m in _WC_TOKEN_RE.finditer(user_norm)]
+    grams = {tuple(user_toks[i:i + 3]) for i in range(len(user_toks) - 2)}
+    chars = list(text)
+    toks = [(m.start(), m.end(), m.group(0).lower().replace("’", "'"))
+            for m in _WC_TOKEN_RE.finditer(text)]
+    marked = [False] * len(toks)
+    for i in range(len(toks) - 2):
+        if (toks[i][2], toks[i + 1][2], toks[i + 2][2]) in grams:
+            marked[i] = marked[i + 1] = marked[i + 2] = True
+    i = 0
+    while i < len(toks):
+        if not marked[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(toks) and marked[j + 1]:
+            j += 1
+        if not _WC_FIRST_PERSON_BEFORE.search(text[max(0, toks[i][0] - 16):toks[i][0]]):
+            for k in range(toks[i][0], toks[j][1]):
+                chars[k] = " "
+        i = j + 1
+    for m in _WC_QUOTED_RE.finditer(text):
+        inner = next(g for g in m.groups() if g is not None)
+        if inner.strip() and inner.lower().replace("’", "'") in user_norm:
+            for k in range(m.start(), m.end()):
+                chars[k] = " "
+    return "".join(chars)
+
+
+def _find_write_claim(text: str) -> tuple[str, str] | None:
+    """(verb, form) of the FIRST completion claim in *text*, else None."""
+    best: tuple[int, str, str] | None = None
+    for label, rx in _WRITE_CLAIM_FORMS:
+        m = rx.search(text)
+        if m is None:
+            continue
+        verb = next((g for g in (m.groupdict().get(k) for k in ("v", "v2", "v3")) if g), m.group(0))
+        if best is None or m.start() < best[0]:
+            best = (m.start(), verb, label)
+    for m in _WC_RECEIPT_RE.finditer(text):
+        np_toks = m.group("np").split()
+        last = np_toks[-1].strip("`*'").lower().replace("’", "'") if np_toks else ""
+        if last in _WC_RECEIPT_NOT_SUBJECT:
+            continue
+        if best is None or m.start() < best[0]:
+            best = (m.start(), m.group("v"), "receipt")
+        break
+    if best is None:
+        return None
+    return " ".join(best[1].split()).lower(), best[2]
 
 
 def _known_cq_ids() -> frozenset[str]:
@@ -272,7 +420,8 @@ def _prepend_honest_line(text: str) -> str:
 
 
 def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
-                                user_id: str = ""):
+                                user_id: str = "", user_text: str = "",
+                                prior_user_texts: Any = ()):
     """Screen ONE model reply for (1) ids that exist in no ledger and (2) a write
     claim made in a turn with zero tool_use.
 
@@ -288,6 +437,12 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
     that called a read tool. Non-string / empty input passes through untouched;
     a ledger that cannot be read skips ITS id family with a WARNING rather than
     redacting real ids (fail-open on the reference set, never on the claim).
+
+    R14-9(b): the lexicon half reads COMPLETION grammar only (_find_write_claim),
+    over the reply with the user's own words masked (``user_text`` + up to six
+    ``prior_user_texts``; _mask_user_echo). The WARN names the VERB and the form
+    label, never the matched words (an arrow / possessive form can carry up to
+    three words before the verb, which in a LEX channel could be a name, D-145).
     """
     if not isinstance(text, str) or not text:
         return text
@@ -322,12 +477,21 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
             if mode == "enforce":
                 out = re.sub(re.escape(fid), "[unknown id]", out, flags=re.IGNORECASE)
     if count == 0:
-        m = _WRITE_CLAIM_RE.search(_LINK_TOKEN_RE.sub(" ", out))
-        if m:
-            emit("%s kind=lexicon phrase=%r mode=%s channel=#%s user=%s -- a write "
+        masked = _LINK_TOKEN_RE.sub(" ", out)
+        users = [u for u in [user_text, *list(prior_user_texts or ())[-6:]]
+                 if isinstance(u, str) and u]
+        if users:
+            try:
+                masked = _mask_user_echo(masked, users)
+            except Exception:  # noqa: BLE001 -- a mask failure never hides a claim
+                log.warning("%s echo mask failed -- screening the unmasked reply",
+                            PHANTOM_LOG_KEY, exc_info=True)
+        hit = _find_write_claim(masked)
+        if hit:
+            verb, form = hit
+            emit("%s kind=lexicon phrase=%r form=%s mode=%s channel=#%s user=%s -- a write "
                  "claim with zero tool_use this turn",
-                 PHANTOM_LOG_KEY, m.group(0).strip(), mode, channel_name or "?",
-                 user_id or "?")
+                 PHANTOM_LOG_KEY, verb, form, mode, channel_name or "?", user_id or "?")
             if mode == "enforce":
                 out = _prepend_honest_line(out)
     return out
@@ -371,20 +535,21 @@ INTERNAL_TOOL_REDACTION = "[internal tool]"
 # The ruled denial lexicon + synonyms (kickoff section 1 slice 1; named in the
 # Code #13 report). Bounded classes only; no nested quantifiers (ReDoS discipline).
 _CAP_NEG_HAVE = (
-    r"\bI\s+(?:don'?t|do\s+not|didn'?t|did\s+not|won'?t|will\s+not)\s+(?:currently\s+|actually\s+|really\s+)?have\s+"
-    r"(?:direct\s+|any\s+|the\s+|a\s+|an\s+)?(?:direct\s+)?"
+    r"\bI\s+(?:don['\u2019]?t|do\s+not|didn['\u2019]?t|did\s+not|won['\u2019]?t|will\s+not)\s+(?:currently\s+|actually\s+|really\s+)?have\s+"
+    r"(?:(?:direct|read|read-only|write|live|real[- ]?time|any|the|a|an|full|current)\s+){0,3}"
     r"(?:tools?|access|visibility|way|ability|permissions?|mechanism|integration|connector|means|"
     r"capability|capabilities|hooks?|line|route|path|window)\b"
 )
 _CAP_NO_HAVE = (
-    r"\bI\s+have\s+no\s+(?:direct\s+)?(?:tools?|access|visibility|way|ability|permission|means|integration|"
+    r"\bI\s+have\s+no\s+(?:(?:direct|read|read-only|live|real[- ]?time|current)\s+){0,2}"
+    r"(?:tools?|access|visibility|way|ability|permission|means|integration|"
     r"connector|mechanism|hooks?)\b"
     r"|\bI\s+lack\s+(?:the\s+|any\s+)?(?:tools?|access|visibility|ability|permission|means)\b"
-    r"|\bthere'?s?\s+(?:is\s+)?no\s+(?:tool|way|integration|connector|hook)\s+(?:for\s+me|I\s+(?:can|have))\b"
+    r"|\bthere['\u2019]?s?\s+(?:is\s+)?no\s+(?:tool|way|integration|connector|hook)\s+(?:for\s+me|I\s+(?:can|have))\b"
 )
 _CAP_CANT_VERB = (
-    r"\bI\s+(?:can'?t|cannot|can\s+not|am\s+not\s+able\s+to|'m\s+not\s+able\s+to|am\s+unable\s+to|"
-    r"'m\s+unable\s+to|won'?t\s+be\s+able\s+to|don'?t\s+have\s+the\s+ability\s+to|have\s+no\s+way\s+to)\s+"
+    r"\bI\s+(?:can['\u2019]?t|cannot|can\s+not|am\s+not\s+able\s+to|['\u2019]m\s+not\s+able\s+to|am\s+unable\s+to|"
+    r"['\u2019]m\s+unable\s+to|won['\u2019]?t\s+be\s+able\s+to|don['\u2019]?t\s+have\s+the\s+ability\s+to|have\s+no\s+way\s+to)\s+"
     r"(?:directly\s+|actually\s+|currently\s+|really\s+)?"
     r"(?:access|see|reach|stage|ship|dismiss|close|approve|queue|read|pull(?:\s+up)?|check|view|open|query|"
     r"use|touch|modify|update|create|send|post|run|execute|trigger|look\s+(?:at|into|up)|get\s+(?:to|into|at)|"
@@ -405,15 +570,16 @@ _CAP_NOT_STATE = (
     r"provisioned|plugged\s+in)"
 )
 _CAP_NOT_CONNECTED = (
-    r"\b(?:I\s+(?:am|'m)\s+not|I'm\s+not|I\s+am\s+not)\s+(?:currently\s+|yet\s+)?" + _CAP_NOT_STATE + r"\b"
-    r"|\bmy\s+(?:tools?|toolset|connectors?|integrations?|access)\s+(?:isn'?t|is\s+not|aren'?t|are\s+not)\s+"
+    r"\b(?:I\s+(?:am|['’]m)\s+not|I['\u2019]m\s+not|I\s+am\s+not)\s+(?:currently\s+|yet\s+)?" + _CAP_NOT_STATE + r"\b"
+    r"|\bmy\s+(?:tools?|toolset|connectors?|integrations?|access)\s+(?:isn['\u2019]?t|is\s+not|aren['\u2019]?t|are\s+not)\s+"
     r"(?:currently\s+|yet\s+)?" + _CAP_NOT_STATE + r"\b"
-    r"|\b(?:that|this|the)\s+(?:tool|connector|integration|hook)\s+(?:isn'?t|is\s+not)\s+"
+    r"|\b(?:that|this|the)\s+(?:tool|connector|integration|hook)\s+(?:isn['\u2019]?t|is\s+not)\s+"
     r"(?:currently\s+|yet\s+)?" + _CAP_NOT_STATE + r"\b"
-    r"|\b(?:isn'?t|is\s+not|aren'?t|are\s+not|not)\s+(?:currently\s+|yet\s+)?" + _CAP_NOT_STATE
+    r"|\b(?:isn['\u2019]?t|is\s+not|aren['\u2019]?t|are\s+not|not)\s+(?:currently\s+|yet\s+)?" + _CAP_NOT_STATE
     + r"\s+(?:(?:to|for)\s+me|on\s+my\s+(?:end|side)|in\s+my\s+(?:tools?|toolset))\b"
     r"|\bnot\s+available\s+to\s+me\b"
-    r"|\b(?:outside|beyond)\s+(?:of\s+)?my\s+(?:reach|access|tools|toolset|capabilities|scope|purview)\b"
+    r"|\b(?:outside|beyond)\s+(?:of\s+)?my\s+(?:(?:current|immediate|present|available|live|working|context)\s+){0,2}"
+    r"(?:reach|access|tools|toolset|capabilities|scope|purview|context(?:\s+window)?|window|view)\b"
 )
 _CAP_USE_INTERFACE = (
     r"\b(?:use|check|open|go\s+to|try|log\s+into|do\s+(?:that|this|it)\s+(?:in|through|via))\s+"
@@ -421,8 +587,14 @@ _CAP_USE_INTERFACE = (
     r"make(?:\.com)?|google\s+calendar)\s+(?:interface|app|ui|dashboard|console|website|site|portal|web\s+app)\b"
     r"|\b(?:do|handle|check|stage|approve|dismiss|close|ship|update|create|complete|mark|queue)\s+"
     r"(?:that|this|it|those|these|them)\s+(?:manually|yourself|directly|by\s+hand)\b"
-    r"|\byou'?ll\s+(?:need|have)\s+to\s+(?:do|handle|check|stage|approve|dismiss|close|ship|update|create|queue)\s+"
+    r"|\byou['\u2019]?ll\s+(?:need|have)\s+to\s+(?:do|handle|check|stage|approve|dismiss|close|ship|update|create|queue)\s+"
     r"(?:that|this|it|those|these|them\s+)?(?:manually|yourself|directly)\b"
+    # R14-9(c): a DEFLECTION -- the reply points at a check it will not run itself
+    # (9/21 08:46:52 "that needs a direct check of the ledger, not another tap").
+    # Trips only when the sentence names a capability the bot HAS (the term side).
+    r"|\b(?:that|this|it|which)\s+(?:needs|requires|would\s+need|would\s+require|takes|calls\s+for)\s+"
+    r"(?:a\s+)?(?:(?:direct|manual|live|separate|real)\s+){0,2}(?:check|look|query|read|lookup|pull)\s+"
+    r"(?:of|at|on|in|into)\b"
 )
 _DENIAL_RE = re.compile(
     "(?:" + _CAP_NEG_HAVE + "|" + _CAP_NO_HAVE + "|" + _CAP_CANT_VERB + "|" + _CAP_NOT_CONNECTED
@@ -442,7 +614,7 @@ _DENIAL_RE = re.compile(
 # classes only (ReDoS discipline).
 _RULED_REFUSAL_RE = re.compile(
     r"(?:\b(?:not\s+)?in\s+this\s+channel\b"
-    r"|\bthis\s+channel\s+(?:isn'?t|is\s+not|doesn'?t|does\s+not|can'?t)\b"
+    r"|\bthis\s+channel\s+(?:isn['\u2019]?t|is\s+not|doesn['\u2019]?t|does\s+not|can['\u2019]?t)\b"
     r"|\bask\s+(?:me\s+)?(?:again\s+)?(?:in|over\s+in|from|via)\s+(?:the\s+)?(?:#|<#|[a-z0-9_-]{1,40}\s+channel\b)"
     r"|\b(?:in|from|via|over\s+in|to)\s+#[a-z0-9_-]{1,60}"
     r"|\b(?:finance|leadership|founder)\s+channel\b"

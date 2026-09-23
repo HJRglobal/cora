@@ -123,6 +123,11 @@ _COMPOUND_TOKENS: tuple[tuple[str, str, str], ...] = (
     ("fighter", "compliance", "fighter"),
     ("sales", "deck", "deck"),
     ("sales", "pulse", "sales_pulse"),
+    # R14-9(c): the code-queue card-ledger READ (cora_queue_status). Keyed on the
+    # read tool's own name so the family exists only where the read is offered, and
+    # contributed ONLY for the founder (the tool refuses everyone else, so a member's
+    # "I can't read the card ledger" is honest). See capability_terms.
+    ("queue", "status", "queue_ledger"),
 )
 
 # Natural-language synonyms for a registry TOKEN. A row contributes ONLY when its
@@ -172,6 +177,14 @@ _TOKEN_ALIASES: dict[str, tuple[str, ...]] = {
     "influencer": ("influencer", "influencers", "influencer tracker"),
     "fighter": ("fighter", "fighters", "fighter compliance"),
     "revops": ("revops", "revops ledger", "rev ops"),
+    # R14-9(c) -- the 9/21 08:44-08:46 denial objects, verbatim ("the card ledger",
+    # "your live card-interaction history", "the live card state", "a direct check
+    # of the ledger"). NEVER "reaction log" or bare "cards" (a Slack reaction log is
+    # something the bot truly cannot read).
+    "queue_ledger": ("card ledger", "queue ledger", "decision ledger", "code queue ledger",
+                     "card state", "card states", "card status", "card presses", "button presses",
+                     "card interaction", "card interactions", "card interaction history",
+                     "decision cards", "the ledger"),
     "dashboards": ("dashboards", "dashboard", "cowork dashboards"),
     "lexicon": ("lexicon",),
     "action_items": ("action items", "meeting action items"),
@@ -210,6 +223,7 @@ _FAMILY_HINTS: dict[str, str] = {
     "blog": "ask me for the blog card drafts",
     "decisions": "ask me for the open decisions",
     "plate": "ask 'what's on my plate'",
+    "queue_ledger": "ask me 'which cards are still unresponded?' -- I read the card ledger",
 }
 
 _QUEUE_HINT_FOUNDER = ("`stage cq-<12 hex>` / `approve cq-<12 hex>` / `dismiss cq-<12 hex>` "
@@ -321,6 +335,8 @@ def capability_terms(entity: str | None, *, cross_entity: bool = False,
     for tok in sorted(present_tokens):
         if tok == "queue":
             continue  # queue objects are added below with the founder-aware hint
+        if tok == "queue_ledger" and not founder:
+            continue  # R14-9(c): the read refuses non-founders -- their denial is honest
         hint = _FAMILY_HINTS.get(tok, f"ask me directly -- I have {tok.replace('_', ' ')} tools in this channel")
         if "_" not in tok and tok not in _ALIAS_ONLY_TOKENS:
             terms.setdefault(_norm(tok), hint)   # a compound / alias-only key contributes ONLY its aliases

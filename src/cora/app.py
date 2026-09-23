@@ -964,6 +964,14 @@ def _self_inventory_force(text: str) -> str | None:
     return "cora_self_inventory" if self_inventory.is_self_inventory_question(text or "") else None
 
 
+def _prior_user_texts(prior_messages: list[dict] | None) -> list[str]:
+    """The last six USER turns' text (never assistant text), for the phantom-write
+    screen's echo mask (R14-9(b)): words the user wrote are not Cora's claims."""
+    return [m["content"] for m in (prior_messages or [])
+            if isinstance(m, dict) and m.get("role") == "user"
+            and isinstance(m.get("content"), str)][-6:]
+
+
 def _queue_status_turn(user_id: str | None, channel_name: str, retrieval_grant: object,
                        user_message: str, prior_messages: list[dict] | None) -> bool:
     """R14-9(a): True when this turn is Harrison, in his DM, asking about the STATE
@@ -2051,6 +2059,7 @@ def _dispatch_qa(
         response_text = slack_egress.screen_phantom_write_claims(
             response_text, tool_use_count=_turn_tool_use_count(gen_meta),
             channel_name=channel_name, user_id=user_id or "",
+            user_text=user_message, prior_user_texts=_prior_user_texts(prior_messages),
         )
         # Code #13 slice 1 (cq-2a88e32a75ea): the honesty rail's sibling screen --
         # a capability DENIAL about something the bot has in this channel (zero
@@ -2195,6 +2204,7 @@ def _dispatch_qa(
     response_text = slack_egress.screen_phantom_write_claims(
         response_text, tool_use_count=_turn_tool_use_count(gen_meta),
         channel_name=channel_name, user_id=user_id or "",
+        user_text=user_message, prior_user_texts=_prior_user_texts(prior_messages),
     )
     # Code #13 slice 1 (cq-2a88e32a75ea): the sibling capability screen (see the
     # non-streaming site above for the contract).

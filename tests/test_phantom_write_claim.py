@@ -136,16 +136,18 @@ class TestIncidentReplay:
         assert out == REPLY_0659_REAL_TOOL
         assert not [r for r in caplog.records if se.PHANTOM_LOG_KEY in r.getMessage()]
 
-    def test_0650_digest_is_the_documented_lexicon_noise_class(self, ledgers, caplog):
-        """The 06:49 message is S1''s to intercept (test_founder_dm_queue_verbs); had
-        the model still answered, this digest-style reply describes items AS
-        'staged' with no tool call -- it trips the ruled lexicon at zero tool_use.
-        Pinned as the false-positive class the observe week must characterize
-        (the phrase is logged for exactly that), not as desired behaviour."""
+    def test_0650_digest_no_longer_trips_the_completion_grammar(self, ledgers, caplog):
+        """DELIBERATE FLIP (R14-9(b), ruled 2026-09-21). This digest-style reply
+        DESCRIBES items as 'staged' ("the staged knowledge-review item", "prompts are
+        staged and waiting") -- the false-positive class the observe week measured
+        (4 of 4 founder-DM hits 9/20-9/21, zero phantoms). The pin used to assert ONE
+        hit "as the documented noise class, not desired behaviour"; the completion
+        grammar reads zero. REPLY_0653 ("Done.") and REPLY_0654 ("All three locked
+        in:") still trip below."""
         caplog.set_level(logging.WARNING, logger=se.__name__)
         out = se.screen_phantom_write_claims(REPLY_0650_DIGEST, tool_use_count=0)
         assert out == REPLY_0650_DIGEST
-        assert len(_hits(caplog, "lexicon")) == 1
+        assert _hits(caplog, "lexicon") == []
 
 
 class TestBenign:
