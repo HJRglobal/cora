@@ -75,6 +75,40 @@ CLAIMS_HOLE_PROBES: dict[str, tuple[str, ...]] = {
         # D-051 EF-7: a disjunction of brands attaches the clean word to BOTH
         "Clean energy from F3 Pure or F3 Energy.",
         "F3 Energy or F3 Pure: clean, natural energy.",
+        # D-051 r143-claims-1: a clause that merely NAMES Pure (the standard of a
+        # comparison, a possessor, an appositive, a relative clause) is not Pure
+        # attachment -- the clean word is said of Energy/Mood
+        "F3 Energy, clean like F3 Pure, hits hard.",
+        "F3 Energy, now made with the same clean-sweetened base as F3 Pure, hits hard.",
+        "F3 Energy, which shares F3 Pure's clean base, hits hard.",
+        "F3 Energy, built on F3 Pure's clean-label formula, is here.",
+        "As clean as F3 Pure, F3 Energy delivers all day.",
+        "Clean-sweetened like F3 Pure, F3 Energy is here.",
+        "F3 Energy: as clean as F3 Pure.",
+        "F3 Energy, F3 Pure's all-natural sibling, is here.",
+        "F3 Mood, as natural as F3 Pure, keeps you calm.",
+        "F3 Mood, the clean companion to F3 Pure, winds you down.",
+        "F3 Energy keeps the full stack while staying as clean as F3 Pure.",
+        "Like F3 Pure's clean formula, F3 Energy's is too.",
+        "F3 Energy delivers the stack, as clean as F3 Pure.",
+        "F3 Energy, with the same clean-label promise as F3 Pure.",
+        # ...the same class the other way round: a later Energy/Mood clause that
+        # takes the clean predicate by ellipsis or comparison
+        "F3 Pure is clean-sweetened, and F3 Energy is too.",
+        "F3 Pure is clean, like F3 Energy.",
+        "F3 Pure is all-natural, and so is F3 Energy.",
+        "F3 Pure is clean-sweetened, as is F3 Energy.",
+        "Like F3 Energy, F3 Pure is clean-sweetened.",
+        "F3 Energy, or the clean version of F3 Pure, hits hard.",
+        "Clean energy from F3 Pure, or F3 Energy.",
+        # D-051 r143-claims-3: the bare-brand fold REPLACED the host clause's
+        # inheritance instead of joining it
+        "F3 Energy: all-natural, F3 Pure too.",
+        "F3 Energy: clean-sweetened, F3 Pure.",
+        "F3 Mood: clean, and F3 Pure too.",
+        "F3 Energy: zero sugar, 200mg caffeine, all-natural flavors, and F3 Pure too.",
+        "F3 Mood: caffeine-free, clean, and F3 Pure too.",
+        "F3 Energy is great, clean, and F3 Pure too.",
         # R14-3 NO-WIDENING: the two ruled phrases are EXACT. Every variant, every
         # bare use, and either phrase in a sentence that names Mood still trips.
         "F3 Energy has natural caffeine.",

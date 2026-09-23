@@ -498,8 +498,11 @@ _NATURAL_OCCURRENCE_RES = (
 #
 # WHAT "ATTRIBUTION" MEANS HERE: the clean word is predicated OF the Energy or Mood
 # line. A clean token is exempt only in these positive, narrow shapes -- (1) it sits
-# in a clause segment that names F3 Pure and NOT Energy/Mood ("... or the clean-
-# sweetened version in F3 Pure": the 8/26 live rejection); (2) its object is the
+# in a clause segment that names F3 Pure and NOT Energy/Mood AND is positively
+# Pure's: Pure is that clause's subject, or the clause is the 8/26 locative disjunct
+# ("... or the clean-sweetened version in F3 Pure": the live rejection), with no
+# comparison / likeness / ellipsis anywhere in the sentence (D-051 r143-claims-1,
+# see rail2_attribution_hit); (2) its object is the
 # ENVIRONMENT as the object of an environmental ACTION ("fund a cleaner planet",
 # "clean up the beaches": the CleanHub article), never a predicate of the brand;
 # (3) one of the two ruled exact phrases in _RAIL2_PHRASE_EXEMPTIONS. Who said it is
@@ -694,6 +697,16 @@ _NATURAL_OCCURRENCE_HYPHEN_RE = re.compile(
 _CLAUSE_SPLIT_RE = re.compile(r"[,;:]|\b(?:or|while|whereas|versus|vs\.?)\b", re.IGNORECASE)
 
 
+def _is_clean_token(tok: str) -> bool:
+    """One lower-cased, edge-stripped token: a clean token itself, or a hyphen/slash
+    compound with a clean part ("clean-energy")."""
+    if tok in _ATTRIBUTION_CLEAN_TOKENS:
+        return True
+    if "-" in tok or "/" in tok:
+        return any(part in _ATTRIBUTION_CLEAN_TOKENS for part in tok.replace("/", "-").split("-"))
+    return False
+
+
 def _attribution_clean_hits(seg: str) -> set[str]:
     """Clean tokens in one clause segment: whole tokens, plus every part of a
     hyphen/slash compound ("clean-energy" -> 'clean'). Linear: each token is split
@@ -701,14 +714,8 @@ def _attribution_clean_hits(seg: str) -> set[str]:
     hit: set[str] = set()
     for w in _words(seg):
         tok = w.lower().strip("'&/-")
-        if tok in _ATTRIBUTION_CLEAN_TOKENS:
+        if _is_clean_token(tok):
             hit.add(tok)
-            continue
-        if "-" in tok or "/" in tok:
-            for part in tok.replace("/", "-").split("-"):
-                if part in _ATTRIBUTION_CLEAN_TOKENS:
-                    hit.add(tok)
-                    break
     return hit
 
 
@@ -840,67 +847,251 @@ def _bare_brand_segment(seg: str) -> bool:
     return named
 
 
+_RAIL2_EM = frozenset({"ENERGY", "MOOD"})
+_RAIL2_DISJUNCTIONS = frozenset({"or", "versus", "vs"})
+
+
+def _clause_split(text: str) -> list[tuple[str, str]]:
+    """[(segment, the delimiter that ENDS it)], with '' after the last segment. It
+    makes the same cut as _CLAUSE_SPLIT_RE.split, but keeps the delimiters, which P2
+    needs (the 8/26 shape is a DISJUNCT)."""
+    out: list[tuple[str, str]] = []
+    pos = 0
+    for m in _CLAUSE_SPLIT_RE.finditer(text):
+        out.append((text[pos:m.start()], m.group(0).lower().rstrip(".")))
+        pos = m.end()
+    out.append((text[pos:], ""))
+    return out
+
+
+class _Clause:
+    """One non-empty clause segment plus the bare coordinated brands folded into it.
+    `prev` / `next` are the delimiters that separate it from its neighbours."""
+
+    __slots__ = ("host", "bare", "prev", "next", "pron")
+
+    def __init__(self, host: str, prev: frozenset[str], pron: bool = False):
+        self.host = host
+        self.bare: list[str] = []
+        self.prev = prev
+        self.next: frozenset[str] = frozenset()
+        self.pron = pron
+
+
+def _rail2_clauses(scan: str, pron_flags: list[bool] | None = None) -> list[_Clause]:
+    """Non-empty clause segments. A bare coordinated brand ("... or F3 Energy") is
+    folded into the non-empty clause before it. An empty segment (", or" leaves one)
+    is skipped, so a bare brand can never land in an empty host, and its delimiters
+    are carried to its neighbours. Bare parts are kept as a list and joined once per
+    clause, so a long run of ", F3 Pure" stays linear."""
+    groups: list[_Clause] = []
+    pending: set[str] = set()
+    for i, (seg, delim) in enumerate(_clause_split(scan)):
+        if _words(seg):
+            if groups and _bare_brand_segment(seg):
+                groups[-1].bare.append(seg)
+                groups[-1].pron = groups[-1].pron or bool(pron_flags and pron_flags[i])
+            else:
+                if groups:
+                    groups[-1].next = frozenset(pending)
+                groups.append(_Clause(seg, frozenset(pending), bool(pron_flags and pron_flags[i])))
+            pending = set()
+        if delim:
+            pending.add(delim)
+    if groups:
+        groups[-1].next = frozenset(pending)
+    return groups
+
+
+#: Leading words skipped before a clause's subject ("and F3 Pure is ...").
+_LEAD_FILLERS = frozenset({
+    "and", "but", "yet", "so", "then", "plus", "while", "whereas", "whilst", "though",
+    "although", "meanwhile", "instead",
+})
+_PURE_HEAD_NOUNS = frozenset({"can", "cans", "line", "formula", "recipe", "blend"})
+_PURE_SUBJECT_ADVERBS = frozenset({"now", "still", "always", "simply", "instead", "itself"})
+#: A CLOSED list (fail closed): a verb that is missing only costs a trip.
+_PURE_PREDICATE_VERBS = frozenset({
+    "is", "isn't", "was", "wasn't", "are", "aren't", "were", "weren't", "will", "stays",
+    "remains", "uses", "used", "carries", "has", "gets", "keeps", "brings", "offers",
+    "delivers", "runs", "relies", "takes", "leans", "swaps", "trades", "adds", "sticks",
+    "pairs", "goes", "comes", "sweetens", "features", "contains", "blends", "skips", "drops",
+    "replaces", "starts", "becomes", "does", "doesn't", "launches", "launched", "arrives",
+    "gives", "packs", "provides", "opts", "chooses", "tastes",
+})
+_P2_DETERMINERS = frozenset({"the", "a", "an"})
+_P2_LOCATIVES = frozenset({"in", "of", "from", "inside"})
+
+
+def _lower_tokens(words: list[str]) -> list[str]:
+    return [w.lower().strip("'&/-") for w in words]
+
+
+def _pure_is_subject(words: list[str]) -> bool:
+    """P1: Pure is the clause's SUBJECT -- "[and|while ...] [the] F3 Pure [can] [now]
+    <predicate verb> ...". A possessive ("F3 Pure's clean base"), a verb-less
+    appositive ("F3 Pure's all-natural sibling"), a comparison ("as clean as F3
+    Pure") or anything else before the brand fails, so the clean word is not
+    positively Pure's and it trips (D-051 r143-claims-1)."""
+    t = _lower_tokens(words)
+    n = len(t)
+    i = 0
+    while i < n and t[i] in _LEAD_FILLERS:
+        i += 1
+    if i < n and t[i] == "the":
+        i += 1
+    f3 = i < n and t[i] in ("f3", "f3's")
+    if f3:
+        i += 1
+    if i >= n or t[i] != "pure" or not (f3 or _is_brandish(words[i])):
+        return False
+    i += 1
+    if i < n and t[i] in _PURE_HEAD_NOUNS:
+        i += 1
+    if i < n and t[i] in _PURE_SUBJECT_ADVERBS:
+        i += 1
+    return i < n and t[i] in _PURE_PREDICATE_VERBS
+
+
+def _pure_locative_disjunct(words: list[str], idx: int, n_clauses: int,
+                            prev: frozenset[str], nxt: frozenset[str]) -> bool:
+    """P2: the 8/26 live shape. "Explore the full stack in F3 Energy or THE
+    CLEAN-SWEETENED VERSION IN F3 PURE." A disjunct noun phrase whose clean word
+    modifies a head noun located in / of / from F3 Pure. The clause must be one side
+    of an "or" / "versus": the LAST clause after one, or the FIRST clause before one
+    (the mirror). A middle clause ("F3 Energy, or the clean version of F3 Pure, hits
+    hard.") is an apposition, so it fails. Every clean word must sit between the
+    determiner and the preposition."""
+    if not ((idx == n_clauses - 1 and prev & _RAIL2_DISJUNCTIONS)
+            or (idx == 0 and nxt & _RAIL2_DISJUNCTIONS)):
+        return False
+    t = _lower_tokens(words)
+    p = next((k for k, w in enumerate(t)
+              if w == "pure" and ((k > 0 and t[k - 1] in ("f3", "f3's")) or _is_brandish(words[k]))), -1)
+    if p < 0:
+        return False
+    k = p - 1
+    if k >= 0 and t[k] in ("f3", "f3's"):
+        k -= 1
+    if k < 0 or t[k] not in _P2_LOCATIVES:
+        return False
+    d = max((j for j in range(k) if t[j] in _P2_DETERMINERS), default=-1)
+    if d < 0 or k - d > 8:
+        return False
+    cleans = [j for j, w in enumerate(t) if _is_clean_token(w)]
+    return bool(cleans) and all(d < j < k for j in cleans)
+
+
+#: A clause holding any of these RELATES two lines (comparison, likeness, a shared
+#: property, ellipsis), so a clean word in the sentence can transfer to Energy/Mood.
+#: "F3 Pure is clean-sweetened, and F3 Energy is too." and "F3 Pure is clean, like
+#: F3 Energy." both passed. While any clause in the sentence holds one, NO clause
+#: clears (r143-claims-1). The token veto only ever ADDS trips.
+_RELATION_TOKENS = frozenset({
+    "like", "alike", "same", "similar", "similarly", "than", "too", "also", "likewise",
+    "equally", "sibling", "siblings", "twin", "twins", "companion", "companions", "cousin",
+    "cousins", "counterpart", "counterparts", "share", "shares", "shared", "sharing",
+    "borrow", "borrows", "borrowed", "borrowing", "both", "either", "neither", "match",
+    "matches", "matched", "matching", "mirror", "mirrors", "mirrored", "mirroring",
+    "identical", "equivalent", "inherit", "inherits", "inherited", "suit",
+})
+#: ...except that a BRAND-LESS clause's "both" is a plain plural ("and both taste
+#: great"), not a transfer.
+_RELATION_WEAK_EXEMPT = frozenset({"both"})
+_AUX = frozenset({"is", "are", "was", "were", "does", "do", "did", "has", "have", "had",
+                  "can", "will", "would", "could", "should"})
+#: "like" is a VERB after these ("If you like F3 Energy, ..."), not a comparison.
+_LIKE_VERB_SUBJECTS = frozenset({"you", "we", "they", "i", "who", "fans", "people", "would",
+                                 "you'd", "we'd"})
+
+
+def _has_relation(words: list[str], *, weak: bool = False) -> bool:
+    t = _lower_tokens(words)
+    n = len(t)
+    for i, w in enumerate(t):
+        if w in _RELATION_TOKENS:
+            if weak and w in _RELATION_WEAK_EXEMPT:
+                continue
+            if w == "like" and i > 0 and t[i - 1] in _LIKE_VERB_SUBJECTS:
+                continue
+            return True
+        if w == "as" and i + 1 < n:
+            if t[i + 1] in _AUX or t[i + 1] in ("well", "with", "in") or "as" in t[i + 1:i + 5]:
+                return True   # "as is F3 Energy", "as well", "as with", "as clean as"
+        if w == "so" and i + 1 < n and t[i + 1] in _AUX:
+            return True       # "and so is F3 Energy"
+    return bool(t) and t[-1] in _AUX   # VP ellipsis: "..., and F3 Energy does."
+
+
 def rail2_attribution_hit(sentence: str) -> tuple[str, str] | None:
     """The SHIPPING rail-2 test since R14-3 (see the block comment above): trips when
-    a clean token is predicated of Energy/Mood -- i.e. it is neither Pure-attached
-    within its own clause segment, nor an environmental object of an environmental
-    action, nor inside one of the two ruled exact phrases (redacted BEFORE clause
-    segmentation, never in a sentence that names Mood). Gated by rail2_harness
-    against the frozen rail2_legacy_hit baseline.
+    a clean token is predicated of Energy/Mood -- i.e. it is neither POSITIVELY
+    Pure-attached, nor an environmental object of an environmental action, nor
+    inside one of the two ruled exact phrases (redacted BEFORE clause segmentation,
+    never in a sentence that names Mood). Gated by rail2_harness against the frozen
+    rail2_legacy_hit baseline.
 
     A clean token also counts when it is one part of a hyphen/slash compound
     ("clean-energy", "cleaner-fuel") or a verb form ("cleans up your afternoon"):
     both passed the legacy rail too, and a narrowing that ships must not keep a
     hole the tokenizer happened to leave open.
 
-    INHERITANCE IS FAIL-CLOSED (D-051 EF-7). The first cut let a brand-less clause
-    inherit only the NEAREST preceding brand clause, so "F3 Energy, like F3 Pure,
-    is clean." cleared: the parenthetical named Pure alone and the predicate
-    "is clean" inherited it, though the sentence's subject is Energy. Now a
-    brand-less segment carrying a clean token inherits the UNION of every line
-    named earlier in the sentence; Energy/Mood anywhere in that union trips (the
-    ruled "ambiguous = trips" posture). Consequence, accepted by ruling: the 9/1
-    shape "..., with F3 Pure using organic cane sugar, monk fruit and stevia as
-    its clean-sweetened base" (Pure AND Energy named earlier) trips again and
-    sits in rail2_harness.UNDECIDED -- write it as two sentences rather than open
-    the holes above with an attachment heuristic. A bare coordinated brand after
-    a split word ("... from F3 Pure or F3 Energy") is merged back into the clause
-    it coordinates with, so "Clean energy from F3 Pure or F3 Energy" reads as one
-    clause naming both. A clause that names a brand ITSELF keeps its own
-    attribution: "... or the clean-sweetened version in F3 Pure" (the 8/26 live
-    rejection) still clears.
+    PURE ATTACHMENT IS POSITIVE, NEVER INFERRED (D-051 r143-claims-1/3). A clean
+    word in a sentence that names Energy/Mood clears only when its clause names
+    Pure and nothing else, AND Pure is attached in one of two shapes:
+      P1  Pure is the clause SUBJECT with a predicate verb ("F3 Energy carries the
+          full stack; F3 Pure is the clean-sweetened version.");
+      P2  the 8/26 locative disjunct ("... or the clean-sweetened version in F3
+          Pure.", and its mirror).
+    It also clears only while NO clause in the sentence holds a relation token
+    (_has_relation). The first cut let a clause's OWN brand win outright, so any
+    clause that merely named Pure cleared, even when Pure was only the standard of
+    comparison or a possessor. "F3 Energy, as clean as F3 Pure, hits hard.", "F3
+    Mood, the clean companion to F3 Pure, ..." and "As clean as F3 Pure, F3 Energy
+    delivers all day." all tripped the legacy rail and PASSED the shipping rail.
+
+    INHERITANCE IS FAIL-CLOSED (D-051 EF-7, tightened by r143). A BRAND-LESS clause
+    with a clean token, in a sentence that names Energy/Mood, always trips. The EF-7
+    union already made that true whenever Energy/Mood was named earlier. A fronted
+    brand-less modifier ("Like F3 Pure: clean-sweetened, F3 Energy delivers.")
+    showed that a Pure-only union is not attachment either. The 9/1 shape therefore
+    still trips and sits in rail2_harness.UNDECIDED; write it as two sentences.
+
+    A bare coordinated brand after a split word ("... from F3 Pure or F3 Energy") is
+    folded into the clause it coordinates with, and its lines JOIN that clause's
+    lines (the union), never replace them. The first cut let the fold REPLACE the
+    host clause's inheritance, so "F3 Mood: clean, and F3 Pure too." cleared: the
+    brand-less host picked up only Pure (r143-claims-3).
     """
     sent = sentence or ""
     lines = brand_lines_in(sent)
-    if not (lines & {"ENERGY", "MOOD"}):
+    if not (lines & _RAIL2_EM):
         return None
     scan_sent = _redact_phrase_exemptions(sent, lines)
     scan_sent = _redact(scan_sent, _NATURAL_OCCURRENCE_RES + (_NATURAL_OCCURRENCE_HYPHEN_RE,))
     scan_sent = _redact(scan_sent, _CLEAN_ENVIRONMENT_RES)
     scan_sent = _redact_env_events(scan_sent)
-    # Segment, folding a bare coordinated brand into the clause before it. Parts
-    # are kept as lists and joined once per segment so a long run of ", F3 Pure"
-    # coordinations stays linear (no repeated string growth).
-    segs: list[list[str]] = []
-    for seg in _CLAUSE_SPLIT_RE.split(scan_sent):
-        if segs and _bare_brand_segment(seg):
-            segs[-1].append(seg)
-        else:
-            segs.append([seg])
-    carry: set[str] = set()
-    for parts in segs:
-        seg = " ".join(parts)
-        own = brand_lines_in(seg)
-        # own attribution wins; a brand-less clause inherits EVERY line named so
-        # far (the union), never just the nearest one
-        seg_lines = own or set(carry)
-        carry |= own
-        hit = _attribution_clean_hits(seg)
+    clauses = _rail2_clauses(scan_sent)
+    n = len(clauses)
+    rows = []
+    related = False
+    for c in clauses:
+        text = " ".join([c.host] + c.bare) if c.bare else c.host
+        host_own = brand_lines_in(c.host)
+        own = host_own | (brand_lines_in(" ".join(c.bare)) if c.bare else set())
+        if _has_relation(_words(text), weak=not own):
+            related = True
+        rows.append((c, text, host_own, own))
+    for idx, (c, text, host_own, own) in enumerate(rows):
+        hit = _attribution_clean_hits(text)
         if not hit:
             continue
-        if "PURE" in seg_lines and not (seg_lines & {"ENERGY", "MOOD"}):
-            continue  # the ONE cleared attachment: the clean word sits with Pure alone
-        return sorted(hit)[0], "/".join(sorted(lines & {"ENERGY", "MOOD"}))
+        if host_own == own == {"PURE"} and not related:
+            host_words = _words(c.host)
+            if (_pure_is_subject(host_words)
+                    or _pure_locative_disjunct(host_words, idx, n, c.prev, c.next)):
+                continue  # the clean word is positively Pure's
+        return sorted(hit)[0], "/".join(sorted(lines & _RAIL2_EM))
     return None
 
 # rail 3 -- Mood is never a sleep aid. Cleared framing is "composure, not sedation",
