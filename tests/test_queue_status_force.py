@@ -870,3 +870,18 @@ class TestDispatchQaBehaviour:
         t = "queue a code session: cards don't refresh after a press -- they still show as unresponded"
         seen, _cache = _drive_dispatch_qa(monkeypatch, t, prior=[{"role": "user", "content": Q1}])
         assert seen["force_tool"] == "cora_queue_code_session"
+
+    def test_the_capture_force_wins_on_a_text_that_fires_both(self, monkeypatch):
+        """D-051 forcing-seams-8 PARTIAL: the text above is NOT a status question
+        (its imperative opening fails the gate), so it could not tell the two
+        precedence orders apart -- moving the queue-status force ABOVE the capture
+        force kept it green. This text fires BOTH detectors, so only the pinned
+        order (every command / write force first) passes."""
+        import cora.app as app_mod
+        t = "have my cards registered? if not, queue a code session: cards don't refresh after a press"
+        # the preconditions that give this test its teeth
+        assert app_mod._code_queue_capture_intent(t) is True
+        assert cq.is_queue_status_question(t) is True
+        seen, cache = _drive_dispatch_qa(monkeypatch, t)
+        assert seen["force_tool"] == "cora_queue_code_session"
+        cache.lookup.assert_not_called()      # still a queue-status-shaped turn
