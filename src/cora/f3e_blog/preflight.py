@@ -538,35 +538,63 @@ _CLEANUP_OBJECTS = (r"(?:beach|beaches|oceans?|coast(?:line)?s?|parks?|rivers?|s
 # a BLACKLIST, so every other continuation ("for your taste buds", "at every
 # workout", "to your routine") kept the redaction (D-051 r143-claims-4). The
 # continuation is now an ALLOWLIST (fail closed). The environmental phrase is
-# redacted only when it ends its clause, or when it runs on into a closed CSR
-# continuation: "with every case sold", "every spring", "for the oceans", "for
-# future generations", "around the world", "through CleanHub". Anything else keeps
-# the clean word in the scan ("supports clean communities in Mesa" trips too).
+# redacted only when it ends its sentence, or when it runs on -- directly or after
+# a comma / semicolon / colon -- into a closed CSR continuation: "with every case
+# sold", "every spring", "for the oceans", "for future generations", "around the
+# world", "through CleanHub", "one case at a time". After the punctuation a CSR
+# participle ("pulling 400 pounds of trash") or a third-party clause ("and fans
+# love it") also qualifies, with no "you"/"your" to the end of the sentence.
+# Anything else keeps the clean word in the scan ("supports clean communities in
+# Mesa" trips too).
 _ENV_PURCHASE_NOUNS = r"(?:cases?|purchases?|orders?|sales?|packs?|box(?:es)?)"
 _ENV_WEEKDAYS = r"(?:mon|tues|wednes|thurs|fri|satur|sun)days?"
 _ENV_TIME_NOUNS = (r"(?:years?|months?|weeks?|weekends?|seasons?|spring|summer|fall|autumn|"
                    r"winter|quarters?|" + _ENV_WEEKDAYS + r")")
+#: The closed CSR continuations ("with every case sold", "one case at a time",
+#: "through CleanHub", "by removing plastic", ...). Each begins at its first word;
+#: the callers supply the whitespace or punctuation before it.
+_ENV_CSR_TAILS = (
+    r"(?:with\s{1,3}(?:every|each)\s{1,3}(?:" + _ENV_PURCHASE_NOUNS
+    + r"|(?:cans?|bottles?)\s{1,3}(?:sold|purchased|bought))\b"
+    r"|(?:every|each|this|next)\s{1,3}(?:" + _ENV_PURCHASE_NOUNS + r"|" + _ENV_TIME_NOUNS + r")\b"
+    r"|one\s{1,3}(?:case|can|purchase|order|pack)\s{1,3}at\s{1,3}a\s{1,3}time\b"
+    r"|on\s{1,3}" + _ENV_WEEKDAYS + r"\b"
+    r"|(?:today|tomorrow|yesterday|together|weekly|monthly|annually|yearly)\b"
+    r"|for\s{1,3}(?:(?:future|next)\s{1,3}generations?|(?:the|our)\s{1,3}" + _ENV_NOUNS + r")\b"
+    r"|(?:across|around|throughout)\s{1,3}(?:the\s{1,3})?"
+    r"(?:world|globe|country|nation|region|state|planet|coast)\b"
+    r"|(?:through|via|with|alongside)\s{1,3}(?:F3|CleanHub|volunteers|fans"
+    r"|(?:our|the|a|its)\s{1,3}(?:partners?|partnerships?|team|crew|community|volunteers|fans))\b"
+    r"|by\s{1,3}(?:removing|pulling|funding|planting|recycling|collecting|cleaning|"
+    r"restoring|protecting)\b"
+    r")"
+)
+#: After a comma / semicolon / colon, two more shapes are CSR, never a metaphor: a
+#: CSR participle ("..., pulling 400 pounds of trash") and a new clause with a
+#: third-party subject ("..., and fans love it"). Both also need the rest of the
+#: sentence (up to 300 characters, else fail closed) to hold no first or second
+#: person: "..., helping you unwind" / "..., letting your mind settle" are product
+#: metaphors wearing the environment's clothes.
+_ENV_CSR_PARTICIPLES = (r"(?:removing|pulling|collecting|planting|recycling|restoring|protecting|"
+                        r"clearing|picking|hauling|diverting|funding)\b")
+_ENV_NEW_CLAUSE = (r"(?:(?:and|but|&)\s{1,3})?(?:fans|volunteers|customers|partners|CleanHub|we|F3|"
+                   r"every|each|together|our\s{1,3}(?:team|fans|partners|volunteers|community|crew))\b")
+_ENV_PERSON = r"(?:you|your|yours|yourself|yourselves|y'all|my|me|mine|myself)"
+_ENV_NO_PERSON_TO_END = (r"(?=(?:(?!\b" + _ENV_PERSON + r"\b)[^.!?\n]){0,300}(?:[.!?\n]|$))")
 _ENV_CONTINUATION_OK = (
     r"(?="
-    # the phrase ends its clause
-    r"\s{0,3}(?:[.;:!?)\]\"'”’]|$)"
-    # ...or a comma NOT followed (directly or after "and") by a second-person /
-    # metaphor / relative tail: ", for your mind", ", and your mind"
-    r"|\s{0,3},(?!\s{0,3}(?:(?:and|&)\s{1,3})?"
-    r"(?:for|of|in|inside|within|into|to|at|on|one|you|your|my|that|which|where)\b)"
-    r"|\s{1,3}with\s{1,3}(?:every|each)\s{1,3}(?:" + _ENV_PURCHASE_NOUNS
-    + r"|(?:cans?|bottles?)\s{1,3}(?:sold|purchased|bought))\b"
-    r"|\s{1,3}(?:every|each|this|next)\s{1,3}(?:" + _ENV_PURCHASE_NOUNS + r"|" + _ENV_TIME_NOUNS + r")\b"
-    r"|\s{1,3}one\s{1,3}(?:case|can|purchase|order|pack)\s{1,3}at\s{1,3}a\s{1,3}time\b"
-    r"|\s{1,3}on\s{1,3}" + _ENV_WEEKDAYS + r"\b"
-    r"|\s{1,3}(?:today|tomorrow|yesterday|together|weekly|monthly|annually|yearly)\b"
-    r"|\s{1,3}for\s{1,3}(?:(?:future|next)\s{1,3}generations?|(?:the|our)\s{1,3}" + _ENV_NOUNS + r")\b"
-    r"|\s{1,3}(?:across|around|throughout)\s{1,3}(?:the\s{1,3})?"
-    r"(?:world|globe|country|nation|region|state|planet|coast)\b"
-    r"|\s{1,3}(?:through|via|with|alongside)\s{1,3}(?:F3|CleanHub|volunteers|fans"
-    r"|(?:our|the|a|its)\s{1,3}(?:partners?|partnerships?|team|crew|community|volunteers|fans))\b"
-    r"|\s{1,3}by\s{1,3}(?:removing|pulling|funding|planting|recycling|collecting|cleaning|"
-    r"restoring|protecting)\b"
+    # the phrase ends its SENTENCE (a ";" or ":" does not end it: the clause after
+    # one is judged like the clause after a comma)
+    r"\s{0,3}(?:[.!?)\]\"'”’]|$)"
+    # ...or runs straight on into a closed CSR continuation
+    r"|\s{1,3}" + _ENV_CSR_TAILS +
+    # ...or a comma / semicolon / colon, then an ALLOWLISTED continuation. D-051
+    # round 2 (F3-R3, r143-claims-4): round 1 made the bare continuation an
+    # allowlist but left the comma branch a refuse-list, so it refused its own
+    # ", one case at a time" and let ", helping you unwind", ", so you can relax",
+    # ", perfect for evenings" through; and ";" / ":" were never checked at all.
+    r"|\s{0,3}[,;:]\s{0,3}(?:" + _ENV_CSR_TAILS
+    + r"|(?:" + _ENV_CSR_PARTICIPLES + r"|" + _ENV_NEW_CLAUSE + r")" + _ENV_NO_PERSON_TO_END + r")"
     r")"
 )
 _CLEAN_ENVIRONMENT_RES = (

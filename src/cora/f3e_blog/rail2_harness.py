@@ -188,6 +188,21 @@ CLAIMS_HOLE_PROBES: dict[str, tuple[str, ...]] = {
         "F3 Mood supports a clean environment for your mind.",
         "F3 Mood supports a clean environment, for your mind.",
         "F3 Energy builds a cleaner world with every sip.",
+        # D-051 round 2 (r143-claims-4 PARTIAL): the comma branch stayed a refuse-list
+        # and ";" / ":" were never checked, so a participle / "so" / adjective tail
+        # still cleared a product metaphor (legacy TRIP / round-1 PASS)
+        "F3 Mood supports a clean environment, helping you unwind.",
+        "F3 Mood restores a clean environment, so you can relax.",
+        "F3 Mood builds a clean environment, letting your mind settle.",
+        "F3 Energy builds a cleaner world, so your workout hits harder.",
+        "F3 Mood supports a clean environment, perfect for evenings.",
+        "F3 Mood supports a clean environment, keeping your mind calm.",
+        "F3 Mood restores a clean environment, sip after sip.",
+        "F3 Energy builds a cleaner world, bottled.",
+        "F3 Mood supports a clean environment: helping you unwind.",
+        "F3 Mood supports a clean environment; your mind will thank you.",
+        "F3 Energy builds a cleaner world, removing your stress.",
+        "F3 Mood supports a clean environment, and we keep your mind calm.",
         # D-051 r143-claims-6: the noun form after a copula, and a compound whose
         # first half is the clean-up object (these passed BOTH rails)
         "F3 Energy is the community clean-up crew for your afternoon slump.",
@@ -275,6 +290,9 @@ RELEASE_PROBES: tuple[str, ...] = (
     "F3 Energy uses exclusively natural caffeine from green tea.",
     "F3 Energy: your daily natural caffeine from green tea.",
     "F3 Energy changes the way natural caffeine from green tea hits.",
+    # F3-R3: the comma branch refused its own allowlisted CSR continuation
+    "F3 Energy funds a cleaner planet, one case at a time.",
+    "F3 Energy helps build a cleaner planet, one can at a time.",
 )
 
 # ── reported, never gated: needs a Harrison ruling ──────────────────────────────

@@ -1322,3 +1322,104 @@ class TestRound2PhraseQuantities:
             return _best_of_3(lambda: pf.rail2_attribution_hit(text))
         base, dbl = run(1500), run(3000)
         assert dbl < base * 2.6 + 0.05, "superlinear: %.4fs -> %.4fs" % (base, dbl)
+
+
+class TestRound2EnvironmentalPunctuation:
+    """F3-R3 + r143-claims-4 PARTIAL: round 1 made the bare continuation an allowlist
+    but kept the COMMA branch a refuse-list, so it refused its own ", one case at a
+    time" (natural CleanHub copy re-tripped) and let every participle / "so" /
+    adjective metaphor tail through; ";" and ":" ended the clause unchecked. Now the
+    punctuation branch takes only the CSR allowlist, a CSR participle, or a
+    third-party clause -- the last two with no "you"/"your" to the sentence end."""
+
+    RELEASED = (
+        "F3 Energy funds a cleaner planet, one case at a time.",
+        "F3 Energy helps build a cleaner planet, one can at a time.",
+        "F3 Energy funds a cleaner planet, with every case sold.",
+        "F3 Energy funds a cleaner planet, through CleanHub.",
+        "F3 Energy funds cleaner oceans, by removing plastic.",
+        "F3 Energy helps clean up the beaches, every spring.",
+        "F3 Energy funds a cleaner planet; fans love it.",
+        "F3 Energy funds a cleaner planet: every case sold plants a tree.",
+        "F3 Energy funds a cleaner planet, and our volunteers log every pound.",
+        "F3 Energy volunteers helped clean up the beach, pulling 400 pounds of trash.",   # pinned
+        "F3 Energy funds a cleaner planet, and fans love it.",                            # pinned
+    )
+    MUST_TRIP = (
+        "F3 Mood supports a clean environment, helping you unwind.",
+        "F3 Mood restores a clean environment, so you can relax.",
+        "F3 Mood builds a clean environment, letting your mind settle.",
+        "F3 Energy builds a cleaner world, so your workout hits harder.",
+        "F3 Mood supports a clean environment, perfect for evenings.",
+        "F3 Mood supports a clean environment, keeping your mind calm.",
+        "F3 Mood restores a clean environment, sip after sip.",
+        "F3 Energy builds a cleaner world, bottled.",
+        "F3 Mood supports a clean environment: helping you unwind.",
+        "F3 Mood supports a clean environment; your mind will thank you.",
+        "F3 Energy builds a cleaner world, removing your stress.",
+        "F3 Mood supports a clean environment, and we keep your mind calm.",
+        "F3 Energy builds a cleaner world, one sip at a time.",          # the reason "one" was refused
+        "F3 Mood supports a clean environment, for your mind.",          # pinned
+        "F3 Mood supports a clean environment, and your mind.",          # pinned
+    )
+
+    @pytest.mark.parametrize("sentence", RELEASED)
+    def test_a_csr_continuation_after_punctuation_is_released(self, sentence):
+        assert pf.rail2_attribution_hit(sentence) is None, sentence
+        r = _pf(sentence)
+        assert r.passed, r.render()
+
+    @pytest.mark.parametrize("sentence", MUST_TRIP)
+    def test_a_metaphor_tail_after_punctuation_trips(self, sentence):
+        assert pf.rail2_attribution_hit(sentence) is not None, sentence
+        assert "R2" in _pf(sentence).tripped_rail_ids, sentence
+        assert pf.rail2_legacy_hit(sentence) is not None
+
+    def test_the_metaphor_tails_are_in_the_gate(self):
+        probes = rh.CLAIMS_HOLE_PROBES["clean_natural_on_energy_mood"]
+        for s in self.MUST_TRIP[:12]:
+            assert s in probes, s
+
+    def test_the_f3_r3_rows_are_release_probes(self):
+        for s in self.RELEASED[:2]:
+            assert s in rh.RELEASE_PROBES, s
+
+    def test_the_title_field_is_covered(self):
+        r = pf.run_preflight(title="F3 Mood Supports A Clean Environment, Helping You Unwind",
+                             summary="", body_html="<p>x</p>")
+        assert "R2" in r.tripped_rail_ids
+
+    def test_the_person_guard_is_bounded_and_fails_closed(self):
+        """A continuation whose sentence runs past the 300-character window is not
+        cleared (fail closed), and a second person anywhere inside it blocks it."""
+        long_tail = "F3 Energy funds a cleaner planet, and fans " + "cheer " * 60 + "on."
+        assert pf.rail2_attribution_hit(long_tail) is not None
+        near = "F3 Energy funds a cleaner planet, and fans cheer as you arrive."
+        assert pf.rail2_attribution_hit(near) is not None
+        assert pf.rail2_attribution_hit("F3 Energy funds a cleaner planet, and fans cheer on.") is None
+
+    DEGENERATE = (
+        "fund a clean planet, and fans " * 1400,
+        "fund a clean planet; " * 1900,
+        "fund a clean planet, pulling " + "x" * 40000,
+        "fund a clean planet, and fans " + " " * 40000,
+        "fund a clean planet," + "y" * 40000,
+        "clean up the beach, pulling " * 1400,
+        "fund a clean planet, one case at a time, " * 950,
+        "fund a clean planet: " + "you " * 10000,
+    )
+
+    @pytest.mark.parametrize("text", DEGENERATE, ids=range(len(DEGENERATE)))
+    def test_d171_the_punctuation_branch_is_fast_at_40k(self, text):
+        for pat in pf._CLEAN_ENVIRONMENT_RES:
+            dt = _best_of_3(lambda: pat.sub(" ", text))
+            assert dt < 0.2, "%s on %r...: %.3fs" % (pat.pattern[:30], text[:20], dt)
+
+    @pytest.mark.parametrize("unit", ["fund a clean planet, and fans ", "fund a clean planet; ",
+                                      "clean up the beach, pulling ", "fund a clean planet, one case at a time, "])
+    def test_d171_the_punctuation_branch_scales_linearly(self, unit):
+        def run(n):
+            text = "F3 Energy " + unit * n + "clean."
+            return _best_of_3(lambda: pf.rail2_attribution_hit(text))
+        base, dbl = run(1200), run(2400)
+        assert dbl < base * 2.6 + 0.05, "superlinear: %.4fs -> %.4fs" % (base, dbl)
