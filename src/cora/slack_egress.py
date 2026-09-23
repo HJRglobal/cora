@@ -266,15 +266,59 @@ PHANTOM_LOG_KEY = "phantom-write-claim"
 #   live          "is now live" / "it's live"
 #   perfect       "has now been staged" / "is just created" (completion adverb req.)
 #   your          "your calendar is updated" / "your note is now queued"
-# with a HABITUAL bail ("is updated weekly / every Monday / by Justin / in QBO").
+# with a HABITUAL / STATE bail ("is updated weekly / every Monday / by Justin / in
+# QBO / with the IRS / behind the payroll run / until October").
 # Measured on the five verbatim incident replies (Slack DM D0B4CTD3B09, read
 # 2026-09-23): the four 9/20-9/21 replies read ZERO, the 9/15 phantom reads ONE.
-# Every pattern is a bounded literal alternation (D-171: re-timed at 40k).
+#
+# Code #14 D-051 remediation (honesty-rails-1/2/4/8, integration-tests-1,
+# redos-slack-surfaces-1):
+#   * NO ECHO MASK. The first cut blanked every reply run sharing a token trigram
+#     with the user's words, which silenced the rail's own incident shapes ("Is the
+#     kickoff prompt staged?" -> "Kickoff prompt staged (draft): ..."; "are all three
+#     locked in?" -> "All three locked in:") and, because it blanked to WHITESPACE,
+#     rebuilt the space runs format_reply had collapsed (the quantifier lookahead
+#     was quadratic on them). The grammar now runs on the UNMASKED reply; a hit is
+#     suppressed ONLY when its own span lies entirely inside a QUOTED span ("..." /
+#     curly quotes / backticks) whose inner text the user typed and that carries >= 3
+#     non-id tokens. A first-person claim is NEVER suppressed; a bare id span is
+#     never an echo. Nothing is blanked, so no offset / whitespace artefacts.
+#   * RECALL: a sentence may open with an emoji / :shortcode: or an interjection
+#     ("Got it -- staged.", "Okay, created the task", "✅ Staged cq-..."); 'initial'
+#     also stops on end-of-text / emoji / dash, takes a coordinated lead participle
+#     ("Approved and staged."), and a SHORT for/with/from object that ends the
+#     sentence ("Queued for your review.", "Staged for Monday's menu."); 'pronoun'
+#     takes "it's been" / "they've been"; a short receipt line ends on '.' / emoji
+#     ("Prompt staged.", "Task created ✅"); a sentence-initial "All staged." counts.
+#   * PRECISION: object words end on a word boundary ("Staged items appear ..." no
+#     longer reads 'it'); a digit object must be a COUNT ("Staged 3 prompts"), never
+#     a date ("Updated 9/12:", "Filed 4/15/2025"); receipt skips metadata heads
+#     (last / date / originally / recently / first / when), 'team' / 'what' and a
+#     capitalized proper-name subject ("Tasks Justin created:").
+#   * D-171: every whitespace run that precedes a literal is POSSESSIVE, and the
+#     quantifier continuation reads `(?<=[ \t])and` after an atomic space run (the
+#     old `[ \t]*` + `\s+and` pair was O(n^2) -- 7 s at 40k). Re-timed at 40k.
 _WC_V = r"(?P<v>staged|queued|locked\s+in|canonicali[sz]ed|filed|created|updated|deleted)"
+_WC_V2 = r"(?P<v2>staged|queued|locked\s+in|canonicali[sz]ed|filed|created|updated|deleted)"
 _WC_A = r"['’]"
-_WC_NOT_HAB = (r"(?!\s+(?:weekly|daily|monthly|nightly|hourly|every|each|automatically|"
-               r"regularly|whenever|when|by|under|on|in|at|from|for|as|per)\b)")
-_WC_START = r"(?:^|(?<=[.!?]\s))[ \t]*(?:[-*•][ \t]+)?\*?"
+_WC_NOT_HAB = (r"(?!\s++(?:weekly|daily|monthly|nightly|hourly|every|each|automatically|"
+               r"regularly|whenever|when|by|under|on|in|at|from|for|as|per|with|behind|until)\b)")
+# A pictograph (✅ ✔ ☑ 👍 🎉 ...) with an optional variation selector, or a Slack
+# :shortcode:. Bounded single-char class; never a run.
+_WC_EMOJI = r"(?:[☀-➿⬀-⯿\U0001F000-\U0001FAFF]️?)"
+_WC_MARK = r"(?:" + _WC_EMOJI + r"|:[a-z0-9_+-]{1,30}:)"
+_WC_INTERJ = (r"(?:got\s++it|okay|ok|yep|yes|yeah|yup|sure(?:\s++thing)?|alright|all\s++right|perfect|"
+              r"great|roger(?:\s++that)?|on\s++it|sounds\s++good|will\s++do|no\s++problem|absolutely|"
+              r"noted|understood)")
+_WC_SEP = r"[ \t]*+(?:[,!.:;]|-{1,2}|[—–])[ \t]*+"
+_WC_START = (r"(?:^|(?<=[.!?]\s))[ \t]*+(?:[-*•][ \t]++)?(?:" + _WC_MARK + r"[ \t]*+){0,3}\*?"
+             r"(?:" + _WC_INTERJ + _WC_SEP + r"\*?)?")
+# A number after a sentence-initial participle is a COUNT only when a word follows
+# that is neither a month nor a time unit ("Updated 2 hours ago" is a timestamp).
+_WC_COUNT = (r"\d{1,3}[ \t]++(?!(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b"
+             r"|(?:sec|second|min|minute|hour|hr|day|week|wk|month|year|yr)s?\b)[a-z]")
+_WC_OBJ = (r"(?:(?:the|a|an|it|them|this|that|these|those|all|both|each|every|your|my|its|their|to|into)\b"
+           r"|cq-|dw-|[`*_]|" + _WC_COUNT + r")")
 _WRITE_CLAIM_FORMS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     (label, re.compile(rx, re.IGNORECASE | re.MULTILINE)) for label, rx in (
         ("first_person",
@@ -285,18 +329,21 @@ _WRITE_CLAIM_FORMS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
          r"everything|all\s+of\s+them|all\s+(?:two|three|four|five|six|seven|eight|nine|ten|\d{1,2}))"
          r"\s+" + _WC_V + r"\b"),
         ("done",
-         _WC_START + r"(?P<v>done|all\s+set)\*?[ \t]*(?:[.!,:;—–]|-{1,2}(?=\s))"),
+         _WC_START + r"(?P<v>done|all\s++set)\*?[ \t]*+(?:[.!,:;—–]|-{1,2}(?=\s)|\Z|" + _WC_EMOJI + r")"),
         ("initial",
-         _WC_START + _WC_V + r"\*?(?:[ \t]*[.!:(]|[ \t]+(?:the|a|an|it|them|this|that|these|those|"
-         r"all|both|each|every|your|my|its|their|to|into|cq-|dw-|\d|[`*_]))"),
+         _WC_START + r"(?:[a-z]{2,20}ed[ \t]++(?:and|&)[ \t]++)?" + _WC_V + r"\*?(?:"
+         r"[ \t]*+(?:[.!:(]|\Z|" + _WC_EMOJI + r"|[—–]|-{1,2}(?=\s))"
+         r"|[ \t]++" + _WC_OBJ
+         + r"|[ \t]++(?:for|with|from)[ \t]++(?:[\w'’&-]++[ \t]*+){1,4}?(?:[.!]|\Z|" + _WC_EMOJI + r"))"),
         ("pronoun",
-         r"\b(?:it|that|this|they|those|these|everything)(?:\s*" + _WC_A + r"(?:s|re)|\s+(?:is|are|"
-         r"has\s+been|have\s+been))(?:\s+(?:now|just|all|successfully|officially))?\s+" + _WC_V
-         + r"\b" + _WC_NOT_HAB),
+         r"\b(?:it|that|this|they|those|these|everything)(?:\s*+" + _WC_A + r"(?:s|ve)\s++been|\s*+"
+         + _WC_A + r"(?:s|re)|\s++(?:is|are|has\s++been|have\s++been))"
+         r"(?:\s++(?:now|just|all|successfully|officially))?\s++" + _WC_V + r"\b" + _WC_NOT_HAB),
         ("quantifier",
-         r"\b(?:both|each\s+one|all\s+(?:two|three|four|five|six|seven|eight|nine|ten|\d{1,2}|of\s+them))"
-         r"(?:\s+(?:are|have\s+been|got))?(?:\s+(?:now|just|successfully))?\s+" + _WC_V
-         + r"(?=[ \t]*(?:[.!,:;)—–]|$|\s+and\b|\s-))"),
+         r"\b(?:both|each\s++one|all\s++(?:two|three|four|five|six|seven|eight|nine|ten|\d{1,2}|of\s++them))"
+         r"(?:\s++(?:are|have\s++been|got))?(?:\s++(?:now|just|successfully))?\s++" + _WC_V
+         + r"(?=[ \t]*+(?:[.!,:;)—–]|$|" + _WC_EMOJI + r"|(?<=[ \t])and\b|(?<=[ \t])-))"
+         r"|" + _WC_START + r"all\s++" + _WC_V2 + r"(?=[ \t]*+(?:[.!,:;]|\Z|" + _WC_EMOJI + r"))"),
         ("arrow", r"(?:→|->|=>)[ \t]*(?:[\w'-]+[ \t]+){0,3}" + _WC_V + r"\b"),
         ("live",
          r"\b(?:is|are)\s+now\s+(?P<v>live)\b|\b(?:it|that|this)(?:\s*" + _WC_A + r"s|\s+is)\s+"
@@ -310,89 +357,131 @@ _WRITE_CLAIM_FORMS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("your",
          r"\byour\s+(?:[\w-]+\s+){0,2}(?:is|are)\s+(?:now\s+|all\s+)?" + _WC_V + r"\b" + _WC_NOT_HAB),
     ))
+#: Forms whose subject is the bot itself -- NEVER suppressed as an echo.
+_WC_FIRST_PERSON_FORMS = frozenset({"first_person", "first_obj"})
 # The receipt form needs a word-level check a regex cannot express cheaply: the
 # token right before the participle must not be a 2nd/3rd-person subject ("the
-# prompts you've staged (see above)" describes Harrison's action, not Cora's).
+# prompts you've staged (see above)" describes Harrison's action, not Cora's), a
+# metadata head ("Last updated:", "Date created:") or a proper name ("Tasks Justin
+# created:"). The `short` group is a receipt SENTENCE of <= 2 tokens at the start
+# of a line that ends on '.' / '!' / an emoji ("Prompt staged.", "Task created ✅").
 _WC_RECEIPT_RE = re.compile(
-    r"^[ \t]*(?:[-*•][ \t]+)?(?::[a-z0-9_+-]{1,30}:[ \t]+)?\*?(?P<np>(?:[\w`'*-]+[ \t]+){1,4})"
-    + _WC_V + r"\*?[ \t]*[(:]",
+    r"^[ \t]*+(?:[-*•][ \t]++)?(?:" + _WC_MARK + r"[ \t]*+){0,3}\*?(?P<np>(?:[\w`'*-]++[ \t]++){1,4})"
+    + _WC_V + r"\*?(?:[ \t]*+(?:[(:]|" + _WC_EMOJI + r")|[ \t]++for[ \t]++(?:cq|dw)-[0-9a-f]{12}\b"
+    r"|(?P<short>[ \t]*+(?:(?:[.!]|" + _WC_MARK + r"){1,3}(?=\s)|(?:[.!]|" + _WC_MARK
+    + r"){0,3}[ \t]*+$)))",
     re.IGNORECASE | re.MULTILINE)
 _WC_RECEIPT_NOT_SUBJECT = frozenset({
     "you", "you've", "youve", "you'd", "you're", "they", "they've", "theyve", "we", "we've",
     "he", "she", "harrison", "has", "have", "had", "was", "were", "be", "been", "is", "are",
-    "not", "never", "i", "i've", "ive"})
+    "not", "never", "i", "i've", "ive",
+    # Code #14 D-051 (honesty-rails-8): metadata heads and non-bot subjects.
+    "last", "date", "originally", "recently", "first", "when", "team", "what", "who", "which",
+    "everyone", "someone", "anyone", "nobody", "nothing", "none", "people", "staff"})
+# A capitalized, non-initial last token is a proper-name SUBJECT ("Tasks Justin
+# created:") unless it is one of the receipt nouns a title-cased receipt uses.
+_WC_RECEIPT_NOUNS = frozenset({
+    "prompt", "prompts", "task", "tasks", "draft", "drafts", "note", "notes", "card", "cards", "deal",
+    "deals", "item", "items", "session", "sessions", "invoice", "invoices", "receipt", "receipts",
+    "event", "events", "entry", "entries", "ticket", "tickets", "job", "jobs", "file", "files", "doc",
+    "docs", "document", "documents", "row", "rows", "brief", "report", "page", "post", "email",
+    "emails", "message", "messages", "reminder", "reminders", "calendar", "meeting", "meetings",
+    "kickoff", "record", "records", "sheet", "list", "folder", "project", "projects", "contact",
+    "contacts", "order", "orders", "comment", "comments", "subtask", "subtasks", "category",
+    "categories", "template", "request", "requests"})
 _WC_TOKEN_RE = re.compile(r"[A-Za-z0-9'’]+")
-_WC_FIRST_PERSON_BEFORE = re.compile(r"\bI(?:\s+have|\s*['’]ve)?(?:\s+just)?\s*\Z", re.IGNORECASE)
+_WC_ID_TOKEN_RE = re.compile(r"\b(?:cq|dw)-[0-9a-f]{12}\b", re.IGNORECASE)
 _WC_QUOTED_RE = re.compile(r"\"([^\"\n]{3,200})\"|“([^”\n]{3,200})”|`([^`\n]{3,200})`")
 _WC_ECHO_MAX_CHARS = 8000
+_WC_ECHO_MIN_TOKENS = 3
 
 
-def _mask_user_echo(text: str, user_texts: Any) -> str:
-    """Blank (same length, offsets kept) every run of >= 3 reply tokens that also
-    occurs as a token trigram in the user's own words (this message + the last few
-    user turns), and any quoted span whose content the user wrote. An explicit
-    first-person claim is NEVER masked ("Yes, I created that category" still
-    counts even when the user said "created that category"). Linear: token lists
-    and a trigram set, no regex backtracking."""
-    joined = " ".join(str(u or "") for u in (user_texts or ()) if u)[:_WC_ECHO_MAX_CHARS]
-    if not joined.strip():
-        return text
-    user_norm = html.unescape(joined).lower().replace("’", "'")
-    user_toks = [m.group(0) for m in _WC_TOKEN_RE.finditer(user_norm)]
-    grams = {tuple(user_toks[i:i + 3]) for i in range(len(user_toks) - 2)}
-    chars = list(text)
-    toks = [(m.start(), m.end(), m.group(0).lower().replace("’", "'"))
-            for m in _WC_TOKEN_RE.finditer(text)]
-    marked = [False] * len(toks)
-    for i in range(len(toks) - 2):
-        if (toks[i][2], toks[i + 1][2], toks[i + 2][2]) in grams:
-            marked[i] = marked[i + 1] = marked[i + 2] = True
-    i = 0
-    while i < len(toks):
-        if not marked[i]:
-            i += 1
-            continue
-        j = i
-        while j + 1 < len(toks) and marked[j + 1]:
-            j += 1
-        if not _WC_FIRST_PERSON_BEFORE.search(text[max(0, toks[i][0] - 16):toks[i][0]]):
-            for k in range(toks[i][0], toks[j][1]):
-                chars[k] = " "
-        i = j + 1
+def _echo_norm(s: str) -> str:
+    return " ".join(html.unescape(str(s or "")).lower().replace("’", "'").split())
+
+
+def _user_quote_spans(text: str, user_texts: Any) -> list[tuple[int, int]]:
+    """(start, end) of every QUOTED span in *text* ("..." / curly / backticks) whose
+    inner text the user typed (this message + the last few user turns) and which
+    carries >= 3 tokens once cq-/dw- ids are removed -- a bare id is never an echo.
+    Offsets are the INNER text (quote marks excluded). Linear: one bounded regex
+    pass plus substring checks against a capped user string."""
+    joined = _echo_norm(" ".join(str(u or "") for u in (user_texts or ()) if u)[:_WC_ECHO_MAX_CHARS])
+    if not joined:
+        return []
+    spans: list[tuple[int, int]] = []
     for m in _WC_QUOTED_RE.finditer(text):
-        inner = next(g for g in m.groups() if g is not None)
-        if inner.strip() and inner.lower().replace("’", "'") in user_norm:
-            for k in range(m.start(), m.end()):
-                chars[k] = " "
-    return "".join(chars)
+        gi = next(i for i, g in enumerate(m.groups(), start=1) if g is not None)
+        inner = m.group(gi)
+        if len(_WC_TOKEN_RE.findall(_WC_ID_TOKEN_RE.sub(" ", inner))) < _WC_ECHO_MIN_TOKENS:
+            continue
+        norm = _echo_norm(inner)
+        if norm and norm in joined:
+            spans.append((m.start(gi), m.end(gi)))
+    return spans
 
 
-def _find_write_claim_span(text: str) -> tuple[int, int, str, str] | None:
-    """(start, end, verb, form) of the FIRST completion claim in *text*, else None."""
+def _receipt_subject_ok(m: re.Match) -> bool:
+    np_toks = m.group("np").split()
+    if not np_toks:
+        return False
+    if m.group("short") is not None and len(np_toks) > 2:
+        return False
+    raw_last = np_toks[-1].strip("`*'")
+    last = raw_last.lower().replace("’", "'")
+    if last in _WC_RECEIPT_NOT_SUBJECT:
+        return False
+    if len(np_toks) >= 2 and raw_last[:1].isupper() and last not in _WC_RECEIPT_NOUNS:
+        return False   # a proper-name subject ("Tasks Justin created:")
+    if (m.group("short") is not None and len(np_toks) == 1 and raw_last[:1].isupper()
+            and last not in _WC_RECEIPT_NOUNS):
+        return False   # "Justin created." describes a teammate, "Prompt staged." is a receipt
+    return True
+
+
+def _verb_of(m: re.Match) -> str:
+    return next((g for g in (m.groupdict().get(k) for k in ("v", "v2", "v3")) if g), m.group(0))
+
+
+def _inside(spans: list[tuple[int, int]], start: int, end: int) -> bool:
+    return any(qs <= start and end <= qe for qs, qe in spans)
+
+
+def _find_write_claim_span(text: str, user_texts: Any = (),
+                           spans: list[tuple[int, int]] | None = None) -> tuple[int, int, str, str] | None:
+    """(start, end, verb, form) of the FIRST completion claim in *text*, else None.
+
+    A hit whose span lies entirely inside a user-typed quoted span (``spans``, or
+    computed from ``user_texts``) is skipped unless it is first-person."""
+    if spans is None:
+        spans = _user_quote_spans(text, user_texts) if user_texts else []
     best: tuple[int, int, str, str] | None = None
     for label, rx in _WRITE_CLAIM_FORMS:
-        m = rx.search(text)
-        if m is None:
-            continue
-        verb = next((g for g in (m.groupdict().get(k) for k in ("v", "v2", "v3")) if g), m.group(0))
-        if best is None or m.start() < best[0]:
-            best = (m.start(), m.end(), verb, label)
+        for m in rx.finditer(text):
+            if best is not None and m.start() >= best[0]:
+                break
+            if spans and label not in _WC_FIRST_PERSON_FORMS and _inside(spans, m.start(), m.end()):
+                continue
+            best = (m.start(), m.end(), _verb_of(m), label)
+            break
     for m in _WC_RECEIPT_RE.finditer(text):
-        np_toks = m.group("np").split()
-        last = np_toks[-1].strip("`*'").lower().replace("’", "'") if np_toks else ""
-        if last in _WC_RECEIPT_NOT_SUBJECT:
+        if best is not None and m.start() >= best[0]:
+            break
+        if not _receipt_subject_ok(m):
             continue
-        if best is None or m.start() < best[0]:
-            best = (m.start(), m.end(), m.group("v"), "receipt")
+        if spans and _inside(spans, m.start(), m.end()):
+            continue
+        best = (m.start(), m.end(), m.group("v"), "receipt")
         break
     if best is None:
         return None
     return best[0], best[1], " ".join(best[2].split()).lower(), best[3]
 
 
-def _find_write_claim(text: str) -> tuple[str, str] | None:
-    """(verb, form) of the FIRST completion claim in *text*, else None."""
-    hit = _find_write_claim_span(text)
+def _find_write_claim(text: str, user_texts: Any = ()) -> tuple[str, str] | None:
+    """(verb, form) of the FIRST completion claim in *text* that is not a quoted
+    echo of the user's own words, else None."""
+    hit = _find_write_claim_span(text, user_texts)
     return (hit[2], hit[3]) if hit else None
 
 
@@ -619,10 +708,11 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
     a ledger that cannot be read skips ITS id family with a WARNING rather than
     redacting real ids (fail-open on the reference set, never on the claim).
 
-    R14-9(b): the lexicon half reads COMPLETION grammar only (_find_write_claim),
-    over the reply with the user's own words masked (``user_text`` + up to six
-    ``prior_user_texts``; _mask_user_echo). The WARN names the VERB and the form
-    label, never the matched words (an arrow / possessive form can carry up to
+    R14-9(b): the lexicon half reads COMPLETION grammar only (_find_write_claim)
+    over the UNMASKED reply; a non-first-person hit lying entirely inside a quoted
+    span the user typed (``user_text`` + up to six ``prior_user_texts``;
+    _user_quote_spans) is an echo and is skipped. The WARN names the VERB and the
+    form label, never the matched words (an arrow / possessive form can carry up to
     three words before the verb, which in a LEX channel could be a name, D-145).
 
     S3: every firing line also appends ONE row to PHANTOM_CLAIMS_LEDGER (the
@@ -673,15 +763,17 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
         masked = _LINK_TOKEN_RE.sub(" ", out)
         users = [u for u in [user_text, *list(prior_user_texts or ())[-6:]]
                  if isinstance(u, str) and u]
+        spans: list[tuple[int, int]] = []
         if users:
             try:
-                masked = _mask_user_echo(masked, users)
-            except Exception:  # noqa: BLE001 -- a mask failure never hides a claim
-                log.warning("%s echo mask failed -- screening the unmasked reply",
+                spans = _user_quote_spans(masked, users)
+            except Exception:  # noqa: BLE001 -- an echo-rule failure never hides a claim
+                log.warning("%s echo rule failed -- screening with no echo exemption",
                             PHANTOM_LOG_KEY, exc_info=True)
-        hit = _find_write_claim(masked)
+                spans = []
+        hit = _find_write_claim_span(masked, spans=spans)
         if hit:
-            verb, form = hit
+            verb, form = hit[2], hit[3]
             ref = _record_rail_hit(rail=PHANTOM_LOG_KEY, kind="lexicon", phrase=verb, text=text,
                                    locate=_locate_write_claim, mode=mode,
                                    channel_name=channel_name, user_id=user_id,

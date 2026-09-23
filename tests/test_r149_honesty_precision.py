@@ -219,32 +219,90 @@ class TestCompletionGrammar:
         "aaaa " * 8000, "\n".join(["a b c d"] * 8000), " " * 40000 + "staged:", "-" * 40000,
     ], ids=["I_have", "all", "arrow", "bullets", "it", "done", "ive", "your", "has", "receipt",
             "words", "lines", "spaces", "dashes"])
-    def test_grammar_and_mask_are_linear(self, shape):
+    def test_grammar_and_echo_rule_are_linear(self, shape):
+        assert _best_of_3(lambda: se._find_write_claim(shape, [shape[:8000]])) < 0.5
+
+
+def _best_of_3(fn) -> float:
+    """D-171: a single run flakes under host load; the bound reads the best of 3."""
+    runs = []
+    for _ in range(3):
         t0 = time.perf_counter()
-        se._find_write_claim(shape)
-        se._mask_user_echo(shape, [shape[:8000]])
-        assert time.perf_counter() - t0 < 0.5
+        fn()
+        runs.append(time.perf_counter() - t0)
+    return min(runs)
 
 
 class TestUserEcho:
+    """Code #14 D-051 (honesty-rails-1/2): the echo rule is QUOTED-SPAN containment,
+    never trigram overlap -- the trigram mask silenced the rail's own incident shapes."""
+
     def test_words_quoted_from_the_user_do_not_count(self):
         reply = "Got it -- you want me to queue it into a staged Cowork session?"
-        assert se._find_write_claim(se._mask_user_echo(reply, [USER_0920])) is None
+        assert se._find_write_claim(reply, [USER_0920]) is None
 
     def test_a_first_person_claim_is_never_masked(self):
         """9/21 14:51 (Hannah): 'You're the one that created that category?' -- a
         reply claiming Cora created it still counts at zero tool_use."""
-        masked = se._mask_user_echo("Yes, I created that category.",
-                                    ["You're the one that created that category?"])
-        assert se._find_write_claim(masked) == ("created", "first_person")
+        assert se._find_write_claim("Yes, I created that category.",
+                                    ["You're the one that created that category?"]) == ("created", "first_person")
+
+    def test_a_first_person_run_the_user_typed_still_counts(self):
+        """The old exemption looked only BEFORE the masked run, so a run that itself
+        began with 'I' was blanked (honesty-rails-1)."""
+        for user, reply in [("Did you say I created that category?", "Yes, I created that category."),
+                            ("make sure I created the task for Justin", "I created the task for Justin."),
+                            ("Can you check whether I staged it?", "You're right, I staged it this morning."),
+                            ("Did I stage it or did you? I staged it I think", "Yes -- I staged it.")]:
+            assert se._find_write_claim(reply, [user]) is not None, (user, reply)
+
+    def test_a_first_person_claim_inside_a_user_quote_still_counts(self):
+        assert se._find_write_claim('The line "I staged the kickoff for you" was not mine.',
+                                    ['Cowork said "I staged the kickoff for you" -- true?']) == ("staged", "first_person")
+
+    def test_a_non_first_person_claim_inside_a_user_typed_quote_is_an_echo(self):
+        user = 'Cowork says "Done. Staged it for Monday." -- did you?'
+        assert se._find_write_claim("Done. Staged it for Monday.") == ("done", "done")   # unquoted: a claim
+        assert se._find_write_claim('You pasted "Done. Staged it for Monday." from the Cowork log.', [user]) is None
+
+    def test_a_quote_the_user_did_not_type_is_not_an_echo(self):
+        assert se._find_write_claim('Cowork logged "Done. Staged it for Monday." an hour ago.',
+                                    ["what did cowork say?"]) == ("staged", "initial")
 
     def test_a_quoted_span_the_user_wrote_is_masked(self):
         quoted = '"Task created: Pay the invoice"'
-        # unmasked, a line-initial quoted receipt shape reads as a claim ...
+        # unquoted, a line-initial receipt shape reads as a claim ...
         assert se._find_write_claim(quoted.strip('"')) == ("created", "receipt")
         # ... but the same words quoted back from the user's own message do not
-        assert se._find_write_claim(se._mask_user_echo(
-            quoted, ["title it Task created: Pay the invoice"])) is None
+        assert se._find_write_claim(quoted, ["title it Task created: Pay the invoice"]) is None
+
+    @pytest.mark.parametrize("user,reply", [
+        ("can you stage cq-a24f9d2210fc please", "Staged `cq-a24f9d2210fc` for you."),
+        ("can you stage cq-a24f9d2210fc please", "Staged `cq-a24f9d2210fc` -- the kickoff lands shortly."),
+        ("can you stage cq-a24f9d2210fc please", "Queued `cq-a24f9d2210fc` for Monday's menu."),
+        (USER_0915, "Staged `cq-a24f9d2210fc` for you."),
+        ("earlier Cowork said: Staged cq-a24f9d2210fc. please confirm", "Staged cq-a24f9d2210fc."),
+    ], ids=["backtick-for-you", "backtick-dash", "queued-backtick", "0915-user", "prior-echo"])
+    def test_a_backticked_or_echoed_id_never_silences_the_claim(self, caplog, user, reply):
+        """honesty-rails-2: a bare id span is never an echo -- blanking it removed the
+        object 'initial' needs and silenced the D-316 phantom class."""
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        _write(reply, user_text=user)
+        assert len(_msgs(caplog, se.PHANTOM_LOG_KEY, "lexicon")) == 1
+
+    @pytest.mark.parametrize("user,reply,form", [
+        ("Is the kickoff prompt staged?", "Kickoff prompt staged (draft): G:\\x.md", "receipt"),
+        ("Is the code-session prompt staged?", "Code-session prompt staged (draft): G:\\x.md", "receipt"),
+        ("are all three locked in?", "All three locked in: A, B, C.", "quantifier"),
+        ("is my deal updated?", "Yes -- your deal is updated to Closed Won.", "your"),
+    ], ids=["kickoff", "code-session", "all-three", "your-deal"])
+    def test_a_question_echo_answer_still_fires(self, caplog, user, reply, form):
+        """honesty-rails-1: answering a status question in the question's own words
+        (the 9/15 receipt and 9/3 06:54 incident shapes) is a claim, not an echo."""
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        _write(reply, user_text=user)
+        hits = _msgs(caplog, se.PHANTOM_LOG_KEY, "lexicon")
+        assert len(hits) == 1 and f"form={form}" in hits[0]
 
     def test_prior_user_turns_count_too_and_slack_entities_decode(self, caplog):
         caplog.set_level(logging.WARNING, logger=se.__name__)
@@ -252,11 +310,123 @@ class TestUserEcho:
                user_text="why?", prior=["ship cq-&lt;STAGED id you are happy to close&gt; code-12-smoke"])
         assert _msgs(caplog, se.PHANTOM_LOG_KEY, "lexicon") == []
 
-    def test_a_mask_failure_screens_the_unmasked_reply(self, caplog, monkeypatch):
+    def test_a_prior_turn_quote_is_an_echo_too(self):
+        assert se._find_write_claim('You wrote "Done. Staged it for Monday." yesterday.',
+                                    ["unrelated", 'I said "Done. Staged it for Monday."']) is None
+
+    def test_an_echo_rule_failure_screens_with_no_exemption(self, caplog, monkeypatch):
         caplog.set_level(logging.WARNING, logger=se.__name__)
-        monkeypatch.setattr(se, "_mask_user_echo", lambda *a, **k: (_ for _ in ()).throw(ValueError()))
-        _write("I've staged it.", user_text="stage it")
-        assert len(_msgs(caplog, se.PHANTOM_LOG_KEY, "lexicon")) == 1
+        user = 'Cowork says "Done. Staged it for Monday." -- did you?'
+        reply = 'You pasted "Done. Staged it for Monday." from the Cowork log.'
+        _write(reply, user_text=user)
+        assert _msgs(caplog, se.PHANTOM_LOG_KEY, "lexicon") == []          # the rule exempts the echo
+        monkeypatch.setattr(se, "_user_quote_spans", lambda *a, **k: (_ for _ in ()).throw(ValueError()))
+        _write(reply, user_text=user)
+        assert len(_msgs(caplog, se.PHANTOM_LOG_KEY, "lexicon")) == 1       # a failure never hides a claim
+
+
+# \u2500\u2500 Code #14 D-051: completion-grammar recall + precision \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+MUST_FIRE_CODE14 = [
+    # honesty-rails-4
+    ("Staged \u2705", "initial"), ("Staged", "initial"), ("\u2705 Staged cq-a24f9d2210fc.", "initial"),
+    (":white_check_mark: Staged cq-a24f9d2210fc.", "initial"),
+    ("\u2705 Task created: Pay the invoice", "receipt"),
+    ("Staged \u2705 -- the kickoff lands in ~15 min.", "initial"),
+    ("Got it -- staged.", "initial"), ("Yep \u2014 staged.", "initial"),
+    ("Okay, created the task for Justin.", "initial"),
+    ("Sure thing \u2014 updated the deal to Closed Won.", "initial"),
+    ("Queued for your review.", "initial"), ("Staged for Monday's menu.", "initial"),
+    ("Updated with the new totals.", "initial"), ("Locked in for Thursday.", "initial"),
+    ("Prompt staged.", "receipt"), ("Deal updated.", "receipt"), ("Task created \u2705", "receipt"),
+    ("It's been staged.", "pronoun"), ("They've been created.", "pronoun"), ("All staged.", "quantifier"),
+    ("Done \u2705", "done"), ("All set \u2705", "done"),
+    # integration-tests-1
+    ("Approved and staged.", "initial"), ("Approved and staged -- the kickoff prompt is ready.", "initial"),
+    ("Queued for the next code session.", "initial"),
+    ("Kickoff prompt staged for cq-0123456789ab.", "receipt"),
+    ("Staged 3 prompts for review.", "initial"),
+]
+MUST_NOT_FIRE_CODE14 = [
+    # honesty-rails-8: descriptive metadata / timeline shapes
+    "Last updated: 2026-09-01 (per the Standing ACTUALS tab).", "*Last updated:* Sept 1",
+    "Date created: March 2025", "Originally filed: April 15, 2025", "Tasks Justin created:",
+    "Deals Tommy updated (last 7 days):", "Here's what the team created:",
+    "Source doc last updated (2026-08-30): the lease addendum",
+    "Timeline from the KB:\n\u2022 Filed 4/15/2025 -- IRS extension",
+    "- Updated 9/12: new pricing sheet (per Tommy)",
+    "Your extension is filed with the IRS until October 15.",
+    "They're queued behind the payroll run at the bank.",
+    # integration-tests-1 refuters: a follow word must END on a word boundary
+    "Staged items appear at the top of the Monday menu.", "Queued items older than 14 days are parked.",
+    "Updated totals are in the sheet.", "Updated allocations went to Justin.",
+    # the for/in precision the slice exists for
+    "Created in 2019, F3 Energy sells drinks.", "Updated in QBO nightly by the bank feed.",
+    "Filed for the 2025 tax year, the extension covers six months.",
+    "Updated 2 hours ago.", "Justin created.", "Nothing staged.", "Not all queued items are listed.",
+    "Are they all staged?",
+]
+
+
+class TestCompletionGrammarCode14:
+    @pytest.mark.parametrize("text,form", MUST_FIRE_CODE14)
+    def test_recall_shapes_fire_with_their_form(self, text, form):
+        hit = se._find_write_claim(text)
+        assert hit is not None and hit[1] == form, (text, hit)
+
+    @pytest.mark.parametrize("text", MUST_NOT_FIRE_CODE14)
+    def test_descriptive_metadata_and_timeline_shapes_never_fire(self, text):
+        assert se._find_write_claim(text) is None, (text, se._find_write_claim(text))
+
+    @pytest.mark.parametrize("user,reply,prior", DESCRIPTIVE_REPLIES, ids=["0920", "0844", "0845", "0846"])
+    def test_the_pinned_descriptive_replies_stay_silent_with_no_echo_rule_at_all(self, user, reply, prior):
+        """Dropping the trigram mask re-fires NONE of the 9/20-9/21 replies: their
+        silence is the grammar's, not a mask's."""
+        assert se._find_write_claim(se._LINK_TOKEN_RE.sub(" ", reply)) is None
+
+
+# D-171: every edited / added pattern at 40k, own tokens + whitespace runs +
+# near-miss prefixes; the bound reads the BEST OF 3 runs.
+_D171_SHAPES = {
+    "q_both_sp": "both staged" + " " * 40000 + "x", "q_both_tab": "both staged" + "\t" * 40000 + "x",
+    "q_both_mix": "both staged" + " \t" * 20000 + "x", "q_all3": "all three queued" + " " * 40000 + "x",
+    "q_each": "each one filed" + " " * 40000 + "x", "q_start": ". all staged" * 3000,
+    "init_sp": "Staged" + " " * 40000 + "x", "init_for": "Staged for" + " a" * 20000 + ",",
+    "init_approved": "Approved and " * 3000 + "x", "init_count": "Staged 1 " * 5000,
+    "init_marks": ":a: " * 10000 + "Staged x", "init_emoji": "\u2705 " * 20000 + "Staged x",
+    "interj": "Got it -- " * 4000, "okay": "okay, " * 6000, "done_sp": "done" + " " * 40000 + "x",
+    "pron_been": "it's been " * 4000, "pron_sp": "it" + " " * 40000 + "x",
+    "rec_lines": "\n".join(["Tasks Justin created:"] * 2000), "rec_x4": ("x " * 4 + "staged zz\n") * 3000,
+    "rec_short": "Prompt staged. " * 2500, "rec_for": "Prompt staged for " * 2200,
+    "quotes": '"Staged the kickoff for you" ' * 1400, "dq": '"' * 40000, "ticks": "`" * 40000,
+    "nl": "\n" * 40000, "dotsp": ". " * 20000,
+}
+
+
+class TestD171Code14:
+    @pytest.mark.parametrize("name", sorted(_D171_SHAPES))
+    def test_every_form_is_linear_at_40k(self, name):
+        shape = _D171_SHAPES[name]
+
+        def run():
+            for _label, rx in se._WRITE_CLAIM_FORMS:
+                list(rx.finditer(shape))
+            list(se._WC_RECEIPT_RE.finditer(shape))
+            se._find_write_claim(shape, [shape[:8000]])
+        assert _best_of_3(run) < 0.5
+
+    def test_the_quantifier_whitespace_run_is_no_longer_quadratic(self):
+        """redos-slack-surfaces-1: 'both staged' + 39k spaces took ~7 s."""
+        rx = dict(se._WRITE_CLAIM_FORMS)["quantifier"]
+        for ws in (" ", "\t", " \t"):
+            shape = "both staged" + ws * (40000 // len(ws)) + "zulu"
+            assert _best_of_3(lambda: rx.search(shape)) < 0.05
+
+    def test_end_to_end_a_reply_echoing_the_user_at_40k_is_linear(self):
+        from cora.reply_formatter import format_reply
+        user = "alpha bravo charlie delta echo foxtrot golf hotel"
+        reply = format_reply("Both staged " + (user + " ") * 700 + "zulu")
+        assert _best_of_3(lambda: se.screen_phantom_write_claims(
+            reply, tool_use_count=0, channel_name="dm", user_id=HARRISON, user_text=user)) < 0.5
 
     def test_app_passes_the_user_text_at_both_final_reply_sites(self):
         import inspect
