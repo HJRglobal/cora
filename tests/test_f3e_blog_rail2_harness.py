@@ -986,11 +986,12 @@ class TestPositivePureAttachment:
 
     def test_locative_disjunct_detector_needs_an_edge_of_an_or(self):
         w = pf._words(" the clean-sweetened version in F3 Pure.")
-        assert pf._pure_locative_disjunct(w, 1, 2, frozenset({"or"}), frozenset())
-        assert not pf._pure_locative_disjunct(w, 1, 3, frozenset({"or"}), frozenset({","}))   # an apposition
-        assert not pf._pure_locative_disjunct(w, 1, 2, frozenset({","}), frozenset())          # no disjunction
+        other = pf._words("Explore the full stack in F3 Energy")
+        assert pf._pure_locative_disjunct(w, 1, 2, frozenset({"or"}), frozenset(), other)
+        assert not pf._pure_locative_disjunct(w, 1, 3, frozenset({"or"}), frozenset({","}), other)   # an apposition
+        assert not pf._pure_locative_disjunct(w, 1, 2, frozenset({","}), frozenset(), other)          # no disjunction
         assert not pf._pure_locative_disjunct(pf._words(" the version in F3 Pure, all clean"),
-                                              1, 2, frozenset({"or"}), frozenset())           # clean outside the NP
+                                              1, 2, frozenset({"or"}), frozenset(), other)           # clean outside the NP
 
     def test_relation_detector(self):
         for s in ("as clean as F3 Pure", "and F3 Energy is too", "and so is F3 Energy", "as is F3 Energy",
@@ -1130,6 +1131,76 @@ class TestCrossSentenceReference:
         dt = _best_of_3(lambda: pf.rail2_attribution_hit("F3 Energy " + text + " clean.",
                                                          context_lines=frozenset({"MOOD"})))
         assert dt < 1.0, "%r...: %.3fs" % (text[:12], dt)
+
+
+class TestRemediationSelfReview:
+    """Holes found by adversarially probing THIS remediation's own new code (D-051
+    doctrine: a fix is a new surface). Each was legacy TRIP / shipping PASS on the
+    remediation's first cut."""
+
+    MUST_TRIP = (
+        # P2 accepted a PREDICATE disjunct (Energy/Mood the subject of the other side)
+        # and a verb-phrase disjunct sharing an Energy/Mood subject
+        "F3 Mood is calm or the natural pick of F3 Pure.",
+        "F3 Energy is the stack or the clean version in F3 Pure.",
+        "F3 Mood keeps you calm or delivers the natural calm of F3 Pure.",
+        # the environmental comma allowance let ", and <metaphor tail>" through
+        "F3 Mood supports a clean environment, and your mind.",
+        "F3 Mood supports a clean environment, and for your mind.",
+        # a COORDINATE adjective before a ruled phrase is a modifier, not a list item
+        "F3 Energy has real, natural caffeine from green tea.",
+    )
+    STILL_PASS = (
+        "Explore the full stack in F3 Energy or the clean-sweetened version in F3 Pure.",
+        "Explore the clean-sweetened version in F3 Pure or the full stack in F3 Energy.",
+        "Try the clean-sweetened version in F3 Pure or the full stack in F3 Energy.",
+        "Explore the full stack in F3 Energy, or the clean-sweetened version in F3 Pure.",
+        "F3 Energy funds a cleaner planet, and fans love it.",
+        "Same flavor, cleaner fuel: F3 Pure is F3 Energy with a cleaner fuel source.",
+        "F3 Energy has L-theanine, natural caffeine from green tea and a nootropic stack.",
+    )
+
+    @pytest.mark.parametrize("sentence", MUST_TRIP)
+    def test_the_self_review_holes_trip(self, sentence):
+        assert pf.rail2_legacy_hit(sentence) is not None
+        assert "R2" in _pf(sentence).tripped_rail_ids, sentence
+
+    def test_the_self_review_holes_are_in_the_gate(self):
+        for s in self.MUST_TRIP:
+            assert s in rh.CLAIMS_HOLE_PROBES["clean_natural_on_energy_mood"], s
+
+    @pytest.mark.parametrize("sentence", STILL_PASS)
+    def test_the_parallel_disjunct_and_plain_lists_still_clear(self, sentence):
+        r = _pf(sentence)
+        assert r.passed, r.render()
+
+    def test_the_other_disjunct_must_name_its_line_after_a_locative(self):
+        assert pf._brand_after_locative(pf._words("Explore the full stack in F3 Energy"), "ENERGY")
+        assert not pf._brand_after_locative(pf._words("F3 Energy is the stack"), "ENERGY")
+        assert not pf._brand_after_locative(pf._words("the stack"), "ENERGY")
+
+    DEGENERATE = (
+        "fund a clean planet , and " * 1500,
+        "fund a clean planet, and your " * 1300,
+        "fund a clean planet," + " " * 40000 + "and your",
+        "fund a clean planet,&" * 2000,
+        ", and " * 6600,
+    )
+
+    @pytest.mark.parametrize("text", DEGENERATE, ids=range(len(DEGENERATE)))
+    def test_d171_the_edited_comma_allowance_is_fast_at_40k(self, text):
+        for pat in pf._CLEAN_ENVIRONMENT_RES:
+            dt = _best_of_3(lambda: pat.sub(" ", text))
+            assert dt < 0.2, "%s on %r...: %.3fs" % (pat.pattern[:30], text[:20], dt)
+
+    @pytest.mark.parametrize("unit", [" or the clean version in F3 Pure", "real, natural caffeine from green tea ",
+                                      "fund a clean planet, and your "])
+    def test_d171_the_follow_up_scales_linearly(self, unit):
+        def run(n):
+            sent = "Explore the full stack in F3 Energy" + unit * n + " clean."
+            return _best_of_3(lambda: pf.rail2_attribution_hit(sent))
+        base, dbl = run(1500), run(3000)
+        assert dbl < base * 2.6 + 0.05, "superlinear: %.4fs -> %.4fs" % (base, dbl)
 
 
 class TestIdiomOverTripsAreFailClosed:

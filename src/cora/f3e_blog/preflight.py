@@ -550,8 +550,10 @@ _ENV_CONTINUATION_OK = (
     r"(?="
     # the phrase ends its clause
     r"\s{0,3}(?:[.;:!?)\]\"'”’]|$)"
-    # ...or a comma NOT followed by a second-person / metaphor / relative tail
-    r"|\s{0,3},(?!\s{0,3}(?:for|of|in|inside|within|into|to|at|on|one|your|my|that|which|where)\b)"
+    # ...or a comma NOT followed (directly or after "and") by a second-person /
+    # metaphor / relative tail: ", for your mind", ", and your mind"
+    r"|\s{0,3},(?!\s{0,3}(?:(?:and|&)\s{1,3})?"
+    r"(?:for|of|in|inside|within|into|to|at|on|one|you|your|my|that|which|where)\b)"
     r"|\s{1,3}with\s{1,3}(?:every|each)\s{1,3}(?:" + _ENV_PURCHASE_NOUNS
     + r"|(?:cans?|bottles?)\s{1,3}(?:sold|purchased|bought))\b"
     r"|\s{1,3}(?:every|each|this|next)\s{1,3}(?:" + _ENV_PURCHASE_NOUNS + r"|" + _ENV_TIME_NOUNS + r")\b"
@@ -767,10 +769,12 @@ def _phrase_is_modified(text: str, start: int, end: int) -> bool:
         gap = window[tok.end():cut].strip()
         if "%" in gap:
             return True   # "100 % natural caffeine ..."
-        if gap in ("&", "+"):
-            return _is_phrase_modifier(tok.group(0))   # "pure & natural ..."
+        if gap in ("&", "+", ","):
+            # "pure & natural ...", and a COORDINATE adjective, "real, natural ..."
+            # ("Same flavor, cleaner fuel" still clears: "flavor" modifies nothing)
+            return _is_phrase_modifier(tok.group(0))
         if gap:
-            return False  # punctuation between: a list item, not a modifier
+            return False  # other punctuation (":" / ";" / "("): not a modifier
         word = tok.group(0).lower().strip("'&/-")
         if word in _PHRASE_COORDINATORS:
             cut = tok.start()
@@ -953,17 +957,50 @@ def _pure_is_subject(words: list[str]) -> bool:
     return i < n and t[i] in _PURE_PREDICATE_VERBS
 
 
+def _brand_after_locative(words: list[str], line: str) -> bool:
+    """True when `line` is named in this clause only as the object of a locative
+    preposition ("... the full stack IN F3 Energy")."""
+    t = _lower_tokens(words)
+    target = line.lower()
+    seen = False
+    for k, w in enumerate(t):
+        if w != target or not ((k > 0 and t[k - 1] in ("f3", "f3's")) or _is_brandish(words[k])):
+            continue
+        j = k - 1
+        if j >= 0 and t[j] in ("f3", "f3's"):
+            j -= 1
+        if j < 0 or t[j] not in _P2_LOCATIVES:
+            return False
+        seen = True
+    return seen
+
+
 def _pure_locative_disjunct(words: list[str], idx: int, n_clauses: int,
-                            prev: frozenset[str], nxt: frozenset[str]) -> bool:
+                            prev: frozenset[str], nxt: frozenset[str],
+                            other_words: list[str] | None = None) -> bool:
     """P2: the 8/26 live shape. "Explore the full stack in F3 Energy or THE
-    CLEAN-SWEETENED VERSION IN F3 PURE." A disjunct noun phrase whose clean word
-    modifies a head noun located in / of / from F3 Pure. The clause must be one side
-    of an "or" / "versus": the LAST clause after one, or the FIRST clause before one
-    (the mirror). A middle clause ("F3 Energy, or the clean version of F3 Pure, hits
-    hard.") is an apposition, so it fails. Every clean word must sit between the
-    determiner and the preposition."""
-    if not ((idx == n_clauses - 1 and prev & _RAIL2_DISJUNCTIONS)
-            or (idx == 0 and nxt & _RAIL2_DISJUNCTIONS)):
+    CLEAN-SWEETENED VERSION IN F3 PURE." It is a disjunct noun phrase whose clean
+    word modifies a head noun located in / of / from F3 Pure, PARALLEL to a disjunct
+    that names Energy/Mood the same way ("the full stack in F3 Energy").
+      * The clause must be one side of an "or" / "versus": the LAST clause after
+        one, which must OPEN with the determiner (a noun phrase, not a verb phrase
+        sharing an Energy/Mood subject: "F3 Mood keeps you calm or delivers the
+        natural calm of F3 Pure." trips). Or it is the FIRST clause before one,
+        with at most an imperative verb before the determiner (the mirror).
+      * A middle clause ("F3 Energy, or the clean version of F3 Pure, hits hard.")
+        is an apposition and fails.
+      * The other disjunct (`other_words`) must name its Energy/Mood line only after
+        a locative preposition. "F3 Mood is calm or the natural pick of F3 Pure."
+        makes Mood the subject, so the clean noun phrase can be its predicate; it
+        trips.
+      * Every clean word sits between the determiner and the preposition."""
+    last = idx == n_clauses - 1 and bool(prev & _RAIL2_DISJUNCTIONS)
+    first = idx == 0 and bool(nxt & _RAIL2_DISJUNCTIONS)
+    if not (last or first):
+        return False
+    other = list(other_words or ())
+    em = brand_lines_in(" ".join(other)) & _RAIL2_EM
+    if not em or not all(_brand_after_locative(other, line) for line in em):
         return False
     t = _lower_tokens(words)
     p = next((k for k, w in enumerate(t)
@@ -977,6 +1014,11 @@ def _pure_locative_disjunct(words: list[str], idx: int, n_clauses: int,
         return False
     d = max((j for j in range(k) if t[j] in _P2_DETERMINERS), default=-1)
     if d < 0 or k - d > 8:
+        return False
+    lead = 0
+    while lead < len(t) and t[lead] in _LEAD_FILLERS:
+        lead += 1
+    if (last and d != lead) or (first and not last and d - lead > 1):
         return False
     cleans = [j for j, w in enumerate(t) if _is_clean_token(w)]
     return bool(cleans) and all(d < j < k for j in cleans)
@@ -1159,8 +1201,9 @@ def rail2_attribution_hit(sentence: str, *, context_lines: frozenset[str] = froz
             continue
         if host_own == own == {"PURE"} and not related:
             host_words = _words(c.host)
+            other = rows[idx - 1][1] if idx == n - 1 and idx > 0 else (rows[1][1] if n > 1 else "")
             if (_pure_is_subject(host_words)
-                    or _pure_locative_disjunct(host_words, idx, n, c.prev, c.next)):
+                    or _pure_locative_disjunct(host_words, idx, n, c.prev, c.next, _words(other))):
                 continue  # the clean word is positively Pure's
         return sorted(hit)[0], "/".join(sorted((lines | ref) & _RAIL2_EM))
     return None

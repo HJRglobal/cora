@@ -101,6 +101,15 @@ CLAIMS_HOLE_PROBES: dict[str, tuple[str, ...]] = {
         "Like F3 Energy, F3 Pure is clean-sweetened.",
         "F3 Energy, or the clean version of F3 Pure, hits hard.",
         "Clean energy from F3 Pure, or F3 Energy.",
+        # ...and the holes adversarial probing found in the remediation's OWN first
+        # cut: a predicate / verb-phrase disjunct (P2), a comma + "and" metaphor
+        # tail, and a coordinate adjective before a ruled phrase
+        "F3 Mood is calm or the natural pick of F3 Pure.",
+        "F3 Energy is the stack or the clean version in F3 Pure.",
+        "F3 Mood keeps you calm or delivers the natural calm of F3 Pure.",
+        "F3 Mood supports a clean environment, and your mind.",
+        "F3 Mood supports a clean environment, and for your mind.",
+        "F3 Energy has real, natural caffeine from green tea.",
         # D-051 r143-claims-5: a pronoun across a sentence boundary laundered a clean
         # word (or a ruled phrase) onto Mood/Energy. These are TWO-sentence probes;
         # new_preflight splits them, so the gate measures the cross-sentence carry
