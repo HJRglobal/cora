@@ -332,6 +332,8 @@ RELEASE_PROBES: tuple[str, ...] = (
     "F3 Energy uses only natural caffeine from green tea.",
     "F3 Energy uses exclusively natural caffeine from green tea.",
     "F3 Energy: your daily natural caffeine from green tea.",
+    # ...and a guard on round 2's OWN new intensifier "way": after a definite
+    # determiner it is a noun (round 1 passed this row; it must stay passing)
     "F3 Energy changes the way natural caffeine from green tea hits.",
     # F3-R3: the comma branch refused its own allowlisted CSR continuation
     "F3 Energy funds a cleaner planet, one case at a time.",
@@ -345,7 +347,8 @@ def _article(body: str, title: str = "Post", summary: str = "") -> dict[str, str
 
 #: D-051 round 2 (F3-R1): ARTICLE-level copy the round-1 cross-sentence carry
 #: re-tripped -- invisible to every single-sentence set above, which is why the
-#: "FP 0/6" gate never saw it. Each passed legacy AND the pre-remediation rail.
+#: "FP 0/6" gate never saw it. Each passed the pre-remediation rail, and each but
+#: the row-8 draft (it carries the ruled green-tea phrase) passed legacy too.
 #: (label, run_preflight fields). Gated must-PASS.
 CARRY_RELEASE_PROBES: tuple[tuple[str, dict[str, str]], ...] = (
     ("an ingredient paragraph after an Energy paragraph",
@@ -427,7 +430,8 @@ CARRY_RELEASE_PROBES: tuple[tuple[str, dict[str, str]], ...] = (
 )
 
 #: ...and the ARTICLE-level laundering shapes the carry must still catch after it
-#: decays (each passes legacy: the clean sentence names no line). Gated must-TRIP.
+#: decays. All but the claims-5 cross-field row pass legacy (the clean sentence
+#: names no line); the last two passed round 1 as well. Gated must-TRIP.
 CARRY_HOLE_PROBES: tuple[tuple[str, dict[str, str]], ...] = (
     ("a pronoun opening the next paragraph", _article("<p>F3 Mood is our evening can.</p><p>It is all-natural.</p>")),
     ("a pronoun opening the body under the title", _article("<p>It is all-natural.</p>", "F3 Mood Tonight")),

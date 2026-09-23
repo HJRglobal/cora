@@ -1204,7 +1204,9 @@ def _has_relation(words: list[str], *, weak: bool = False) -> bool:
 #:       complement is not an evaluative comparison ("no different", "no less
 #:       so") and which picks up no pro-form ("carries IT forward", "is ONE");
 #:   (B) it is a contrast adverbial: "Unlike F3 Energy";
-#:   (C) it is a conditional about the reader: "If you like F3 Energy".
+#:   (C) it is a conditional about the reader: "If you like F3 Energy";
+#:   (D) (a back-referring clause only) the reader / team voicing a preference
+#:       about the referent: "..., and we love it".
 #: Anything else fails closed: it trips.
 _EM_PREDICATE_VERBS = _PURE_PREDICATE_VERBS | frozenset({
     "hits", "fuels", "powers", "lifts", "focuses", "targets", "leads", "wins", "sharpens",
@@ -1628,7 +1630,7 @@ def rail2_attribution_hit(sentence: str, *, context_lines: frozenset[str] = froz
     CROSS-SENTENCE REFERENCE (r143-claims-5). `context_lines` are the lines an
     earlier sentence left in view (run_preflight's decaying Rail2Carry, fed by
     rail2_context_after). They apply only when a clause here carries a
-    back-reference (_rail2_backref_flags: never an expletive or idiomatic pronoun,
+    back-reference (_rail2_backref_flags: never an expletive or generic pronoun,
     never a Pure-subject sentence's own possessive, and in a clause that names
     Energy/Mood only a pronoun coordinated with the brand) -- "F3 Mood is our
     evening can. It is all-natural.", "... Like F3 Energy, it runs on a cleaner
