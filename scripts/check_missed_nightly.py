@@ -3,9 +3,14 @@ cq-fb50c9e6c911). Decisions live in src/cora/nightly_catchup.py (pure, tested).
 
 Schedule: daily 08:30 AZ as "Cora - Missed Nightly Catch-Up"
 (deployment/setup-missed-nightly-catchup-task.ps1; ExecutionTimeLimit 4h). Dry-run by
-default; the registered task passes --apply.
+default. The lane is T1 (ruling 9.2, 2026-09-19): the registered task passes
+--record, which RECORDS today's dry-run plan (one plan row, mode=dry-run, plus a
+plan-only run marker) and replays nothing, so the 08:45 health check can tell "fired,
+nothing to replay" from "did not fire". The setup PS1's -Apply switch registers T2
+(--apply) instead. A plain run with neither flag still writes NOTHING.
 
     .venv\\Scripts\\python.exe scripts\\check_missed_nightly.py                 # plan for today, writes nothing
+    .venv\\Scripts\\python.exe scripts\\check_missed_nightly.py --record        # T1: record today's plan, replay nothing
     .venv\\Scripts\\python.exe scripts\\check_missed_nightly.py --day 2026-09-09  # replay a past window (dry-run ONLY)
     .venv\\Scripts\\python.exe scripts\\check_missed_nightly.py --day 2026-09-09 --now 08:45   # ... as of 08:45 that day
     .venv\\Scripts\\python.exe scripts\\check_missed_nightly.py --apply           # replay today's misses, in order
@@ -40,7 +45,9 @@ run a task Task Scheduler reports RUNNING or Disabled; run a task whose next
 trigger is imminent; run for a past window with --apply (refused, exit 2); --apply
 without the live scheduler read (--no-scheduler) or with a pinned clock (--now) --
 both refused, exit 2, because the window / imminent / RUNNING / slug rules would
-run blind; consult any model.
+run blind; --record under the same conditions (a past --day, --now, --no-scheduler)
+or together with --apply -- refused, exit 2, because a recorded plan is read as the
+lane's fire and must be the live one; consult any model.
 """
 from __future__ import annotations
 
@@ -184,6 +191,10 @@ def main(argv: list[str] | None = None, *, now_az: datetime | None = None,
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--day", help="window date YYYY-MM-DD (AZ); default today. Past days are dry-run ONLY.")
     parser.add_argument("--apply", action="store_true", help="replay today's misses (default: print the plan)")
+    parser.add_argument("--record", action="store_true",
+                        help="T1: RECORD today's dry-run plan (one plan row, mode=dry-run, + a "
+                             "plan-only run marker) and replay nothing. Today's live window on "
+                             "the real clock only; mutually exclusive with --apply")
     parser.add_argument("--set", default=str(nc.DEFAULT_SET_PATH), help="nightly set yaml")
     parser.add_argument("--log-dir", default=str(nc.DEFAULT_TASK_LOG_DIR), help="logs/tasks dir")
     parser.add_argument("--no-scheduler", action="store_true",
@@ -212,6 +223,25 @@ def main(argv: list[str] | None = None, *, now_az: datetime | None = None,
         return 2
     if args.apply and args.now:
         print("REFUSED: --now pins the clock for dry-runs only; a live replay evaluates the real clock.")
+        return 2
+    # --record (Code #14 R14-7 4a, ruling 9.2 = T1): the SAME refusals as --apply.
+    # A recorded plan is what the 08:45 health check reads as "the lane fired", so
+    # it must describe today's LIVE window on the REAL clock and the REAL scheduler
+    # -- a pinned --day/--now or a --no-scheduler guess would write a false record.
+    if args.record and args.apply:
+        print("REFUSED: --record (T1: record the plan, replay nothing) and --apply (T2: replay) "
+              "are mutually exclusive.")
+        return 2
+    if args.record and day != real_now.date():
+        print(f"REFUSED: --record is for today's window only ({real_now.date().isoformat()}); "
+              f"{day.isoformat()} is a dry-run replay and writes nothing.")
+        return 2
+    if args.record and args.no_scheduler:
+        print("REFUSED: --record needs the live Task Scheduler read (--no-scheduler assumes every "
+              "task Ready); a recorded plan must be the real one. Drop --no-scheduler.")
+        return 2
+    if args.record and args.now:
+        print("REFUSED: --now pins the clock for dry-runs only; a recorded plan evaluates the real clock.")
         return 2
 
     try:
@@ -270,6 +300,21 @@ def main(argv: list[str] | None = None, *, now_az: datetime | None = None,
         print(f"Missed-nightly catch-up -- window {day.isoformat()} -- {mode} -- now {eval_now.strftime('%H:%M')} AZ"
               + banner_note)
         print(nc.format_plan(decisions))
+    if args.record:
+        # T1: the plan is the record. mode stays "dry-run" (nothing was replayed);
+        # the health check reads a dry-run plan row as "fired (T1 plan recorded)".
+        nc.append_ledger(nc.plan_row(day, eval_now, "dry-run", decisions))
+        would = [d.task.name for d in decisions if d.action == "run"]
+        run_marker.write(
+            nc.TASK_NAME, script=SCRIPT_NAME, ok=True, outputs=0, outcome="plan-only",
+            detail="window=%s T1 plan recorded; %s" % (
+                day.isoformat(),
+                ("would have replayed " + ", ".join(would)) if would else "nothing to replay"),
+            extra={"catch_up": True, "window": day.isoformat(), "mode": "dry-run",
+                   "would_replay": would, "counts": nc.counts(decisions)},
+        )
+        print(f"recorded the T1 plan for {day.isoformat()} (mode=dry-run; nothing replayed)")
+        return 0
     if not args.apply:
         return 0
 

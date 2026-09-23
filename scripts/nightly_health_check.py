@@ -729,6 +729,12 @@ def check_missed_nightly_catchup(now: datetime | None = None) -> CheckResult:
     failed or timed out. OK only when every ENABLED task fired on schedule (or a
     replay finished clean) -- the tail is derived from the counts, never a
     constant. Never CRITICAL.
+
+    T1 (ruling 9.2; Code #14 R14-7): the registered lane runs `--record`, which
+    writes a mode=dry-run plan row and replays nothing. That row reads as "fired
+    (T1 plan recorded)": OK when every enabled task fired, WARN "T1: would have
+    replayed N task(s) (not replayed): ..." when the plan holds `run` rows; the
+    unverified / skipped_window WARNs are unchanged.
     """
     name = "Missed-nightly catch-up"
     try:
@@ -766,16 +772,33 @@ def check_missed_nightly_catchup(now: datetime | None = None) -> CheckResult:
     deferred = summary.get("deferred") or []
     failed = [r for r in replays if str(r.get("action")) != "ran"]
     head = f"{day}: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
-    if attention or unverified or failed or deferred:
-        parts = [f"{d.get('task')} {d.get('action')}"
-                 + (" (not verified)" if str(d.get("action")) in nc.UNVERIFIED_ACTIONS else "")
-                 for d in attention]
+    # Code #14 R14-7 (4a): a mode=dry-run plan row is the T1 lane's RECORDED plan
+    # (check_missed_nightly --record, ruling 9.2). It proves the lane FIRED; a `run`
+    # decision in it means "would have replayed" -- nothing was, by design -- so it
+    # WARNs in its own words instead of reading as a pending replay. Every other
+    # attention action (skipped_window / cannot_check / ...) keeps its semantics.
+    t1 = str(summary.get("mode") or "") == "dry-run"
+    would_replay: list[dict] = []
+    if t1:
+        would_replay = [d for d in attention if str(d.get("action")) == "run"]
+        attention = [d for d in attention if str(d.get("action")) != "run"]
+    if attention or unverified or failed or deferred or would_replay:
+        parts: list[str] = []
+        if would_replay:
+            parts.append(f"T1: would have replayed {len(would_replay)} task(s) (not replayed): "
+                         + ", ".join(str(d.get("task")) for d in would_replay))
+        parts += [f"{d.get('task')} {d.get('action')}"
+                  + (" (not verified)" if str(d.get("action")) in nc.UNVERIFIED_ACTIONS else "")
+                  for d in attention]
         parts += [f"{d.get('task')} {d.get('action')} (unknown action -- not verified)" for d in unverified]
         parts += [f"{r.get('task')} replay {r.get('action')} rc={r.get('rc')}" for r in failed]
         parts += [f"{r.get('task')} deferred at spawn time: {r.get('action')}" for r in deferred]
         return CheckResult(name, "warn", head + " -- " + "; ".join(parts))
     fired = sum(1 for d in enabled if str(d.get("action")) == "fired")
-    if replays:
+    if t1 and enabled and fired == len(enabled):
+        tail = (f"; fired (T1 plan recorded) -- every task fired on schedule "
+                f"({fired}/{len(enabled)} enabled)")
+    elif replays:
         tail = f"; {len(replays)} replay(s) finished clean"
     elif enabled and fired == len(enabled):
         tail = f"; every task fired on schedule ({fired}/{len(enabled)} enabled)"

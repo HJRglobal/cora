@@ -1,6 +1,14 @@
 # Setup Windows Scheduled Task: "Cora - Missed Nightly Catch-Up" (Code #13 slice 2,
-# cq-fb50c9e6c911). Runs scripts/check_missed_nightly.py --apply once a day at
-# 08:30 AZ: for every task in data/maps/nightly-catchup-set.yaml with NO fire
+# cq-fb50c9e6c911). Runs scripts/check_missed_nightly.py once a day at 08:30 AZ.
+#
+# MODE (ruling 9.2, 2026-09-19 -- the lane is T1; Code #14 R14-7):
+#   default  -> T1: "check_missed_nightly.py --record" RECORDS today's dry-run plan
+#               (one plan row, mode=dry-run, + a plan-only run marker) and replays
+#               NOTHING, so the 08:45 health check reads "fired (T1 plan recorded)"
+#               instead of warning that the lane never fired.
+#   -Apply   -> T2 act-with-audit: "check_missed_nightly.py --apply" replays.
+#
+# Under T2, for every task in data/maps/nightly-catchup-set.yaml with NO fire
 # evidence for today's window (run marker / run_hidden header / scheduler
 # LastRunTime) it replays the task ONCE, in trigger order, through run_hidden,
 # and writes its own ledger (logs/nightly-catchup.jsonl) + a run marker. The
@@ -26,10 +34,13 @@
 #
 # Run from elevated PowerShell:
 #     cd C:\Users\Harri\code\cora
-#     .\deployment\setup-missed-nightly-catchup-task.ps1
+#     .\deployment\setup-missed-nightly-catchup-task.ps1           # T1 (records the plan)
+#     .\deployment\setup-missed-nightly-catchup-task.ps1 -Apply    # T2 (replays)
 #
 # To remove:
 #     Unregister-ScheduledTask -TaskName 'Cora - Missed Nightly Catch-Up' -Confirm:$false
+
+param([switch]$Apply)
 
 $ErrorActionPreference = "Stop"
 
@@ -57,11 +68,20 @@ if ($existing) {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
 
+# T1 by default (ruling 9.2): record the dry-run plan. -Apply registers T2.
+$ArgLine = "`"$ScriptPath`" --record"
+$Mode = "T1 (dry-run plan, recorded; replays nothing)"
+if ($Apply) {
+    $ArgLine = "`"$ScriptPath`" --apply"
+    $Mode = "T2 (act-with-audit; replays misses)"
+}
+Write-Host "  Mode: $Mode" -ForegroundColor Cyan
+
 # Windowless action via the shared helper.
 . "$PSScriptRoot\_task-action.ps1"
 $action = New-WrappedTaskAction -TaskName $TaskName `
     -Execute $PythonExe `
-    -Argument "`"$ScriptPath`"" `
+    -Argument $ArgLine `
     -WorkingDirectory $RepoRoot
 
 $trigger = New-ScheduledTaskTrigger -Daily -At $FireAt
@@ -80,14 +100,14 @@ $settings = New-ScheduledTaskSettingsSet `
 
 Register-ScheduledTask `
     -TaskName $TaskName `
-    -Description "Missed-start catch-up for the nightly ingest set: replays any nightly task with no fire evidence for today's window, once, in trigger order, via run_hidden. Deterministic, no LLM. Ledger logs/nightly-catchup.jsonl; the 08:45 health check reads it. T2 act-with-audit pending Harrison's tier confirm (Code #13)." `
+    -Description "Missed-start catch-up for the nightly ingest set: replays any nightly task with no fire evidence for today's window, once, in trigger order, via run_hidden. Deterministic, no LLM. Ledger logs/nightly-catchup.jsonl; the 08:45 health check reads it. T1 (dry-run plan, recorded) by default per the 2026-09-19 ruling 9.2; -Apply registers T2 act-with-audit." `
     -Action $action `
     -Trigger $trigger `
     -Principal $principal `
     -Settings $settings | Out-Null
 
 $after = Get-ScheduledTask -TaskName $TaskName
-Write-Host "  Registered: $TaskName (daily $FireAt AZ, limit 4h)" -ForegroundColor Green
+Write-Host "  Registered: $TaskName (daily $FireAt AZ, limit 4h, $Mode)" -ForegroundColor Green
 Write-Host ""
 Write-Host "Dry-run first (safe, writes nothing):" -ForegroundColor Cyan
 Write-Host "  & '$PythonExe' '$ScriptPath'"

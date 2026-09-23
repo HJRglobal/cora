@@ -903,3 +903,137 @@ class TestB5PerSpawnRecheck:
         assert nc.LANE_BUDGET_MIN == 240
         _, tasks = nc.load_set(_REAL_SET)
         assert sum(t.max_minutes for t in tasks if t.enabled) > nc.LANE_BUDGET_MIN   # the premise the budget guards
+
+
+# ── Code #14 R14-7 (4 + 4a): T1 records its plan (ruling 9.2) ────────────────
+#
+# Under T1 (no --apply) the lane returned before writing its plan row or its run
+# marker, so the 08:45 check WARNed daily "NO catch-up decision row" + "no run
+# marker ever recorded" while the task DID fire (logs/tasks/...-2026-09-22.log:
+# "dry-run ... counts: fired=16 ... EXIT: 0"). --record writes the plan (mode
+# dry-run) + a plan-only marker; a plain dry run still writes nothing.
+
+_T1_SET = ("tasks:\n"
+           "  - name: cowork-cora-kb-sync-slack\n    trigger_az: '02:00'\n    command: slack\n"
+           "  - name: cowork-cora-kb-sync-static\n    trigger_az: '04:00'\n    command: static\n")
+
+
+def _t1_reader(names):
+    return ({n: nc.TaskState(state="Ready", next_run=_az(DAY_0910, 12, 20)) for n in names}, {})
+
+
+class TestR147RecordT1Plan:
+    def test_record_writes_one_dry_run_plan_row_and_one_plan_only_marker(self, ledger, tmp_path, monkeypatch):
+        mod = _load_script()
+        monkeypatch.setenv("TASK_RUNS_LEDGER_PATH", str(tmp_path / "task-runs.jsonl"))
+        set_yaml = tmp_path / "set.yaml"
+        set_yaml.write_text(_T1_SET, encoding="utf-8")
+        _write_header(tmp_path, "cowork-cora-kb-sync-slack", _az(DAY_0910, 2, 0, 1))   # static missed
+        spawned = []
+        rc = mod.main(["--record", "--set", str(set_yaml), "--log-dir", str(tmp_path)],
+                      now_az=_az(DAY_0910, 8, 30), states_reader=_t1_reader,
+                      popen=lambda *a, **k: spawned.append(a))
+        assert rc == 0 and spawned == []                              # T1 replays NOTHING
+        rows = [json.loads(l) for l in ledger.read_text(encoding="utf-8").splitlines()]
+        assert len(rows) == 1 and rows[0]["row"] == "plan" and rows[0]["mode"] == "dry-run"
+        assert rows[0]["window_date"] == "2026-09-10" and rows[0]["counts"] == {"fired": 1, "run": 1}
+        markers = run_marker.read_markers()
+        assert len(markers) == 1
+        m = markers[0]
+        assert m["task"] == nc.TASK_NAME and m["ok"] is True and m["outputs"] == 0
+        assert m["outcome"] == "plan-only" and m["catch_up"] is True and m["window"] == "2026-09-10"
+        assert m["would_replay"] == ["cowork-cora-kb-sync-static"]
+
+    @pytest.mark.parametrize("extra", [
+        ["--day", "2026-09-09"],
+        ["--now", "08:45"],
+        ["--no-scheduler"],
+        ["--apply"],
+    ])
+    def test_record_refuses_a_pinned_or_blind_run_and_apply(self, ledger, tmp_path, monkeypatch, extra):
+        mod = _load_script()
+        monkeypatch.setenv("TASK_RUNS_LEDGER_PATH", str(tmp_path / "task-runs.jsonl"))
+        spawned = []
+        rc = mod.main(["--record", *extra, "--log-dir", str(tmp_path)], now_az=_az(DAY_0910, 8, 30),
+                      states_reader=_t1_reader, popen=lambda *a, **k: spawned.append(a))
+        assert rc == 2 and spawned == []
+        assert not ledger.exists() and run_marker.read_markers() == []
+
+    def test_plain_dry_run_still_writes_nothing(self, ledger, tmp_path, monkeypatch):
+        """The pinned 'dry-run writes nothing' contract is untouched by --record."""
+        mod = _load_script()
+        monkeypatch.setenv("TASK_RUNS_LEDGER_PATH", str(tmp_path / "task-runs.jsonl"))
+        set_yaml = tmp_path / "set.yaml"
+        set_yaml.write_text(_T1_SET, encoding="utf-8")
+        rc = mod.main(["--set", str(set_yaml), "--log-dir", str(tmp_path)], now_az=_az(DAY_0910, 8, 30),
+                      states_reader=_t1_reader)
+        assert rc == 0 and not ledger.exists() and run_marker.read_markers() == []
+
+
+def _t1_plan(ledger: Path, day: date, decisions: list[tuple[str, str]]) -> None:
+    rows = [{"task": t, "trigger_az": "04:00", "action": a, "reason": "r", "evidence": []} for t, a in decisions]
+    cnt: dict[str, int] = {}
+    for _, a in decisions:
+        cnt[a] = cnt.get(a, 0) + 1
+    nc.append_ledger({"row": "plan", "ts": _az(day, 8, 30).astimezone(timezone.utc).isoformat(timespec="seconds"),
+                      "window_date": day.isoformat(), "mode": "dry-run", "decisions": rows, "counts": cnt}, ledger)
+
+
+class TestR147HealthReadsT1:
+    def test_a_t1_plan_where_everything_fired_is_ok_fired_t1_plan_recorded(self, ledger):
+        _t1_plan(ledger, DAY_0910, [("a", "fired"), ("b", "fired"), ("c", "skipped_disabled_in_set")])
+        r = nhc.check_missed_nightly_catchup(now=_az(DAY_0910, 8, 45))
+        assert r.status == "ok" and "fired (T1 plan recorded)" in r.detail and "(2/2 enabled)" in r.detail
+
+    def test_a_t1_plan_with_run_rows_warns_would_have_replayed_not_replayed(self, ledger):
+        _t1_plan(ledger, DAY_0910, [("a", "fired"), ("cowork-cora-kb-sync-static", "run"),
+                                    ("Cora - Drive Sweep", "run")])
+        r = nhc.check_missed_nightly_catchup(now=_az(DAY_0910, 8, 45))
+        assert r.status == "warn"
+        assert ("T1: would have replayed 2 task(s) (not replayed): cowork-cora-kb-sync-static, "
+                "Cora - Drive Sweep") in r.detail
+        assert "cowork-cora-kb-sync-static run" not in r.detail   # not the T2 "pending replay" form
+
+    def test_a_t1_plan_keeps_the_unverified_and_skipped_window_warns(self, ledger):
+        _t1_plan(ledger, DAY_0910, [("a", "fired"), ("b", "skipped_window"), ("c", "cannot_check")])
+        r = nhc.check_missed_nightly_catchup(now=_az(DAY_0910, 12, 35))
+        assert r.status == "warn"
+        assert "b skipped_window (not verified)" in r.detail and "c cannot_check (not verified)" in r.detail
+        assert "T1: would have replayed" not in r.detail
+
+    def test_the_t2_apply_plan_reading_is_unchanged(self, ledger):
+        _plan(ledger, DAY_0910, [("a", "fired"), ("x", "run")])
+        r = nhc.check_missed_nightly_catchup(now=_az(DAY_0910, 8, 45))
+        assert r.status == "warn" and "x run" in r.detail and "T1:" not in r.detail
+
+
+class TestR147SetupPs1:
+    _PS1 = _REPO / "deployment" / "setup-missed-nightly-catchup-task.ps1"
+
+    def _code_lines(self) -> list[str]:
+        text = self._PS1.read_text(encoding="ascii")
+        return [ln for ln in text.splitlines() if not ln.lstrip().startswith("#")]
+
+    def test_param_switch_is_declared_before_the_error_preference(self):
+        code = "\n".join(self._code_lines())
+        assert "param([switch]$Apply)" in code
+        assert code.index("param([switch]$Apply)") < code.index('$ErrorActionPreference = "Stop"')
+
+    def test_default_argument_records_and_apply_appears_only_inside_the_if(self):
+        lines = self._code_lines()
+        default = [ln for ln in lines if ln.strip().startswith("$ArgLine =")]
+        assert default and "--record" in default[0] and "--apply" not in default[0]
+        code = "\n".join(lines)
+        if_start = code.index("if ($Apply) {")
+        if_end = code.index("}", if_start)
+        apply_hits = [i for i in range(len(code)) if code.startswith("--apply", i)]
+        assert apply_hits and all(if_start < i < if_end for i in apply_hits)
+        assert "-Argument $ArgLine" in code
+
+    def test_header_and_description_say_t1_by_default(self):
+        text = self._PS1.read_text(encoding="ascii")
+        assert "Runs scripts/check_missed_nightly.py --apply once a day" not in text
+        assert ("T1 (dry-run plan, recorded) by default per the 2026-09-19 ruling 9.2; "
+                "-Apply registers T2 act-with-audit") in text
+        assert "T2 act-with-audit pending Harrison's tier confirm" not in text
+        assert 'Write-Host "  Mode: $Mode"' in text
