@@ -298,6 +298,9 @@ PHANTOM_LOG_KEY = "phantom-write-claim"
 #   * D-171: every whitespace run that precedes a literal is POSSESSIVE, and the
 #     quantifier continuation reads `(?<=[ \t])and` after an atomic space run (the
 #     old `[ \t]*` + `\s+and` pair was O(n^2) -- 7 s at 40k). Re-timed at 40k.
+# Round 2 (re-review F1-R2 / honesty-rails-8): the for/with/from object bails on a
+# by-agent / habitual word (_WC_OBJ_NOT_HAB) and a participle + ':' / '(' + a DATE
+# or "(per ...)" is a metadata label (_WC_LABEL_COLON / _WC_LABEL_PAREN).
 _WC_V = r"(?P<v>staged|queued|locked\s+in|canonicali[sz]ed|filed|created|updated|deleted)"
 _WC_V2 = r"(?P<v2>staged|queued|locked\s+in|canonicali[sz]ed|filed|created|updated|deleted)"
 _WC_A = r"['’]"
@@ -319,6 +322,29 @@ _WC_COUNT = (r"\d{1,3}[ \t]++(?!(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|d
              r"|(?:sec|second|min|minute|hour|hr|day|week|wk|month|year|yr)s?\b)[a-z]")
 _WC_OBJ = (r"(?:(?:the|a|an|it|them|this|that|these|those|all|both|each|every|your|my|its|their|to|into)\b"
            r"|cq-|dw-|[`*_]|" + _WC_COUNT + r")")
+# Code #14 D-051 round 2 (F1-R2): the short for/with/from object of 'initial' bails on
+# a BY-AGENT or HABITUAL word anywhere in its <= 4 tokens, the same bail _WC_NOT_HAB
+# gives the pronoun / your / perfect forms -- "Queued for review by Justin.",
+# "Updated from the bank feed nightly.", "Filed with the IRS every April." describe a
+# teammate's or a recurring action, not Cora's. Bounded lookahead (<= 3 possessive
+# tokens), so linear.
+_WC_HAB_WORD = (r"(?:by|weekly|daily|monthly|nightly|hourly|annually|yearly|quarterly|every|each|"
+                r"automatically|regularly|whenever)")
+_WC_OBJ_NOT_HAB = r"(?!(?:[\w'’&-]++[ \t]++){0,3}" + _WC_HAB_WORD + r"\b)"
+# Code #14 D-051 round 2 (honesty-rails-8): a sentence-initial participle + ':' + a
+# DATE (or "(per ...)", or a dated bullet on the next line) is a METADATA LABEL --
+# "Updated: 9/12 (per the doc footer)", "*Filed:* 4/15/2025", "Created: March 2025",
+# "- Updated: 2026-09-12", "Filed (per the county record): 4/15/2025". A date must END
+# on a non-word char, so a staged prompt's dated FILENAME ("Staged: 2026-09-16_fndr_
+# cora-code-prompt.md") is still a claim. Receipts are untouched (a receipt label IS
+# the 9/15 phantom shape).
+_WC_DATE = (r"(?:\d{1,4}[/.-]\d{1,2}(?:[/.-]\d{2,4})?|(?:19|20)\d{2}"
+            r"|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]{0,6}\.?[ \t]++\d{1,4}(?:st|nd|rd|th)?)"
+            r"(?![\w/-])")
+_WC_LABEL_COLON = (r":(?![ \t]*+\*{0,2}[ \t]*+(?:\n[ \t]*+(?:[-*•][ \t]++)?)?(?:" + _WC_DATE
+                   + r"|\(per\b))")
+_WC_LABEL_PAREN = (r"\((?!(?:(?:per|last)\b[^()\n]{0,80}\)[ \t]*+\*{0,2}:[ \t]*+\*{0,2}[ \t]*+" + _WC_DATE
+                   + r"|" + _WC_DATE + r"))")
 _WRITE_CLAIM_FORMS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     (label, re.compile(rx, re.IGNORECASE | re.MULTILINE)) for label, rx in (
         ("first_person",
@@ -332,9 +358,11 @@ _WRITE_CLAIM_FORMS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
          _WC_START + r"(?P<v>done|all\s++set)\*?[ \t]*+(?:[.!,:;—–]|-{1,2}(?=\s)|\Z|" + _WC_EMOJI + r")"),
         ("initial",
          _WC_START + r"(?:[a-z]{2,20}ed[ \t]++(?:and|&)[ \t]++)?" + _WC_V + r"\*?(?:"
-         r"[ \t]*+(?:[.!:(]|\Z|" + _WC_EMOJI + r"|[—–]|-{1,2}(?=\s))"
+         r"[ \t]*+(?:[.!]|" + _WC_LABEL_COLON + r"|" + _WC_LABEL_PAREN + r"|\Z|" + _WC_EMOJI
+         + r"|[—–]|-{1,2}(?=\s))"
          r"|[ \t]++" + _WC_OBJ
-         + r"|[ \t]++(?:for|with|from)[ \t]++(?:[\w'’&-]++[ \t]*+){1,4}?(?:[.!]|\Z|" + _WC_EMOJI + r"))"),
+         + r"|[ \t]++(?:for|with|from)[ \t]++" + _WC_OBJ_NOT_HAB
+         + r"(?:[\w'’&-]++[ \t]*+){1,4}?(?:[.!]|\Z|" + _WC_EMOJI + r"))"),
         ("pronoun",
          r"\b(?:it|that|this|they|those|these|everything)(?:\s*+" + _WC_A + r"(?:s|ve)\s++been|\s*+"
          + _WC_A + r"(?:s|re)|\s++(?:is|are|has\s++been|have\s++been))"
@@ -422,7 +450,10 @@ def _user_quote_spans(text: str, user_texts: Any) -> list[tuple[int, int]]:
 
 
 def _receipt_subject_ok(m: re.Match) -> bool:
-    np_toks = m.group("np").split()
+    # A bare bullet char is not a noun phrase (round 2, honesty-rails-8): the np class
+    # admits '-' / '*', so "- Created: 2024-03-01" backtracked into np='-' and read the
+    # dated metadata bullet as a receipt once 'initial' stopped claiming it.
+    np_toks = [t for t in m.group("np").split() if any(c.isalnum() for c in t)]
     if not np_toks:
         return False
     if m.group("short") is not None and len(np_toks) > 2:

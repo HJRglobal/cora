@@ -146,3 +146,66 @@ class TestTypedIdPureEcho:
         assert _best_of_3(lambda: list(se._ID_STATE_CLAIM_RE.finditer(shape))) < 0.2
         assert _best_of_3(lambda: se._id_is_pure_echo(shape, "cq-000000000002")) < 0.5
         assert _best_of_3(lambda: _write(shape, user_text=ASK, count=1)) < 1.0
+
+
+# ── F1-R2 + honesty-rails-8: 'initial' precision (by-agent / habitual / labels) ──
+MUST_NOT_FIRE_R2 = [
+    # F1-R2: a by-agent or habitual word inside the short for/with/from object
+    "Queued for review by Justin.", "Filed with the IRS by Justin.", "Queued for review by the bookkeeper.",
+    "Queued for Monday by Harrison.", "Updated from the bank feed nightly.", "Updated with actuals every Monday.",
+    "Filed with the IRS every April.", "Queued for review weekly.", "Yes, filed with the IRS by Justin.",
+    "Per the KB: the sales tax return. Filed with the state by Justin.",
+    "Looking at the sheet notes. Updated from the bank feed nightly.", "Updated for each store.",
+    # honesty-rails-8 remainder: a participle + ':' / '(' metadata LABEL
+    "Updated: 9/12 (per the doc footer)", "Created: March 2025 (per the doc properties)",
+    "*Filed:* 4/15/2025", "Doc properties\n- Created: 2024-03-01\n- Updated: 2026-09-12",
+    "Filed (per the county record): 4/15/2025", "Updated (last): 9/12",
+    "Updated (2026-08-30): the lease addendum", "Created:\n- 2024-03-01", "**Updated:** Sept 1st",
+    "Updated: (per the doc footer) 9/12", "* Created: 2024-03-01",
+]
+MUST_FIRE_R2 = [
+    # a dated FILENAME is not a date label (the 9/15 prompt path shape)
+    ("Staged: 2026-09-16_fndr_cora-code-prompt.md", "initial"),
+    ("Staged: cq-a24f9d2210fc", "initial"), ("Updated: the deal is now Closed Won.", "initial"),
+    ("Staged (draft): G:\\x.md", "initial"), ("Staged (per your ask): the kickoff prompt", "initial"),
+    ("Created: Tue 2pm with Justin", "initial"), ("Updated:\nThe deal is Closed Won.", "initial"),
+    ("- Created: Pay the invoice", "initial"),
+    # the round-1 for/with/from recall stays
+    ("Queued for your review.", "initial"), ("Staged for Monday's menu.", "initial"),
+    ("Updated with the new totals.", "initial"), ("Queued for the next code session.", "initial"),
+    ("Filed to the Receipts & Invoices inbox.", "initial"),
+    # receipts are untouched by the label rule
+    ("- Task created: Pay the invoice", "receipt"), ("Kickoff prompt staged (draft): G:\\x.md", "receipt"),
+]
+
+
+class TestInitialPrecisionR2:
+    @pytest.mark.parametrize("text", MUST_NOT_FIRE_R2)
+    def test_third_party_habitual_and_label_shapes_never_fire(self, text):
+        assert se._find_write_claim(text) is None, (text, se._find_write_claim(text))
+
+    @pytest.mark.parametrize("text,form", MUST_FIRE_R2)
+    def test_claims_next_to_those_shapes_still_fire(self, text, form):
+        hit = se._find_write_claim(text)
+        assert hit is not None and hit[1] == form, (text, hit)
+
+    def test_a_label_reply_writes_no_counted_line(self, caplog):
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        _write("Per the doc properties:\n- Created: 2024-03-01\n- Updated: 2026-09-12\n"
+               "Filed (per the county record): 4/15/2025")
+        assert _msgs(caplog, se.PHANTOM_LOG_KEY, "lexicon") == []
+
+    @pytest.mark.parametrize("shape", [
+        "Queued for" + " a" * 20000 + " by x.", "Updated from " + "the " * 10000 + "nightly.",
+        "Updated:" + " " * 40000 + "9/12", "Updated:" + "*" * 40000, "Updated:\n" + " " * 40000 + "- 9/12",
+        "Filed (per" + " x" * 20000 + "): 4/15", "Filed (" + "per " * 10000 + ")", "Updated: " + "9/" * 20000,
+        "Updated: " + "March " * 6000 + "1", "Updated (" + "2026-" * 8000, ("Updated: 9/12\n" * 3000),
+        "- Created: 2024-03-01\n" * 1800, "Staged: " + "2026-09-16_" * 3600,
+    ], ids=["for_by", "from_nightly", "colon_sp", "colon_stars", "colon_nl", "paren_per", "paren_per_rep",
+            "slashes", "months", "paren_dates", "label_lines", "bullets", "filenames"])
+    def test_the_new_label_and_habitual_patterns_are_linear_at_40k(self, shape):
+        """D-171: _WC_OBJ_NOT_HAB / _WC_LABEL_COLON / _WC_LABEL_PAREN / _WC_DATE at 40k."""
+        rx = dict(se._WRITE_CLAIM_FORMS)["initial"]
+        assert _best_of_3(lambda: list(rx.finditer(shape))) < 0.2
+        assert _best_of_3(lambda: list(se._WC_RECEIPT_RE.finditer(shape))) < 0.2
+        assert _best_of_3(lambda: se._find_write_claim(shape)) < 0.5
