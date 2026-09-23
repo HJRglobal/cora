@@ -2536,9 +2536,12 @@ class TestMeetJoinAudit:
         """D-171: the one regex this consumer adds."""
         for s in ("_" * 40_000, "1" * 40_000, "_20260826T163000" * 2_500,
                   ("_12345678T123456" * 2_500) + "Q"):
-            t = time.perf_counter()
-            mc._base_event_id(s)
-            assert time.perf_counter() - t < 0.2
+            best = float("inf")
+            for _ in range(3):   # best of 3: a single run flakes under host load
+                t = time.perf_counter()
+                mc._base_event_id(s)
+                best = min(best, time.perf_counter() - t)
+            assert best < 0.2
         assert mc._base_event_id("gc-1_20260826T163000Z") == "gc-1"
         assert mc._base_event_id("gc-1") == "gc-1"
 

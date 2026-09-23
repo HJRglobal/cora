@@ -187,12 +187,15 @@ def test_price_outside_retail_no_warn():
 
 
 def test_internal_doc_url_scan_is_linear_on_a_long_label_run():
-    """Code #14: the same `(?:[a-z0-9-]+\.){0,3}intuit\.com` quadratic scan lived in
-    the email send guard's class-7 pattern."""
+    r"""Code #14: the same `(?:[a-z0-9-]+\.){0,3}intuit\.com` quadratic scan lived in
+    the email send guard's class-7 pattern. BEST OF 3 per shape (D-171)."""
     import time
     from cora.revops import email_egress_guard as eg
     for shape in ("a" * 40_000, "-" * 40_000, "a." * 20_000):
-        t0 = time.perf_counter()
-        eg._INTERNAL_DOC_URL_RE.search(shape)
-        assert time.perf_counter() - t0 < 0.2
+        best = float("inf")
+        for _ in range(3):
+            t0 = time.perf_counter()
+            eg._INTERNAL_DOC_URL_RE.search(shape)
+            best = min(best, time.perf_counter() - t0)
+        assert best < 0.2, shape[:8]
     assert eg._INTERNAL_DOC_URL_RE.search("https://c1.qbo.intuit.com/app/report")

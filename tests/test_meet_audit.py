@@ -402,14 +402,18 @@ def test_normalize_meeting_code_is_linear_on_degenerate_inputs():
     """D-171: re-time the one regex on 40k of what its class eats and of what it
     keeps, plus a URL-shaped degenerate. Growth shape: 4x input must not cost
     more than ~8x time."""
-    for ch in (" ", "-", "a", "/", "?"):
-        for s in (ch * 40_000, "meet.google.com/" + ch * 40_000):
+    def best_of_3(s):   # D-171: a single run flakes under host load; the min is the cost
+        best = float("inf")
+        for _ in range(3):
             t = time.perf_counter()
             ma.normalize_meeting_code(s)
-            assert time.perf_counter() - t < 0.2, repr(ch)
-    small, big = "-a" * 10_000, "-a" * 40_000
-    t = time.perf_counter(); ma.normalize_meeting_code(small); ts = time.perf_counter() - t
-    t = time.perf_counter(); ma.normalize_meeting_code(big); tb = time.perf_counter() - t
+            best = min(best, time.perf_counter() - t)
+        return best
+
+    for ch in (" ", "-", "a", "/", "?"):
+        for s in (ch * 40_000, "meet.google.com/" + ch * 40_000):
+            assert best_of_3(s) < 0.2, repr(ch)
+    ts, tb = best_of_3("-a" * 10_000), best_of_3("-a" * 40_000)
     assert tb < max(ts * 8, 0.05)
 
 

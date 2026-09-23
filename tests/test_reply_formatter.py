@@ -561,14 +561,18 @@ import pytest as _pytest_redos  # noqa: E402
                                           "abc-" * 10_000 + ".intuit.com/x"],
                                 ids=["letters", "digits", "dashes", "dotted", "long-label"])
 def test_bare_doc_url_scan_is_linear_on_a_long_label_run(shape):
-    """The old `(?:[a-z0-9-]+\.){0,3}intuit\.com` bounded the repetitions, not the
+    r"""The old `(?:[a-z0-9-]+\.){0,3}intuit\.com` bounded the repetitions, not the
     inner `+`: a 40k run of letters/digits/dashes cost ~7 s on EVERY outbound Slack
-    post (sanitize_text). Must stay well under 0.2 s."""
+    post (sanitize_text). Must stay well under 0.2 s -- BEST OF 3 (D-171: a single
+    run flakes under host load; the minimum is what the pattern costs)."""
     import time
     from cora import reply_formatter as rf
-    t0 = time.perf_counter()
-    rf.redact_links_and_ids(shape)
-    assert time.perf_counter() - t0 < 0.2
+    best = float("inf")
+    for _ in range(3):
+        t0 = time.perf_counter()
+        rf.redact_links_and_ids(shape)
+        best = min(best, time.perf_counter() - t0)
+    assert best < 0.2
 
 
 @_pytest_redos.mark.parametrize("text,gone", [

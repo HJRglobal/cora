@@ -55,13 +55,14 @@ R143_LEGACY_MISSES = frozenset({
 })
 
 
-def _best_of_3(fn) -> float:
-    """D-171: a single timing run flakes under host load; the minimum of three is the
-    measurement."""
+def _best_of_3(fn, *args) -> float:
+    """D-171 / D-051 integration-tests-6: a single timing run flakes under host load
+    (the concurrent-suite state of every review and slice gate); the MINIMUM of three
+    calls is what the code costs. Bounds are never loosened."""
     best = float("inf")
     for _ in range(3):
         t0 = time.perf_counter()
-        fn()
+        fn(*args)
         best = min(best, time.perf_counter() - t0)
     return best
 
@@ -319,9 +320,7 @@ class TestReDoS:
 
     def test_pathological_clause_runs(self):
         sent = "F3 Energy " + ("," * 20000) + " clean"
-        t0 = time.perf_counter()
-        pf.rail2_attribution_hit(sent)
-        assert time.perf_counter() - t0 < 1.0
+        assert _best_of_3(pf.rail2_attribution_hit, sent) < 1.0
 
 
 class TestScript:
@@ -553,9 +552,7 @@ class TestNewPatternReDoS:
     def test_each_new_pattern_is_fast_on_degenerate_input(self):
         for pat in self._patterns():
             for text in self.DEGENERATE:
-                t0 = time.perf_counter()
-                pat.sub(" ", text)
-                dt = time.perf_counter() - t0
+                dt = _best_of_3(pat.sub, " ", text)
                 assert dt < 0.2, "%s on %r...: %.3fs" % (pat.pattern[:40], text[:20], dt)
 
     @pytest.mark.parametrize("unit,tail", [

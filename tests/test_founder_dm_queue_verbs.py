@@ -402,10 +402,13 @@ class TestVerbAttempt:
         text = "stage" + " " * 40_000 + "x"
         assert cq.normalize_verb_text(text) == text        # strip() cannot help: trailing char
         assert cq.match_queue_verb(text) is None
-        t0 = time.perf_counter()
-        assert cq.looks_like_queue_verb_attempt(text) is None
-        assert cq._VERB_ATTEMPT_RE.search(text) is None
-        assert time.perf_counter() - t0 < 0.2
+        best = float("inf")
+        for _ in range(3):   # best of 3 (D-171): a single run flakes under host load
+            t0 = time.perf_counter()
+            assert cq.looks_like_queue_verb_attempt(text) is None
+            assert cq._VERB_ATTEMPT_RE.search(text) is None
+            best = min(best, time.perf_counter() - t0)
+        assert best < 0.2
         # the quote-alternating shape (already linear) and a real attempt still match
         assert cq.looks_like_queue_verb_attempt("stage " + "' " * 5_000 + "cq-<12 hex>") == "stage"
 
@@ -425,10 +428,13 @@ class TestVerbAttempt:
         """D-171 re-time of the R14-2 prefix atoms, on the DEGENERATE inputs (the
         7th-ReDoS lesson: seed the pathological character, not a realistic one)."""
         import time
-        t0 = time.perf_counter()
-        cq.looks_like_queue_verb_attempt(shape)
-        cq._VERB_ATTEMPT_RE.match(shape)
-        assert time.perf_counter() - t0 < 0.2
+        best = float("inf")
+        for _ in range(3):   # best of 3 (D-171): a single run flakes under host load
+            t0 = time.perf_counter()
+            cq.looks_like_queue_verb_attempt(shape)
+            cq._VERB_ATTEMPT_RE.match(shape)
+            best = min(best, time.perf_counter() - t0)
+        assert best < 0.2
 
     def test_refusal_carries_zero_write_claim_lexicon(self, caplog):
         """The refusal must not itself trip S2' or be mangled by the sanitizer."""
