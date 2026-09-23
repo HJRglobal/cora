@@ -89,6 +89,22 @@ class TestShippedRegistry:
                 assert str(r["confirmed_by"]).startswith("Harrison"), r["lane"]
                 assert confirmed_events and all(e.get("evidence") for e in confirmed_events), r["lane"]
 
+    def test_harrisons_batch_confirm_landed_on_every_seeded_row(self):
+        """DELIBERATE FLIP (Code #14 R14-7): the rows were seeded pending-Harrison
+        (Code #13); his 2026-09-19 batch confirm (ask 9.1) was applied by Cowork on
+        2026-09-20 and is committed here verbatim. Every seeded row now carries
+        `confirmed_by: Harrison 2026-09-19` and a `confirmed` event; nightly-catchup
+        carries the ruled T1 demotion (ask 9.2)."""
+        reg = lr.load(_REAL)
+        assert lr.pending_confirmation(reg) == []
+        for row in reg["lanes"]:
+            assert str(row["confirmed_by"]).startswith("Harrison 2026-09-19"), row["lane"]
+            assert any(ev.get("event") == "confirmed" for ev in row["events"]), row["lane"]
+        catchup = next(r for r in reg["lanes"] if r["lane"] == "nightly-catchup")
+        assert catchup["tier"] == "T1"
+        assert any(ev.get("event") == "demoted" and ev.get("tier") == "T1"
+                   for ev in catchup["events"])
+
     def test_bespoke_rows_carried_verbatim(self):
         """The Code #12 / ingest-report / mirror rows keep their VALUES (the key
         `demotion` became `demotion_triggers`)."""
@@ -270,8 +286,11 @@ class TestValidate:
         assert any("event tier 'T9'" in p for p in probs), probs
 
     def test_the_shipped_seeded_events_carry_their_row_tier(self):
-        """Rule (a) is live from day one: every seeded event in the real file
-        says the tier its row holds, so a hand-edited `tier` now fails validate."""
+        """Rule (a) is live from day one: the LAST tier-bearing event in the real
+        file says the tier its row holds, so a hand-edited `tier` fails validate.
+        Re-pinned 2026-09-22 (Code #14): the seeded tier equals the row tier on
+        every row EXCEPT nightly-catchup, seeded T2 and demoted T1 by ruling 9.2 --
+        the demotion event, not the seed, now carries the row's tier."""
         reg = lr.load(_REAL)
         for r in lr.lanes(reg):
             seeded = [e for e in r["events"] if e.get("event") == "seeded"]
@@ -282,6 +301,10 @@ class TestValidate:
             assert tiered[-1]["tier"] == r["tier"], r["lane"]
             if len(tiered) == 1:
                 assert seeded[0].get("tier") == r["tier"], r["lane"]
+            if r["lane"] != "nightly-catchup":
+                assert all(e.get("tier") == r["tier"] for e in seeded), r["lane"]
+        catchup = lr.row_for("nightly-catchup", reg)
+        assert [e.get("tier") for e in catchup["events"] if e.get("tier")] == ["T2", "T1"]
         import copy
         edited = copy.deepcopy(reg)
         lr.row_for("s2-phantom-write-screen", edited)["tier"] = "T3"
