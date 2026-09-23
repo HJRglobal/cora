@@ -1045,6 +1045,9 @@ def _queue_status_turn(user_id: str | None, channel_name: str, retrieval_grant: 
     must reach the model with no forced read on iteration 0, or the read's
     tool_use switches off the S2' zero-tool screen for the very turn that
     confirms a write. Never on a queue-verb attempt either: the verb path owns it.
+    The suppression drops only the FORCE: the caller re-reads the unsuppressed
+    result (pending=False) and keeps the semantic-cache READ bypassed on it
+    (D-051 F2-R2), so a pending turn never serves a cached, ledger-less answer.
 
     The follow-up window is the last three USER turns of prior_messages. It is
     NOT time-bounded: _fetch_dm_history / _fetch_thread_history carry only
@@ -1578,6 +1581,12 @@ def _dispatch_qa(
     queue_status_turn = _queue_status_turn(user_id, channel_name, retrieval_grant,
                                            user_message, prior_messages,
                                            pending=bool(pending_note))
+    # D-051 F2-R2: a live staged write suppresses the FORCE above, never the cache
+    # bypass -- a queue-status-shaped question must still not be served a cached
+    # answer composed without the ledger. The unsuppressed shape is re-read only
+    # when the suppression could have fired (a pending note is live).
+    queue_status_shape = queue_status_turn or (bool(pending_note) and _queue_status_turn(
+        user_id, channel_name, retrieval_grant, user_message, prior_messages))
     # S3 (cq-439d89a84de4): the rail ledger's scope for this turn -- computed ONCE,
     # before the cache read, so the cached-serve screens carry it too.
     rail_ctx = _rail_context(channel_id, user_id, entity, retrieval_grant, is_dm, is_founder)
@@ -1585,7 +1594,7 @@ def _dispatch_qa(
     # never be served from (or stored into) the shared semantic cache, where a
     # different user's similar question would replay them.
     if (not hints.bypass_cache and retrieval_grant is None and not web_intent
-            and not inventory_turn and not queue_status_turn):
+            and not inventory_turn and not queue_status_shape):
         try:
             question_embedding = kb_embeddings.embed_query(user_message)
             cached_response = sc.get_cache().lookup(entity, question_embedding)

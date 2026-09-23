@@ -615,7 +615,11 @@ class TestAppSeam:
         import cora.app as app
         body = inspect.getsource(app._dispatch_qa)
         i_calc = body.index("queue_status_turn = _queue_status_turn(")
-        i_cache = body.index("and not inventory_turn and not queue_status_turn):")
+        # D-051 F2-R2: the cache-read bypass keys on the UNSUPPRESSED shape
+        i_shape = body.index("queue_status_shape = queue_status_turn or (bool(pending_note) and "
+                             "_queue_status_turn(")
+        assert i_calc < i_shape
+        i_cache = body.index("and not inventory_turn and not queue_status_shape):")
         i_asana = body.index("force_tool = _asana_destructive_intent(user_message)")
         i_qs = body.index('force_tool = "cora_queue_status"')
         i_inv = body.index('force_tool = "cora_self_inventory"')
@@ -713,6 +717,29 @@ class TestDispatchQaBehaviour:
         seen, _cache = _drive_dispatch_qa(monkeypatch, "yes go ahead -- have my cards registered?",
                                           prior=prior, pending_note=_PENDING_NOTE)
         assert seen["force_tool"] != "cora_queue_status"
+
+    @pytest.mark.parametrize("text", [Q1, "have my cards registered?",
+                                      "yes go ahead -- have my cards registered?"])
+    def test_a_pending_turn_drops_the_force_but_never_reads_the_cache(self, text, monkeypatch):
+        """D-051 F2-R2: the pending suppression is the documented design for the
+        FORCE; the cache-read bypass must survive it. The first cut keyed both on
+        the suppressed flag, so Q1 asked while any stash was live became eligible
+        for a cached FNDR answer composed without the ledger (0 model calls)."""
+        prior = [{"role": "user", "content": Q1}, {"role": "assistant", "content": "Checking."}]
+        seen, cache = _drive_dispatch_qa(monkeypatch, text, prior=prior, pending_note=_PENDING_NOTE)
+        assert seen["force_tool"] != "cora_queue_status"
+        cache.lookup.assert_not_called()
+        cache.store.assert_not_called()
+
+    def test_the_harness_sees_a_cache_read_on_a_pending_turn(self, monkeypatch):
+        """Control for the test above: a non-queue question on a pending turn still
+        READS the cache (only the store is excluded, by cache_storable), so the
+        assert_not_called there is an observation, not a blind spot."""
+        seen, cache = _drive_dispatch_qa(monkeypatch, "what's our cash position this week?",
+                                         pending_note=_PENDING_NOTE)
+        assert seen["force_tool"] is None
+        cache.lookup.assert_called_once()
+        cache.store.assert_not_called()
 
     def test_an_earlier_force_still_wins_on_the_same_text(self, monkeypatch):
         t = "queue a code session: cards don't refresh after a press -- they still show as unresponded"

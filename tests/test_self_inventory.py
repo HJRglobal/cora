@@ -553,8 +553,10 @@ class TestAppRoute:
         # gated on the same predicate the cache-read bypass uses, and never on a grant turn
         assert "inventory_turn = bool(user_id) and retrieval_grant is None and _self_inventory_force(user_message) is not None" in body
         # DELIBERATE re-pin (R14-9(a)): the cache-read guard now also bypasses a
-        # queue-status turn, so the old single-line substring ends differently
-        assert "and not inventory_turn and not queue_status_turn):" in body
+        # queue-status turn, so the old single-line substring ends differently.
+        # Re-pinned again (D-051 F2-R2): it keys on the UNSUPPRESSED queue-status
+        # shape, so a pending staged write cannot re-open the cache read.
+        assert "and not inventory_turn and not queue_status_shape):" in body
         assert "elif force_tool is None and inventory_turn:" in body
 
     def test_explicit_commands_win_and_writes_are_never_stolen(self, app):
