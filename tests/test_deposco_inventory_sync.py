@@ -23,6 +23,17 @@ import run_deposco_inventory_sync as sync  # noqa: E402
 KNOWN = ["PURE-Original", "PURE-Citrus", "PURESL"]
 
 
+@pytest.fixture(autouse=True)
+def no_real_runtime_configuration(monkeypatch):
+    """Read-lane hygiene (2026-09-23): `main()` now calls `_configure_runtime`
+    (load_dotenv on the real `.env` + a dated FileHandler under `logs/`).
+    Several tests below call `sync.main(...)` directly, so without this the
+    fix would just move the exact problem it closes from "at import" to "at
+    any test that exercises main()". Neutralize it everywhere in this file --
+    none of these tests assert on real env or log output."""
+    monkeypatch.setattr(sync, "_configure_runtime", lambda: None)
+
+
 def row(item_number, **measures):
     facilities = measures.pop("_facilities", None)
     return dc.EnterpriseInventoryRow(

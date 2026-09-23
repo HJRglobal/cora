@@ -287,6 +287,19 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "CORA_F3E_BLOG_LEDGER_PATH", str(tmp_path / "f3e-blog-publish-ledger.jsonl")
     )
+    # Deposco order-push pending store + ledger (SONNET-HANDOFF step 4) -- same
+    # class as the F3E blog cards/ledger pair above: a per-id JSON store plus an
+    # append-only ledger, both env-var-driven so a suite run can never write into
+    # data/state/deposco-order-pending/ or the real push ledger.
+    monkeypatch.setenv(
+        "CORA_DEPOSCO_PENDING_DIR", str(tmp_path / "deposco-order-pending")
+    )
+    monkeypatch.setenv(
+        "CORA_DEPOSCO_PUSH_LEDGER_PATH", str(tmp_path / "deposco-push-ledger.jsonl")
+    )
+    monkeypatch.setenv(
+        "CORA_DEPOSCO_DEMOTION_STATE_PATH", str(tmp_path / "deposco-standing-demotion.json")
+    )
     # WS-4 drive-extractor pause: .env carries DRIVE_EXTRACTOR_PROPOSALS_ENABLED=0
     # (the D-066 production pause) and config.py's import-time load_dotenv() pulls
     # it into the test process, short-circuiting run_proposal_loop and reddening

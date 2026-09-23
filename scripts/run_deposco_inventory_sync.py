@@ -49,32 +49,56 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(_REPO_ROOT / ".env", override=True)
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-# D-119: --dry-run is the pre-flight gate; a cp1252 console must not break it.
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
-    except (AttributeError, ValueError):  # pragma: no cover
-        pass
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(
-            _REPO_ROOT / "logs"
-            / f"deposco-inventory-sync-{datetime.datetime.now().strftime('%Y-%m-%d')}.log",
-            encoding="utf-8",
-        ),
-    ],
-)
 log = logging.getLogger("deposco-inventory-sync")
 
 from cora import drive_io, inventory_state as inv  # noqa: E402
 from cora.connectors import deposco_client as dc  # noqa: E402
+
+#: Guards against re-adding handlers if `main()` is ever called twice in one
+#: process; `logging.basicConfig` is itself a no-op once the root logger
+#: already has handlers, but this also skips the log-path computation.
+_RUNTIME_CONFIGURED = False
+
+
+def _configure_runtime() -> None:
+    """Load `.env` and wire up logging -- deferred to the first call from
+    `main()`, never at import.
+
+    Read-lane hygiene fix (2026-09-23, SONNET-HANDOFF step 2): this used to run
+    at MODULE SCOPE, so `import run_deposco_inventory_sync` (which
+    `tests/test_deposco_inventory_sync.py` does at collection) created a
+    dated, empty `logs/deposco-inventory-sync-<date>.log` file on every pytest
+    collection and overwrote the test session's environment with the real
+    `.env` via `override=True` -- neither of which importing a module should
+    ever do. `main()` calls this first; nothing else in the module (including
+    every test, which drives `build_payload`/`main` against fakes) needs it.
+
+    D-119: --dry-run is the pre-flight gate; a cp1252 console must not break it.
+    """
+    global _RUNTIME_CONFIGURED
+    load_dotenv(_REPO_ROOT / ".env", override=True)
+    if _RUNTIME_CONFIGURED:
+        return
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+        except (AttributeError, ValueError):  # pragma: no cover
+            pass
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(
+                _REPO_ROOT / "logs"
+                / f"deposco-inventory-sync-{datetime.datetime.now().strftime('%Y-%m-%d')}.log",
+                encoding="utf-8",
+            ),
+        ],
+    )
+    _RUNTIME_CONFIGURED = True
 
 #: This writer's own file. Deliberately NOT registered in
 #: `inventory_state.STORE_FILES`: that store models per-SALES-CHANNEL counts, and
@@ -246,6 +270,7 @@ def render_dry_run(payload: dict) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_runtime()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env", default="prod", choices=sorted(dc.ENVIRONMENTS),
                         help="prod for real figures; ua is a reachability smoke only "

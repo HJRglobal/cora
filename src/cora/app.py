@@ -23,6 +23,8 @@ from . import channel_content_guard
 from . import confirm_cards
 from . import decision_alerts
 from .f3e_blog import publish_cards as f3e_blog_cards
+from .deposco_orders import cards as deposco_cards
+from .deposco_orders import handler as deposco_handler
 from . import user_access
 from . import lex_phi_access
 from .config import config
@@ -4702,6 +4704,81 @@ def handle_f3e_blog_publish(ack, body, client) -> None:
 def handle_f3e_blog_dismiss(ack, body, client) -> None:
     ack()
     _handle_f3e_blog_tap(body, client, action="dismiss")
+
+
+# ── Deposco order-push cards (SONNET-HANDOFF 2026-09-09, step 7) ────────────
+#
+# Thin wrapper: Slack I/O only. Authorisation, the exactly-once claim, the
+# live preflight re-check, the push, the multistatus-correct classification
+# and the D-110 read-back all live in deposco_orders.handler -- see that
+# module's docstring. Mirrors the f3e_blog split above exactly.
+#
+# NOTHING pushes to prod outside this tap: deposco_push.DeposcoPushClient
+# refuses a prod push without BOTH the CORA_DEPOSCO_PUSH_CHANNELS allowlist
+# AND a claimed pending id, and the only caller that can ever hold one is
+# deposco_handler.process_push_tap, called from here.
+
+
+def _handle_deposco_push_tap(body: dict, client, *, action: str) -> None:
+    try:
+        actions = body.get("actions") or []
+        pending_id = (actions[0].get("value") if actions else "") or ""
+        actor_id = (body.get("user") or {}).get("id", "")
+        channel_id = (body.get("channel") or {}).get("id", "")
+        message_ts = (body.get("message") or {}).get("ts", "")
+
+        if os.environ.get("CORA_EVAL_MODE") == "1":
+            return
+
+        if not confirm_cards.confirm_buttons_enabled():
+            if channel_id and actor_id:
+                try:
+                    client.chat_postEphemeral(
+                        channel=channel_id, user=actor_id,
+                        text=("My confirm buttons are switched off right now. "
+                              "Nothing on this card can be tapped until they're "
+                              "back on."))
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+
+        if action == "push":
+            outcome, msg = deposco_handler.process_push_tap(pending_id, actor_id)
+        else:
+            outcome, msg = deposco_handler.process_dismiss_tap(pending_id, actor_id)
+
+        if outcome in ("not_authorized", "orphaned", "already_handled"):
+            # Ephemeral only -- never edit the shared card: not_authorized is
+            # someone else's tap, and already_handled is the race loser.
+            try:
+                client.chat_postEphemeral(channel=channel_id, user=actor_id, text=msg)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        entry = deposco_handler.pending.get_entry(pending_id)
+        if entry and channel_id and message_ts:
+            new_blocks = deposco_cards.terminal_card_blocks(
+                (body.get("message") or {}).get("blocks") or [], entry)
+            try:
+                client.chat_update(channel=channel_id, ts=message_ts,
+                                   text=msg, blocks=new_blocks)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("deposco push tap: chat_update failed: %s", exc)
+    except Exception:  # noqa: BLE001 -- a handler error must never crash the bot
+        log.warning("deposco push tap handler error (non-fatal)", exc_info=True)
+
+
+@app.action(deposco_cards.ACTION_PUSH_CONFIRM)
+def handle_deposco_push_confirm(ack, body, client) -> None:
+    ack()
+    _handle_deposco_push_tap(body, client, action="push")
+
+
+@app.action(deposco_cards.ACTION_PUSH_DISMISS)
+def handle_deposco_push_dismiss(ack, body, client) -> None:
+    ack()
+    _handle_deposco_push_tap(body, client, action="dismiss")
 
 
 # ── S3 meeting-ask cards (cq-f52c6b691127) ──────────────────────────────────

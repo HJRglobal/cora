@@ -1,0 +1,34 @@
+# data/maps/amazon-msku-map.yaml -- Deposco item number -> Amazon merchant SKU
+# (msku), for the FBA payload's OPTIONAL per-line msku validation.
+#
+# THE CLASS THIS CATCHES: the Deposco item number for F3 Mood Variety is
+# `F3VPM4` (Shopify feed SKU); the AMAZON merchant SKU for the same product is
+# `F3VPM` -- one character different, easy to transpose, and Seller Central
+# will silently accept the wrong one on typed entry. If a spec supplies an
+# `msku` for a line, spec.py cross-checks it against this map and refuses a
+# mismatch rather than shipping a transfer nobody can reconcile on the Amazon
+# side. `msku` is optional in a spec; when absent, no check happens.
+#
+# Sourced from Seller Central reads recorded in canon (1jjjjjjj, the Mood FBA
+# shipment build): FBA19NG0MR50's Contents tab (4 MSKUs, verified live
+# 2026-09-11) and the Mood Variety listing (2026-09-03, ASIN B0CGTBQVJH). Pure
+# rows carry forward from `data/maps/f3e-channel-sku-map.yaml`'s `amazon.sku`
+# column (VERIFIED LIVE 2026-08-04/05) -- restated here rather than
+# cross-imported so this map stays a single flat lookup for the payload
+# builder, with its own provenance.
+
+items:
+  # ── F3 MOOD (live FBA shipments, verified in Seller Central) ───────────────
+  F3-Peach:  {msku: "F3-PeachParadise",       asin: B0GZ8NFVRC, confirmed: true}
+  F3PC:      {msku: "F3-PinaColada",          asin: B0GZ8Y8984, confirmed: true}
+  F3SC:      {msku: "F3-StrawberryCream",     asin: B0GZ89J8CG, confirmed: true}
+  F3-Orange: {msku: "Mood-Orange-Stickerless", asin: B0C2QKKCQ2, confirmed: true}
+  F3VPM4:    {msku: "F3VPM",                  asin: B0CGTBQVJH, confirmed: true}
+
+  # ── F3 PURE (never yet FBA-shipped as of this build; carried forward from
+  # f3e-channel-sku-map.yaml for completeness, same amazon.sku values) ───────
+  PURE-Original: {msku: "F3-PURE-ORIG",   asin: B0GG4ZTDK9, confirmed: true}
+  PURE-Citrus:   {msku: "F3-PURE-CITRUS", asin: B0GG4W9KK4, confirmed: true}
+  PURE-Tropical: {msku: "F3-PURE-TROP",   asin: B0GG4T8NLJ, confirmed: true}
+  PURESL:        {msku: "F3-PURE-SL",     asin: B0GG4MKHY3, confirmed: true}
+  F3-PureE-V4F:  {msku: "F3-PureE-V4F",   asin: B0H73G8QFR, confirmed: true}

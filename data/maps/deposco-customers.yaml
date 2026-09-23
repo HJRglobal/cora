@@ -1,0 +1,53 @@
+# data/maps/deposco-customers.yaml -- wholesale buyer address book + allowed-SKU
+# set, keyed by buyer code. Read by src/cora/deposco_orders/spec.py.
+#
+# WHY THIS EXISTS: the two SO 081226 defect classes (keyed as a Purchase Order;
+# a stray F3 Original Energy line Alex could not delete) are eliminated by
+# construction when ship-to/bill-to come from HERE, never hand-typed per order,
+# and lines are refused at validation against `allowed_skus` before a push is
+# ever staged. See the SONNET-HANDOFF step 4 / design proposal SS3.3.
+#
+# `allowed_skus` is the buyer-level guard: Gotham DSD only ever takes F3 Pure,
+# so an Energy line on a Gotham spec is refused at validation, never caught by
+# Nimbl after the fact.
+#
+# Sourced from: Harrison's 8/11 email (`19ff29f3ccd77ca1`), the pure-spec-sheet,
+# and the live prod read-back 2026-09-23
+# (`_notes/2026-09-23_f3e_deposco-prod-read-verification.md`, order 081226).
+# ship_to/bill_to fields map straight onto Deposco's shipToAddress/billToAddress
+# JSON blocks. bill_to reuses the buyer's own AP contact -- the PROVEN shape
+# (UA rehearsal 8/14, 201 + read-back) -- not an invented "F3 Energy LLC"
+# address, which is not confirmed anywhere in canon as of this build.
+
+customers:
+  GOTHAM:
+    display_name: "Gotham DSD"
+    allowed_skus:
+      - PURE-Original
+      - PURE-Citrus
+      - PURE-Tropical
+      - PURESL
+      - F3-PureE-V4F
+    ship_to:
+      name: "Gotham DSD"
+      contactName: "Receiving"
+      attention: "Receiving - #401"
+      addressLine1: "4747 Vandam St"
+      addressLine2: "#401"
+      city: "Long Island City"
+      stateProvinceCode: "NY"
+      postalCode: "11101"
+      countryCode: "US"
+    bill_to:
+      name: "Gotham DSD"
+      contactName: "Justin Moran (AP)"
+      attention: "Accounts Payable"
+      addressLine1: "4747 Vandam St"
+      addressLine2: "#401"
+      city: "Long Island City"
+      stateProvinceCode: "NY"
+      postalCode: "11101"
+      countryCode: "US"
+    # Site constraint text folded into every pushed order's notes block
+    # (SS3.3: "notes template carries site constraints from the address book").
+    site_notes: "13 ft dock height limit at Vandam St -- confirm carrier/equipment before scheduling. Confirm arrival window with Receiving before dispatch."
