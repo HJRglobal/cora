@@ -373,6 +373,95 @@ class TestOutcomeClassification:
         assert "Call Nimbl now" in msg
 
 
+# ── Integration: the REAL DeposcoPushClient's prod gate, reached through handler ──
+
+
+def _patch_real_client_read_methods(monkeypatch, *, find_order_detail_sequence):
+    """Patches METHODS on the real `dc.DeposcoClient` class -- not the class
+    itself -- so `DeposcoPushClient.__init__`'s own internal
+    `dc.DeposcoClient(...)` construction (it shares the exact same module
+    reference `handler.dc` does) stays REAL and unaffected. Replacing the
+    whole class here would ALSO replace what deposco_push.py builds its
+    `_reader` from, defeating the point of this test."""
+    seq = list(find_order_detail_sequence)
+    state = {"n": 0}
+
+    def fake_find_order_detail(self, order_type, number):
+        idx = min(state["n"], len(seq) - 1) if seq else 0
+        state["n"] += 1
+        return seq[idx] if seq else None
+
+    monkeypatch.setattr(dc.DeposcoClient, "find_order_detail", fake_find_order_detail)
+    monkeypatch.setattr(
+        dc.DeposcoClient, "search_orders",
+        lambda self, order_type, **kw: dc.DeposcoResponse("prod", "/search/Order", 200, "<orders/>"),
+    )
+    monkeypatch.setattr(dc.DeposcoClient, "item_exists", lambda self, item_number: True)
+    monkeypatch.setattr(
+        dc.DeposcoClient, "get_enterprise_availability",
+        lambda self, item_numbers=None, **kw: dc.AvailabilityResult(
+            env="prod",
+            rows=[dc.EnterpriseInventoryRow(item_number="PURE-Original", measures={"atpQty": 500})],
+        ),
+    )
+
+
+class TestRealPushClientProdGateReachedThroughHandler:
+    """Every other test in this file mocks dpush.DeposcoPushClient entirely --
+    which proves the orchestration logic, but never proves the REAL prod
+    double-gate (deposco_push.py's own class) is actually invoked correctly
+    from process_push_tap. This uses the real class end to end -- only the
+    READ methods and the final _send (the actual httpx call) are stubbed."""
+
+    def test_prod_push_with_no_channel_allowlist_is_safely_refused_not_crashed(
+        self, monkeypatch,
+    ):
+        """This is the ACTUAL live state of this build: CORA_DEPOSCO_PUSH_CHANNELS
+        is never set (guardrail). A tap on a prod-staged card must be refused
+        by the real gate, reported as a clean 'error' outcome -- never a crash,
+        and never a false push."""
+        monkeypatch.delenv("CORA_DEPOSCO_PUSH_CHANNELS", raising=False)
+        monkeypatch.setenv("DEPOSCO_PROD_USER", "prod-user")
+        monkeypatch.setenv("DEPOSCO_PROD_PASS", "prod-pass")
+        entry = _stage()  # env="prod" by default in _stage's payload build
+        _patch_real_client_read_methods(monkeypatch, find_order_detail_sequence=[None])
+        monkeypatch.setattr(
+            dpush.DeposcoPushClient, "_send",
+            lambda self, *a, **k: (_ for _ in ()).throw(
+                AssertionError("no network call should ever be attempted")),
+        )
+        outcome, msg = handler.process_push_tap(entry["id"], handler.HARRISON_ID)
+        assert outcome == "error"
+        assert "refused" in msg.lower()
+        assert pending.get_entry(entry["id"])["state"] == pending.STATE_STAGED, (
+            "a refused push must release the claim back to STAGED, not strand it CLAIMED"
+        )
+
+    def test_prod_push_with_the_channel_allowlisted_reaches_the_real_send(self, monkeypatch):
+        """The mirror case: WITH the allowlist set, the real gate lets the
+        call through to _send (proving the gate is not simply always-refuse)."""
+        monkeypatch.setenv("CORA_DEPOSCO_PUSH_CHANNELS", "wholesale")
+        monkeypatch.setenv("DEPOSCO_PROD_USER", "prod-user")
+        monkeypatch.setenv("DEPOSCO_PROD_PASS", "prod-pass")
+        entry = _stage()
+        _patch_real_client_read_methods(
+            monkeypatch, find_order_detail_sequence=[None, _record(entry["number"])],
+        )
+        sent = []
+
+        class _FakeResponse:
+            status_code = 207
+            text = "201 Created"
+
+        monkeypatch.setattr(
+            dpush.DeposcoPushClient, "_send",
+            lambda self, url, headers, body: (sent.append(url), _FakeResponse())[-1],
+        )
+        outcome, msg = handler.process_push_tap(entry["id"], handler.HARRISON_ID)
+        assert sent, "the real gate should have let this call reach _send"
+        assert outcome == "confirmed"
+
+
 # ── Dismiss ───────────────────────────────────────────────────────────────────
 
 
