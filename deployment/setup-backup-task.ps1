@@ -18,7 +18,10 @@ $REPO_DIR     = "C:\Users\Harri\code\cora"
 $SCRIPT_PATH  = "$REPO_DIR\scripts\backup_logs.py"
 # 1:00PM AZ -- moved off 4:30AM so the online backup reads the 5.7GB cora_kb.db
 # while it is quiescent (no KB-sync writer active), not during kb-sync-drive.
-$TRIGGER_TIME = "1:00PM"
+# 20:30 AZ = the LIVE trigger (moved 2026-07-27 from 1:00PM for the memory-incident
+# mitigation; the file kept the old default until DR/VM step-1 M3 reconciled it against
+# the task-estate manifest, 2026-09-23). A re-run must not silently move the task back.
+$TRIGGER_TIME = "8:30PM"
 
 Write-Host ""
 Write-Host "=== Cora Log Backup Task Setup ==="

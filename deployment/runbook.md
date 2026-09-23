@@ -919,7 +919,7 @@ The cross-entity scope rule in the entity's system prompt may be firing too broa
 Check the log for config validation errors or an `AuthenticationError`. Most likely cause: a token in `.env` is malformed or expired.
 
 **Log shows `rate_limited`:**
-A user hit the per-user (10/hr) or the channel hit the per-channel (50/hr) cap. This is normal during stress tests and load bursts. Caps reset automatically after 60 minutes — no action needed.
+A user hit the per-user (30/hr, `rate_limiter._USER_LIMIT`) or the channel hit the per-channel (50/hr, `_CHANNEL_LIMIT`) cap -- the numbers live in `src/cora/rate_limiter.py`; the Slack refusal copy is derived from the same constant (DR/VM step-1 M3 fixed a "10/hour" copy drift). This is normal during stress tests and load bursts. Caps reset automatically after 60 minutes — no action needed.
 
 ---
 
