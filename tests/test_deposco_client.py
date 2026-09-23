@@ -588,6 +588,99 @@ class TestOrderStatusParsing:
         assert dc.parse_order_status(dc.DeposcoResponse("ua", "/x", 200, empty)) == []
 
 
+# ── OrderHeader detail: the real D-110 read-back route (V2, 2026-09-23) ──────
+
+ORDER_HEADER_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<ns2:orders xmlns:ns2="http://integration.deposco.com/orderheader">
+  <order>
+    <businessUnit>F3E</businessUnit>
+    <number>TEST-GOTHAM-003</number>
+    <type>Sales Order</type>
+    <status>Complete</status>
+    <shipToAddress>
+      <name>Test Buyer</name>
+      <attention>Receiving</attention>
+      <postalCode>11101</postalCode>
+    </shipToAddress>
+    <shipVia>General Freight</shipVia>
+    <customerOrderNumber>TEST-GOTHAM-003</customerOrderNumber>
+    <createdBy>AlexCor</createdBy>
+    <orderLines>
+      <orderLine>
+        <lineNumber>TEST-GOTHAM-003--1</lineNumber>
+        <lineStatus>Complete</lineStatus>
+        <orderPackQuantity>208.0</orderPackQuantity>
+        <itemNumber>PURE-Original</itemNumber>
+        <unitPrice>21.70</unitPrice>
+      </orderLine>
+      <orderLine>
+        <lineNumber>TEST-GOTHAM-003--2</lineNumber>
+        <lineStatus>Complete</lineStatus>
+        <orderPackQuantity>208.0</orderPackQuantity>
+        <itemNumber>PURE-Citrus</itemNumber>
+        <unitPrice>21.70</unitPrice>
+      </orderLine>
+    </orderLines>
+  </order>
+</ns2:orders>"""
+
+
+class TestOrderHeaderDetailParsing:
+    """The route V2 actually found: /search/Order carries full line detail,
+    not just a count -- see OrderHeaderRecord's docstring for the finding."""
+
+    def test_header_fields_parse(self):
+        record = dc.parse_order_header_detail(
+            dc.DeposcoResponse("prod", "/x", 200, ORDER_HEADER_XML))[0]
+        assert record.number == "TEST-GOTHAM-003"
+        assert record.order_type == "Sales Order"
+        assert record.ship_to_name == "Test Buyer"
+        assert record.ship_to_postal_code == "11101"
+        assert record.ship_via == "General Freight"
+        assert record.created_by == "AlexCor"
+
+    def test_lines_carry_item_and_quantity(self):
+        record = dc.parse_order_header_detail(
+            dc.DeposcoResponse("prod", "/x", 200, ORDER_HEADER_XML))[0]
+        assert [line.item_number for line in record.lines] == ["PURE-Original", "PURE-Citrus"]
+        assert record.lines[0].order_pack_quantity == 208
+        assert record.lines[0].unit_price == "21.70"
+
+    def test_line_item_qty_multiset(self):
+        record = dc.parse_order_header_detail(
+            dc.DeposcoResponse("prod", "/x", 200, ORDER_HEADER_XML))[0]
+        assert record.line_item_qty_multiset() == {"PURE-Original": 208, "PURE-Citrus": 208}
+
+    def test_multiset_sums_repeated_items_and_skips_unparseable_lines(self):
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<ns2:orders xmlns:ns2="http://integration.deposco.com/orderheader">
+  <order>
+    <number>TEST-REPEAT</number>
+    <orderLines>
+      <orderLine><itemNumber>PURE-Original</itemNumber><orderPackQuantity>100.0</orderPackQuantity></orderLine>
+      <orderLine><itemNumber>PURE-Original</itemNumber><orderPackQuantity>8.0</orderPackQuantity></orderLine>
+      <orderLine><itemNumber>PURE-Citrus</itemNumber><orderPackQuantity>bogus</orderPackQuantity></orderLine>
+    </orderLines>
+  </order>
+</ns2:orders>"""
+        record = dc.parse_order_header_detail(dc.DeposcoResponse("prod", "/x", 200, xml))[0]
+        assert record.line_item_qty_multiset() == {"PURE-Original": 108}
+
+    def test_non_xml_payload_yields_nothing(self):
+        assert dc.parse_order_header_detail({"order": []}) == []
+
+    def test_find_order_detail_filters_client_side_and_returns_none_on_a_miss(self, ua_env):
+        t = FakeTransport(FakeResponse(200, ORDER_HEADER_XML, "application/xml"))
+        c = client(transport=t)
+        assert c.find_order_detail("Sales Order", "NOT-THE-RIGHT-NUMBER") is None
+
+    def test_find_order_detail_returns_the_matching_record(self, ua_env):
+        t = FakeTransport(FakeResponse(200, ORDER_HEADER_XML, "application/xml"))
+        record = client(transport=t).find_order_detail("Sales Order", "TEST-GOTHAM-003")
+        assert record is not None
+        assert record.line_item_qty_multiset() == {"PURE-Original": 208, "PURE-Citrus": 208}
+
+
 # ── Envelope + misc ──────────────────────────────────────────────────────────
 
 

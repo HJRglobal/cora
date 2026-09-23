@@ -539,6 +539,19 @@ class DeposcoClient:
         response = self.find_order(order_type, number)
         return number in response.text
 
+    def find_order_detail(self, order_type: str, number: str) -> "OrderHeaderRecord | None":
+        """The D-110 read-back route: existence + full line detail in one call.
+
+        Filters client-side on `number` even though `/search/Order` already
+        filters server-side (V3a, 2026-09-23: exactly one order returned per
+        number) -- the same defensive posture `get_order_status` uses against
+        `/status/order/search`, which does NOT filter server-side. Returns
+        None on a miss; never raises for "not found" (the response is still a
+        200 with no matching `<order>`, not a 404).
+        """
+        records = parse_order_header_detail(self.find_order(order_type, number))
+        return next((r for r in records if r.number == number), None)
+
     def get_order_status(self, order_type: str, number: str) -> list["OrderStatus"]:
         """Status records for one order.
 
@@ -910,6 +923,89 @@ def _parse_receipt_lines_json(payload: Any) -> list[ReceiptLine]:
                 status=str(entry.get("status") or ""),
             )
         )
+    return out
+
+
+@dataclass
+class OrderHeaderLine:
+    """One order line from the OrderHeader schema (`/search/Order`)."""
+
+    line_number: str = ""
+    item_number: str = ""
+    line_status: str = ""
+    order_pack_quantity: int | None = None
+    unit_price: str = ""
+
+
+@dataclass
+class OrderHeaderRecord:
+    """Full per-order detail from the OrderHeader schema (`/search/Order`).
+
+    THIS IS THE READ-BACK ROUTE (2026-09-23 prod verification, V2). The
+    original design assumed line-level read-back would need `/status/order`;
+    live, that route returned 91 records for a 79-day prod window and MISSED
+    all three known real orders (081226, the two real FBA shipments) -- it is
+    capped/unreliable for a bulk historical query on tenant ESM. The route
+    this client already used for existence (`find_order`, D-110) turns out to
+    carry full line detail too -- item number, quantity, unit price, ship-to,
+    shipVia, createdBy -- so it is both the existence check AND the
+    line-multiset comparison a D-110 read-back needs. Record:
+    `_notes/2026-09-23_f3e_deposco-prod-read-verification.md`.
+    """
+
+    number: str = ""
+    order_type: str = ""
+    order_status: str = ""
+    ship_to_name: str = ""
+    ship_to_attention: str = ""
+    ship_to_postal_code: str = ""
+    ship_via: str = ""
+    customer_order_number: str = ""
+    created_by: str = ""
+    lines: list[OrderHeaderLine] = field(default_factory=list)
+
+    def line_item_qty_multiset(self) -> dict[str, int]:
+        """`{item_number: total_qty}`, for a D-110 read-back comparison against
+        a pushed payload's own lines. A line with an unparseable quantity
+        contributes nothing rather than a wrong number -- see `coerce_qty`."""
+        totals: dict[str, int] = {}
+        for line in self.lines:
+            if not line.item_number or line.order_pack_quantity is None:
+                continue
+            totals[line.item_number] = totals.get(line.item_number, 0) + line.order_pack_quantity
+        return totals
+
+
+def parse_order_header_detail(response: Any) -> list[OrderHeaderRecord]:
+    """Full per-order, per-line detail from `/search/Order` (OrderHeader
+    schema) -- see `OrderHeaderRecord` for why this, not `/status/order`, is
+    the D-110 read-back route."""
+    payload = _payload_root(response)
+    if not isinstance(payload, ET.Element):
+        return []
+    out: list[OrderHeaderRecord] = []
+    for order_el in _find_all(payload, "order"):
+        ship_to = next((c for c in order_el if _strip_ns(c.tag) == "shipToAddress"), None)
+        record = OrderHeaderRecord(
+            number=_child_text(order_el, "number"),
+            order_type=_child_text(order_el, "type"),
+            order_status=_child_text(order_el, "status"),
+            ship_to_name=_child_text(ship_to, "name") if ship_to is not None else "",
+            ship_to_attention=_child_text(ship_to, "attention") if ship_to is not None else "",
+            ship_to_postal_code=_child_text(ship_to, "postalCode") if ship_to is not None else "",
+            ship_via=_child_text(order_el, "shipVia"),
+            customer_order_number=_child_text(order_el, "customerOrderNumber"),
+            created_by=_child_text(order_el, "createdBy"),
+        )
+        for line_el in _find_all(order_el, "orderLine"):
+            record.lines.append(OrderHeaderLine(
+                line_number=_child_text(line_el, "lineNumber"),
+                item_number=_child_text(line_el, "itemNumber"),
+                line_status=_child_text(line_el, "lineStatus"),
+                order_pack_quantity=coerce_qty(_child_text(line_el, "orderPackQuantity")),
+                unit_price=_child_text(line_el, "unitPrice"),
+            ))
+        out.append(record)
     return out
 
 
