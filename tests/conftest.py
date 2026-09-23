@@ -452,6 +452,11 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     # SAME patch that introduced the writer.
     monkeypatch.setenv("MAILBOX_INTAKE_WATERMARK_PATH",
                        str(tmp_path / "mailbox-intake-watermark.json"))
+    # Code #14 S2: the nightly health check's run-artifact directory (writer:
+    # scripts/nightly_health_check.main on a real run; pruner: scripts/compact_logs
+    # prune_reports). Redirected in the SAME commit that introduced the writer --
+    # a main() test with argv=[] reaches the artifact write.
+    monkeypatch.setenv("CORA_HEALTH_REPORT_DIR", str(tmp_path / "health-reports"))
     # Found by WIDENING the isolation rail's suffix list to include *_LEDGER
     # (session #11 S4). Both were live, unredirected write paths that the
     # PATH/DIR/ROOT-only scanner could not see -- and decision_inbox has TWO env

@@ -1912,6 +1912,30 @@ def _line_within(line: str, cutoff: datetime) -> bool:
     return stamped >= cutoff
 
 
+# Code #14 S2 (cq-0f04ad6543a8): the health check's OWN log. main() logs every
+# non-OK result as "<ts> INFO health-check: [<STATUS>] <name>: <detail>", and that
+# file (logs/health-check-YYYY-MM-DD.log) is inside this scan's own glob and 26h
+# window. The "Critical log patterns" detail QUOTES the matched line, so once the
+# detail is logged in full (S2) the next morning's scan would re-match the quote and
+# re-raise the same CRITICAL forever -- each day's report re-logging the previous
+# hit (live precedent: health-check-2026-08-28.log:27-28 carries exactly such a
+# quoted snippet; only the old [:100] cut kept the matched text out).
+#
+# The exclusion is deliberately NARROWER than "skip the whole file": a real
+# writer failure raised INSIDE this process (REPEAT_SIGNAL_WRITE_FAILING from the
+# decision-gate check, RUN_MARKER_WRITE_FAILING) is logged to this same file by
+# the root handler and must stay visible. So in the check's own files ONLY the
+# report lines (and the unstamped continuation lines of a legacy multi-line
+# report detail) are skipped. Plain string tests -- no new regex (D-171).
+_OWN_LOG_PREFIX = "health-check-"
+_OWN_REPORT_MARKERS = tuple(
+    f" health-check: [{s}] " for s in ("OK", "WARN", "CRITICAL", "FIXED"))
+
+
+def _is_own_log(path: Path) -> bool:
+    return path.name.startswith(_OWN_LOG_PREFIX)
+
+
 def check_logs_24h() -> list[CheckResult]:
     """Scan last 24h log files for ERRORs and critical patterns."""
     results: list[CheckResult] = []
@@ -1947,7 +1971,20 @@ def check_logs_24h() -> list[CheckResult]:
         except Exception:
             continue
 
+        own_log = _is_own_log(lf)
+        in_own_report = False  # inside a report line's unstamped continuation
         for line in text.splitlines():
+            # S2: in the check's own log, a report line and its continuation lines
+            # are this check's OUTPUT, never new evidence. Decided before the
+            # recency test so an in-window continuation of an out-of-window
+            # report line is still recognised as a continuation.
+            report_line = False
+            if own_log:
+                if _LOG_LINE_TS_RE.match(line):
+                    in_own_report = any(m in line for m in _OWN_REPORT_MARKERS)
+                    report_line = in_own_report
+                else:
+                    report_line = in_own_report
             # PER-LINE recency (D-051 lens-4/lens-5 MEDIUM). A start-date-pinned
             # log accumulates the whole life of an instance and its mtime is always
             # fresh, so file-level filtering alone reports week-old criticals as
@@ -1969,6 +2006,12 @@ def check_logs_24h() -> list[CheckResult]:
             # metric. Validated on the known 8/28 corpus: 56, not 57 and not 63.
             if _ERROR_LINE_RE.search(line):
                 total_errors += 1
+            # The ERROR tally above is deliberately NOT gated on report_line: a
+            # report line is INFO-level by construction (never an ERROR-level
+            # match) and its continuations are unstamped (never counted), so the
+            # count is unchanged -- while a real ERROR this process logged stays in.
+            if report_line:
+                continue
             if _CRITICAL_RE.search(line):
                 snippet = line[:120].strip()
                 # Dedup on the BARE snippet -- the list stores a prefixed form, so
@@ -2468,8 +2511,11 @@ def check_egress_rails(now: datetime | None = None) -> CheckResult:
 # ── Report builder ────────────────────────────────────────────────────────────
 
 
-def _build_report(all_results: list[CheckResult], run_time: float) -> str:
-    today = datetime.now().strftime("%Y-%m-%d %H:%M AZ")
+def _build_report(all_results: list[CheckResult], run_time: float,
+                  now: datetime | None = None) -> str:
+    # `now` exists for test determinism only (S2); main() never passes it, so the
+    # posted report is byte-identical to before.
+    today = (now if now is not None else datetime.now()).strftime("%Y-%m-%d %H:%M AZ")
 
     criticals  = [r for r in all_results if r.status == "critical"]
     warnings   = [r for r in all_results if r.status == "warn"]
@@ -2516,6 +2562,129 @@ def _build_report(all_results: list[CheckResult], run_time: float) -> str:
         sections.append("\n_All systems healthy. Nothing to fix._")
 
     return "\n".join(sections)
+
+
+# ── Durable run artifact (Code #14 S2, cq-0f04ad6543a8) ───────────────────────
+#
+# Before S2 the only full read of a run was the Slack post: the task log cut every
+# detail at 100 chars ("... task-estate added: fndr-notetak") and nothing else was
+# kept. Each real run now leaves reports/health/YYYY-MM-DD.json (+ a .md twin) with
+# every check's FULL detail. Local disk only, gitignored (/reports/), not under the
+# KB static walk (that walks G:, not the repo), never routed anywhere shared -- it
+# carries the same details the post already carries. A dry run never writes one
+# (D-290): a same-date dry run would otherwise overwrite the real run's artifact.
+
+_AZ = timezone(timedelta(hours=-7))  # Arizona: MST all year, no DST
+ARTIFACT_SCHEMA = 1
+
+
+def _health_report_dir() -> Path:
+    """Resolved PER CALL (never an import-time constant): the conftest autouse
+    fixture points CORA_HEALTH_REPORT_DIR at tmp so no test can write the real
+    reports/ directory."""
+    raw = (os.environ.get("CORA_HEALTH_REPORT_DIR") or "").strip()
+    return Path(raw) if raw else _REPO_ROOT / "reports" / "health"
+
+
+def _az_now(now: datetime | None = None) -> datetime:
+    if now is None:
+        return datetime.now(_AZ)
+    if now.tzinfo is None:  # the host clock is AZ; a naive stamp is AZ wall time
+        return now.replace(tzinfo=_AZ)
+    return now.astimezone(_AZ)
+
+
+def _artifact_paths(now: datetime | None = None,
+                    out_dir: Path | None = None) -> tuple[Path, Path]:
+    d = out_dir if out_dir is not None else _health_report_dir()
+    day = _az_now(now).date().isoformat()
+    return d / f"{day}.json", d / f"{day}.md"
+
+
+def _build_artifact(all_results: list[CheckResult], run_time: float, *,
+                    exit_code: int, dry_run: bool, report_text: str,
+                    now: datetime | None = None) -> dict:
+    """The structured record of one run. `checks` round-trips: CheckResult(**c)
+    for each entry rebuilds the exact inputs, so _build_report over the rebuilt
+    list reproduces report_text for the same clock."""
+    stamp = _az_now(now)
+    counts = {s: sum(1 for r in all_results if r.status == s)
+              for s in ("critical", "warn", "fixed", "ok")}
+    heartbeat = next(({"status": r.status, "detail": r.detail}
+                      for r in all_results if r.name == "Cora heartbeat"), None)
+    rails = next((r for r in all_results if r.name.startswith("Egress rails")), None)
+    rails_line = (f"{rails.name} [{rails.status}]: {rails.detail}"
+                  if rails is not None else None)
+    return {
+        "schema": ARTIFACT_SCHEMA,
+        "run_ts": stamp.isoformat(timespec="seconds"),
+        "run_time_s": float(run_time),
+        "exit_code": int(exit_code),
+        "dry_run": bool(dry_run),
+        "counts": counts,
+        "heartbeat": heartbeat,
+        "rails_line": rails_line,
+        "checks": [{"name": r.name, "status": r.status, "detail": r.detail,
+                    "fix_applied": r.fix_applied} for r in all_results],
+        "report_text": report_text,
+    }
+
+
+def _md_cell(text: str) -> str:
+    return (text or "").replace("|", "\\|").replace("\r", "").replace("\n", "<br>")
+
+
+def _render_artifact_md(artifact: dict) -> str:
+    c = artifact["counts"]
+    lines = [
+        f"# Cora health check -- {artifact['run_ts']}",
+        "",
+        f"- exit code: {artifact['exit_code']}  (dry run: {artifact['dry_run']})",
+        f"- ran in {artifact['run_time_s']:.1f}s",
+        f"- {c['critical']} critical / {c['warn']} warn / {c['fixed']} fixed / {c['ok']} ok",
+        "- heartbeat: " + (f"{artifact['heartbeat']['status']} -- "
+                            f"{artifact['heartbeat']['detail']}"
+                            if artifact.get("heartbeat") else "(no heartbeat result)"),
+        f"- egress rails: {artifact.get('rails_line') or '(no egress-rails result)'}",
+        "",
+        "## Every check (full detail)",
+        "",
+        "| status | check | detail | fix applied |",
+        "|---|---|---|---|",
+    ]
+    for chk in artifact["checks"]:
+        lines.append(f"| {chk['status']} | {_md_cell(chk['name'])} | "
+                     f"{_md_cell(chk['detail'])} | {_md_cell(chk['fix_applied'])} |")
+    lines += ["", "## Report as posted", "", "```", artifact["report_text"], "```", ""]
+    return "\n".join(lines)
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _write_artifact(artifact: dict, out_dir: Path | None = None) -> Path | None:
+    """Write <day>.json + <day>.md atomically (tmp + os.replace). Fail-soft: a
+    write failure logs a warning and returns None -- it must never block the
+    Slack post. A same-day re-run overwrites (last real run wins)."""
+    try:
+        json_path, md_path = _artifact_paths(
+            datetime.fromisoformat(artifact["run_ts"]), out_dir)
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(json_path, json.dumps(artifact, ensure_ascii=False, indent=2) + "\n")
+        _atomic_write(md_path, _render_artifact_md(artifact))
+        return json_path
+    except Exception as exc:  # noqa: BLE001 -- observability must never block the post
+        log.warning("health-check artifact write failed (report still posts): %s", exc)
+        return None
+
+
+def _flatten_detail(detail: str) -> str:
+    """One log line per result: the FULL detail with newlines folded (S2). The old
+    [:100] cut made the Slack post the only full read of record."""
+    return (detail or "").replace("\r\n", "\n").replace("\n", " | ")
 
 
 def _post_to_slack(message: str, token: str, channel: str) -> None:
@@ -2652,8 +2821,11 @@ def main() -> int:
 
     for r in all_results:
         if args.verbose or r.status != "ok":
+            # S2: the FULL detail, flattened to one line (was r.detail[:100]).
+            # check_logs_24h skips these report lines in its own log, so a quoted
+            # critical snippet can never re-raise itself the next morning.
             log.info("[%s] %s: %s%s",
-                     r.status.upper(), r.name, r.detail[:100],
+                     r.status.upper(), r.name, _flatten_detail(r.detail),
                      f" | FIX: {r.fix_applied}" if r.fix_applied else "")
 
     log.info("Health check complete in %.1fs — %d critical, %d warn, %d fixed",
@@ -2661,12 +2833,24 @@ def main() -> int:
 
     # Build and post report
     report = _build_report(all_results, run_time)
+    exit_code = 1 if criticals else 0
+    artifact = _build_artifact(all_results, run_time, exit_code=exit_code,
+                               dry_run=args.dry_run, report_text=report)
 
     if args.dry_run:
         sys.stdout = open(sys.stdout.fileno(), "w", encoding="utf-8", errors="replace", closefd=False)
         print("\n=== REPORT (dry-run) ===\n")
         print(report)
+        # D-290: a dry run writes NO artifact (a same-date dry run would overwrite
+        # the real run's record).
+        json_path, _md = _artifact_paths(datetime.fromisoformat(artifact["run_ts"]))
+        print(f"\n[dry-run] would write {json_path} (+ .md twin)")
+        sys.stdout.flush()
         return 0
+
+    written = _write_artifact(artifact)
+    if written is not None:
+        log.info("Run artifact written: %s", written)
 
     # Always post — Harrison wants a daily all-clear or issue report every morning
     should_post = True
@@ -2681,7 +2865,7 @@ def main() -> int:
         log.warning("SLACK_BOT_TOKEN not set — report not posted")
         print(report)
 
-    return 1 if criticals else 0
+    return exit_code
 
 
 if __name__ == "__main__":

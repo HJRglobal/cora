@@ -24,11 +24,12 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import os
 import re
 import shutil
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -150,6 +151,43 @@ def trim_ledgers(ledger_days: int, min_mb: float, dry_run: bool) -> list[dict]:
     return out
 
 
+def _health_report_dir() -> Path:
+    """Same resolution as nightly_health_check._health_report_dir (env var read
+    PER CALL, default <repo>/reports/health) -- the conftest autouse fixture
+    redirects it for every test."""
+    raw = (os.environ.get("CORA_HEALTH_REPORT_DIR") or "").strip()
+    return Path(raw) if raw else REPO_ROOT / "reports" / "health"
+
+
+def prune_reports(days: int, dry_run: bool, *, today=None,
+                  report_dir: Path | None = None) -> dict:
+    """Delete health-check run artifacts (reports/health/YYYY-MM-DD.{json,md})
+    older than `days`, keyed on the FILENAME date (Code #14 S2). A file whose stem
+    is not a plain date is never touched. --dry-run counts and deletes nothing."""
+    d = report_dir if report_dir is not None else _health_report_dir()
+    today = today or date.today()
+    cutoff = today - timedelta(days=days)
+    pruned = 0
+    freed = 0
+    if not d.exists():
+        return {"pruned": 0, "freed_bytes": 0, "dir": str(d)}
+    for p in sorted(d.iterdir()):
+        if not p.is_file() or p.suffix not in (".json", ".md"):
+            continue
+        try:
+            file_day = datetime.strptime(p.stem, "%Y-%m-%d").date()
+        except ValueError:
+            continue  # not a dated artifact -- never ours to delete
+        if file_day >= cutoff:
+            continue
+        size = p.stat().st_size
+        if not dry_run:
+            p.unlink()
+        pruned += 1
+        freed += size
+    return {"pruned": pruned, "freed_bytes": freed, "dir": str(d)}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Cora log + ledger compaction.")
     ap.add_argument("--log-days", type=int, default=30,
@@ -160,6 +198,9 @@ def main() -> int:
                     help="Keep this many days of JSONL ledger lines.")
     ap.add_argument("--ledger-min-mb", type=float, default=5.0,
                     help="Only trim a .jsonl ledger once it exceeds this size.")
+    ap.add_argument("--report-days", type=int, default=90,
+                    help="Delete health-check run artifacts (reports/health) older "
+                         "than this many days, by filename date.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -180,6 +221,11 @@ def main() -> int:
                   f">{args.ledger_days}d, kept {r['kept']}")
     else:
         print(f"{tag}ledgers: none over {args.ledger_min_mb}MB -- nothing to trim")
+
+    reports = prune_reports(args.report_days, args.dry_run)
+    print(f"{tag}health reports: pruned {reports['pruned']} artifact file(s) "
+          f"({_fmt_mb(reports['freed_bytes'])}) older than {args.report_days}d "
+          f"in {reports['dir']}")
     return 0
 
 

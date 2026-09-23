@@ -117,6 +117,9 @@ data/*.db.bak*
 /backups/
 data/health-kb-baseline.json
 data/health-flywheel-baseline.json
+# Code #14 S2: the nightly health check's durable run artifacts
+# (reports/health/YYYY-MM-DD.json + .md). Runtime output, never committed.
+/reports/
 data/cora-proposed-memory-updates.archive.jsonl
 data/decisions-inbox.md
 data/*.jsonl.bak-*
