@@ -531,3 +531,26 @@ lanes:
         event: confirmed
         by: Harrison
         evidence: "batch confirm: Code #13 ask block RULED 2026-09-19 (_shared/projects/cora/_notes/2026-09-19_fndr_RULINGS-code-13-ask-batch.md: registry confirmed as seeded except nightly-catchup); applied to this file by Cowork 2026-09-20 (decisions.md 2026-09-20 [FNDR/ORG+CORA])"
+
+  # Code #14 R14-8. NO capability_terms and NO ask_hint, deliberately: the bot's
+  # honesty rail (cora.capability_set) reads this file at CALL time, and a term on
+  # a DARK lane would make it treat "I can't read Meet join logs" as a phantom
+  # denial. Add terms only if the lane ever backs a user-facing ask.
+  - lane: meet-join-audit
+    title: "Meet join audit read (connectors/meet_audit.read_call_ended -> meeting_capture._apply_meet_audit): Reports API activities.list applicationName=meet eventName=call_ended, READ-ONLY, admin subject in the code seam (D-308)"
+    tier: T0
+    status: dark
+    promotion_criteria: "none sought -- a read lane that only re-buckets the 07:22 audit's PRESUMED-unconvened meetings (evidence, not action; person-organised misses are the next rung, not this one). dark -> live is a LIFECYCLE change (a note event) once Harrison grants admin.reports.audit.readonly and scripts/probe_meet_audit.py reads clean -- never a tier change"
+    demotion_triggers: "a contradiction (a captured Meet meeting with zero join events), a partial or error read, or any participant identifier found at rest -> the lane decides nothing that day (presumptions stand) and the health check WARNs"
+    evidence_monitor:
+      description: "the 07:22 audit ledger row's meet_audit_state (live | dark:* | lag | partial | error | contradiction) read by nightly_health_check.check_meet_join_audit (WARN on error / partial / contradiction); the contradiction cross-check is what makes it failing-capable; tests/test_meet_audit.py + TestMeetJoinAudit"
+      failing_capable: true
+    audit_surface: "logs/meeting-capture-ledger.jsonl audit rows (meet_audit_state, meet_audit_reason, convened_event_ids, unconvened_confirmed_event_ids, unconvened_presumed_event_ids -- ids and counts only) + the 07:22 post to #founder-operations"
+    authority: Harrison
+    confirmed_by: pending-Harrison
+    events:
+      - ts: 2026-09-22
+        event: seeded
+        tier: T0
+        by: code-14
+        evidence: "ruling 9.6 (2026-09-19 ask batch: YES, as a LOCKED LANE) + D-324; ships dark behind the DWD scope's presence; the row text is session-authored, so it awaits Harrison's confirm"

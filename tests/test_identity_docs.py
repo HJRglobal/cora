@@ -314,10 +314,37 @@ def test_inventory_records_slack_user_token_absent_and_not_added():
     assert len(re.findall(r"^SLACK_USER_TOKEN=", ex, flags=re.M)) == 1
 
 
-def test_inventory_marks_fireflies_as_the_only_admin_identity():
+def test_inventory_marks_fireflies_and_the_meet_join_audit_as_the_only_admin_identities():
+    """DELIBERATE FLIP (Code #14 R14-8; was
+    test_inventory_marks_fireflies_as_the_only_admin_identity). Ruling 9.6 made the
+    Meet join audit read the SECOND D-308 admin-level lane, so the inventory now
+    carries exactly two Admin=YES rows, and the Fireflies row no longer claims to
+    be the only one."""
     inv = _identity_sections()[SECTIONS[0]]
     rows = [l for l in inv.splitlines() if l.startswith("| ") and "YES" in l.split("|")[5]]
-    assert len(rows) == 1 and rows[0].startswith("| Fireflies "), rows
+    assert len(rows) == 2, rows
+    assert rows[0].startswith("| Fireflies "), rows
+    assert rows[1].startswith("| Google Workspace (Meet join audit read) "), rows
+    assert "the ONE admin-level" not in inv
+    assert "one of two admin-level lanes" in rows[0]
+
+
+def test_inventory_meet_join_audit_row_states_its_rails_and_blast_radius():
+    """The row is the D-308 record for the Reports lane: the doctrine, the only
+    call it makes, the refused identity, the per-call subject key, and the fact
+    that the scope reads EVERY audit log (the narrowing is code)."""
+    inv = _identity_sections()[SECTIONS[0]]
+    row = next(l for l in inv.splitlines() if l.startswith("| Google Workspace (Meet join audit read) "))
+    for phrase in ("D-308", "D-307", "`applicationName=meet`", "`eventName=call_ended`",
+                   "NEVER cora@", "`CORA_REPORTS_IMPERSONATE`", "`admin.reports.audit.readonly`",
+                   "EVERY Workspace audit log", "the narrowing to Meet is CODE",
+                   "`tests/test_meet_audit.py`", "DARK until Harrison grants the scope",
+                   "check_meet_join_audit"):
+        assert phrase in row, phrase
+    # the key is documented as a commented example, never an active .env.example line
+    ex = _ENV_EXAMPLE.read_text(encoding="utf-8")
+    assert re.findall(r"^# CORA_REPORTS_IMPERSONATE=", ex, flags=re.M) != []
+    assert re.findall(r"^CORA_REPORTS_IMPERSONATE=", ex, flags=re.M) == []
 
 
 # -- rotation section --

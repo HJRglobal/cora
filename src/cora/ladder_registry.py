@@ -101,6 +101,7 @@ KNOWN_LANES: tuple[str, ...] = (
     "repeat-signal-escalation",
     "expected-invoice-owner-nudge",
     "cowork-run-marker-contract",
+    "meet-join-audit",
 )
 
 

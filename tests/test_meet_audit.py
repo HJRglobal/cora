@@ -354,3 +354,57 @@ def test_probe_lane_reads_the_last_hour_through_the_same_seam():
     start = datetime.strptime(kw["startTime"], "%Y-%m-%dT%H:%M:%S.000Z")
     end = datetime.strptime(kw["endTime"], "%Y-%m-%dT%H:%M:%S.000Z")
     assert end - start == timedelta(hours=1)
+
+
+# -- the staged read-only probe (scripts/probe_meet_audit.py) --
+
+def _load_probe():
+    """Exec the script, then restore os.environ: its load_dotenv(override=True)
+    must not leak a live .env into later tests."""
+    import importlib.util
+    import os
+
+    saved = dict(os.environ)
+    spec = importlib.util.spec_from_file_location(
+        "_probe_meet_audit", _REPO / "scripts" / "probe_meet_audit.py")
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+    return mod
+
+
+def test_probe_runs_dark_under_the_suite_and_exits_nonzero(capsys):
+    mod = _load_probe()
+    assert mod.main(["--day", "2026-08-26"]) == 2
+    out = capsys.readouterr().out
+    assert "state: dark:test" in out and "read-only" in out
+
+
+def test_probe_prints_counts_and_key_names_never_values(monkeypatch, capsys):
+    mod = _load_probe()
+    pages = [{"items": [_event(endpoint="ep-1"),
+                        _event(endpoint="ep-2", ident="cora@hjrglobal.com", name="Cora NoteTaker")]}]
+    real = ma.read_call_ended
+    monkeypatch.setattr(mod.ma, "read_call_ended", lambda s, e: real(s, e, service=_Svc(pages)))
+    assert mod.main(["--day", "2026-08-26"]) == 0
+    out = capsys.readouterr().out
+    assert "state: live" in out and "call_ended events read: 2" in out
+    assert "joins usable: 2 (human 1, bot 1)" in out and "distinct meetings: 1" in out
+    assert "meeting_code" in out and "identifier" in out          # key NAMES
+    for leak in ("pal@example.test", "Pal Example", "203.0.113.9", "votcadence", "VOTCADENCE",
+                 "gc-1_", "cora@hjrglobal.com", "Cora NoteTaker", "conf-xyz", "ep-1"):
+        assert leak not in out, leak
+    for j in real(T0, T1, service=_Svc(pages)).joins:
+        assert j.endpoint_key not in out
+
+
+def test_probe_source_is_read_only_ascii_and_calls_only_the_seam():
+    src = (_REPO / "scripts" / "probe_meet_audit.py").read_text(encoding="utf-8")
+    assert all(ord(c) < 128 for c in src)
+    for forbidden in ("write_ledger", "chat_postMessage", "WebClient", "upsert_documents",
+                      "open(", "write_text", "requests.", "_build_reports_service"):
+        assert forbidden not in src, forbidden
+    assert src.count("ma.read_call_ended(") == 1

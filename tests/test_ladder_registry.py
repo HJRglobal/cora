@@ -94,10 +94,17 @@ class TestShippedRegistry:
         (Code #13); his 2026-09-19 batch confirm (ask 9.1) was applied by Cowork on
         2026-09-20 and is committed here verbatim. Every seeded row now carries
         `confirmed_by: Harrison 2026-09-19` and a `confirmed` event; nightly-catchup
-        carries the ruled T1 demotion (ask 9.2)."""
+        carries the ruled T1 demotion (ask 9.2).
+
+        DELIBERATE FLIP (Code #14 R14-8): the lane was RULED (ask 9.6) but its ROW
+        text is session-authored, so the new meet-join-audit row is seeded
+        `pending-Harrison` -- the ONE pending row. Every other row keeps the
+        9/19 confirm."""
         reg = lr.load(_REAL)
-        assert lr.pending_confirmation(reg) == []
+        assert lr.pending_confirmation(reg) == ["meet-join-audit"]
         for row in reg["lanes"]:
+            if row["lane"] == "meet-join-audit":
+                continue
             assert str(row["confirmed_by"]).startswith("Harrison 2026-09-19"), row["lane"]
             assert any(ev.get("event") == "confirmed" for ev in row["events"]), row["lane"]
         catchup = next(r for r in reg["lanes"] if r["lane"] == "nightly-catchup")
@@ -131,6 +138,23 @@ class TestShippedRegistry:
         for r in lr.lanes(reg):
             if r.get("acting_probe"):
                 assert r["acting_probe"] in lr.PROBES, r["lane"]
+
+    def test_meet_join_audit_row_is_a_dark_t0_read_lane_with_no_capability_terms(self, monkeypatch):
+        """Code #14 R14-8. The bot's honesty rail reads this file at CALL time: a
+        capability term on a DARK lane would turn an honest "I can't read Meet join
+        logs" into a phantom-denial flag. So the row carries none, and the rail
+        gains nothing from it."""
+        reg = lr.load(_REAL)
+        row = lr.row_for("meet-join-audit", reg)
+        assert row["tier"] == "T0" and row["status"] == "dark"
+        assert row["evidence_monitor"]["failing_capable"] is True
+        assert "capability_terms" not in row and "ask_hint" not in row
+        assert row["confirmed_by"] == "pending-Harrison"
+        assert [ev["event"] for ev in row["events"]] == ["seeded"]
+        assert "check_meet_join_audit" in row["evidence_monitor"]["description"]
+        monkeypatch.setattr(cs, "LADDER_REGISTRY_PATH", _REAL)
+        terms = cs.capability_terms("FNDR", cross_entity=True, founder=True)
+        assert not any("meet join" in t or "meet-join" in t for t in terms)
 
     def test_capability_terms_flow_into_the_honesty_rail(self, monkeypatch):
         monkeypatch.setattr(cs, "LADDER_REGISTRY_PATH", _REAL)
@@ -400,7 +424,9 @@ class TestRender:
         assert set(s["by_tier"]) == set(lr.TIERS)
         # 0 after the 2026-09-19 batch confirm (applied 2026-09-20). A NEW lane ships
         # pending-Harrison and is confirmed in its own commit -- which must update this pin.
-        assert s["pending_confirmation"] == []
+        # DELIBERATE FLIP (Code #14 R14-8): the new meet-join-audit row is that case --
+        # the one row awaiting Harrison's confirm.
+        assert s["pending_confirmation"] == ["meet-join-audit"]
 
 
 # ── the readers: nightly health check + Monday digest ─────────────────────────
