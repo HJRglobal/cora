@@ -63,11 +63,11 @@ def main() -> int:
     p("=" * 78)
 
     # ── R1: real Gotham-shape wholesale push, also carrying plannedShipDate (R5) ──
-    p("\n--- R1: wholesale push (TEST reference TEST005) ---")
+    p("\n--- R1: wholesale push (TEST reference TEST006) ---")
     r1_raw = {
         "channel": "wholesale",
         "buyer_or_fc_code": "GOTHAM",
-        "reference": "TEST005",
+        "reference": "TEST006",
         "authored_by": "Claude Code UA rehearsal",
         "freight_terms": "Prepaid",
         "planned_ship_date": "2026-09-25",
@@ -80,11 +80,11 @@ def main() -> int:
     r1_ok = _run_one(p, handler, spec_mod, r1_raw, env=ENV, label="R1")
 
     # ── R6: real FBA push to GEU3 ────────────────────────────────────────────
-    p("\n--- R6: FBA push to GEU3 (TEST reference FBA00000003) ---")
+    p("\n--- R6: FBA push to GEU3 (TEST reference FBA00000004) ---")
     r6_raw = {
         "channel": "fba",
         "buyer_or_fc_code": "GEU3",
-        "reference": "FBA00000003",
+        "reference": "FBA00000004",
         "authored_by": "Claude Code UA rehearsal",
         "freight_terms": "Prepaid",
         "notes": "UA rehearsal of the new push module (FBA shape). Ships nothing.",

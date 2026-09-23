@@ -102,7 +102,8 @@ def _patch_clients(monkeypatch, *, read_client=None, push_client=None, reference
 def _record(number, atp_ok=True):
     return dc.OrderHeaderRecord(
         number=number, customer_order_number="4471", ship_to_postal_code="11101",
-        lines=[dc.OrderHeaderLine(item_number="PURE-Original", order_pack_quantity=208)],
+        lines=[dc.OrderHeaderLine(item_number="PURE-Original", order_pack_quantity=208,
+                                  unit_price="21.70")],
     )
 
 
@@ -324,6 +325,65 @@ class TestOutcomeClassification:
         outcome, msg = handler.process_push_tap(entry["id"], handler.HARRISON_ID)
         assert outcome == "unknown"
         assert "cannot find it" in msg
+
+    def test_read_back_error_after_a_successful_create_is_unknown_not_stuck(self, monkeypatch):
+        """D-051 review, 2026-09-23: a push already happened by this point --
+        if the read-back ITSELF errors (not 'not found'), the entry must not
+        be left stuck in CLAIMED forever (unresolvable, no card update, no
+        ledger row). UNKNOWN is correct: an order was created, its state
+        cannot be verified, and it is locked rather than lost."""
+        entry = _stage()
+
+        class RaisingReadClient(FakeReadClient):
+            def find_order_detail(self, order_type, number):
+                if self._calls == 0:
+                    self._calls += 1
+                    return None  # the live re-preflight's number_miss check
+                raise dc.DeposcoUnavailable("network blip during read-back")
+
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self._calls = 0
+
+        _patch_clients(
+            monkeypatch, reference_hit=False,
+            read_client=RaisingReadClient(),
+            push_client=FakePushClient(dpush.PushOutcome(env="prod", status=201, text="201 Created")),
+        )
+        outcome, msg = handler.process_push_tap(entry["id"], handler.HARRISON_ID)
+        assert outcome == "unknown"
+        assert pending.get_entry(entry["id"])["state"] == pending.STATE_UNKNOWN
+        rows = pending._read_ledger()
+        assert rows[-1]["event"] == pending.STATE_UNKNOWN and rows[-1]["clean"] is False
+
+    def test_ledger_row_is_written_before_the_terminal_pending_state(self, monkeypatch):
+        """D-051 review, 2026-09-23: the ledger is what channel_stage_blocked
+        reads -- if a crash can only interrupt ONE of the two writes, the
+        ledger row must already exist by the time pending.resolve runs."""
+        entry = _stage()
+        order = ["none yet"]
+        real_resolve = pending.resolve
+
+        def spy_resolve(pending_id, state, **fields):
+            order.append(("resolve", state))
+            return real_resolve(pending_id, state, **fields)
+
+        real_ledger = pending.append_ledger_row
+
+        def spy_ledger(**kw):
+            order.append(("ledger", kw.get("event")))
+            return real_ledger(**kw)
+
+        monkeypatch.setattr(handler.pending, "resolve", spy_resolve)
+        monkeypatch.setattr(handler.pending, "append_ledger_row", spy_ledger)
+        _patch_clients(
+            monkeypatch, reference_hit=False,
+            read_client=FakeReadClient(find_order_detail_sequence=[None, _record(entry["number"])]),
+            push_client=FakePushClient(dpush.PushOutcome(env="prod", status=201, text="201 Created")),
+        )
+        handler.process_push_tap(entry["id"], handler.HARRISON_ID)
+        calls = [c for c in order if c != "none yet"]
+        assert calls == [("ledger", pending.STATE_CONFIRMED), ("resolve", pending.STATE_CONFIRMED)]
 
     def test_200_on_create_is_anomaly_updated(self, monkeypatch):
         entry = _stage()

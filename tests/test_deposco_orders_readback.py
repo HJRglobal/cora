@@ -11,8 +11,8 @@ PAYLOAD = {"order": [{
     "otherReferenceNumber": "4471",
     "shipToAddress": {"postalCode": "11101"},
     "orderLines": {"orderLine": [
-        {"itemNumber": "PURE-Original", "orderPackQuantity": "208.0"},
-        {"itemNumber": "PURE-Citrus", "orderPackQuantity": "208.0"},
+        {"itemNumber": "PURE-Original", "orderPackQuantity": "208.0", "unitPrice": "21.70"},
+        {"itemNumber": "PURE-Citrus", "orderPackQuantity": "208.0", "unitPrice": "21.70"},
     ]},
 }]}
 
@@ -22,8 +22,10 @@ def _record(**kw):
         number="F3E-W-GOTHAM-4471", customer_order_number="4471",
         ship_to_postal_code="11101",
         lines=[
-            dc.OrderHeaderLine(item_number="PURE-Original", order_pack_quantity=208),
-            dc.OrderHeaderLine(item_number="PURE-Citrus", order_pack_quantity=208),
+            dc.OrderHeaderLine(item_number="PURE-Original", order_pack_quantity=208,
+                              unit_price="21.70"),
+            dc.OrderHeaderLine(item_number="PURE-Citrus", order_pack_quantity=208,
+                              unit_price="21.70"),
         ],
     )
     defaults.update(kw)
@@ -87,6 +89,59 @@ class TestLineMismatch:
         ])])
         result = readback.read_back(client, PAYLOAD)
         assert result.line_match is False
+
+
+class TestPriceMismatch:
+    """D-051 review, 2026-09-23: a wrong price must not classify CONFIRMED
+    just because item/qty/ship-to/reference all matched."""
+
+    def test_a_wrong_price_is_a_mismatch(self):
+        client = FakeClient([_record(lines=[
+            dc.OrderHeaderLine(item_number="PURE-Original", order_pack_quantity=208,
+                              unit_price="18.50"),
+            dc.OrderHeaderLine(item_number="PURE-Citrus", order_pack_quantity=208,
+                              unit_price="21.70"),
+        ])])
+        result = readback.read_back(client, PAYLOAD)
+        assert result.price_match is False
+        assert result.clean is False
+        assert "unitPrice differs" in result.mismatches[-1]
+
+    def test_textually_different_but_equal_prices_are_not_a_mismatch(self):
+        """'21.70' vs '21.7' are the same value -- a Decimal comparison, not
+        a string comparison."""
+        client = FakeClient([_record(lines=[
+            dc.OrderHeaderLine(item_number="PURE-Original", order_pack_quantity=208,
+                              unit_price="21.7"),
+            dc.OrderHeaderLine(item_number="PURE-Citrus", order_pack_quantity=208,
+                              unit_price="21.70"),
+        ])])
+        result = readback.read_back(client, PAYLOAD)
+        assert result.price_match is True
+        assert result.clean is True
+
+    def test_matching_price_is_clean(self):
+        client = FakeClient([_record()])
+        assert readback.read_back(client, PAYLOAD).price_match is True
+
+
+class TestVacuousPassIsRefused:
+    """D-051 review, 2026-09-23: our own payload.py always sets shipToAddress
+    postalCode and otherReferenceNumber (spec.py requires a non-empty
+    reference); reaching read-back with either blank means something is
+    already wrong upstream, so it must not silently pass."""
+
+    def test_blank_expected_postal_code_is_a_mismatch_not_a_pass(self):
+        payload = {"order": [dict(PAYLOAD["order"][0], shipToAddress={})]}
+        result = readback.read_back(FakeClient([_record()]), payload)
+        assert result.ship_to_postal_match is False
+        assert result.clean is False
+
+    def test_blank_expected_reference_is_a_mismatch_not_a_pass(self):
+        payload = {"order": [dict(PAYLOAD["order"][0], otherReferenceNumber="")]}
+        result = readback.read_back(FakeClient([_record()]), payload)
+        assert result.reference_match is False
+        assert result.clean is False
 
 
 class TestShipToAndReferenceMismatch:

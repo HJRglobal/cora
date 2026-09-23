@@ -284,6 +284,28 @@ def process_push_tap(pending_id: str, actor_id: str) -> tuple[str, str]:
     return _classify_and_resolve(pending_id, claimed, outcome, read_client)
 
 
+def _ledger_then_resolve(
+    pending_id: str, state: str, *, channel: str, number: str, actor: str, clean: bool,
+    **resolve_fields,
+) -> None:
+    """Ledger row FIRST, then the terminal pending-entry write.
+
+    D-051 review, 2026-09-23: these are two independent, non-atomic writes
+    to two different files with no shared transaction. `pending.resolve`'s
+    write makes the entry correctly terminal either way (no re-push risk
+    either order), but `channel_stage_blocked` / `consecutive_clean_count`
+    -- the gates that stop a REPEAT bad push on this channel -- read ONLY the
+    ledger. A crash between the two writes must therefore never leave the
+    ledger row missing: better a pending entry stuck non-terminal in CLAIMED
+    (a data-hygiene nuisance, no safety consequence -- it can never be
+    re-claimed or double-pushed) than a not-clean push silently invisible to
+    the gate that is supposed to block the channel's next stage on it.
+    """
+    pending.append_ledger_row(channel=channel, number=number, event=state,
+                              clean=clean, actor=actor)
+    pending.resolve(pending_id, state, **resolve_fields)
+
+
 def _classify_and_resolve(
     pending_id: str, entry: dict, outcome: dpush.PushOutcome, read_client: dc.DeposcoClient,
 ) -> tuple[str, str]:
@@ -293,9 +315,8 @@ def _classify_and_resolve(
     actor = entry.get("claimed_by", "")
 
     if outcome.blank_after_retries or outcome.network_exhausted:
-        pending.resolve(pending_id, pending.STATE_UNKNOWN, push_status=outcome.status)
-        pending.append_ledger_row(channel=channel, number=number, event=pending.STATE_UNKNOWN,
-                                  clean=False, actor=actor)
+        _ledger_then_resolve(pending_id, pending.STATE_UNKNOWN, channel=channel, number=number,
+                             actor=actor, clean=False, push_status=outcome.status)
         return "unknown", (
             f"UNKNOWN: the push for {number} did not get a clear answer from Deposco. "
             f"Check esm.deposco.com before anything else. This entry is locked -- "
@@ -307,43 +328,56 @@ def _classify_and_resolve(
     # 2026-09-23) -- the real per-order result is in the body text, never the
     # outer status code. See PushOutcome's docstring for the full finding.
     if outcome.updated:
-        pending.resolve(pending_id, pending.STATE_ANOMALY_UPDATED, push_status=outcome.status)
-        pending.append_ledger_row(channel=channel, number=number,
-                                  event=pending.STATE_ANOMALY_UPDATED, clean=False, actor=actor)
+        _ledger_then_resolve(pending_id, pending.STATE_ANOMALY_UPDATED, channel=channel,
+                             number=number, actor=actor, clean=False, push_status=outcome.status)
         return "anomaly_updated", (
             f"ANOMALY: Deposco says an EXISTING order {number} was silently "
             f"UPDATED, not created. Call Nimbl now."
         )
 
     if outcome.created:
-        rb = readback.read_back_with_retries(read_client, payload)
+        # A push already happened by this point -- Deposco said it created
+        # the order. If the READ-BACK itself now fails (network/auth error,
+        # not "not found"), we genuinely cannot tell CONFIRMED from MISMATCH,
+        # and the entry must not be left stuck in CLAIMED (unresolvable,
+        # un-re-claimable, no card update, no ledger row -- D-051 review,
+        # 2026-09-23). UNKNOWN is the correct bucket: an order was created,
+        # its state cannot be verified from here, and it is locked rather
+        # than guessed at or silently lost.
+        try:
+            rb = readback.read_back_with_retries(read_client, payload)
+        except Exception as exc:  # noqa: BLE001
+            _ledger_then_resolve(pending_id, pending.STATE_UNKNOWN, channel=channel,
+                                 number=number, actor=actor, clean=False,
+                                 push_status=outcome.status,
+                                 detail=f"read-back errored: {exc.__class__.__name__}")
+            return "unknown", (
+                f"UNKNOWN: {number} was created but I could not read it back to verify "
+                f"({exc.__class__.__name__}). Check esm.deposco.com before anything else. "
+                f"This entry is locked -- it will never auto-retry."
+            )
         if not rb.found:
-            pending.resolve(pending_id, pending.STATE_UNKNOWN, push_status=201)
-            pending.append_ledger_row(channel=channel, number=number, event=pending.STATE_UNKNOWN,
-                                      clean=False, actor=actor)
+            _ledger_then_resolve(pending_id, pending.STATE_UNKNOWN, channel=channel,
+                                 number=number, actor=actor, clean=False, push_status=201)
             return "unknown", (
                 f"UNKNOWN: Deposco said 201 Created for {number} but I cannot find it "
                 f"on read-back. Check esm.deposco.com before anything else. This "
                 f"entry is locked -- it will never auto-retry."
             )
         if rb.clean:
-            pending.resolve(pending_id, pending.STATE_CONFIRMED, push_status=201)
-            pending.append_ledger_row(channel=channel, number=number,
-                                      event=pending.STATE_CONFIRMED, clean=True, actor=actor)
+            _ledger_then_resolve(pending_id, pending.STATE_CONFIRMED, channel=channel,
+                                 number=number, actor=actor, clean=True, push_status=201)
             return "confirmed", f"CONFIRMED: {number} created and read back clean."
-        pending.resolve(pending_id, pending.STATE_MISMATCH, push_status=201,
-                        mismatches=rb.mismatches)
-        pending.append_ledger_row(channel=channel, number=number, event=pending.STATE_MISMATCH,
-                                  clean=False, actor=actor)
+        _ledger_then_resolve(pending_id, pending.STATE_MISMATCH, channel=channel, number=number,
+                             actor=actor, clean=False, push_status=201, mismatches=rb.mismatches)
         return "mismatch", (
             f"MISMATCH: {number} was created but does not match what was sent "
             f"({'; '.join(rb.mismatches)}). Call Nimbl now."
         )
 
-    pending.resolve(pending_id, pending.STATE_FAILED, push_status=outcome.status,
-                    detail=(outcome.text or "")[:300])
-    pending.append_ledger_row(channel=channel, number=number, event=pending.STATE_FAILED,
-                              clean=False, actor=actor)
+    _ledger_then_resolve(pending_id, pending.STATE_FAILED, channel=channel, number=number,
+                         actor=actor, clean=False, push_status=outcome.status,
+                         detail=(outcome.text or "")[:300])
     return "failed", (
         f"FAILED: Deposco rejected {number} (HTTP {outcome.status}). Nothing was "
         f"created. Correct the spec and re-stage."

@@ -84,7 +84,8 @@ class FakeReadClient:
         from cora.connectors import deposco_client as dc
         return dc.OrderHeaderRecord(
             number=number, customer_order_number="4471", ship_to_postal_code="11101",
-            lines=[dc.OrderHeaderLine(item_number="PURE-Original", order_pack_quantity=208)],
+            lines=[dc.OrderHeaderLine(item_number="PURE-Original", order_pack_quantity=208,
+                                      unit_price="21.70")],
         )
 
     def search_orders(self, order_type, **kw):

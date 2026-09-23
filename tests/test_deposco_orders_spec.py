@@ -7,6 +7,8 @@ two SO 081226 defect classes unreachable before a payload is ever built.
 
 from __future__ import annotations
 
+import pytest
+
 from cora.deposco_orders import spec as spec_mod
 
 VALID_WHOLESALE = {
@@ -143,6 +145,41 @@ class TestLineFieldValidation:
         ])
         assert any("qty must be an integer" in e for e in _errors(raw))
 
+    def test_fractional_qty_is_refused_not_silently_truncated(self):
+        """D-051 review, 2026-09-23: int(208.5) == 208 -- a fractional qty
+        must be refused outright, never silently rounded to a DIFFERENT
+        number than what was typed."""
+        raw = dict(VALID_WHOLESALE, lines=[
+            {"sku": "PURE-Original", "qty": 208.5, "unit_price": "21.70"},
+        ])
+        result = spec_mod.validate_spec(raw)
+        assert not result.ok, "a fractional qty must never validate"
+        assert any("whole number" in e for e in result.errors)
+
+    def test_fractional_qty_as_a_string_is_also_refused(self):
+        raw = dict(VALID_WHOLESALE, lines=[
+            {"sku": "PURE-Original", "qty": "208.5", "unit_price": "21.70"},
+        ])
+        assert any("whole number" in e for e in _errors(raw))
+
+    def test_boolean_qty_is_refused_not_coerced(self):
+        """bool is an int subclass in Python -- int(True) == 1 would silently
+        accept a typo'd `qty: true`."""
+        raw = dict(VALID_WHOLESALE, lines=[
+            {"sku": "PURE-Original", "qty": True, "unit_price": "21.70"},
+        ])
+        assert any("qty must be an integer" in e for e in _errors(raw))
+
+    def test_whole_number_float_qty_is_allowed(self):
+        """208.0 is a whole number even though it arrived as a float (a
+        common YAML-parsing shape) -- only a genuine fraction is refused."""
+        raw = dict(VALID_WHOLESALE, lines=[
+            {"sku": "PURE-Original", "qty": 208.0, "unit_price": "21.70"},
+        ])
+        result = spec_mod.validate_spec(raw)
+        assert result.ok, result.errors
+        assert result.spec.lines[0].qty == 208
+
     def test_missing_unit_price_is_refused(self):
         raw = dict(VALID_WHOLESALE, lines=[{"sku": "PURE-Original", "qty": 10}])
         assert any("unit_price is required" in e for e in _errors(raw))
@@ -185,6 +222,19 @@ class TestLineFieldValidation:
         result = spec_mod.validate_spec(raw)
         assert result.ok, result.errors
 
+    @pytest.mark.parametrize("bad_price", ["nan", "NaN", "inf", "Infinity", "-inf"])
+    def test_non_finite_unit_price_is_refused_not_crashed(self, bad_price):
+        """D-051 review, 2026-09-23: Decimal('nan') < 0 RAISES
+        InvalidOperation (uncaught) and Decimal('inf').as_tuple() has a
+        non-numeric exponent that would crash the decimal-places check --
+        both must be refused before either comparison runs."""
+        raw = dict(VALID_WHOLESALE, lines=[
+            {"sku": "PURE-Original", "qty": 10, "unit_price": bad_price},
+        ])
+        result = spec_mod.validate_spec(raw)
+        assert not result.ok
+        assert any("finite" in e for e in result.errors)
+
 
 class TestReferenceShape:
     def test_wholesale_reference_must_be_alnum_and_hyphen_only(self):
@@ -199,6 +249,57 @@ class TestReferenceShape:
         raw = dict(VALID_WHOLESALE)
         del raw["reference"]
         assert any("reference is required" in e for e in _errors(raw))
+
+    def test_reference_case_is_canonicalized_to_uppercase(self):
+        """D-051 review, 2026-09-23: '4471a' and '4471A' derived the
+        IDENTICAL Deposco order number (build_order_number uppercases its own
+        copy) while the ORIGINAL-case reference landed in the payload's
+        otherReferenceNumber/customerOrderNumber -- a false idempotency
+        collision. One canonical form (set here) removes it."""
+        raw = dict(VALID_WHOLESALE, reference="4471a")
+        result = spec_mod.validate_spec(raw)
+        assert result.ok, result.errors
+        assert result.spec.reference == "4471A"
+
+    def test_two_specs_differing_only_in_reference_case_are_no_longer_identical(self):
+        lower = spec_mod.validate_spec(dict(VALID_WHOLESALE, reference="4471a")).spec
+        upper = spec_mod.validate_spec(dict(VALID_WHOLESALE, reference="4471A")).spec
+        assert lower.reference == upper.reference, (
+            "both must canonicalize to the SAME reference -- they are the same PO"
+        )
+
+    def test_reference_too_long_for_the_buyer_code_is_refused_here_not_later(self):
+        """D-051 review, 2026-09-23: the wholesale reference regex alone
+        allows up to 29 chars, but payload.py's derived order number
+        (F3E-W-{BUYER}-{PO}) has its own <=30-char limit -- for GOTHAM (6
+        chars) that leaves only ~17 chars for the reference. This must be
+        refused at validation, matching the module's own 'refused HERE,
+        never mangled later' claim, not surface later as a PayloadBuildError."""
+        raw = dict(VALID_WHOLESALE, reference="A" * 20)
+        result = spec_mod.validate_spec(raw)
+        assert not result.ok
+        assert any("too long" in e for e in result.errors)
+
+    def test_a_reference_that_fits_the_buyer_code_budget_is_allowed(self):
+        raw = dict(VALID_WHOLESALE, reference="A" * 17)
+        result = spec_mod.validate_spec(raw)
+        assert result.ok, result.errors
+
+
+class TestWfsUnconditionalRefusal:
+    """D-051 review, 2026-09-23: WFS and FBA shared the exact same address
+    lookup (an Amazon-only facility map) with the WFS refusal firing only on
+    a MISS -- refused unconditionally now, before any lookup."""
+
+    def test_wfs_is_refused_even_if_the_fc_code_matches_a_real_amazon_facility(self):
+        raw = {
+            "channel": "wfs", "buyer_or_fc_code": "GEU3", "reference": "9480757WFA",
+            "authored_by": "Harrison",
+            "lines": [{"sku": "PURE-Original", "qty": 10, "unit_price": "21.70"}],
+        }
+        result = spec_mod.validate_spec(raw)
+        assert not result.ok
+        assert any("WFS channel has no address book" in e for e in result.errors)
 
 
 class TestMskuCrossCheck:

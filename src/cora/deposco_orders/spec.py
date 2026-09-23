@@ -133,15 +133,21 @@ def _address_book_for(channel: str, code: str) -> tuple[dict | None, list[str]]:
         if entry is None:
             return None, [f"buyer code {code!r} not found in deposco-customers.yaml"]
         return entry, []
-    if channel in ("fba", "wfs"):
+    if channel == "wfs":
+        # UNCONDITIONAL -- checked before ever consulting the Amazon FC map.
+        # D-051 review, 2026-09-23: WFS and FBA shared the exact same
+        # lookup (data/maps/deposco-amazon-fc.yaml, an Amazon-only facility
+        # map) with the refusal firing only on a MISS -- so a WFS spec whose
+        # buyer_or_fc_code happened to match a real Amazon FC code would have
+        # silently resolved to that Amazon facility's address.
+        return None, [
+            "WFS channel has no address book yet in this build -- "
+            "do not stage a WFS spec (deferred per the 2026-09-09 ruling)"
+        ]
+    if channel == "fba":
         facilities = load_amazon_fcs()
         entry = facilities.get(code)
         if entry is None:
-            if channel == "wfs":
-                return None, [
-                    "WFS channel has no address book yet in this build -- "
-                    "do not stage a WFS spec (deferred per the 2026-09-09 ruling)"
-                ]
             return None, [f"FC code {code!r} not found in deposco-amazon-fc.yaml"]
         return entry, []
     return None, [f"unknown channel {channel!r}"]
@@ -176,6 +182,36 @@ def validate_spec(raw: dict) -> ValidationResult:
         errors.append(
             f"reference {reference!r} does not match the expected {channel} shape"
         )
+    else:
+        # Canonicalize to uppercase HERE, once, so every downstream use (the
+        # derived order number, AND otherReferenceNumber/customerOrderNumber
+        # in the payload) agrees. D-051 review, 2026-09-23: build_order_number
+        # already uppercases its OWN copy for the derived number, but the
+        # ORIGINAL-case reference was what landed in the payload's reference
+        # fields -- so "4471a" and "4471A" derived the IDENTICAL order number
+        # (a false idempotency collision) while looking like different POs in
+        # the payload. One canonical form removes the mismatch entirely.
+        reference = reference.upper()
+        # The reference-shape regexes cap length independently of the BUYER
+        # code's length, but payload.py's derived order number
+        # (F3E-W-{BUYER}-{PO} / F3E-AMZ-{ShipmentID} / F3E-WMT-{ShipmentID})
+        # has its OWN <=30-char limit -- D-051 review, 2026-09-23: for the
+        # only configured buyer (GOTHAM, 6 chars) a reference past ~17 chars
+        # passed HERE but only raised PayloadBuildError later, at staging
+        # time, contradicting this module's own "refused HERE, never mangled
+        # later" claim. Mirror payload.py's exact prefix shape so the two
+        # never drift out of sync.
+        _prefix_len = {
+            "wholesale": len("F3E-W-") + len(code) + len("-"),
+            "fba": len("F3E-AMZ-"),
+            "wfs": len("F3E-WMT-"),
+        }.get(channel, 0)
+        if _prefix_len + len(reference) > 30:
+            errors.append(
+                f"reference {reference!r} is too long for buyer/FC {code!r}: the "
+                f"derived order number would be {_prefix_len + len(reference)} "
+                f"chars, over Deposco's 30-char limit"
+            )
 
     reference2 = str(raw.get("reference2") or "").strip()
     planned_ship_date = str(raw.get("planned_ship_date") or "").strip()
@@ -220,13 +256,26 @@ def validate_spec(raw: dict) -> ValidationResult:
 
             qty_raw = raw_line.get("qty")
             qty = None
-            try:
-                qty = int(qty_raw)
-            except (TypeError, ValueError):
+            # int() TRUNCATES a float (int(208.5) == 208) rather than
+            # refusing it -- D-051 review, 2026-09-23: a fractional qty must
+            # be refused, never silently rounded down to a different number
+            # than what was typed.
+            if isinstance(qty_raw, bool) or not isinstance(qty_raw, (int, float, str)):
                 errors.append(f"line {i}: qty must be an integer, got {qty_raw!r}")
             else:
-                if qty <= 0:
-                    errors.append(f"line {i}: qty must be > 0, got {qty}")
+                try:
+                    qty_decimal = Decimal(str(qty_raw))
+                except InvalidOperation:
+                    errors.append(f"line {i}: qty must be an integer, got {qty_raw!r}")
+                else:
+                    if qty_decimal != qty_decimal.to_integral_value():
+                        errors.append(
+                            f"line {i}: qty must be a whole number, got {qty_raw!r}"
+                        )
+                    else:
+                        qty = int(qty_decimal)
+                        if qty <= 0:
+                            errors.append(f"line {i}: qty must be > 0, got {qty}")
 
             unit_price_raw = raw_line.get("unit_price")
             unit_price = str(unit_price_raw if unit_price_raw is not None else "").strip()
@@ -238,7 +287,16 @@ def validate_spec(raw: dict) -> ValidationResult:
                 except InvalidOperation:
                     errors.append(f"line {i}: unit_price {unit_price!r} is not a number")
                 else:
-                    if price < 0:
+                    # is_finite() FIRST: Decimal("nan") < 0 RAISES InvalidOperation
+                    # (uncaught, would crash validation) and Decimal("inf").as_tuple()
+                    # has a non-numeric exponent ('F'), which the decimal-places
+                    # check below would crash on -- D-051 review, 2026-09-23. "nan"
+                    # and "inf"/"Infinity" are refused here, before either comparison.
+                    if not price.is_finite():
+                        errors.append(
+                            f"line {i}: unit_price {unit_price!r} must be a finite number"
+                        )
+                    elif price < 0:
                         errors.append(f"line {i}: unit_price must be >= 0, got {unit_price!r}")
                     # A sub-cent price would carry undefined rounding into
                     # payload.py's order-total sum (D-051 review, 2026-09-23:
