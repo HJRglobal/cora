@@ -5,6 +5,9 @@ the two honesty rails, found by the focused re-review and confirmed by a refuter
                             (round 1 exempted every typed id, so a fabricated STATE
                             claim about it -- "Yes -- cq-X is staged." -- wrote no
                             counted line at any tool count); prior turns count too.
+                            ROUND 3 (R2-A1) supersedes: the exemption is an ALLOWLIST
+                            of negative relays for ids typed in the CURRENT message
+                            only (tests/test_d051_r3_honesty_rails.py).
 
 Every sentence here is a probe reproduced against the round-1 tip (bca189c) before the
 fix; the "base" column of the re-review is the pre-remediation branch (b04d3f6).
@@ -102,14 +105,17 @@ class TestTypedIdPureEcho:
                    for r in caplog.records)
 
     def test_a_forced_follow_up_naming_no_id_relays_a_prior_turn_id(self, caplog):
-        """forcing-seams-5 residual: the queue-status force covers follow-ups within
-        three turns, and the id came from the PRIOR user turn."""
+        """ROUND 3 FLIP (R2-A1): the typed set is the CURRENT message only. Round 2
+        widened it to six prior turns for this forced follow-up, and the widening let a
+        made-up status for an earlier-named id go uncounted. The honest relay of a
+        prior-turn id on the follow-up is now an ACCEPTED OVER-TRIP (counted); the
+        claim still counts (tests/test_d051_r3_honesty_rails.py)."""
         caplog.set_level(logging.INFO, logger=se.__name__)
         _write(RELAY, user_text="and is it there now?", prior=[ASK], count=1)
-        assert _msgs(caplog, se.PHANTOM_LOG_KEY, "fabricated-id") == []
+        assert len(_msgs(caplog, se.PHANTOM_LOG_KEY, "fabricated-id")) == 1
         _write("Yes -- cq-000000000002 is staged now.", user_text="and is it there now?",
                prior=[ASK], count=1)
-        assert len(_msgs(caplog, se.PHANTOM_LOG_KEY, "fabricated-id")) == 1
+        assert len(_msgs(caplog, se.PHANTOM_LOG_KEY, "fabricated-id")) == 2
 
     def test_an_id_older_than_six_user_turns_is_not_typed(self, caplog):
         caplog.set_level(logging.WARNING, logger=se.__name__)
@@ -144,7 +150,7 @@ class TestTypedIdPureEcho:
     def test_the_echo_rule_is_linear_at_40k(self, shape):
         """D-171: the state regex, the sentence cut and the per-occurrence cap."""
         assert _best_of_3(lambda: list(se._ID_STATE_CLAIM_RE.finditer(shape))) < 0.2
-        assert _best_of_3(lambda: se._id_is_pure_echo(shape, "cq-000000000002")) < 0.5
+        assert _best_of_3(lambda: se._id_is_negative_relay(shape, "cq-000000000002")) < 0.5
         assert _best_of_3(lambda: _write(shape, user_text=ASK, count=1)) < 1.0
 
 

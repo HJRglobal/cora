@@ -906,6 +906,26 @@ _LINK_TOKEN_RE = re.compile(r"<[^<>\n]{1,400}>")
 # is this message plus the last six user turns (a forced status follow-up names no
 # id: "and is it there now?"). Anything else about a typed id is screened in full,
 # redaction under enforce included.
+#
+# Code #14 D-051 round 3 (R2-A1): SUPERSEDES the paragraph above. The exemption is an
+# ALLOWLIST, not an absence test. Round 2's "no claim detected" rule, over a typed set
+# widened to six prior turns, let a made-up status for an id the user named EARLIER go
+# uncounted and unredacted whenever its phrasing slipped the grammar -- "`cq-1111aaaa2222`
+# (Sprouts reorder) is staged.", "- `cq-...` — staged ✅", "`cq-...`: approved ✅",
+# "Yes -- the Sprouts card (cq-...) landed.", "Found it: cq-.... It's staged". An unknown
+# id is now exempt from the fabricated-id half ONLY when (i) the user typed it in the
+# CURRENT message (no prior-turn widening), and (ii) EVERY sentence naming it carries an
+# explicit NEGATIVE relay (_ID_NEG_RELAY_RE: "not in the queue ledger", "isn't in the
+# ledger", "couldn't find", "no record of", "never captured", "unknown id", "doesn't
+# exist", "no such", "has not been staged") AND no positive status -- no noun-subject
+# state claim, no status word (_ID_STATUS_WORD_RE) that is not itself negated within the
+# three tokens before it, and no completion claim (the lexicon grammar). The id's
+# sentence also takes the NEXT sentence when that one continues it (opens with a
+# pronoun, a status word or a conjunction: "... not in the queue ledger. It's staged
+# under a new id." counts). Everything else is counted and redacted under enforce, as
+# at the base. Fails toward COUNTING: an honest relay phrased outside the allowlist, or
+# the forced follow-up that relays a PRIOR turn's id ("and is it there now?"), is an
+# accepted over-trip.
 _ID_STATE_CLAIM_RE = re.compile(
     r"\b(?:cq|dw)-[0-9a-f]{12}\b[`*_]{0,3}[ \t]*+"
     r"(?:is|are|was|were|has|have|had|got|gets|['’]s)"
@@ -916,17 +936,59 @@ _ID_STATE_CLAIM_RE = re.compile(
 _ID_SENTENCE_BREAK_RE = re.compile(r"[.!?;\n]")
 _ID_ECHO_RADIUS = 300
 _ID_ECHO_MAX_OCCURRENCES = 64
+# Round 3 (R2-A1): the NEGATIVE relays an honest answer about an unknown id uses -- the
+# card-status read's own "not in the queue ledger" line first. Closed list; anything
+# phrased outside it is counted.
+_ID_LEDGER_NOUN = (r"(?:(?:code[ \t-]?)?(?:session[ \t]++)?(?:queue|ledger|backlog|menu|list)"
+                   r"|records?|system)")
+_ID_NEG_STATUS = (r"(?:staged|queued|approved|shipped|filed|created|captured|recorded|logged|"
+                  r"registered|merged|landed)")
+_ID_NEG_RELAY_RE = re.compile(
+    r"\b(?:not|isn['’]t|wasn['’]t|aren['’]t|weren['’]t)[ \t]++(?:in|on)[ \t]++"
+    r"(?:(?:the|our|my|your|any|that)[ \t]++)?(?:[\w-]{1,20}[ \t]++)?" + _ID_LEDGER_NOUN + r"\b"
+    r"|\b(?:couldn['’]t|could[ \t]++not|can['’]t|cannot|can[ \t]++not|didn['’]t|did[ \t]++not|"
+    r"don['’]t|do[ \t]++not)[ \t]++(?:find|locate|see)\b"
+    r"|\bno[ \t]++(?:record|trace|entry|entries|row|match)(?:e?s)?[ \t]++(?:of|for)\b"
+    r"|\bnever[ \t]++(?:been[ \t]++)?captured\b"
+    r"|\bunknown[ \t]++(?:id|card|item|entry)\b"
+    r"|\b(?:doesn['’]t|does[ \t]++not|didn['’]t|did[ \t]++not)[ \t]++exist\b"
+    r"|\bno[ \t]++such\b"
+    r"|\b(?:(?:has|have|had)[ \t]++(?:not|never)|hasn['’]t|haven['’]t|hadn['’]t)[ \t]++been[ \t]++"
+    + _ID_NEG_STATUS + r"\b"
+    r"|\b(?:(?:is|are|was|were)[ \t]++(?:not|never)|isn['’]t|aren['’]t|wasn['’]t|weren['’]t)"
+    r"[ \t]++(?:yet[ \t]++)?" + _ID_NEG_STATUS + r"\b",
+    re.IGNORECASE)
+# A POSITIVE status anywhere in the id's sentence voids the exemption unless that word is
+# itself negated (one of the three tokens before it is a negator). Closed vocabulary.
+_ID_STATUS_WORD_RE = re.compile(
+    r"\b(?:staged|queued|approved|shipped|filed|created|updated|deleted|merged|closed|dismissed|"
+    r"parked|kept|live|done|completed?|landed|registered|recorded|captured|logged|confirmed|saved|"
+    r"added|posted|scheduled|ready|canonicali[sz]ed|locked[ \t]++in|all[ \t]++set|good[ \t]++to[ \t]++go|"
+    r"(?:went|gone|goes|go)[ \t]++through|in[ \t]++the[ \t]++queue|"
+    r"on[ \t]++(?:the|monday['’]s|this[ \t]++week['’]s|next[ \t]++week['’]s)[ \t]++menu)\b",
+    re.IGNORECASE)
+_ID_NEGATORS = frozenset({"not", "never", "no", "nothing", "none", "nor", "without", "cannot"})
+_ID_NEG_LOOKBACK_CHARS = 40
+# The NEXT sentence continues the id's sentence when it opens with a pronoun, a status
+# word (a subject-less fragment: "Staged ✅.") or a conjunction.
+_ID_CONTINUATION_RE = re.compile(
+    r"[ \t\n*_`>\"'“”•-]{0,12}(?:" + _WC_MARK + r"[ \t]*+){0,3}"
+    r"(?:(?:it|that|this|they|those|these|which|both|all|and|but|also|now|then|so)\b"
+    r"|" + _ID_STATUS_WORD_RE.pattern + r")",
+    re.IGNORECASE)
 
 
 def _typed_ids(rx: re.Pattern[str], user_texts: Any) -> set[str]:
-    """The ids of *rx*'s family in the user's own words (this message + the last six
-    user turns), capped at _WC_ECHO_MAX_CHARS like the lexicon echo rule."""
+    """The ids of *rx*'s family in the user's own words, capped at _WC_ECHO_MAX_CHARS
+    like the lexicon echo rule. Round 3 (R2-A1): the screen passes the CURRENT message
+    only."""
     joined = " ".join(str(u) for u in (user_texts or ()) if isinstance(u, str) and u)
     return {m.group(0).lower() for m in rx.finditer(joined[:_WC_ECHO_MAX_CHARS])}
 
 
 def _id_sentence(text: str, start: int, end: int) -> str:
-    """The sentence (bounded +/-_ID_ECHO_RADIUS chars) that carries text[start:end]."""
+    """The sentence (bounded +/-_ID_ECHO_RADIUS chars) that carries text[start:end],
+    plus the NEXT sentence when it continues this one (_ID_CONTINUATION_RE)."""
     lo = max(0, start - _ID_ECHO_RADIUS)
     before = text[lo:start]
     cut = 0
@@ -934,26 +996,47 @@ def _id_sentence(text: str, start: int, end: int) -> str:
         cut = b.end()
     after = text[end:end + _ID_ECHO_RADIUS]
     m = _ID_SENTENCE_BREAK_RE.search(after)
-    return before[cut:] + text[start:end] + (after[:m.start()] if m else after)
+    if m is None:
+        return before[cut:] + text[start:end] + after
+    sentence = before[cut:] + text[start:end] + after[:m.start()]
+    nxt = text[end + m.end():end + m.end() + _ID_ECHO_RADIUS]
+    lead = len(nxt) - len(nxt.lstrip(" \t\n"))
+    if _ID_CONTINUATION_RE.match(nxt, lead):
+        stop = _ID_SENTENCE_BREAK_RE.search(nxt, lead)
+        sentence += " " + nxt[lead:stop.start() if stop else len(nxt)]
+    return sentence
 
 
-def _id_is_pure_echo(text: str, fid: str) -> bool:
-    """True only when EVERY occurrence of *fid* in *text* sits in a sentence with no
-    completion claim and no noun-subject state claim. Fails toward COUNTING: an
-    unevaluable sentence or more than _ID_ECHO_MAX_OCCURRENCES occurrences is not an
-    echo."""
+def _has_positive_status(sentence: str) -> bool:
+    """A status word in *sentence* none of whose three preceding tokens is a negator."""
+    for m in _ID_STATUS_WORD_RE.finditer(sentence):
+        toks = _WC_TOKEN_RE.findall(sentence[max(0, m.start() - _ID_NEG_LOOKBACK_CHARS):m.start()])[-3:]
+        if not any(t.lower() in _ID_NEGATORS or t.lower().endswith(("n't", "n’t")) for t in toks):
+            return True
+    return False
+
+
+def _id_is_negative_relay(text: str, fid: str,
+                          spans: list[tuple[int, int]] | None = None) -> bool:
+    """True only when EVERY occurrence of *fid* in *text* (``spans``, else a literal
+    search) sits in a sentence that carries an explicit negative relay and no positive
+    status (no noun-subject state claim, no un-negated status word, no completion
+    claim). Fails toward COUNTING: no occurrence, more than _ID_ECHO_MAX_OCCURRENCES of
+    them, or an unevaluable sentence is not a relay."""
     try:
-        seen = 0
-        for m in re.finditer(re.escape(fid), text, re.IGNORECASE):
-            seen += 1
-            if seen > _ID_ECHO_MAX_OCCURRENCES:
+        if spans is None:
+            spans = [(m.start(), m.end()) for m in re.finditer(re.escape(fid), text, re.IGNORECASE)]
+        if not spans or len(spans) > _ID_ECHO_MAX_OCCURRENCES:
+            return False
+        for start, end in spans:
+            sentence = _id_sentence(text, start, end)
+            if (not _ID_NEG_RELAY_RE.search(sentence) or _ID_STATE_CLAIM_RE.search(sentence)
+                    or _has_positive_status(sentence)
+                    or _find_write_claim_span(sentence) is not None):
                 return False
-            sentence = _id_sentence(text, m.start(), m.end())
-            if _ID_STATE_CLAIM_RE.search(sentence) or _find_write_claim_span(sentence) is not None:
-                return False
-        return seen > 0
-    except Exception:  # noqa: BLE001 -- an unevaluable echo is counted, never hidden
-        log.warning("%s id-echo rule failed -- the id is screened in full", PHANTOM_LOG_KEY,
+        return True
+    except Exception:  # noqa: BLE001 -- an unevaluable relay is counted, never hidden
+        log.warning("%s id-relay rule failed -- the id is screened in full", PHANTOM_LOG_KEY,
                     exc_info=True)
         return False
 
@@ -995,14 +1078,14 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
     form label, never the matched words (an arrow / possessive form can carry up to
     three words before the verb, which in a LEX channel could be a name, D-145).
 
-    Fabricated-id half (Code #14 D-051 forcing-seams-5, round 2 F1-R1): an unknown
-    id the user typed (this message or the last six user turns) that the reply
-    relays as a PURE ECHO ("did cq-000000000002 land?" -> "`cq-000000000002` -- not
-    in the queue ledger") is not a fabrication -- it is logged at INFO (no
-    ``kind=``, never counted) and never redacted. A pure echo carries no completion
-    claim and no noun-subject state claim in any sentence that names it
-    (_id_is_pure_echo, at ANY tool count); "Yes -- cq-000000000002 is staged." about
-    a typed id is screened in full, like every id the user did not type.
+    Fabricated-id half (Code #14 D-051 forcing-seams-5, round 2 F1-R1, round 3
+    R2-A1): an unknown id the user typed in THIS message that the reply relays as an
+    explicit NEGATIVE relay ("did cq-000000000002 land?" -> "`cq-000000000002` -- not
+    in the queue ledger") is not a fabrication -- it is logged at INFO (no ``kind=``,
+    never counted) and never redacted. Every sentence naming it must carry an
+    allowlisted negative relay and no positive status (_id_is_negative_relay, at ANY
+    tool count); "Yes -- cq-000000000002 is staged.", a status with no negative, an id
+    typed only in a PRIOR turn and every id the user did not type are screened in full.
 
     S3: every firing line also appends ONE row to PHANTOM_CLAIMS_LEDGER (the
     adjudication record: a scrubbed snippet or a withheld marker, see
@@ -1057,12 +1140,19 @@ def screen_phantom_write_claims(text, *, tool_use_count, channel_name: str = "",
                         "this turn ref=%s", PHANTOM_LOG_KEY, label, len(found), ref or "-")
             continue
         unknown = found - set(known)
-        typed = _typed_ids(rx, users) if unknown else set()
-        claim_view = _LINK_TOKEN_RE.sub(" ", text)
-        echoed = {fid for fid in unknown & typed if _id_is_pure_echo(claim_view, fid)}
+        # Round 3 (R2-A1): typed = the CURRENT message only (never the prior turns).
+        typed = _typed_ids(rx, [user_text]) if unknown else set()
+        echoed: set[str] = set()
+        if unknown & typed:
+            claim_view = _LINK_TOKEN_RE.sub(" ", text)
+            occ: dict[str, list[tuple[int, int]]] = {}
+            for m in rx.finditer(claim_view):
+                occ.setdefault(m.group(0).lower(), []).append((m.start(), m.end()))
+            echoed = {fid for fid in unknown & typed
+                      if _id_is_negative_relay(claim_view, fid, occ.get(fid, []))}
         if echoed:
-            log.info("%s fabricated-id echo -- %d unknown %s id(s) the user typed were relayed "
-                     "as a pure echo and not counted", PHANTOM_LOG_KEY, len(echoed), label)
+            log.info("%s fabricated-id echo -- %d unknown %s id(s) the user typed this turn were "
+                     "relayed as a negative relay and not counted", PHANTOM_LOG_KEY, len(echoed), label)
         for fid in sorted(unknown - echoed):
             ref = _record_rail_hit(rail=PHANTOM_LOG_KEY, kind="fabricated-id", phrase=fid,
                                    text=text, locate=_locate_text(fid), mode=mode,

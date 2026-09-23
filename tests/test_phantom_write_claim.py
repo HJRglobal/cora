@@ -338,9 +338,10 @@ class TestKnownIds:
 class TestUserTypedIdEcho:
     """Code #14 D-051 forcing-seams-5: "did cq-000000000002 land?" about a mistyped id
     -> the card-status read renders "`cq-000000000002` -- not in the queue ledger" and
-    the model relays it. An unknown id the user typed (this turn or the last six user
-    turns, round 2) relayed as a PURE ECHO is not a fabrication; a claim about it and
-    an id the user did not type are screened in full (tests/test_d051_r2_honesty_rails.py)."""
+    the model relays it. An unknown id the user typed in THIS message relayed as an
+    allowlisted NEGATIVE relay is not a fabrication (round 3, R2-A1); a claim about it,
+    an id typed only in a prior turn and an id the user did not type are screened in
+    full (tests/test_d051_r2_honesty_rails.py, tests/test_d051_r3_honesty_rails.py)."""
 
     RELAY = "- `cq-000000000002` -- not in the queue ledger"
 
@@ -366,19 +367,19 @@ class TestUserTypedIdEcho:
         fab = _hits(caplog, "fabricated-id")
         assert len(fab) == 1 and "cq-000000000003" in fab[0]
 
-    def test_an_id_typed_only_in_a_prior_turn_is_an_echo_when_relayed(self, ledgers, caplog):
-        """DELIBERATE FLIP (Code #14 D-051 round 2, forcing-seams-5 residual): the
-        queue-status force covers follow-ups within three turns and the model passes
-        cq_id from history, so a relay on the follow-up ("and the other one?") is the
-        same echo. A claim about that id still counts (the pure-echo rule)."""
+    def test_an_id_typed_only_in_a_prior_turn_is_counted_even_when_relayed(self, ledgers, caplog):
+        """ROUND 3 FLIP (Code #14 D-051 R2-A1): round 2 treated a prior-turn id as typed
+        (the forcing-seams-5 residual), and that widening let a made-up status for an
+        earlier-named id go uncounted. The typed set is the CURRENT message only: the
+        honest relay on the follow-up is an ACCEPTED OVER-TRIP, the claim counts."""
         caplog.set_level(logging.WARNING, logger=se.__name__)
         se.screen_phantom_write_claims(self.RELAY, tool_use_count=1, user_text="and the other one?",
                                        prior_user_texts=["did cq-000000000002 land?"])
-        assert _hits(caplog, "fabricated-id") == []
+        assert len(_hits(caplog, "fabricated-id")) == 1
         se.screen_phantom_write_claims("cq-000000000002 is staged.", tool_use_count=1,
                                        user_text="and the other one?",
                                        prior_user_texts=["did cq-000000000002 land?"])
-        assert len(_hits(caplog, "fabricated-id")) == 1
+        assert len(_hits(caplog, "fabricated-id")) == 2
 
     def test_enforce_never_redacts_the_users_own_id(self, ledgers, monkeypatch):
         monkeypatch.setenv("CORA_SENTINEL_ENFORCE", "enforce")
