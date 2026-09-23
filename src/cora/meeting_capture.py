@@ -1154,13 +1154,24 @@ UNCONVENED_BASIS_GROUP_CALENDAR = "group-calendar-organizer"
 #: presumption above can be upgraded to evidence. NARROW FIRST RUNG: ONLY meetings
 #: that are PRESUMED unconvened today (group-calendar blocks) are ever
 #: re-bucketed; a person-organised MISS is never touched in v1.
-#:   0 human join endpoints -> confirmed unconvened (UNCONVENED_BASIS_MEET_NO_JOIN)
-#:   1 human endpoint       -> confirmed unconvened, solo (UNCONVENED_BASIS_MEET_SOLO)
-#:  >=2 human endpoints     -> a MISS (CONVENED_BASIS_MEET): people met, nothing
-#:                             captured it -- stricter than today, never looser.
+#: Counted in PEOPLE, not endpoints (D-051 lex-phi-identity-2: one person on a
+#: laptop + phone, or a drop-and-rejoin, is two endpoints -- counting endpoints made
+#: a solo block a false MISS). A person = the read's per-read hash of an EMAIL
+#: identity (connectors/meet_audit MeetJoin.person_key); an endpoint without one is
+#: "cannot tell who".
+#:   0 human endpoints                 -> confirmed unconvened (..._MEET_NO_JOIN)
+#:   1 person (any endpoints), or ONE
+#:     unidentified endpoint           -> confirmed unconvened, solo (..._MEET_SOLO)
+#:  >=2 distinct people                -> a MISS (CONVENED_BASIS_MEET): people met,
+#:                                        nothing captured it -- stricter, never looser.
+#:   anything else (an unidentified
+#:     endpoint beside another)        -> CANNOT TELL: the lane decides nothing for
+#:                                        that meeting; the presumption stands.
 UNCONVENED_BASIS_MEET_NO_JOIN = "meet-audit:no-join"
 UNCONVENED_BASIS_MEET_SOLO = "meet-audit:solo-join"
 CONVENED_BASIS_MEET = "meet-audit:joined"
+MEET_BASIS_CANNOT_TELL = "meet-audit:cannot-tell"
+MEET_BUCKET_UNDECIDED = "undecided"
 
 #: The read may DECIDE only after the audit log has had time to land. The 07:22
 #: fire audits a day that ended ~7h earlier; a manual earlier run reads "lag".
@@ -1233,6 +1244,10 @@ class AuditReport:
     meet_audit_state: str = ""
     meet_audit_reason: str = ""
     meet_events_read: int = 0
+    #: presumed-unconvened meetings the live lane saw joins for but could not count
+    #: in PEOPLE (an endpoint with no email identity beside another): the presumption
+    #: stands, and the event id is kept so "cannot tell" is visible, never silent.
+    meet_undecided_ids: list[str] = field(default_factory=list)
 
     @property
     def unconvened_confirmed(self) -> list[AuditedMeeting]:
@@ -1390,23 +1405,45 @@ def meet_joins_for(
 
 
 def classify_convened(joins: Any) -> tuple[str, str]:
-    """(bucket, basis) from one meeting's matched joins, counting DISTINCT HUMAN
-    endpoints (a bot alone in the room is not a meeting):
-      >=2 -> ("convened", CONVENED_BASIS_MEET)
-        1 -> ("unconvened", UNCONVENED_BASIS_MEET_SOLO)
-        0 -> ("unconvened", UNCONVENED_BASIS_MEET_NO_JOIN)"""
-    humans = {j.endpoint_key for j in (joins or ()) if getattr(j, "is_human", False)
-              and getattr(j, "endpoint_key", "")}
-    if len(humans) >= 2:
+    """(bucket, basis) from one meeting's matched joins, counting distinct HUMAN
+    PEOPLE (a bot alone in the room is not a meeting; one person's laptop + phone,
+    or a rejoin, is one person -- D-051 lex-phi-identity-2):
+      >=2 people                      -> ("convened", CONVENED_BASIS_MEET)
+      1 person, or 1 unidentified
+        endpoint alone                -> ("unconvened", UNCONVENED_BASIS_MEET_SOLO)
+      0 human endpoints               -> ("unconvened", UNCONVENED_BASIS_MEET_NO_JOIN)
+      otherwise                       -> (MEET_BUCKET_UNDECIDED, MEET_BASIS_CANNOT_TELL)
+    FAIL CLOSED: an endpoint with no email identity (anonymous, dial-in) may be the
+    same person as another endpoint or a second one, so it never counts as a second
+    person and never lets one identity read as solo -- the lane decides nothing."""
+    humans = [j for j in (joins or ()) if getattr(j, "is_human", False)
+              and getattr(j, "endpoint_key", "")]
+    if not humans:
+        return "unconvened", UNCONVENED_BASIS_MEET_NO_JOIN
+    people = {j.person_key for j in humans if getattr(j, "person_key", "")}
+    anonymous = {j.endpoint_key for j in humans if not getattr(j, "person_key", "")}
+    if len(people) >= 2:
         return "convened", CONVENED_BASIS_MEET
-    if len(humans) == 1:
+    if (len(people) == 1 and not anonymous) or (not people and len(anonymous) == 1):
         return "unconvened", UNCONVENED_BASIS_MEET_SOLO
-    return "unconvened", UNCONVENED_BASIS_MEET_NO_JOIN
+    return MEET_BUCKET_UNDECIDED, MEET_BASIS_CANNOT_TELL
+
+
+def _creator_email(event: dict[str, Any]) -> str:
+    creator = event.get("creator") if isinstance(event.get("creator"), dict) else {}
+    return ((creator or {}).get("email") or "").strip().lower()
 
 
 def _creator_in_domain(event: dict[str, Any]) -> bool:
-    creator = event.get("creator") if isinstance(event.get("creator"), dict) else {}
-    return _is_dwd_domain(((creator or {}).get("email") or "").strip().lower())
+    return _is_dwd_domain(_creator_email(event))
+
+
+def _creator_external(event: dict[str, Any]) -> bool:
+    """True only when the event NAMES a creator outside the Workspace domains. A
+    missing creator is not "external" (the contradiction check still applies to it:
+    fail closed)."""
+    email = _creator_email(event)
+    return bool(email) and not _is_dwd_domain(email)
 
 
 def _apply_meet_audit(
@@ -1424,16 +1461,26 @@ def _apply_meet_audit(
     FAIL CLOSED. The read decides only when ALL hold: the lane is `live` (a
     complete, un-capped read -- never dark / error / partial); the lag floor has
     elapsed; and the CONTRADICTION CHECK passed -- every CAPTURED Meet meeting on
-    the day has >=1 matched join (a captured meeting with no join means the log
-    is missing events, so its silence proves nothing). Otherwise every bucket is
-    exactly what the structural logic decided and only report.meet_audit_state
-    records why (a dark state renders byte-identically to the pre-R14-8 report).
+    the day that the org's log can record has >=1 matched join (a captured meeting
+    with no join means the log is missing events, so its silence proves nothing).
+    Otherwise every bucket is exactly what the structural logic decided and only
+    report.meet_audit_state records why (a dark state renders byte-identically to
+    the pre-R14-8 report).
+
+    "Can record" (D-051 lex-phi-identity-4): the org's Meet audit log may not record
+    a meeting HOSTED OUTSIDE the Workspace domains -- the premise the zero-join
+    branch below already rests on. So a captured Meet whose event names an external
+    creator is neither a contradiction (its missing joins say nothing about this
+    log) nor a control (its joins, if any, prove nothing about in-domain coverage).
+    A captured Meet with NO creator on the event is still checked (fail closed) but
+    is not a control; only an in-domain-created captured Meet with a join is.
 
     When it decides, it touches ONLY report.unconvened (the narrow first rung):
-    >=2 human endpoints moves the meeting to report.misses (stricter); one human
-    confirms it unconvened (solo); zero confirms it unconvened ONLY when the
-    evidence can reach it -- a same-day captured Meet meeting proved the log
-    present (a control) AND the event's creator is in the Workspace domains
+    >=2 distinct PEOPLE moves the meeting to report.misses (stricter); one person
+    confirms it unconvened (solo); endpoints it cannot count in people leave the
+    presumption standing (report.meet_undecided_ids); zero confirms it unconvened
+    ONLY when the evidence can reach it -- a same-day captured Meet meeting proved
+    the log present (a control) AND the event's creator is in the Workspace domains
     (whose Meet activity the org's audit log records). Without those the zero
     stays a presumption. A person-organised MISS is never re-bucketed in v1.
     """
@@ -1471,19 +1518,22 @@ def _apply_meet_audit(
         return
 
     # CONTRADICTION CHECK: the failing-capable cross-check. Every captured Meet
-    # meeting must show >=1 join; one that does not means the log is incomplete.
+    # meeting the org's log can record must show >=1 join; one that does not means
+    # the log is incomplete. An externally-created one is outside that log's reach
+    # (lex-phi-identity-4) -- skipped, and never a control.
     controls = 0
     for key, meeting in meetings.items():
         if not by_meeting.get(key):
             continue
         ev = raw_events.get(key) or {}
-        if not _meet_code(ev):
+        if not _meet_code(ev) or _creator_external(ev):
             continue
         if not meet_joins_for(ev, meeting.event_ids, joins):
             report.meet_audit_state = "contradiction"
             report.meet_audit_reason = "a captured Meet meeting has no join event"
             return
-        controls += 1
+        if _creator_in_domain(ev):
+            controls += 1
 
     keep: list[AuditedMeeting] = []
     for meeting in report.unconvened:
@@ -1493,6 +1543,11 @@ def _apply_meet_audit(
             keep.append(meeting)          # Zoom / Teams / link-less: not evaluable
             continue
         bucket, basis = classify_convened(meet_joins_for(ev, meeting.event_ids, joins))
+        if bucket == MEET_BUCKET_UNDECIDED:
+            # cannot count the joins in people: decide nothing for this meeting
+            report.meet_undecided_ids.append(meeting.event_id)
+            keep.append(meeting)
+            continue
         if bucket == "convened":
             meeting.convened_basis = basis
             meeting.unconvened_basis = ""
@@ -2020,8 +2075,13 @@ def render_report(report: AuditReport) -> str:
             f"\n*:white_circle: Presumed unconvened ({len(presumed)})* "
             "-- group-calendar blocks, no join evidence"
         )
+        undecided = set(report.meet_undecided_ids)
         for m in sorted(presumed, key=lambda x: x.start_label)[:15]:
-            lines.append(f"  - {m.start_label}  {_esc(m.title)}  _(organizer {_esc(m.organizer)})_")
+            # lex-phi-identity-2: the live lane saw joins it could not count in
+            # people -- still a presumption, and the line says why (never silent).
+            why = ("  _[joined -- the Meet join log cannot tell one person from two]_"
+                   if m.event_id in undecided else "")
+            lines.append(f"  - {m.start_label}  {_esc(m.title)}  _(organizer {_esc(m.organizer)})_{why}")
         if len(presumed) > 15:
             lines.append(f"  _...and {len(presumed) - 15} more_")
 

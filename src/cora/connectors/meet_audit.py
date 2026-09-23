@@ -39,9 +39,15 @@ scope-guarantee doctrine. A refused subject never reaches `with_subject`.
 
 D-145 / D-082. A Meet audit event carries participant emails (external and
 agency addresses on client meetings), display names, IPs and locations. They are
-DROPPED at parse: the only per-endpoint value that leaves `_parse_event` is a
-12-hex SHA-256 prefix used to count distinct endpoints, plus an is-human flag
-decided in-function. Nothing identifying is returned, logged or stored.
+DROPPED at parse: the only per-endpoint values that leave `_parse_event` are a
+12-hex SHA-256 prefix used to count distinct endpoints, a 12-hex PER-READ keyed
+hash of the participant's email identifier used to count distinct PEOPLE (D-051
+lex-phi-identity-2: one person on laptop + phone, or a drop-and-rejoin, is two
+endpoints but one person), plus an is-human flag decided in-function. The person
+hash is keyed with a random salt minted inside each read_call_ended call and never
+stored, so it cannot be linked across reads or reversed by hashing a known
+address; it lives only in memory, is never logged, and the audit ledger carries
+counts + event ids only. Nothing identifying is returned, logged or stored.
 
 The parameter KEY NAMES the parser reads (meeting_code, calendar_event_id,
 conference_id, identifier, display_name, endpoint_id, duration_seconds,
@@ -55,10 +61,12 @@ lazily inside audit_day's default reader. Script-side, no restart.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -129,6 +137,11 @@ class MeetJoin:
     end_ts: int              # UTC epoch the endpoint left (0 if unknown)
     endpoint_key: str        # 12-hex hash, for DISTINCT counting only
     is_human: bool
+    #: 12-hex PER-READ keyed hash of the participant's EMAIL identifier, for counting
+    #: distinct PEOPLE (two endpoints of one person share it). "" = the endpoint
+    #: carried no email identity (anonymous / dial-in): the consumer must treat such
+    #: an endpoint as "cannot tell who", never as a second person.
+    person_key: str = ""
 
 
 @dataclass
@@ -293,9 +306,29 @@ def _is_notetaker(identifier: str, display_name: str) -> bool:
     return any(m in name for m in _NOTETAKER_NAME_MARKERS)
 
 
-def _parse_event(activity: dict[str, Any], event: dict[str, Any]) -> MeetJoin | None:
+#: identifier_type values that name an EMAIL identity ("" = the key is absent: the
+#: identifier's own shape decides). Anything else -- a phone number, an unknown
+#: type -- is not a person identity this lane can dedup on.
+_EMAIL_IDENTIFIER_TYPES = frozenset({"", "email_address"})
+
+
+def _person_key(identifier: str, identifier_type: str, salt: bytes) -> str:
+    """The per-read keyed hash of an EMAIL identity, or "" when the endpoint carries
+    none. Plain string tests (no regex). The salt is per read, so the value is
+    meaningless outside the read that minted it."""
+    ident = (identifier or "").strip().lower()
+    if not ident or "@" not in ident:
+        return ""
+    if (identifier_type or "").strip().lower() not in _EMAIL_IDENTIFIER_TYPES:
+        return ""
+    return hmac.new(salt, ident.encode("utf-8", errors="replace"), hashlib.sha256).hexdigest()[:12]
+
+
+def _parse_event(activity: dict[str, Any], event: dict[str, Any], *,
+                 person_salt: bytes) -> MeetJoin | None:
     """One call_ended event -> a MeetJoin with every identifier DROPPED, or None
-    when it cannot be joined to a meeting or counted as a distinct endpoint."""
+    when it cannot be joined to a meeting or counted as a distinct endpoint.
+    `person_salt` is the read's own random key for the person hash (never stored)."""
     params = _param_map(event)
     code = normalize_meeting_code(str(params.get("meeting_code") or ""))
     cal_id = str(params.get("calendar_event_id") or "").strip()
@@ -307,6 +340,7 @@ def _parse_event(activity: dict[str, Any], event: dict[str, Any]) -> MeetJoin | 
     if not endpoint:
         return None
     key = hashlib.sha256(endpoint.encode("utf-8", errors="replace")).hexdigest()[:12]
+    person = _person_key(identifier, str(params.get("identifier_type") or ""), person_salt)
     human = not _is_notetaker(identifier, display)
     end_ts = _epoch(((activity.get("id") or {}) if isinstance(activity.get("id"), dict) else {}).get("time"))
     start_ts = _epoch(params.get("start_timestamp_seconds"))
@@ -321,6 +355,7 @@ def _parse_event(activity: dict[str, Any], event: dict[str, Any]) -> MeetJoin | 
         meeting_code=code, calendar_event_id=cal_id,
         conference_id=str(params.get("conference_id") or "").strip(),
         start_ts=start_ts, end_ts=end_ts, endpoint_key=key, is_human=human,
+        person_key=person,
     )
 
 
@@ -342,6 +377,9 @@ def read_call_ended(
     """
     window = (int(_epoch_dt(start_utc)), int(_epoch_dt(end_utc)))
     out = MeetAuditRead(state=STATE_ERROR, window=window)
+    # The person-hash key for THIS read only (lex-phi-identity-2). A local, never
+    # stored, never logged: the same address hashes differently in the next read.
+    person_salt = secrets.token_bytes(16)
     try:
         svc = service if service is not None else _build_reports_service()
         joins: list[MeetJoin] = []
@@ -366,7 +404,7 @@ def read_call_ended(
                         continue
                     out.events_read += 1
                     keys_seen.update(_param_map(event).keys())
-                    j = _parse_event(activity, event)
+                    j = _parse_event(activity, event, person_salt=person_salt)
                     if j is not None:
                         joins.append(j)
             token = resp.get("nextPageToken") or None

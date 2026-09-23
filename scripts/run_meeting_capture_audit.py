@@ -168,6 +168,10 @@ def main() -> int:
         "convened_event_ids": [m.event_id for m in report.convened_misses],
         "unconvened_confirmed_event_ids": [m.event_id for m in report.unconvened_confirmed],
         "unconvened_presumed_event_ids": [m.event_id for m in report.unconvened_presumed],
+        # D-051 lex-phi-identity-2: presumed blocks the live lane saw joins for but
+        # could not count in PEOPLE (an endpoint with no email identity). Event ids
+        # only -- the per-read person hash never leaves the read.
+        "meet_undecided_event_ids": list(report.meet_undecided_ids),
     }])
 
     if args.post:

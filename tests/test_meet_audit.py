@@ -313,6 +313,73 @@ def test_notetaker_endpoints_are_not_human(ident, name):
     assert [j.is_human for j in r.joins] == [False]
 
 
+# ── D-051 lex-phi-identity-2: distinct PEOPLE, via a per-read keyed hash ─────
+
+def _read_items(items):
+    return ma.read_call_ended(T0, T1, service=_Svc([{"items": items}]))
+
+
+def test_two_endpoints_of_one_identity_share_one_person_key():
+    """One person on a laptop + a phone (or a rejoin): two endpoint keys, ONE person."""
+    r = _read_items([_event(endpoint="ep-laptop"), _event(endpoint="ep-phone")])
+    assert len(r.joins) == 2 and len({j.endpoint_key for j in r.joins}) == 2
+    assert len({j.person_key for j in r.joins}) == 1
+    assert re.fullmatch(r"[0-9a-f]{12}", r.joins[0].person_key)
+
+
+def test_the_identity_is_case_and_space_insensitive_but_people_stay_distinct():
+    r = _read_items([_event(endpoint="e1", ident="Pal@Example.test"),
+                     _event(endpoint="e2", ident=" pal@example.test "),
+                     _event(endpoint="e3", ident="other@example.test")])
+    keys = [j.person_key for j in r.joins]
+    assert keys[0] == keys[1] != keys[2]
+
+
+def test_the_person_key_is_per_read_never_linkable_or_reversible():
+    """The salt is minted inside each read: the same address hashes differently in
+    the next read, and the key is not the plain SHA-256 of the address (which anyone
+    holding the address could recompute)."""
+    import hashlib
+    a = _read_items([_event()]).joins[0].person_key
+    b = _read_items([_event()]).joins[0].person_key
+    assert a and b and a != b
+    plain = hashlib.sha256(b"pal@example.test").hexdigest()[:12]
+    assert plain not in (a, b)
+
+
+@pytest.mark.parametrize("ident,itype", [
+    ("", "email_address"),              # no identifier at all (endpoint id only)
+    ("+15555550100", "phone_number"),   # a dial-in
+    ("pal@example.test", "phone_number"),
+    ("pal@example.test", "something_new"),
+])
+def test_an_endpoint_without_an_email_identity_has_no_person_key(ident, itype):
+    ev = _event(ident=ident)
+    for prm in ev["events"][0]["parameters"]:
+        if prm["name"] == "identifier_type":
+            prm["value"] = itype
+    (j,) = _read_items([ev]).joins
+    assert j.person_key == "" and j.endpoint_key
+
+
+def test_a_missing_identifier_type_falls_back_to_the_identifier_shape():
+    ev = _event()
+    ev["events"][0]["parameters"] = [prm for prm in ev["events"][0]["parameters"]
+                                     if prm["name"] != "identifier_type"]
+    (j,) = _read_items([ev]).joins
+    assert j.person_key
+
+
+def test_the_person_salt_never_reaches_the_read_or_the_log(caplog):
+    """Only the 12-hex key leaves the read; the MeetAuditRead carries no salt and
+    the read logs nothing identifying."""
+    import logging
+    with caplog.at_level(logging.DEBUG):
+        r = _read_items([_event()])
+    assert not hasattr(r, "person_salt") and "salt" not in repr(r)
+    assert "pal@example.test" not in caplog.text and r.joins[0].person_key not in caplog.text
+
+
 def test_missing_start_is_derived_from_end_and_duration():
     ev = _event()
     params = ev["events"][0]["parameters"]
@@ -388,17 +455,23 @@ def test_probe_prints_counts_and_key_names_never_values(monkeypatch, capsys):
     pages = [{"items": [_event(endpoint="ep-1"),
                         _event(endpoint="ep-2", ident="cora@hjrglobal.com", name="Cora NoteTaker")]}]
     real = ma.read_call_ended
-    monkeypatch.setattr(mod.ma, "read_call_ended", lambda s, e: real(s, e, service=_Svc(pages)))
+    reads: list = []
+    monkeypatch.setattr(mod.ma, "read_call_ended",
+                        lambda s, e: reads.append(real(s, e, service=_Svc(pages))) or reads[-1])
     assert mod.main(["--day", "2026-08-26"]) == 0
     out = capsys.readouterr().out
     assert "state: live" in out and "call_ended events read: 2" in out
     assert "joins usable: 2 (human 1, bot 1)" in out and "distinct meetings: 1" in out
+    # lex-phi-identity-2: endpoints vs PEOPLE, as counts only
+    assert "distinct identified people: 1 (human endpoints without an email identity: 0)" in out
     assert "meeting_code" in out and "identifier" in out          # key NAMES
     for leak in ("pal@example.test", "Pal Example", "203.0.113.9", "votcadence", "VOTCADENCE",
                  "gc-1_", "cora@hjrglobal.com", "Cora NoteTaker", "conf-xyz", "ep-1"):
         assert leak not in out, leak
-    for j in real(T0, T1, service=_Svc(pages)).joins:
+    (used,) = reads                                    # the SAME read the probe printed
+    for j in used.joins:
         assert j.endpoint_key not in out
+        assert not j.person_key or j.person_key not in out
 
 
 def test_probe_source_is_read_only_ascii_and_calls_only_the_seam():

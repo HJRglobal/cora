@@ -11,7 +11,10 @@ It prints ONLY:
   * the lane state (live | dark:scope | dark:api | dark:subject | partial | error)
     and its fixed reason class;
   * counts: pages, call_ended events read, joins usable, human vs bot endpoints,
-    distinct endpoints, distinct meetings;
+    distinct endpoints, distinct identified people (per-read keyed hash of the
+    email identifier -- the count only) and human endpoints with no email
+    identity, distinct meetings. Endpoints vs people is how the endpoint_id
+    semantics are confirmed (D-051 lex-phi-identity-2);
   * the parameter KEY NAMES the log actually carries (never their values) -- this
     is how the parser's VERIFY-AT-BUILD field names are confirmed;
   * the age of the newest event (how far behind real time the log runs).
@@ -52,6 +55,8 @@ def summarize(read: "ma.MeetAuditRead", *, now: datetime | None = None) -> list[
         f"call_ended events read: {read.events_read}",
         f"joins usable: {len(joins)} (human {len(humans)}, bot {len(joins) - len(humans)})",
         f"distinct endpoints: {len({j.endpoint_key for j in joins})}",
+        f"distinct identified people: {len({j.person_key for j in humans if j.person_key})} "
+        f"(human endpoints without an email identity: {sum(1 for j in humans if not j.person_key)})",
         f"distinct meetings: {len(meetings)}",
         "parameter key names: " + (", ".join(read.param_keys) if read.param_keys else "(none observed)"),
     ]

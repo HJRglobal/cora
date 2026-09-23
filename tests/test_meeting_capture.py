@@ -2264,12 +2264,18 @@ _AFTER = datetime(2026, 8, 27, 14, 0, tzinfo=AZ)
 _CTL_LINK = "https://meet.google.com/amb-hero-cmp"
 
 
-def _mj(link_or_code, *, hh=9, mm=35, ep="ep-a", human=True, minutes=20, cal_id="", day=26):
+def _mj(link_or_code, *, hh=9, mm=35, ep="ep-a", human=True, minutes=20, cal_id="", day=26,
+        person=None):
+    """One parsed join. `person` is the identity behind the endpoint: None = a
+    distinct person per endpoint (the fixture default), a string = that person
+    (two endpoints sharing it are ONE person), "" = no email identity (anonymous)."""
     start = int(datetime(2026, 8, day, hh, mm, tzinfo=AZ).timestamp())
+    who = ("person-" + ep) if person is None else person
     return ma.MeetJoin(
         meeting_code=ma.normalize_meeting_code(link_or_code), calendar_event_id=cal_id,
         conference_id="", start_ts=start, end_ts=start + minutes * 60,
         endpoint_key=_hashlib.sha256(ep.encode()).hexdigest()[:12], is_human=human,
+        person_key=_hashlib.sha256(who.encode()).hexdigest()[:12] if who else "",
     )
 
 
@@ -2284,9 +2290,13 @@ def _with_creator(events, creator="harrison@hjrglobal.com"):
 
 
 def _control():
-    """A captured Meet meeting whose join IS in the log -- proves the log present."""
-    return _ev("ctl-1", summary="Amber Heron Compass", hh=13, link=_CTL_LINK,
-               organizer="harrison@hjrglobal.com")
+    """A captured Meet meeting whose join IS in the log -- proves the log present.
+    In-domain CREATED (lex-phi-identity-4: only an in-domain-created captured Meet
+    is a control; the org log may not record an externally-hosted one)."""
+    ev = _ev("ctl-1", summary="Amber Heron Compass", hh=13, link=_CTL_LINK,
+             organizer="harrison@hjrglobal.com")
+    ev["creator"] = {"email": "harrison@hjrglobal.com"}
+    return ev
 
 
 def _ctl_join():
@@ -2563,6 +2573,215 @@ class TestMeetJoinAudit:
         assert "Velvet Otter" not in json.dumps(row)
         # the run-marker detail pin is untouched
         assert markers[0]["detail"] == "scheduled=6 captured=1 missed=1 unconvened=4"
+
+
+_VOT = "https://meet.google.com/vot-cade-nce"
+_GC1 = "gc-1_20260826T163000Z"
+
+
+def _gc1(r):
+    return [m for m in r.unconvened + r.misses if m.event_id == _GC1][0]
+
+
+class TestMeetJoinAuditPeopleNotEndpoints:
+    """D-051 lex-phi-identity-2: the lane counts PEOPLE. One person on a laptop and
+    a phone, or a drop-and-rejoin, is two call_ended endpoints -- counting those
+    turned a presumed-unconvened solo block into a false MISS."""
+
+    def test_one_person_on_two_endpoints_is_solo_not_a_miss(self):
+        events, transcripts = _labor_day_with_control()
+        joins = [_ctl_join(),
+                 _mj(_VOT, ep="laptop", person="solo@hjrglobal.test"),
+                 _mj(_VOT, ep="phone", person="solo@hjrglobal.test", mm=40)]
+        r = _audit_meet(events, transcripts, _read(joins))
+        assert r.meet_audit_state == "live" and r.misses == []
+        assert _gc1(r).unconvened_basis == mc.UNCONVENED_BASIS_MEET_SOLO
+        assert r.meet_undecided_ids == []
+        out = mc.render_report(r)
+        assert "Not captured" not in out and "_[one person joined]_" in out
+
+    def test_two_distinct_people_are_still_a_miss(self):
+        events, transcripts = _labor_day_with_control()
+        joins = [_ctl_join(),
+                 _mj(_VOT, ep="a1", person="one@hjrglobal.test"),
+                 _mj(_VOT, ep="a2", person="one@hjrglobal.test"),
+                 _mj(_VOT, ep="b1", person="two@hjrglobal.test", mm=40)]
+        r = _audit_meet(events, transcripts, _read(joins))
+        assert [m.event_id for m in r.misses] == [_GC1]
+        assert r.misses[0].convened_basis == mc.CONVENED_BASIS_MEET
+
+    @pytest.mark.parametrize("joins", [
+        # one identified person + an endpoint with no email identity (a dial-in)
+        [_mj(_VOT, ep="laptop", person="solo@hjrglobal.test"), _mj(_VOT, ep="dial", person="")],
+        # two anonymous endpoints: one person rejoining, or two people -- unknowable
+        [_mj(_VOT, ep="anon1", person=""), _mj(_VOT, ep="anon2", person="", mm=40)],
+    ], ids=["person-plus-dial-in", "two-anonymous"])
+    def test_endpoints_it_cannot_count_in_people_leave_the_presumption(self, joins):
+        """FAIL CLOSED: neither a MISS (it may be one person) nor a confirmed solo
+        (it may be two). The presumption stands and the line says why."""
+        events, transcripts = _labor_day_with_control()
+        r = _audit_meet(events, transcripts, _read([_ctl_join()] + joins))
+        assert r.meet_audit_state == "live" and r.misses == []
+        gc1 = _gc1(r)
+        assert gc1.unconvened_basis == mc.UNCONVENED_BASIS_GROUP_CALENDAR
+        assert gc1.convened_basis == ""
+        assert r.meet_undecided_ids == [_GC1]
+        assert gc1 in r.unconvened_presumed and gc1 not in r.unconvened_confirmed
+        out = mc.render_report(r)
+        assert "_[joined -- the Meet join log cannot tell one person from two]_" in out
+        assert ":white_check_mark:" not in out
+
+    def test_one_anonymous_endpoint_alone_is_solo(self):
+        events, transcripts = _labor_day_with_control()
+        r = _audit_meet(events, transcripts, _read([_ctl_join(), _mj(_VOT, ep="anon", person="")]))
+        assert _gc1(r).unconvened_basis == mc.UNCONVENED_BASIS_MEET_SOLO
+        assert r.meet_undecided_ids == []
+
+    def test_bots_never_count_as_people_or_as_unknowns(self):
+        events, transcripts = _labor_day_with_control()
+        joins = [_ctl_join(),
+                 _mj(_VOT, ep="laptop", person="solo@hjrglobal.test"),
+                 _mj(_VOT, ep="bot1", human=False, person=""),
+                 _mj(_VOT, ep="bot2", human=False)]
+        r = _audit_meet(events, transcripts, _read(joins))
+        assert _gc1(r).unconvened_basis == mc.UNCONVENED_BASIS_MEET_SOLO and r.misses == []
+
+    def test_classify_convened_truth_table(self):
+        p = lambda ep, who: _mj(_VOT, ep=ep, person=who)  # noqa: E731
+        assert mc.classify_convened([]) == ("unconvened", mc.UNCONVENED_BASIS_MEET_NO_JOIN)
+        assert mc.classify_convened([p("a", "x"), p("b", "x")]) == \
+            ("unconvened", mc.UNCONVENED_BASIS_MEET_SOLO)
+        assert mc.classify_convened([p("a", "x"), p("b", "y")]) == \
+            ("convened", mc.CONVENED_BASIS_MEET)
+        assert mc.classify_convened([p("a", "x"), p("b", "y"), p("c", "")]) == \
+            ("convened", mc.CONVENED_BASIS_MEET)   # two proven people: the unknown cannot undo it
+        assert mc.classify_convened([p("a", "x"), p("c", "")]) == \
+            (mc.MEET_BUCKET_UNDECIDED, mc.MEET_BASIS_CANNOT_TELL)
+        assert mc.classify_convened([p("c", ""), p("c", "")]) == \
+            ("unconvened", mc.UNCONVENED_BASIS_MEET_SOLO)   # the SAME endpoint twice
+
+    def test_the_real_parser_folds_a_rejoin_into_one_person(self):
+        """The review's repro, end to end through connectors/meet_audit: two
+        call_ended events, one identifier, endpoint_ids ep-1 / ep-2."""
+        start = int(datetime(2026, 8, 26, 9, 35, tzinfo=AZ).timestamp())
+
+        def event(endpoint, ident="solo.person@hjrglobal.test", itype="email_address"):
+            params = [{"name": "meeting_code", "value": "VOTCADENCE"},
+                      {"name": "identifier", "value": ident},
+                      {"name": "identifier_type", "value": itype},
+                      {"name": "display_name", "value": "Solo Person"},
+                      {"name": "endpoint_id", "value": endpoint},
+                      {"name": "duration_seconds", "intValue": "600"},
+                      {"name": "start_timestamp_seconds", "intValue": str(start)}]
+            return {"id": {"time": datetime.fromtimestamp(start + 600, timezone.utc)
+                           .strftime("%Y-%m-%dT%H:%M:%S.000Z")},
+                    "events": [{"name": "call_ended", "parameters": params}]}
+
+        class _Svc:
+            def __init__(self, items):
+                self.items = items
+
+            def activities(self):
+                return self
+
+            def list(self, **kw):
+                return self
+
+            def execute(self, num_retries=0):
+                return {"items": self.items}
+
+        read = ma.read_call_ended(datetime(2026, 8, 26, tzinfo=timezone.utc),
+                                  datetime(2026, 8, 27, tzinfo=timezone.utc),
+                                  service=_Svc([event("ep-1"), event("ep-2")]))
+        assert read.state == ma.STATE_LIVE and len(read.joins) == 2
+        assert len({j.endpoint_key for j in read.joins}) == 2
+        assert len({j.person_key for j in read.joins}) == 1
+        assert mc.classify_convened(read.joins) == ("unconvened", mc.UNCONVENED_BASIS_MEET_SOLO)
+        # a phone-number identifier is not an email identity: cannot tell
+        dial = ma.read_call_ended(datetime(2026, 8, 26, tzinfo=timezone.utc),
+                                  datetime(2026, 8, 27, tzinfo=timezone.utc),
+                                  service=_Svc([event("ep-1"),
+                                                event("ep-2", ident="+15555550100", itype="phone_number")]))
+        assert mc.classify_convened(dial.joins) == (mc.MEET_BUCKET_UNDECIDED, mc.MEET_BASIS_CANNOT_TELL)
+
+    def test_audit_ledger_carries_undecided_event_ids_only(self, monkeypatch):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "_audit_script_meet_undecided", _REPO_ROOT / "scripts" / "run_meeting_capture_audit.py")
+        mod = importlib.util.module_from_spec(spec)
+        monkeypatch.setattr(sys, "argv", ["run_meeting_capture_audit.py", "--day", DAY])
+        spec.loader.exec_module(mod)
+        events, transcripts = _labor_day_with_control()
+        report = _audit_meet(events, transcripts, _read(
+            [_ctl_join(), _mj(_VOT, ep="laptop", person="solo@hjrglobal.test"),
+             _mj(_VOT, ep="dial", person="")]))
+        monkeypatch.setattr(mod.mc, "load_config", lambda: _cfg())
+        monkeypatch.setattr(mod.mc, "audit_day", lambda day, cfg: report)
+        monkeypatch.setattr(mod.run_marker, "write", lambda task, **kw: None)
+        assert mod.main() == 0
+        rows = [json.loads(l) for l in mc.ledger_path().read_text(encoding="utf-8").splitlines()]
+        row = [r for r in rows if r.get("lane") == "audit"][-1]
+        assert row["meet_undecided_event_ids"] == [_GC1]
+        assert _GC1 in row["unconvened_presumed_event_ids"]
+        flat = json.dumps(row)
+        assert "@" not in json.dumps(row["meet_undecided_event_ids"])
+        assert "solo@" not in flat and "hjrglobal.test" not in flat
+
+
+class TestMeetJoinAuditExternalHost:
+    """D-051 lex-phi-identity-4: the org's Meet audit log may not record a meeting
+    hosted outside the Workspace -- the premise the zero-join branch already rests
+    on. So an externally-created captured Meet is neither a contradiction (its
+    missing joins say nothing about this log) nor a control."""
+
+    @staticmethod
+    def _external_captured(*, creator="host@vendor.example"):
+        ev = _ev("ext-1", summary="Saffron Delta Review", hh=15,
+                 link="https://meet.google.com/saf-delt-rvw", organizer="host@vendor.example",
+                 attendees=["harrison@hjrglobal.com", "host@vendor.example"])
+        if creator is not None:
+            ev["creator"] = {"email": creator}
+        tr = _t("t-ext", cal_id="ext-1", hh=15, link="https://meet.google.com/saf-delt-rvw",
+                organizer="host@vendor.example")
+        return ev, tr
+
+    def test_an_external_captured_meet_with_no_join_is_not_a_contradiction(self):
+        events, transcripts = _labor_day_with_control()
+        ev, tr = self._external_captured()
+        events["harrison@hjrglobal.com"].append(ev)
+        r = _audit_meet(events, transcripts + [tr], _read([_ctl_join()]))
+        assert r.meet_audit_state == "live", r.meet_audit_reason
+        assert len(r.unconvened_confirmed) == 5 and r.misses == []
+        assert "Meet join log read contradiction" not in mc.render_report(r)
+
+    def test_an_external_captured_meet_is_never_a_control(self):
+        """Its join proves nothing about in-domain coverage: with no IN-DOMAIN
+        captured control, zero-join blocks stay presumptions (the stricter MISS
+        still applies)."""
+        events = {"harrison@hjrglobal.com": _with_creator(_labor_day_events())}
+        ev, tr = self._external_captured()
+        events["harrison@hjrglobal.com"].append(ev)
+        ext_join = _mj("https://meet.google.com/saf-delt-rvw", hh=15, mm=2, ep="ext-a")
+        r = _audit_meet(events, [tr], _read([ext_join]))
+        assert r.meet_audit_state == "live"
+        assert r.unconvened_confirmed == [] and len(r.unconvened_presumed) == 5
+
+    def test_a_captured_meet_with_no_creator_is_still_checked(self):
+        """Fail closed: only a NAMED external creator exempts a meeting; a captured
+        Meet whose event carries no creator and no join is still a contradiction."""
+        events, transcripts = _labor_day_with_control()
+        ev, tr = self._external_captured(creator=None)
+        events["harrison@hjrglobal.com"].append(ev)
+        r = _audit_meet(events, transcripts + [tr], _read([_ctl_join()]))
+        assert r.meet_audit_state == "contradiction"
+
+    def test_an_in_domain_captured_meet_with_no_join_is_still_a_contradiction(self):
+        events, transcripts = _labor_day_with_control()
+        ev, tr = self._external_captured(creator="hannah@hjrglobal.com")
+        events["harrison@hjrglobal.com"].append(ev)
+        r = _audit_meet(events, transcripts + [tr], _read([_ctl_join()]))
+        assert r.meet_audit_state == "contradiction"
 
 
 class TestMeetJoinAuditHealthCheck:
