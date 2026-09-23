@@ -3978,12 +3978,33 @@ _QS_VERB_ID_RE = re.compile(
 # if any have not been responded to") and Q3 ("I have pressed them all") keep
 # forcing; "did they go through?" no longer does (accepted recall cost). Every
 # lookahead is bounded and fixed-position (D-171).
+#
+# D-051 F2-R1: in an INVERTED follow-up ("did those land?", "have those
+# registered?", "did any land?") the auxiliary sits BEFORE the pronoun and the
+# status MAIN verb after it, so the lookahead also takes the status main verbs --
+# but only when the verb closes its clause (end, punctuation, or a closing adverb:
+# "did those register yet?"). That keeps a determiner in front of a participle
+# adjective or a homograph noun out ("those landed costs", "any registered
+# users", "those land parcels"). A bare BASE form after `any` also needs an
+# auxiliary right before `any`: "did any land?" is a follow-up, "did we buy any
+# land?" ends the same way and is not. Each lookbehind is fixed-width.
+_QS_PRON_END = (r"(?=[ \t]{0,3}(?:[?.!,;:)\-–—]|\Z|(?:yet|ok|okay|properly|"
+                r"correctly|already|fine|now|too|then|in|on|at|through|successfully)\b))")
+_QS_PRON_ADV = r"(?:(?:actually|really|ever|finally|both|all|two|three)[ \t]{1,3})?"
+_QS_PRON_PART = (r"(?:" + _QS_PRON_ADV + r"(?:landed|registered|recorded|stuck)\b" + _QS_PRON_END
+                 + r"|" + _QS_PRON_ADV
+                 + r"(?:t(?:ake|ook)[ \t]{1,3}effect|show(?:s|ing|ed)?[ \t]{1,3}as)\b)")
+_QS_PRON_BASE = r"(?:" + _QS_PRON_ADV + r"(?:land|register|stick)\b" + _QS_PRON_END + r")"
 _QS_PRONOUN_RE = re.compile(
     r"\b(?:them"
-    r"|(?:those|these)(?=[ \t]{0,3}(?:[?.!,;:)]|\Z|(?:have|has|had|were|was|are|is|did|do|got|"
-    r"get|went|go|all|still|been|of|ones|not|that|which|i|you)\b))"
-    r"|any(?=[ \t]{0,3}(?:[?.!,;:)]|\Z|(?:have|has|had|were|was|are|is|not|still|been|got|get|"
-    r"did|go|went|left|that|which|of[ \t]{1,3}(?:them|those|these))\b))"
+    r"|(?:those|these)(?=[ \t]{0,3}(?:[?.!,;:)\-–—]|\Z|(?:have|has|had|were|was|are|is|"
+    r"did|do|got|get|went|go|all|still|been|of|ones|not|that|which|i|you)\b|"
+    + _QS_PRON_PART + r"|" + _QS_PRON_BASE + r"))"
+    r"|any(?=[ \t]{0,3}(?:[?.!,;:)\-–—]|\Z|(?:have|has|had|were|was|are|is|not|still|"
+    r"been|got|get|did|go|went|left|that|which|of[ \t]{1,3}(?:them|those|these))\b|"
+    + _QS_PRON_PART + r"))"
+    r"|(?:(?<=\bdid[ \t])|(?<=\bdo[ \t])|(?<=\bdoes[ \t])|(?<=\bcan[ \t])|(?<=\bwill[ \t])|"
+    r"(?<=\bcould[ \t])|(?<=\bwould[ \t]))any(?=[ \t]{1,3}" + _QS_PRON_BASE + r")"
     r"|the[ \t]+(?:rest|others)"
     r"|(?:my|the|those|these)[ \t]+"
     r"(?:press(?:es)?|taps?|clicks?)(?![ \t]+(?:release|releases|pipeline|coverage|hits?|kit|"

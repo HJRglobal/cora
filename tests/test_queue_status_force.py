@@ -111,6 +111,19 @@ TIER_B_NEGATIVES_WITH_A_CARD_PRIOR = [
     "did those payments go through?",
     "did those invoices land?",
     "did they go through?",   # 'they' is not press-referring (accepted recall cost)
+    # D-051 F2-R1: the status MAIN verb after the pronoun counts only when it closes
+    # its clause, so a determiner before a participle adjective / homograph noun
+    # stays out; a bare base form after `any` also needs an auxiliary before `any`
+    "did we buy any land?",
+    "is there any land still available?",
+    "are these landed costs final?",
+    "any registered users on the new portal?",
+    "are those registered trademarks still pending?",
+    "were those recorded calls uploaded?",
+    "did those two people land?",
+    "any stuck orders?",
+    "any take on the Sprouts deal?",
+    "did any land in the bank?",
 ]
 TIER_B_POSITIVES_WITH_A_CARD_PRIOR = [
     Q2, Q3,
@@ -119,6 +132,22 @@ TIER_B_POSITIVES_WITH_A_CARD_PRIOR = [
     "did the rest go through?",
     "are these still showing as unresponded?",
     "have I missed any?",
+    # D-051 F2-R1: do-support follow-ups -- the auxiliary BEFORE the pronoun, the
+    # status main verb after it. The round-1 narrowing dropped every one of these.
+    "did those land?",
+    "have those registered?",
+    "did these register?",
+    "did any land?",
+    "have any registered?",
+    "have these landed?",
+    "did those register yet?",
+    "are those recorded?",
+    "did those stick?",
+    "did those take effect?",
+    "so did those actually register?",
+    "and these -- landed?",
+    "those landed?",
+    "did those two land?",
 ]
 
 # Real founder-DM texts (bot logs, 6/11-9/21; 80-char log cut where it applies) that
@@ -238,8 +267,9 @@ class TestPredicate:
         "?" + "them all " * 55, ("card still show " * 31)[:499] + "?",
         ("cq-0123456789ab staged " * 22)[:499] + "?", ("them still pending " * 27)[:499] + "?",
         ("those have landed " * 28)[:499] + "?", "any " * 124 + "?",
+        ("did those land? " * 32)[:499], ("did any register " * 30)[:499] + "?",
     ], ids=["spaces", "cards", "responded", "pronouns", "mixed", "id-status", "them-status",
-            "those-landed", "any"])
+            "those-landed", "any", "did-those-land", "did-any-register"])
     def test_predicate_is_fast_on_degenerate_input_at_the_gate(self, shape):
         t0 = time.perf_counter()
         cq.is_queue_status_question(shape, prior_user_texts=[shape, shape, shape])
@@ -255,11 +285,17 @@ class TestPredicate:
         "catch-up " * 4_000 + "cards", "knowledge" + " " * 40_000 + "base",
         "show me " * 5_000, "give" + " " * 40_000 + "me", "code backlog " * 3_000,
         "decision " * 4_000 + "cards", "button " * 6_000 + "presses", "staged status " * 3_000,
+        # D-051 round-2 shapes (F2-R1 pronoun + main verb)
+        "those landed " * 3_000, "did any land " * 3_000, "any" + " " * 40_000 + "land",
+        "those actually " * 3_000 + "register", "those take" + " " * 40_000 + "effect",
+        "did any " * 5_000 + "x", "these -- " * 4_000,
     ], ids=["spaces", "card", "responded", "bang", "still", "cq",
             "any", "those", "any-tabs", "stage-cq", "stage-spaces-cq", "restage-tick",
             "the-rest", "monday-menu", "monday-tabs", "catch-up", "knowledge-spaces",
             "show-me", "give-spaces", "code-backlog", "decision-cards", "button-presses",
-            "id-status"])
+            "id-status",
+            "those-landed", "did-any-land", "any-spaces-land", "those-actually",
+            "those-take-spaces", "did-any", "these-dash"])
     def test_raw_regexes_are_linear_past_the_gate(self, shape):
         """D-171: the 500-char gate runs first, but each compiled pattern must stand
         on its own at Slack's 40k cap too. Best of 3: measured ~14ms worst shape on
