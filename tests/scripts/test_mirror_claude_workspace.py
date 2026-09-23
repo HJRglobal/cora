@@ -772,6 +772,7 @@ def test_sibling_checkout_wins_over_the_subdirectory_heuristic(monkeypatch, tmp_
 from datetime import date as _date, timedelta as _td  # noqa: E402
 
 RM_TODAY = _date(2026, 9, 19)   # pinned clock -- never key a test on the live date
+RM_NOW = m.datetime(2026, 9, 19, 3, 45, tzinfo=m._AZ)   # the 03:45 AZ mirror run
 
 
 def _marker(zk: Path, tid: str, day: _date | str, payload: dict | None = None, raw: str | None = None) -> Path:
@@ -797,6 +798,9 @@ def cadence(tmp_path, monkeypatch):
         monkeypatch.setattr(m, "CADENCE_PATH", p)
         return p
     monkeypatch.setattr(m, "_today_az", lambda: RM_TODAY)
+    # the mirror's run INSTANT, pinned to its real 03:45 AZ fire (the registered
+    # grace is measured in hours to this instant -- D-051 dry-run-writes-1)
+    monkeypatch.setattr(m, "_now_az", lambda: RM_NOW)
     return _set
 
 
@@ -843,13 +847,15 @@ def test_markerless_task_with_cadence_row_reads_did_not_run_never_ok(roots, cade
 
 
 def test_registered_markerless_task_reads_awaiting_first_in_parity_and_status(roots, cadence):
-    """R14-6: a row stamped `registered:` today with no marker renders 'awaiting first
-    marker' in BOTH the ZONE-K parity table and mirror-status.json -- counted, never in
-    did_not_run (so the 08:45 lane does not WARN) and never counted as ok."""
+    """R14-6: a row stamped `registered:` YESTERDAY with no marker still renders
+    'awaiting first marker' at the 03:45 run (the -Apply may have run after the day's
+    fire; D-051 dry-run-writes-1) in BOTH the ZONE-K parity table and
+    mirror-status.json -- counted, never in did_not_run (so the 08:45 lane does not
+    WARN) and never counted as ok. Two days back, the daily grace has elapsed."""
     cadence({"russet-lark-digest": {"cadence_hours": 24, "expects_output": True,
-                                    "registered": RM_TODAY.isoformat()},
+                                    "registered": (RM_TODAY - _td(days=1)).isoformat()},
              "slate-heron-digest": {"cadence_hours": 24, "expects_output": True,
-                                    "registered": (RM_TODAY - _td(days=1)).isoformat()}})
+                                    "registered": (RM_TODAY - _td(days=2)).isoformat()}})
     _task(roots["tasks"], "russet-lark-digest")
     _task(roots["tasks"], "slate-heron-digest")
     _run(["--apply", "--only", "cowork_tasks"])

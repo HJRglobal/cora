@@ -169,18 +169,109 @@ def _reg(cadence_h, registered, marker=None):
 
 
 def test_registered_grace_is_one_cadence_daily():
-    """Registered today, no marker -> awaiting (0h < 24h). Registered yesterday -> 24h
-    is NOT < 24h, so the grace has elapsed: did not run. 1x, not run_marker's 2x."""
+    """Registered today, no marker -> awaiting. A bare date is the END of that AZ day,
+    so registered yesterday is 0h old at the start of today -> still awaiting (the
+    -Apply may have run after yesterday's fire; D-051 dry-run-writes-1). Two days back
+    is 24h past that origin, NOT < 24h: did not run. 1x, not run_marker's 2x."""
     row = _reg(24, "2026-09-19")
     assert row["status"] == m.RM_AWAITING_FIRST
     assert "registered 2026-09-19" in row["detail"] and "1x cadence" in row["detail"]
-    late = _reg(24, "2026-09-18")
+    assert _reg(24, "2026-09-18")["status"] == m.RM_AWAITING_FIRST
+    late = _reg(24, "2026-09-17")
     assert late["status"] == m.RM_DID_NOT_RUN and "grace has elapsed" in late["detail"]
 
 
 def test_registered_grace_weekly_boundary():
-    assert _reg(168, "2026-09-13")["status"] == m.RM_AWAITING_FIRST   # 144h < 168h
-    assert _reg(168, "2026-09-12")["status"] == m.RM_DID_NOT_RUN      # 168h, not < 168h
+    """Sat 9/12 registered (after that day's 06:30 fire) -> the next fire is Sat 9/19
+    06:30, so the 9/19 mirror still awaits it; one day earlier the grace is spent."""
+    assert _reg(168, "2026-09-13")["status"] == m.RM_AWAITING_FIRST   # 120h < 168h
+    assert _reg(168, "2026-09-12")["status"] == m.RM_AWAITING_FIRST   # 144h < 168h
+    assert _reg(168, "2026-09-11")["status"] == m.RM_DID_NOT_RUN      # 168h, not < 168h
+
+
+# ── D-051 dry-run-writes-1: the grace ends at the FIRST FIRE, not at midnight ──
+from datetime import datetime as _dt, timedelta as _tdelta, timezone as _tz  # noqa: E402
+
+_AZ = _tz(_tdelta(hours=-7))
+
+
+def _at(d: str, hh: int, mm: int) -> "_dt":
+    y, mo, dd = (int(x) for x in d.split("-"))
+    return _dt(y, mo, dd, hh, mm, tzinfo=_AZ)
+
+
+def _reg_at(cadence_h, registered, now):
+    ent = {"cadence_hours": cadence_h, "expects_output": True, "registered": registered}
+    return m.evaluate_run_marker("t", None, ent, today=now.date(), now=now)["status"]
+
+
+def test_registered_mid_morning_daily_is_still_awaiting_at_the_next_0345_mirror():
+    """The finding's pin: -Apply at 10:00 AZ on 9/25 (after the 06:40 fire), daily
+    cadence. The 9/26 03:45 mirror (the one the 08:45 health check reads) must say
+    awaiting -- the first fire is 06:40. By the 12:15 run that fire is overdue."""
+    for reg in (_at("2026-09-25", 10, 0), "2026-09-25T10:00", "2026-09-25T17:00:00+00:00"):
+        assert _reg_at(24, reg, _at("2026-09-25", 12, 15)) == m.RM_AWAITING_FIRST, reg
+        assert _reg_at(24, reg, _at("2026-09-26", 3, 45)) == m.RM_AWAITING_FIRST, reg
+        assert _reg_at(24, reg, _at("2026-09-26", 12, 15)) == m.RM_DID_NOT_RUN, reg
+
+
+def test_a_bare_date_counts_from_the_end_of_that_az_day():
+    """A date-only stamp may have been written at 23:59, so its first fire can be a
+    whole cadence after that midnight: awaiting through D+1, did not run on D+2."""
+    for now in (_at("2026-09-25", 12, 15), _at("2026-09-26", 3, 45), _at("2026-09-26", 12, 15)):
+        assert _reg_at(24, "2026-09-25", now) == m.RM_AWAITING_FIRST, now
+    assert _reg_at(24, "2026-09-25", _at("2026-09-27", 3, 45)) == m.RM_DID_NOT_RUN
+
+
+def test_weekly_registered_after_the_saturday_fire_awaits_the_next_saturday():
+    """hygiene-asana: cron Sat 06:30. Registered Sat 9/26 -> first fire Sat 10/3 06:30;
+    the 10/3 03:45 mirror awaits it, the 10/4 03:45 mirror reports the miss."""
+    assert _reg_at(168, "2026-09-26", _at("2026-10-03", 3, 45)) == m.RM_AWAITING_FIRST
+    assert _reg_at(168, "2026-09-26", _at("2026-10-04", 3, 45)) == m.RM_DID_NOT_RUN
+
+
+def test_monthly_grace_is_the_longest_calendar_month_not_720h():
+    """cowork-cora-redundancy-audit: cron 1st 10:00. Registered Oct 1 (after the fire)
+    -> first fire Nov 1 10:00, 31 days on: the Nov 1 03:45 mirror must await it (720h
+    would read did not run that morning). Nov 2 reports the miss."""
+    for reg in ("2026-10-01", "2026-10-01T11:00"):
+        assert _reg_at(720, reg, _at("2026-11-01", 3, 45)) == m.RM_AWAITING_FIRST, reg
+        assert _reg_at(720, reg, _at("2026-11-02", 3, 45)) == m.RM_DID_NOT_RUN, reg
+    assert m._first_fire_grace_h(720) == 744 and m._first_fire_grace_h(168) == 168
+    assert m._first_fire_grace_h(24) == 24
+
+
+def test_a_future_registered_value_is_still_absent_with_a_run_instant():
+    """Keep the fail-closed rule: a registered DAY after the run's day is a typo, never
+    an excuse -- including a timestamp that lands on a later AZ day."""
+    now = _at("2026-09-25", 3, 45)
+    for reg in ("2026-09-26", "2026-09-26T01:00", "2027-09-25"):
+        ent = {"cadence_hours": 24, "expects_output": True, "registered": reg}
+        row = m.evaluate_run_marker("t", None, ent, today=now.date(), now=now)
+        assert row["status"] == m.RM_DID_NOT_RUN and "in the future -- ignored" in row["detail"], reg
+
+
+def test_the_mirror_passes_its_run_instant_only_when_it_matches_today(monkeypatch, tmp_path):
+    """plan_cowork_tasks hands the evaluator the REAL run instant (a daily row
+    registered 9/25 10:00 reads awaiting at 9/26 03:45). A pinned `today` that does
+    not match the instant falls back to the start of that day -- never a mixed clock."""
+    task = tmp_path / "tasks" / "amber-wren-digest"
+    task.mkdir(parents=True)
+    (task / "SKILL.md").write_text("---\nname: amber-wren-digest\n---\nbody\n", encoding="utf-8")
+    monkeypatch.setenv("COWORK_TASKS_ROOT", str(tmp_path / "tasks"))
+    monkeypatch.setattr(m, "read_run_marker", lambda tid: None)
+    monkeypatch.setattr(m, "load_cadence", lambda: ({"amber-wren-digest": {
+        "cadence_hours": 24, "expects_output": True, "registered": "2026-09-25T10:00"}}, None))
+    monkeypatch.setattr(m, "_now_az", lambda: _at("2026-09-26", 3, 45))
+    monkeypatch.setattr(m, "_today_az", lambda: date(2026, 9, 26))
+    plan = m.Plan()
+    m.plan_cowork_tasks(plan, m.load_config())
+    assert plan.run_markers["amber-wren-digest"]["status"] == m.RM_AWAITING_FIRST
+    # today pinned to 9/27 while the instant says 9/26: start of 9/27 is 38h on
+    monkeypatch.setattr(m, "_today_az", lambda: date(2026, 9, 27))
+    plan2 = m.Plan()
+    m.plan_cowork_tasks(plan2, m.load_config())
+    assert plan2.run_markers["amber-wren-digest"]["status"] == m.RM_DID_NOT_RUN
 
 
 def test_registered_accepts_date_datetime_and_iso():

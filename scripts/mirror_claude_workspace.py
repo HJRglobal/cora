@@ -543,37 +543,78 @@ RM_UNKNOWN_CADENCE = "unknown cadence"
 # first marker' for ONE cadence after that date -- neither ok nor an alarm. It is
 # deliberately NOT in RUN_MARKER_ALARM_STATUSES and never collapses to RM_OK (a blind
 # row must never render as clean). No `registered:` = no excuse (today's behaviour).
+#
+# D-051 dry-run-writes-1: the grace is measured in HOURS from the registration
+# INSTANT to the mirror's run instant -- never in whole days from midnight. The day
+# cut ended the grace one mirror run BEFORE the first fire it exists to cover: an
+# -Apply at 10:00 AZ on D (after that day's 06:40 fire) read 'did not run' at the
+# D+1 03:45 mirror, three hours before the task's first possible fire, so the 08:45
+# health check posted a false MISSED FIRE. A bare date means the END of that AZ day
+# (the -Apply may have run at 23:59, and its first fire can be a whole cadence after
+# that); a full timestamp is that instant.
 RM_AWAITING_FIRST = "awaiting first marker"
+_AZ = timezone(_td_hours(-7))    # America/Phoenix (no DST)
+#: A DOM cron (declared 720h = 30d) fires once per CALENDAR month, so two fires can be
+#: 31 days apart: the first-fire grace for such a row is the longest month, or a
+#: 31-day month's first fire reads 'did not run' the morning it is due.
+_MONTHLY_CADENCE_H = 28 * 24
+_LONGEST_MONTH_H = 31 * 24.0
 RUN_MARKER_ALARM_STATUSES = (RM_DID_NOT_RUN, RM_WROTE_NOTHING, RM_UNREADABLE, RM_REPORTED_ERROR)
 _RM_RENDER_ORDER = (RM_DID_NOT_RUN, RM_WROTE_NOTHING, RM_UNREADABLE, RM_REPORTED_ERROR,
                     RM_UNKNOWN_CADENCE, RM_AWAITING_FIRST, RM_OK)
 
 
-def _registered_day(value) -> date | None:
-    """The DATE part of a cadence row's `registered:` value, or ``None`` (= absent, no
-    grace). YAML hands back a ``date`` for ``2026-09-19`` and a ``datetime`` for a full
-    timestamp; a quoted value arrives as a str and is parsed as ISO. Anything else
+def _end_of_day_az(d: date) -> datetime:
+    """The first instant AFTER AZ day *d* (a bare `registered:` date's grace origin)."""
+    return datetime(d.year, d.month, d.day, tzinfo=_AZ) + _td_hours(24)
+
+
+def _as_az(dt: datetime) -> datetime:
+    """A naive timestamp is AZ (the date the footer stamps); an aware one converts."""
+    return dt.replace(tzinfo=_AZ) if dt.tzinfo is None else dt.astimezone(_AZ)
+
+
+def _registered_instant(value) -> tuple[date, datetime] | None:
+    """``(registered AZ day, grace origin instant)`` for a cadence row's `registered:`
+    value, or ``None`` (= absent, no grace). YAML hands back a ``date`` for
+    ``2026-09-19`` and a ``datetime`` for a full timestamp; a quoted value arrives as a
+    str and is parsed as ISO. A bare date's origin is the END of that AZ day (the
+    -Apply may have run at 23:59); a timestamp's origin is that instant. Anything else
     (bool, int, 'soon', '') is unparseable and therefore counts as ABSENT -- a typo
     must never become an excuse."""
     if isinstance(value, bool) or value is None:
         return None
     if isinstance(value, datetime):   # before `date`: datetime IS-A date
-        return value.date()
+        inst = _as_az(value)
+        return inst.date(), inst
     if isinstance(value, date):
-        return value
+        return value, _end_of_day_az(value)
     if isinstance(value, str):
         s = value.strip()
         if not s:
             return None
-        try:
-            return datetime.fromisoformat(s).date()
+        try:                          # a bare 'YYYY-MM-DD' first: it is a DAY, not midnight
+            d = date.fromisoformat(s)
+            return d, _end_of_day_az(d)
         except ValueError:
             pass
         try:
-            return date.fromisoformat(s)
+            inst = _as_az(datetime.fromisoformat(s))
+            return inst.date(), inst
         except ValueError:
             return None
     return None
+
+
+def _first_fire_grace_h(cadence_h: float) -> float:
+    """ONE cadence, in hours. A monthly row's cadence is a calendar month, whose
+    longest gap between fires is 31 days (720h would end the grace a day early)."""
+    return max(cadence_h, _LONGEST_MONTH_H) if cadence_h >= _MONTHLY_CADENCE_H else cadence_h
+
+
+def _now_az() -> datetime:
+    """The mirror's run instant in America/Phoenix (the registered-grace clock)."""
+    return datetime.now(_AZ)
 
 
 def _today_az() -> date:
@@ -636,7 +677,7 @@ def read_run_marker(task_id: str) -> dict | None:
 
 
 def evaluate_run_marker(task_id: str, marker: dict | None, cadence_entry: dict | None,
-                        *, today: date) -> dict:
+                        *, today: date, now: datetime | None = None) -> dict:
     """One task's row: ``{task, status, detail, last_marker, ok, outputs, cadence_hours,
     expects_output, note}``. The wording of the two cadence alarms mirrors
     run_marker.evaluate (MISSED FIRE / FIRED BUT WROTE NOTHING).
@@ -646,9 +687,12 @@ def evaluate_run_marker(task_id: str, marker: dict | None, cadence_entry: dict |
     computable), NOT 'did not run'; a task with a row and no marker inside 2x its
     cadence is 'did not run' -- the row this whole slice exists to render honestly.
     R14-6: a markerless row whose entry carries a parseable, non-future `registered:`
-    date less than ONE cadence ago is 'awaiting first marker' (non-alarm, never ok);
-    the grace applies only while NO marker exists -- a marker that exists is judged
-    exactly as before."""
+    value less than ONE cadence (in hours, from the registration instant to `now`)
+    ago is 'awaiting first marker' (non-alarm, never ok); the grace applies only
+    while NO marker exists -- a marker that exists is judged exactly as before.
+    `now` is the mirror's run instant (AZ); without it the START of `today` is used
+    (the earliest instant a run dated `today` can be -- production passes the real
+    one)."""
     row: dict = {"task": task_id, "status": RM_OK, "detail": "", "last_marker": "",
                  "ok": None, "outputs": None, "cadence_hours": None,
                  "expects_output": None, "note": ""}
@@ -682,12 +726,22 @@ def evaluate_run_marker(task_id: str, marker: dict | None, cadence_entry: dict |
         # registered-gated grace; no registered = no excuse), NOT numeric parity: that
         # evaluator excuses 2x cadence. A date in the FUTURE is treated as absent
         # (fail-closed: a typo'd year must not silence a real 'did not run').
-        reg = _registered_day(cadence_entry.get("registered")) if isinstance(cadence_entry, dict) else None
-        if reg is not None and reg <= today and (today - reg).days * 24 < cadence_h:
-            row["status"] = RM_AWAITING_FIRST
-            row["detail"] = (f"registered {reg.isoformat()}, first marker due within "
-                             f"{cadence_h:.0f}h (1x cadence grace) -- not yet an alarm, not ok")
-            return row
+        # Measured in HOURS from the registration instant (a bare date = the END of
+        # that AZ day) to the run instant -- see the RM_AWAITING_FIRST comment.
+        got = (_registered_instant(cadence_entry.get("registered"))
+               if isinstance(cadence_entry, dict) else None)
+        reg = got[0] if got else None
+        if got is not None and reg <= today:
+            run_at = (_as_az(now) if now is not None
+                      else datetime(today.year, today.month, today.day, tzinfo=_AZ))
+            elapsed_h = max(0.0, (run_at - got[1]).total_seconds() / 3600.0)
+            grace_h = _first_fire_grace_h(cadence_h)
+            if elapsed_h < grace_h:
+                row["status"] = RM_AWAITING_FIRST
+                row["detail"] = (f"registered {reg.isoformat()}, first marker due within "
+                                 f"{grace_h:.0f}h of registration ({elapsed_h:.0f}h elapsed; "
+                                 f"1x cadence grace) -- not yet an alarm, not ok")
+                return row
         row["status"] = RM_DID_NOT_RUN
         row["detail"] = (f"no run marker ever recorded (cadence {cadence_h:.0f}h) -- MISSED FIRE, "
                          f"or the footer is not yet injected")
@@ -868,7 +922,8 @@ def plan_skills(plan: Plan, cfg: Config) -> None:
                                    cls="skills"))
 
 
-def plan_cowork_tasks(plan: Plan, cfg: Config, *, today: date | None = None) -> None:
+def plan_cowork_tasks(plan: Plan, cfg: Config, *, today: date | None = None,
+                      now: datetime | None = None) -> None:
     dirs = _task_dirs(cfg)
     root = _tasks_root(cfg)
     plan.roots_found["cowork_tasks"] = root.exists()
@@ -878,6 +933,13 @@ def plan_cowork_tasks(plan: Plan, cfg: Config, *, today: date | None = None) -> 
     # Code #13 slice 9c: the DECLARED cadence map + the AZ date the markers are
     # stamped in. `today` is injectable so tests pin the clock.
     today = today or _today_az()
+    # D-051 dry-run-writes-1: the `registered:` grace is measured to the run
+    # INSTANT. A pinned `today` without a matching instant (tests, or a run that
+    # straddles midnight) falls back to the start of `today` inside the evaluator.
+    if now is None:
+        now = _now_az()
+    if _as_az(now).date() != today:
+        now = None
     cadence, cadence_err = load_cadence()
     plan.cadence_error = cadence_err
     if cadence_err:
@@ -925,7 +987,7 @@ def plan_cowork_tasks(plan: Plan, cfg: Config, *, today: date | None = None) -> 
         # screen is withheld behind a hash key (same posture as the INDEX row above;
         # the hash lets two withheld tasks stay distinguishable without naming either).
         rm_row = evaluate_run_marker(d.name, read_run_marker(d.name), cadence.get(d.name),
-                                     today=today)
+                                     today=today, now=now)
         id_reason = screen_reason(d.name, cfg)
         rm_key = d.name if (not id_reason or opted) else f"[withheld-{_sha_text(d.name)[:8]}]"
         rm_row["task"] = rm_key
@@ -1379,7 +1441,8 @@ def _render_run_markers(plan: Plan, cfg: Config) -> list[str]:
                  "reads **did not run** -- never ok. A marker with `outputs: []` on an "
                  "`expects_output` task reads **fired but wrote nothing**. A markerless task "
                  "whose row carries `registered:` reads **awaiting first marker** for ONE "
-                 "cadence after that date, then **did not run**.")
+                 "cadence after it (hours to this run; a bare date counts from the END of "
+                 "that AZ day, a monthly row from 31 days), then **did not run**.")
     lines.append("")
     lines.append("| task | status | last marker | ok | outputs | cadence (h) | detail |")
     lines.append("|---|---|---|---|---|---|---|")
@@ -1554,12 +1617,13 @@ def _uniquify_dest_collisions(plan: Plan) -> None:
     plan.writes = kept
 
 
-def build_plan(cfg: Config, only: str | None, *, today: date | None = None) -> Plan:
+def build_plan(cfg: Config, only: str | None, *, today: date | None = None,
+               now: datetime | None = None) -> Plan:
     plan = Plan()
     if only in (None, "skills"):
         plan_skills(plan, cfg)
     if only in (None, "cowork_tasks"):
-        plan_cowork_tasks(plan, cfg, today=today)
+        plan_cowork_tasks(plan, cfg, today=today, now=now)
     if only in (None, "code_memory"):
         plan_code_memory(plan, cfg)
     if only in (None, "cowork_memory"):

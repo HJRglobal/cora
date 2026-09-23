@@ -35,7 +35,11 @@
 #                   ISO timestamp). While the task has NO marker yet, the row reads
 #                   'awaiting first marker' -- neither an alarm nor ok -- for ONE
 #                   cadence after this date (ruling 9.11(ii), Code #14 R14-6), then
-#                   'did not run'. No `registered:` = no excuse (reads 'did not run'
+#                   'did not run'. The cadence is counted in HOURS to the mirror's
+#                   run instant: a bare date counts from the END of that AZ day (so
+#                   an -Apply after that day's fire still awaits the next one), a
+#                   timestamp from that instant, and a monthly (720) row's cadence
+#                   is 31 days. No `registered:` = no excuse (reads 'did not run'
 #                   at once). An unparseable or FUTURE date counts as absent. Stamp
 #                   it only with the REAL -Apply date: a guessed date silences a real
 #                   'did not run' for a whole cadence.
