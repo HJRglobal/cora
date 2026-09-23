@@ -1009,13 +1009,28 @@ def format_mechanical_dm(update: dict[str, Any]) -> str:
     Deliberately terse: this lane is bookkeeping, and its whole problem was that
     179 items of it made a 296-item queue unreadable. It carries the entity so
     an approver who is not the founder can tell whose task they are closing.
+
+    Code #14 S7: the entity badge comes from review_lanes.resolve_entity (payload
+    entity -> the ONE known code in the description -> the Asana project gid in
+    the task_url; never a default). It used to read payload.entity only and fall
+    back to a literal '?', which ~283 of 303 PENDING mechanical rows rendered
+    (pass-5 / task_close / hubspot_note rows carry no payload entity). Unresolved
+    now renders NO badge. Raw <U...> speaker tokens in the description are
+    resolved the same way the decision card resolves them.
     """
     utype = update.get("update_type", "generic")
-    payload = update.get("payload") or {}
-    desc = update.get("description", "(no description)")
-    entity = str(payload.get("entity") or "").strip().upper() or "?"
+    payload = update.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    desc = _card_resolve_slack_ids(str(update.get("description") or "(no description)"))
+    try:
+        from . import review_lanes  # function-local: review_lanes imports this module
+        entity = str(review_lanes.resolve_entity(update) or "").strip().upper()
+    except Exception:  # noqa: BLE001 -- a badge is never worth a crash
+        log.warning("mechanical card: entity resolver failed", exc_info=True)
+        entity = ""
     label = _TYPE_LABEL.get(utype, utype)
-    lines = [f"*[{label}]* `{entity}`\n{desc}"]
+    header = f"*[{label}]*" + (f" `{entity}`" if entity else "")
+    lines = [f"{header}\n{desc}"]
     link = _bare_url(payload.get("task_url") or payload.get("deal_url") or "")
     name = payload.get("task_name") or payload.get("deal_name") or ""
     if link:

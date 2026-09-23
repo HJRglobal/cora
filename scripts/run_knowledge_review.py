@@ -871,8 +871,14 @@ def _build_mechanical_batch_card(pending: list[dict], now_dt, *, expired_this_ru
         age = _age_days(u, now_dt)
         desc = str(u.get("description") or "(no description)")[:140]
         shown += 1
-        lines.append(f"  {shown}. [{u.get('update_type')}] {tag or '?'} "
-                     f"{'' if age is None else str(age) + 'd'} -- {desc}")
+        # Code #14 S7: an unresolved entity renders NOTHING (it used to print a
+        # literal '?', the same defect class as the per-item mechanical card).
+        bits = [f"  {shown}. [{u.get('update_type')}]"]
+        if tag:
+            bits.append(tag)
+        if age is not None:
+            bits.append(f"{age}d")
+        lines.append(" ".join(bits) + f" -- {desc}")
     if withheld or lex_hidden:
         lines.append(f"  ({withheld} withheld by the content screen; {lex_hidden} LEX row(s) counted, "
                      f"never rendered -- across the whole pending pool)")
