@@ -300,6 +300,10 @@ def _cap(cid, *, status="PROPOSED", title="Queue fixture item", entity="FNDR", s
 
 
 MENU_TS = "2026-09-21T14:00:54.478710+00:00"
+# D-051 integration-tests-3: the LEX row's RAW title must be distinctive. The first
+# cut seeded it with the redaction placeholder itself, so a renderer that printed
+# the raw fold title would have printed the same string and passed.
+LEX_RAW_TITLE = "Quibblewick website footer rebuild"
 
 
 def _seed_menu(qdir: Path):
@@ -309,7 +313,8 @@ def _seed_menu(qdir: Path):
     rows = [_cap(c) for c in decided]
     # the evidence-floor row: APPROVED, passive signal, no permalink -> has_evidence False
     rows.append(_cap(floor_held, status="APPROVED", signal="passive", summary="", title="Folder links"))
-    rows.append(_cap(lex, status="APPROVED", entity="LEX-LLC", title="[LEX build ask -- details withheld]"))
+    rows.append(_cap(lex, status="APPROVED", entity="LEX-LLC", title=LEX_RAW_TITLE,
+                     summary="Quibblewick summary text"))
     for c in decided:
         rows.append({"event": "staged", "id": c, "ts": "2026-09-21T15:20:00+00:00", "via": "button"})
     # a decision BEFORE the menu ts must not count
@@ -336,12 +341,15 @@ class TestRenderer:
 
     def test_a_lex_row_renders_by_id_with_the_placeholder_only(self, qledger):
         _decided, _f, lex = _seed_menu(qledger)
-        out = cq.render_card_status()
-        assert lex in out
-        line = next(l for l in out.splitlines() if lex in l)
-        # the load_items LEX-safe view: the fixed placeholder, never a raw title
-        assert "[LEX build ask -- details withheld]" in line
-        assert "no decision recorded" in line
+        # the fold really holds the raw title -- or this test proves nothing
+        assert cq._fold_items()[lex]["title"] == LEX_RAW_TITLE
+        for out in (cq.render_card_status(), cq.render_card_status([lex])):
+            assert lex in out
+            line = next(l for l in out.splitlines() if lex in l)
+            # the load_items LEX-safe view: the fixed placeholder, never a raw title
+            assert cq._LEX_REDACTED_TITLE in line
+            assert "Quibblewick" not in out           # D-145: not on ANY line of the render
+            assert "no decision recorded" in line
 
     def test_the_read_states_its_scope(self, qledger):
         """D-051 forcing-seams-2: a turn mis-forced by a question about another card
@@ -583,3 +591,94 @@ class TestAppSeam:
         assert app._code_queue_capture_intent(t) is True
         assert cq.is_queue_status_question(t) is False
 
+
+# ── the seam, driven through _dispatch_qa (D-051 forcing-seams-8) ────────────
+# test_source_order_and_cache_bypass pins substring ORDER only; an edit that kept
+# the literals but overwrote force_tool (or re-read the cache) would stay green.
+# This drives the real pipeline with the model, the context load and the cache
+# stubbed (no network, no ledger writes) and observes what reached the model.
+
+_PENDING_NOTE = ("STAGED WRITES AWAITING CONFIRMATION: this person currently has a "
+                 "personal note staged and unconfirmed (newest first: a personal note).")
+
+
+def _drive_dispatch_qa(monkeypatch, text, *, prior=None, pending_note=""):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+    import cora.app as app_mod
+
+    monkeypatch.setattr(cq, "HARRISON_ID", HARRISON)
+    seen: dict = {}
+
+    def fake_generate(*_a, meta=None, **kw):
+        seen.update(kw)
+        if meta is not None:
+            meta["used_tools"] = True
+            meta["used_verbatim_tool"] = False
+        return "Relayed from the ledger."
+
+    posts = {"n": 0}
+
+    def fake_say(**_kw):
+        posts["n"] += 1
+        if posts["n"] == 1:
+            raise RuntimeError("no placeholder")   # -> the non-streaming path
+        return {"ok": True}
+
+    cache = MagicMock()
+    cache.lookup.return_value = None
+    hints = SimpleNamespace(bypass_cache=False, skip_kb=True, kb_k_override=None, cache_ttl=300)
+    with patch.object(app_mod, "generate_response", side_effect=fake_generate), \
+         patch.object(app_mod.ic, "classify", return_value="qa"), \
+         patch.object(app_mod.ic, "routing_hints", return_value=hints), \
+         patch.object(app_mod.sc, "get_cache", return_value=cache), \
+         patch.object(app_mod.kb_embeddings, "embed_query", return_value=[0.0] * 8), \
+         patch.object(app_mod, "load_context_parts", return_value=("static", "kb")), \
+         patch.object(app_mod, "load_prompt", return_value="sys"), \
+         patch.object(app_mod.model_router, "choose_model", return_value="model-x"), \
+         patch.object(app_mod.model_router, "short_label", return_value="x"), \
+         patch.object(app_mod.user_identity, "display_name", return_value="Harrison"), \
+         patch.object(app_mod.user_identity, "get_user", return_value=None), \
+         patch.object(app_mod.lex_phi_access, "phi_allowed", return_value=False), \
+         patch.object(app_mod.knowledge_check, "recall_ask_note", return_value=""), \
+         patch.object(app_mod._tool_dispatch, "describe_live_pendings", return_value=pending_note), \
+         patch.object(app_mod.active_thread_store, "register"):
+        app_mod._dispatch_qa(
+            channel_id="D0TESTDM", channel_name="dm", user_id=HARRISON,
+            user_message=text, reply_thread_ts="1789999254.000100", entity="FNDR",
+            client=MagicMock(), say=fake_say, prior_messages=list(prior or []),
+        )
+    return seen, cache
+
+
+class TestDispatchQaBehaviour:
+    def test_a_card_question_forces_the_read_and_never_touches_the_cache(self, monkeypatch):
+        seen, cache = _drive_dispatch_qa(monkeypatch, Q1)
+        assert seen["force_tool"] == "cora_queue_status"
+        cache.lookup.assert_not_called()
+        cache.store.assert_not_called()
+
+    def test_a_follow_up_forces_the_read_through_the_real_dm_priors(self, monkeypatch):
+        prior = [{"role": "user", "content": Q1}, {"role": "assistant", "content": "Checking."}]
+        seen, cache = _drive_dispatch_qa(monkeypatch, Q2, prior=prior)
+        assert seen["force_tool"] == "cora_queue_status"
+        cache.lookup.assert_not_called()
+
+    def test_the_harness_can_see_a_cache_read_and_store(self, monkeypatch):
+        """Control: an ordinary DM question reads AND stores, so the two
+        assert_not_called above are observations, not blind spots."""
+        seen, cache = _drive_dispatch_qa(monkeypatch, "what's our cash position this week?")
+        assert seen["force_tool"] is None
+        cache.lookup.assert_called_once()
+        cache.store.assert_called_once()
+
+    def test_a_pending_staged_write_is_not_pre_empted_end_to_end(self, monkeypatch):
+        prior = [{"role": "user", "content": Q1}, {"role": "assistant", "content": "Checking."}]
+        seen, _cache = _drive_dispatch_qa(monkeypatch, "yes go ahead -- have my cards registered?",
+                                          prior=prior, pending_note=_PENDING_NOTE)
+        assert seen["force_tool"] != "cora_queue_status"
+
+    def test_an_earlier_force_still_wins_on_the_same_text(self, monkeypatch):
+        t = "queue a code session: cards don't refresh after a press -- they still show as unresponded"
+        seen, _cache = _drive_dispatch_qa(monkeypatch, t, prior=[{"role": "user", "content": Q1}])
+        assert seen["force_tool"] == "cora_queue_code_session"
