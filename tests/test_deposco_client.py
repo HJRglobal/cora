@@ -624,6 +624,38 @@ class TestResponseEnvelope:
             dc.DeposcoResponse("ua", "/x", 200, "<a>").xml()
 
 
+class TestItemExistence:
+    """The order-push preflight's items-exist check (V4 / step 4)."""
+
+    def test_get_item_hits_the_documented_route(self, ua_env):
+        t = FakeTransport(FakeResponse(200, '{"itemNumber": "PURE-Original"}'))
+        client(transport=t).get_item("PURE-Original")
+        assert t.urls[0].endswith("/items/F3E/PURE-Original")
+
+    def test_item_exists_true_on_200(self, ua_env):
+        t = FakeTransport(FakeResponse(200, '{"itemNumber": "PURE-Original"}'))
+        assert client(transport=t).item_exists("PURE-Original") is True
+
+    def test_item_exists_false_on_confirmed_404(self, ua_env):
+        t = FakeTransport(FakeResponse(404, "not found"))
+        assert client(transport=t).item_exists("F3-NOT-A-REAL-SKU") is False
+
+    def test_404_raises_deposco_not_found_not_the_generic_error(self, ua_env):
+        t = FakeTransport(FakeResponse(404, "not found"))
+        with pytest.raises(dc.DeposcoNotFound):
+            client(transport=t).get_item("F3-NOT-A-REAL-SKU")
+
+    def test_a_non_404_failure_is_not_swallowed_as_absent(self, ua_env):
+        """An auth or network failure must propagate -- a preflight gate must
+        see it, never read it as a quiet 'item does not exist'."""
+        t = FakeTransport(*[FakeResponse(500, "boom")] * (dc.TRANSIENT_RETRIES + 1))
+        with pytest.raises(dc.DeposcoUnavailable):
+            client(transport=t).item_exists("PURE-Original")
+
+    def test_deposco_not_found_is_a_deposco_error_subclass(self):
+        assert issubclass(dc.DeposcoNotFound, dc.DeposcoError)
+
+
 class TestClientDefaults:
     def test_business_unit_and_tenant_come_from_env(self, ua_env):
         c = client()

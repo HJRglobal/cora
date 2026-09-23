@@ -143,6 +143,16 @@ class DeposcoUsageError(DeposcoError):
     """The caller asked for something this client refuses to build."""
 
 
+class DeposcoNotFound(DeposcoError):
+    """A definitive HTTP 404 -- the requested resource does not exist.
+
+    Distinguished from the generic 4xx branch because callers with an
+    existence-check use (the order-push preflight's item and order checks)
+    need to tell "confirmed absent" apart from "the request itself failed" --
+    collapsing both into one exception would let an auth hiccup or a network
+    blip read as a false "item does not exist"."""
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Path safety (finding 3) -- the bad shape is unconstructable
 # ─────────────────────────────────────────────────────────────────────────────
@@ -395,6 +405,12 @@ class DeposcoClient:
                 self._backoff(transient_seen)
                 continue
 
+            if status == 404:
+                raise self._fail(
+                    DeposcoNotFound,
+                    f"{self.env}: HTTP 404 on {path} -- not found. Body: {body[:400]}",
+                )
+
             if status >= 400:
                 hint = ""
                 if status == 400 and "%20" in path:
@@ -616,6 +632,24 @@ class DeposcoClient:
         return parse_receipt_lines(
             self._get(f"/receiptlines/{self.business_unit}/{receipt_number}")
         )
+
+    # -- Items (doc's Item API) -- the order-push preflight's existence check --
+
+    def get_item(self, item_number: str) -> DeposcoResponse:
+        """One item's detail by item number. Raises `DeposcoNotFound` on a
+        definitive 404; any other failure propagates as itself rather than
+        being folded into "not found"."""
+        return self._get(f"/items/{self.business_unit}/{item_number}")
+
+    def item_exists(self, item_number: str) -> bool:
+        """True only on a confirmed 200. A confirmed 404 is False. Anything
+        else (auth, network, blank-200 exhaustion) is NOT caught here -- a
+        preflight gate must see that failure, not a false "does not exist"."""
+        try:
+            self.get_item(item_number)
+            return True
+        except DeposcoNotFound:
+            return False
 
 
 def _ssl_context():
