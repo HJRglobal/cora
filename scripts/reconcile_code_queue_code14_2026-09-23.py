@@ -31,8 +31,11 @@ incident).
     NOT SEEDED (so nothing to transition): R14-1, R14-2, R14-4, R14-5, R14-6, R14-7, R14-8.
 
 Every transition is GUARDED on the fix being present on the checked-out tree
-(behavioural / reachability checks, never a grep for a string a stub could carry). A
-DISMISSED or SUPERSEDED row is never flipped (MARK_SHIPPED itself has no terminal guard).
+(behavioural / reachability checks, never a grep for a string a stub could carry):
+behaviour runs the shipped function; wiring parses the source with `ast` and needs a
+real Call / keyword / assignment node, so a comment naming the wiring is blocked
+(D-051 integration-tests-4). A DISMISSED or SUPERSEDED row is never flipped
+(MARK_SHIPPED itself has no terminal guard).
 
     --probe-gate   proves the C7 gate on THIS tree against a throwaway ledger: a
                    MARK_SHIPPED with no bundle reference must be refused. Never touches
@@ -47,6 +50,7 @@ Run (from the repo root, AFTER the FF-merge, with main's tree checked out):
 from __future__ import annotations
 
 import argparse
+import ast
 import inspect
 import logging
 import os
@@ -54,6 +58,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
@@ -77,6 +83,23 @@ READBACK_ID = "cq-a24f9d2210fc"
 
 
 # -- code-presence preconditions (each returns a blocker string, or None) ----------
+# D-051 integration-tests-4: every WIRING check parses the function's source with
+# `ast` and looks for a real Call / keyword / assignment node -- a comment or a
+# string literal carrying the same text is NOT a node, so a stub that only
+# mentions the wiring is blocked. Every BEHAVIOUR check runs the shipped function.
+def _fn_ast(fn: Callable) -> ast.AST:
+    return ast.parse(textwrap.dedent(inspect.getsource(fn)))
+
+
+def _call_name(node: ast.Call) -> str:
+    f = node.func
+    return f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else "")
+
+
+def _calls(tree: ast.AST, name: str) -> list[ast.Call]:
+    return [n for n in ast.walk(tree) if isinstance(n, ast.Call) and _call_name(n) == name]
+
+
 def _capture_log(logger_name: str, fn: Callable[[], object]) -> tuple[object, list[str]]:
     hits: list[str] = []
 
@@ -108,6 +131,40 @@ def _s2_present() -> str | None:
         return "S2 artifact does not carry the report text"
     if nhc._is_own_log(Path("bot-2026-09-23.log")):
         return "S2 own-log detector claims a bot log"
+    # BEHAVIOUR (integration-tests-4): the check's OWN log re-read -- a quoted
+    # critical in a report line must NOT re-raise, while a real writer failure the
+    # check's process logged to the same file MUST stay critical. Throwaway dir;
+    # the module's _LOG_DIR is restored.
+    saved_dir = nhc._LOG_DIR
+    tmpdir = Path(tempfile.mkdtemp(prefix="cq14-s2-"))
+    try:
+        now = datetime.now()
+        ts = (now - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S,000")
+        own = tmpdir / f"health-check-{now:%Y-%m-%d}.log"
+        own.write_text(f"{ts} INFO health-check: [CRITICAL] Critical log patterns: 1 critical "
+                       f"pattern(s) found: |   * [cora-probe.log] {ts} ERROR cora.probe: "
+                       f"REPEAT_SIGNAL_WRITE_FAILING quoted\n", encoding="utf-8")
+        nhc._LOG_DIR = tmpdir
+        got = {r.name: r.status for r in nhc.check_logs_24h()}
+        if got.get("Critical log patterns") != "ok":
+            return "S2 the check re-raises its own quoted report line from its own log"
+        with own.open("a", encoding="utf-8") as fh:
+            fh.write(f"{ts} ERROR cora.probe: REPEAT_SIGNAL_WRITE_FAILING real\n")
+        got = {r.name: r.status for r in nhc.check_logs_24h()}
+        if got.get("Critical log patterns") != "critical":
+            return "S2 a real writer failure in the check's own log no longer reads critical"
+    finally:
+        nhc._LOG_DIR = saved_dir
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    # BEHAVIOUR: the full-detail line folds newlines and never truncates.
+    long_detail = "head\n" + ("x" * 150) + "\nTAIL-OF-DETAIL"
+    flat = nhc._flatten_detail(long_detail)
+    if "\n" in flat or not flat.endswith("TAIL-OF-DETAIL") or len(flat) < 150:
+        return "S2 the health-check log line truncates or keeps newlines in the detail"
+    # WIRING (AST): main() logs every result through _flatten_detail(r.detail).
+    if not any(c.args and isinstance(c.args[0], ast.Attribute) and c.args[0].attr == "detail"
+               for c in _calls(_fn_ast(nhc.main), "_flatten_detail")):
+        return "S2 main() does not log the result detail through _flatten_detail"
     return None
 
 
@@ -117,11 +174,32 @@ def _s3_present() -> str | None:
         if not hasattr(se, name):
             return f"S3 slack_egress.{name} missing"
     import importlib
-    main_src = inspect.getsource(importlib.import_module("cora.main"))
-    if "arm_rail_ledger()" not in main_src:
+    # WIRING (AST, integration-tests-4): a real call, never a comment that names it.
+    main_tree = ast.parse(inspect.getsource(importlib.import_module("cora.main")))
+    if not _calls(main_tree, "arm_rail_ledger"):
         return "S3 the bot entry point never arms the rail ledger"
-    if inspect.getsource(app._dispatch_qa).count("rail_context=rail_ctx") != 6:
+    qa_tree = _fn_ast(app._dispatch_qa)
+    passes = [kw for c in ast.walk(qa_tree) if isinstance(c, ast.Call) for kw in c.keywords
+              if kw.arg == "rail_context" and isinstance(kw.value, ast.Name)
+              and kw.value.id == "rail_ctx"]
+    if len(passes) != 6:
         return "S3 rail_context is not passed at all six screen sites in _dispatch_qa"
+    built = [n for n in ast.walk(qa_tree) if isinstance(n, ast.Assign)
+             and any(isinstance(t, ast.Name) and t.id == "rail_ctx" for t in n.targets)
+             and isinstance(n.value, ast.Call) and _call_name(n.value) == "_rail_context"]
+    if len(built) != 1:
+        return "S3 _dispatch_qa does not build rail_ctx from _rail_context"
+    # BEHAVIOUR: the per-turn scope the bot actually computes. LEX scope and a Tier-2
+    # grant turn withhold the snippet; an ordinary non-LEX turn keeps one.
+    lex = app._rail_context("C0PROBE", None, "LEX-LLC", None, False, False)
+    if (lex or {}).get("snippet_withheld") != se.RAIL_SNIPPET_WITHHELD_LEX:
+        return "S3 app._rail_context does not withhold the snippet in LEX scope"
+    grant = app._rail_context("C0PROBE", "U0PROBE", "F3E", object(), False, False)
+    if (grant or {}).get("snippet_withheld") != se.RAIL_SNIPPET_WITHHELD_GRANT:
+        return "S3 app._rail_context does not withhold the snippet on a Tier-2 grant turn"
+    plain = app._rail_context("C0PROBE", None, "F3E", None, False, False)
+    if (plain or {}).get("snippet_withheld") is not None:
+        return "S3 app._rail_context withholds the snippet on an ordinary non-LEX turn"
     loc = lambda t: (0, min(len(t), 10))  # noqa: E731
     if se._rail_snippet("a LEX client note", loc, {"snippet_withheld": se.RAIL_SNIPPET_WITHHELD_LEX}) \
             != se.RAIL_SNIPPET_WITHHELD_LEX:
@@ -232,8 +310,24 @@ def _r149_present() -> str | None:
         return "R14-9(a) the cora_queue_status ledger-read tool is not registered"
     if "cora_queue_status" in set(getattr(td, "_GLOBAL_CORE_TOOLS", ())):
         return "R14-9(a) cora_queue_status leaked into the global core tool set"
-    if not hasattr(app, "_queue_status_turn"):
+    seam = getattr(app, "_queue_status_turn", None)
+    if not callable(seam):
         return "R14-9(a) the forcing seam _queue_status_turn is missing"
+    # BEHAVIOUR (integration-tests-4): the seam forces for Harrison in his DM only.
+    ask = "have my cards been responded to?"
+    if seam(code_queue.HARRISON_ID, "dm", None, ask, []) is not True:
+        return "R14-9(a) the forcing seam does not fire for Harrison's card-status DM"
+    if seam("U0PROBEMEMBER", "dm", None, ask, []) or \
+            seam(code_queue.HARRISON_ID, "f3e-sales", None, ask, []) or \
+            seam(code_queue.HARRISON_ID, "dm", object(), ask, []):
+        return "R14-9(a) the forcing seam fires outside Harrison's DM (member / channel / grant)"
+    # WIRING (AST): _dispatch_qa consults the seam and forces the ledger-read tool.
+    qa_tree = _fn_ast(app._dispatch_qa)
+    forced = [n for n in ast.walk(qa_tree) if isinstance(n, ast.Assign)
+              and any(isinstance(t, ast.Name) and t.id == "force_tool" for t in n.targets)
+              and isinstance(n.value, ast.Constant) and n.value.value == "cora_queue_status"]
+    if not _calls(qa_tree, "_queue_status_turn") or not forced:
+        return "R14-9(a) _dispatch_qa never consults the seam or never forces cora_queue_status"
     if se._find_write_claim("the nine staged prompts are waiting for you") is not None:
         return "R14-9(b) a descriptive 'staged' still counts as a write claim"
     if se._find_write_claim("I staged the kickoff prompt for you.") is None:
@@ -253,9 +347,23 @@ def _r143_present() -> str | None:
     from cora.f3e_blog import preflight as pf
     if not hasattr(pf, "rail2_attribution_hit"):
         return "R14-3 rail2_attribution_hit missing"
-    src = inspect.getsource(pf.run_preflight)
-    if "rail2_attribution_hit(" not in src or "rail2_legacy_hit(" in src:
+    # WIRING (AST, integration-tests-4): a real call to the attribution rail and no
+    # call to the legacy one -- a comment naming either is not a call.
+    rp_tree = _fn_ast(pf.run_preflight)
+    if not _calls(rp_tree, "rail2_attribution_hit") or _calls(rp_tree, "rail2_legacy_hit"):
         return "R14-3 run_preflight is not wired to the attribution rail"
+    # BEHAVIOUR: the SHIPPING preflight trips R2 on a clean claim of Energy and
+    # passes the ruled phrase, which the frozen legacy rail still trips -- so a
+    # run_preflight that fell back to the legacy scan (or dropped rail 2) is blocked.
+    ruled = "F3 Energy carries 120 mg of natural caffeine from green tea."
+    if "R2" not in pf.run_preflight(title="t", summary="",
+                                    body_html="<p>F3 Energy is a clean energy drink.</p>"
+                                    ).tripped_rail_ids:
+        return "R14-3 run_preflight does not trip rail 2 on a clean claim of Energy"
+    if "R2" in pf.run_preflight(title="t", summary="", body_html="<p>%s</p>" % ruled).tripped_rail_ids:
+        return "R14-3 run_preflight still trips rail 2 on the ruled green-tea phrase"
+    if hasattr(pf, "rail2_legacy_hit") and pf.rail2_legacy_hit(ruled) is None:
+        return "R14-3 the frozen legacy baseline no longer trips the ruled phrase (probe is blind)"
     if pf.rail2_attribution_hit("F3 Energy carries 120 mg of natural caffeine from green tea.") is not None:
         return "R14-3 the ruled exact phrase 'natural caffeine from green tea' still trips"
     if pf.rail2_attribution_hit("F3 Energy is a clean energy drink.") is None:

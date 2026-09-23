@@ -246,3 +246,164 @@ def test_the_s7_precondition_blocks_a_question_mark_badge(monkeypatch):
     monkeypatch.setattr(kr, "format_mechanical_dm", lambda u: "*[Asana task]* `?`\nClose a probe task")
     blocker = mod._s7_present()
     assert blocker and "'?'" in blocker
+
+
+# -- D-051 integration-tests-4: each precondition BLOCKS a stubbed tree ----------
+# One stub per SHIPPED id whose old check a stub could satisfy: the substance of
+# the fix is gone while every name, and every string a grep looked for, is kept.
+import pytest  # noqa: E402
+
+
+def _nhc(mod):
+    import nightly_health_check as nhc   # the same module object the script imports
+    return nhc
+
+
+@pytest.mark.parametrize("stub", ["own_log_detector", "report_markers", "truncating_flatten",
+                                  "main_skips_flatten"])
+def test_s2_blocks_a_tree_without_the_own_log_skip_or_the_full_detail_line(monkeypatch, stub):
+    mod = _load()
+    nhc = _nhc(mod)
+    if stub == "own_log_detector":
+        monkeypatch.setattr(nhc, "_is_own_log", lambda path: False)
+        want = "re-raises its own quoted report line"
+    elif stub == "report_markers":
+        monkeypatch.setattr(nhc, "_OWN_REPORT_MARKERS", ())
+        want = "re-raises its own quoted report line"
+    elif stub == "truncating_flatten":
+        monkeypatch.setattr(nhc, "_flatten_detail", lambda detail: (detail or "")[:100])
+        want = "truncates or keeps newlines"
+    else:
+        def main():  # a main() that only NAMES the helper: _flatten_detail(r.detail)
+            return 0
+        monkeypatch.setattr(nhc, "main", main)
+        want = "does not log the result detail through _flatten_detail"
+    blocker = mod._s2_present()
+    assert blocker and want in blocker, blocker
+    # the probe never leaves the module pointed at its throwaway log dir
+    assert nhc._LOG_DIR.name == "logs"
+
+
+def test_s2_blocks_a_tree_that_hides_a_real_writer_failure_in_its_own_log(monkeypatch):
+    """The narrow exclusion must stay narrow: a check that skips its whole own log
+    would hide REPEAT_SIGNAL_WRITE_FAILING raised inside the health-check process."""
+    mod = _load()
+    nhc = _nhc(mod)
+    real = nhc.check_logs_24h
+
+    def skip_whole_own_log():
+        saved = nhc._CRITICAL_RE
+        try:
+            nhc._CRITICAL_RE = __import__("re").compile(r"\A(?!x)x")   # matches nothing
+            return real()
+        finally:
+            nhc._CRITICAL_RE = saved
+    monkeypatch.setattr(nhc, "check_logs_24h", skip_whole_own_log)
+    blocker = mod._s2_present()
+    assert blocker and "no longer reads critical" in blocker
+
+
+@pytest.mark.parametrize("stub", ["never_withholds", "wiring_only_in_comments", "no_ledger_arm"])
+def test_s3_blocks_a_tree_whose_rail_context_never_withholds_or_is_unwired(monkeypatch, stub):
+    mod = _load()
+    from cora import app
+    if stub == "never_withholds":
+        monkeypatch.setattr(app, "_rail_context", lambda *a, **k: {
+            "channel_id": "C0", "entity": "LEX-LLC", "snippet_withheld": None, "founder_belt": False})
+        want = "does not withhold the snippet in LEX scope"
+    elif stub == "wiring_only_in_comments":
+        def _dispatch_qa(*a, **k):
+            # exactly six in COMMENTS, which the old source-count grep accepted:
+            # rail_context=rail_ctx rail_context=rail_ctx rail_context=rail_ctx
+            # rail_context=rail_ctx rail_context=rail_ctx rail_context=rail_ctx
+            return None
+        monkeypatch.setattr(app, "_dispatch_qa", _dispatch_qa)
+        want = "not passed at all six screen sites"
+    else:
+        import importlib
+        main_mod = importlib.import_module("cora.main")
+        monkeypatch.setattr(mod.inspect, "getsource",
+                            lambda obj, _real=mod.inspect.getsource:
+                            "# slack_egress.arm_rail_ledger() is armed elsewhere\nx = 'arm_rail_ledger()'\n"
+                            if obj is main_mod else _real(obj))
+        want = "never arms the rail ledger"
+    blocker = mod._s3_present()
+    assert blocker and want in blocker, blocker
+
+
+@pytest.mark.parametrize("stub", ["comment_only", "legacy_behind_getattr", "result_discarded",
+                                  "legacy_named", "referenced_never_called"])
+def test_r143_blocks_a_run_preflight_that_only_mentions_the_attribution_rail(monkeypatch, stub):
+    """Every stub keeps the helper names; the first three also satisfy the old
+    substring test ('rail2_attribution_hit(' present, 'rail2_legacy_hit(' absent)."""
+    mod = _load()
+    from cora.f3e_blog import preflight as pf
+    if stub == "comment_only":
+        def run_preflight(*, title, summary, body_html, lane="learn"):
+            # rail2_attribution_hit( is wired below
+            return pf.PreflightResult(passed=True)
+        want = "not wired to the attribution rail"
+    elif stub == "legacy_behind_getattr":
+        def run_preflight(*, title, summary, body_html, lane="learn"):
+            text = pf.unescaped(body_html)
+            legacy = getattr(pf, "rail2_legacy_" + "hit")      # no Call node named legacy
+            hit = pf.rail2_attribution_hit(text) or legacy(text)
+            trips = [pf.Trip("R2", "clean/natural", "body", text)] if hit else []
+            return pf.PreflightResult(passed=not trips, trips=trips)
+        want = "still trips rail 2 on the ruled green-tea phrase"
+    elif stub == "result_discarded":
+        def run_preflight(*, title, summary, body_html, lane="learn"):
+            pf.rail2_attribution_hit(body_html)              # called, result thrown away
+            return pf.PreflightResult(passed=True)
+        want = "does not trip rail 2 on a clean claim"
+    elif stub == "legacy_named":
+        def run_preflight(*, title, summary, body_html, lane="learn"):
+            text = pf.unescaped(body_html)
+            hit = pf.rail2_legacy_hit(text)   # the frozen same-sentence scan
+            trips = [pf.Trip("R2", "clean/natural", "body", text)] if hit else []
+            return pf.PreflightResult(passed=not trips, trips=trips)
+        want = "not wired to the attribution rail"
+    else:
+        def run_preflight(*, title, summary, body_html, lane="learn"):
+            _ = pf.rail2_attribution_hit  # referenced, never called
+            return pf.PreflightResult(passed=True)
+        want = "not wired to the attribution rail"
+    monkeypatch.setattr(pf, "run_preflight", run_preflight)
+    blocker = mod._r143_present()
+    assert blocker and want in blocker, blocker
+
+
+@pytest.mark.parametrize("stub", ["seam_none", "seam_never_fires", "seam_fires_for_anyone",
+                                  "never_forced"])
+def test_r149a_blocks_a_tree_without_a_working_forcing_seam(monkeypatch, stub):
+    mod = _load()
+    from cora import app
+    if stub == "seam_none":
+        monkeypatch.setattr(app, "_queue_status_turn", None)
+        want = "seam _queue_status_turn is missing"
+    elif stub == "seam_never_fires":
+        monkeypatch.setattr(app, "_queue_status_turn", lambda *a, **k: False)
+        want = "does not fire for Harrison"
+    elif stub == "seam_fires_for_anyone":
+        monkeypatch.setattr(app, "_queue_status_turn", lambda *a, **k: True)
+        want = "fires outside Harrison's DM"
+    else:
+        def _dispatch_qa(*a, **k):
+            queue_status_turn = app._queue_status_turn(*a)
+            # force_tool = "cora_queue_status"
+            return queue_status_turn
+        monkeypatch.setattr(app, "_dispatch_qa", _dispatch_qa)
+        want = "never forces cora_queue_status"
+    blocker = mod._r149_present()
+    assert blocker and want in blocker, blocker
+
+
+def test_the_s2_probe_restores_the_log_dir_and_writes_no_real_log():
+    mod = _load()
+    nhc = _nhc(mod)
+    before = nhc._LOG_DIR
+    listing = sorted(p.name for p in before.glob("health-check-*.log")) if before.exists() else []
+    assert mod._s2_present() is None
+    assert nhc._LOG_DIR == before
+    after = sorted(p.name for p in before.glob("health-check-*.log")) if before.exists() else []
+    assert after == listing
