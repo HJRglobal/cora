@@ -982,24 +982,45 @@ class _Clause:
 
 def _rail2_clauses(scan: str, pron_flags: list[bool] | None = None) -> list[_Clause]:
     """Non-empty clause segments. A bare coordinated brand ("... or F3 Energy") is
-    folded into the non-empty clause before it. An empty segment (", or" leaves one)
+    folded into the non-empty clause before it -- or, when it LEADS the sentence
+    ("F3 Energy or F3 Pure is ..."), into the first clause after it. An empty
+    segment (", or" leaves one)
     is skipped, so a bare brand can never land in an empty host, and its delimiters
     are carried to its neighbours. Bare parts are kept as a list and joined once per
     clause, so a long run of ", F3 Pure" stays linear."""
     groups: list[_Clause] = []
     pending: set[str] = set()
+    # D-051 round 2 (r143-claims-3 PARTIAL): a LEADING bare brand ("F3 Energy or F3
+    # Pure is clean.", "F3 Energy, F3 Pure are clean.") had no clause before it to
+    # fold into, so it became a clause of its own and the Pure clause after it read
+    # as a P1 subject and cleared -- the EF-7 disjunction class, mirrored. It now
+    # folds FORWARD into the first real clause (union of lines, as backward).
+    lead: list[str] = []
+    lead_pron = False
     for i, (seg, delim) in enumerate(_clause_split(scan)):
         if _words(seg):
-            if groups and _bare_brand_segment(seg):
-                groups[-1].bare.append(seg)
-                groups[-1].pron = groups[-1].pron or bool(pron_flags and pron_flags[i])
+            flag = bool(pron_flags and pron_flags[i])
+            if _bare_brand_segment(seg):
+                if groups:
+                    groups[-1].bare.append(seg)
+                    groups[-1].pron = groups[-1].pron or flag
+                else:
+                    lead.append(seg)
+                    lead_pron = lead_pron or flag
             else:
                 if groups:
                     groups[-1].next = frozenset(pending)
-                groups.append(_Clause(seg, frozenset(pending), bool(pron_flags and pron_flags[i])))
+                clause = _Clause(seg, frozenset(pending), flag or lead_pron)
+                clause.bare.extend(lead)
+                lead, lead_pron = [], False
+                groups.append(clause)
             pending = set()
         if delim:
             pending.add(delim)
+    if lead:   # nothing but bare brands: one clause of them
+        clause = _Clause(lead[0], frozenset(), lead_pron)
+        clause.bare.extend(lead[1:])
+        groups.append(clause)
     if groups:
         groups[-1].next = frozenset(pending)
     return groups
@@ -1134,6 +1155,13 @@ _RELATION_TOKENS = frozenset({
     "borrow", "borrows", "borrowed", "borrowing", "both", "either", "neither", "match",
     "matches", "matched", "matching", "mirror", "mirrors", "mirrored", "mirroring",
     "identical", "equivalent", "inherit", "inherits", "inherited", "suit",
+    # D-051 round 2 (r143-claims-1 PARTIAL): transfer verbs / markers the closed
+    # list missed ("F3 Pure copies its clean base", "modeled on F3 Energy",
+    # "joins F3 Energy as ...", "ditto F3 Energy")
+    "copy", "copies", "copied", "copying", "follow", "follows", "followed", "following",
+    "emulate", "emulates", "emulated", "echo", "echoes", "echoed", "modeled", "modelled",
+    "based", "resemble", "resembles", "resembled", "comparable", "akin", "parallel", "parallels",
+    "join", "joins", "joined", "ditto",
 })
 #: ...except that a BRAND-LESS clause's "both" is a plain plural ("and both taste
 #: great"), not a transfer.
@@ -1161,6 +1189,118 @@ def _has_relation(words: list[str], *, weak: bool = False) -> bool:
         if w == "so" and i + 1 < n and t[i + 1] in _AUX:
             return True       # "and so is F3 Energy"
     return bool(t) and t[-1] in _AUX   # VP ellipsis: "..., and F3 Energy does."
+
+
+#: D-051 round 2 (r143-claims-1 PARTIAL): a Pure-attached clean word clears only
+#: when every clause beside it that names Energy/Mood -- or that points back at one
+#: -- STANDS ALONE, i.e. carries its own predicate. The relation-token veto is a
+#: closed BLACKLIST, and comparison wording outside it transferred the clean word:
+#: "..., and F3 Energy is no different.", "..., and that goes for F3 Energy.",
+#: "In line with F3 Energy, F3 Pure is clean.", "F3 Pure is clean; ditto F3
+#: Energy." (legacy TRIP / round-1 PASS). This is the allowlist the review asked
+#: for. A clause stands alone when:
+#:   (A) its SUBJECT is the Energy/Mood brand (or, for a back-referring clause, the
+#:       pronoun / its possessive) with a predicate verb of its own, whose
+#:       complement is not an evaluative comparison ("no different", "no less
+#:       so") and which picks up no pro-form ("carries IT forward", "is ONE");
+#:   (B) it is a contrast adverbial: "Unlike F3 Energy";
+#:   (C) it is a conditional about the reader: "If you like F3 Energy".
+#: Anything else fails closed: it trips.
+_EM_PREDICATE_VERBS = _PURE_PREDICATE_VERBS | frozenset({
+    "hits", "fuels", "powers", "lifts", "focuses", "targets", "leads", "wins", "sharpens",
+    "wakes", "calms", "settles", "helps", "kicks", "handles",
+})
+_CONTRAST_PREPS = frozenset({"unlike", "versus", "vs"})
+_READER_SUBJECTS = frozenset({"you", "we", "they", "i", "fans", "people", "athletes"})
+_READER_VERBS = frozenset({"like", "love", "drink", "know", "prefer", "want", "need", "enjoy",
+                           "choose", "pick", "grab", "try", "reach", "train"})
+_COPULAS = frozenset({"is", "isn't", "was", "wasn't", "are", "aren't", "were", "weren't",
+                      "remains", "stays", "becomes"})
+_EVALUATIVE_COMPLEMENTS = frozenset({"no", "so", "just", "exactly", "equally", "likewise",
+                                     "similarly", "also", "too", "ditto"})
+#: object pronouns anywhere after the verb pick up the other clause's predicate
+#: ("F3 Energy carries it forward", "F3 Energy has it"); the other pro-forms only
+#: when they END the clause ("does so", "is one", "has that", "is the same") -- a
+#: numeral or determiner ("has one goal", "carries that stack") is not one
+_PRO_FORM_OBJECTS = frozenset({"it", "them"})
+_PRO_FORMS_AT_END = frozenset({"that", "this", "one", "ones", "same", "so", "likewise"})
+_BACKREF_SUBJECTS = frozenset({"it", "they", "it's", "they're"})
+_BACKREF_POSSESSIVE_SUBJECTS = frozenset({"its", "their"})
+#: (D) for a back-referring clause: the reader / the team voicing a preference
+#: about the referent ("..., and we love it") says nothing about it being clean
+_PREFERENCE_VERBS = frozenset({"love", "loves", "like", "likes", "enjoy", "enjoys", "adore",
+                               "prefer", "prefers", "crave", "craves"})
+
+
+def _picks_up_a_pro_form(rest: list[str]) -> bool:
+    if set(rest) & _PRO_FORM_OBJECTS:
+        return True
+    return 0 < len(rest) <= 2 and rest[-1] in _PRO_FORMS_AT_END
+
+
+def _voices_a_preference(t: list[str]) -> bool:
+    """(D): "we love it", "fans really love it", "our team loves them" -- the whole
+    clause, with nothing after the object pronoun but at most two plain words."""
+    i = 0
+    if t[:1] == ["our"] and len(t) > 1:
+        i = 2                                        # "our team", "our fans"
+    elif t[:1] and t[0] in _READER_SUBJECTS:
+        i = 1
+    else:
+        return False
+    if i < len(t) and t[i] in ("really", "just", "all", "absolutely", "already"):
+        i += 1
+    if i >= len(t) or t[i] not in _PREFERENCE_VERBS:
+        return False
+    rest = t[i + 1:]
+    return (bool(rest) and rest[0] in _PRO_FORM_OBJECTS and len(rest) <= 3
+            and not (set(rest[1:]) & (_BACKREF_PRONOUNS | _PRO_FORMS_AT_END)))
+
+
+def _clause_stands_alone(words: list[str], *, back_referring: bool = False) -> bool:
+    t = _lower_tokens(words)
+    n = len(t)
+    i = 0
+    while i < n and t[i] in _LEAD_FILLERS:
+        i += 1
+    if i >= n:
+        return False
+    if t[i] in _CONTRAST_PREPS:                                          # (B)
+        return True
+    if (t[i] in ("if", "when", "whenever") and i + 2 < n and t[i + 1] in _READER_SUBJECTS
+            and t[i + 2] in _READER_VERBS):                              # (C)
+        return True
+    if t[i] == "the":
+        i += 1
+    if back_referring and _voices_a_preference(t[i:]):                   # (D)
+        return True
+    if back_referring:                                                   # (A), a pronoun subject
+        if i < n and t[i] in _BACKREF_SUBJECTS:
+            i += 1
+            if t[i - 1] in ("it's", "they're"):                          # the copula is fused
+                return (i >= n or t[i] not in _EVALUATIVE_COMPLEMENTS) and not _picks_up_a_pro_form(t[i:])
+        elif i + 1 < n and t[i] in _BACKREF_POSSESSIVE_SUBJECTS:
+            i += 2                                                       # "its flavor ..."
+        else:
+            return False
+    else:                                                                # (A), the brand as subject
+        if i < n and t[i] in ("f3", "f3's"):
+            i += 1
+        if i >= n or t[i] not in ("energy", "mood") or not _is_brandish(words[i]):
+            return False
+        i += 1
+        if i < n and t[i] in _PURE_HEAD_NOUNS:
+            i += 1
+    if i < n and t[i] in _PURE_SUBJECT_ADVERBS:
+        i += 1
+    if i >= n or t[i] not in _EM_PREDICATE_VERBS:
+        return False
+    rest = t[i + 1:]
+    if t[i] in _COPULAS and rest and rest[0] in _EVALUATIVE_COMPLEMENTS:
+        return False                                                     # "is no different"
+    if rest and rest[-1] == "so":
+        return False                                                     # "is even more so"
+    return not _picks_up_a_pro_form(rest)                                # "carries it forward"
 
 
 #: Pronouns that point back at a line named in an EARLIER sentence ("F3 Mood is our
@@ -1533,9 +1673,13 @@ def rail2_attribution_hit(sentence: str, *, context_lines: frozenset[str] = froz
         if host_own == own == {"PURE"} and not related:
             host_words = _words(c.host)
             other = rows[idx - 1][1] if idx == n - 1 and idx > 0 else (rows[1][1] if n > 1 else "")
-            if (_pure_is_subject(host_words)
-                    or _pure_locative_disjunct(host_words, idx, n, c.prev, c.next, _words(other))):
-                continue  # the clean word is positively Pure's
+            if _pure_is_subject(host_words) and all(
+                    _clause_stands_alone(_words(t2), back_referring=not (o2 & _RAIL2_EM))
+                    for j, (c2, t2, _h2, o2) in enumerate(rows)
+                    if j != idx and ((o2 & _RAIL2_EM) or (c2.pron and ref_em))):
+                continue  # the clean word is positively Pure's, and nothing beside it takes it
+            if _pure_locative_disjunct(host_words, idx, n, c.prev, c.next, _words(other)):
+                continue  # the 8/26 locative disjunct
         return sorted(hit)[0], "/".join(sorted((lines | ref) & _RAIL2_EM))
     return None
 

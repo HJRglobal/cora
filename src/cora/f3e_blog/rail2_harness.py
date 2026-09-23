@@ -109,6 +109,33 @@ CLAIMS_HOLE_PROBES: dict[str, tuple[str, ...]] = {
         "Like F3 Energy, F3 Pure is clean-sweetened.",
         "F3 Energy, or the clean version of F3 Pure, hits hard.",
         "Clean energy from F3 Pure, or F3 Energy.",
+        # D-051 round 2 (r143-claims-1 PARTIAL): comparison / transfer wording OUTSIDE
+        # the closed relation list -- an Energy/Mood clause beside a Pure-attached
+        # clean word must now stand alone (legacy TRIP / round-1 PASS)
+        "F3 Pure is clean-sweetened, and F3 Energy is no different.",
+        "F3 Pure is clean-sweetened, and F3 Mood is no exception.",
+        "F3 Pure is all-natural, and that goes for F3 Energy.",
+        "F3 Pure is all-natural, and that is true of F3 Energy.",
+        "In line with F3 Energy, F3 Pure is clean.",
+        "Following F3 Energy's lead, F3 Pure is all-natural.",
+        "F3 Pure is clean; ditto F3 Energy.",
+        "F3 Pure is clean, and F3 Energy is no less so.",
+        "F3 Pure is clean, just as F3 Energy is bold.",
+        "Besides F3 Energy, F3 Pure is clean.",
+        "F3 Pure is clean, and F3 Energy carries it forward.",
+        "F3 Pure is clean-sweetened, and F3 Energy has it.",
+        "F3 Pure is clean-sweetened, and F3 Energy is one.",
+        # D-051 round 2 (r143-claims-3 PARTIAL): a LEADING bare brand never folded,
+        # so the Pure clause after it cleared -- the EF-7 disjunction, mirrored
+        "F3 Energy or F3 Pure is clean.",
+        "F3 Energy or F3 Pure is the clean pick.",
+        "F3 Mood or F3 Pure is the natural pick.",
+        "F3 Energy or F3 Pure is a clean way to start the day.",
+        "F3 Energy, F3 Pure are clean.",
+        "F3 Energy, F3 Mood, F3 Pure are all clean.",
+        "F3 Energy vs F3 Pure is the clean matchup.",
+        "F3 ENERGY OR F3 PURE IS CLEAN",
+        "F3 Energy Or F3 Pure Is The Clean Pick",
         # ...and the holes adversarial probing found in the remediation's OWN first
         # cut: a predicate / verb-phrase disjunct (P2), a comma + "and" metaphor
         # tail, and a coordinate adjective before a ruled phrase
@@ -437,6 +464,8 @@ CARRY_HOLE_PROBES: tuple[tuple[str, dict[str, str]], ...] = (
      _article("<p>F3 Mood is our evening can. Unlike F3 Pure, its base is all-natural.</p>")),
     ("the Mood guard across a field (r143-claims-5)",
      _article("<p>It, like F3 Energy, runs on a cleaner fuel source.</p>", "F3 Mood: Our Evening Can")),
+    ("a back-referring clause beside Pure must stand alone (r143-claims-1)",
+     _article("<p>F3 Mood is calm. F3 Pure is clean, and that goes for it.</p>")),
 )
 
 # ── reported, never gated: needs a Harrison ruling ──────────────────────────────

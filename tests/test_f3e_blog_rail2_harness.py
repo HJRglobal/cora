@@ -1780,3 +1780,157 @@ class TestRound2PronounResolution:
             return _best_of_3(lambda: pf.rail2_attribution_hit(sent, context_lines=frozenset({"MOOD"})))
         base, dbl = run(1500), run(3000)
         assert dbl < base * 2.6 + 0.05, "superlinear: %.4fs -> %.4fs" % (base, dbl)
+
+
+class TestRound2PureAttachmentStandsAlone:
+    """r143-claims-1 PARTIAL: the relation veto is a closed blacklist, so comparison
+    wording outside it transferred a Pure-attached clean word ("..., and F3 Energy
+    is no different."). An Energy/Mood clause -- or a clause pointing back at one
+    -- beside the clean clause must now STAND ALONE (its own subject + predicate,
+    a contrast adverbial, or a reader conditional). r143-claims-3 PARTIAL: a
+    LEADING bare brand folds forward ("F3 Energy or F3 Pure is clean.")."""
+
+    CLAIMS_1 = (
+        "F3 Pure is clean-sweetened, and F3 Energy is no different.",
+        "F3 Pure is clean-sweetened, and F3 Mood is no exception.",
+        "F3 Pure is all-natural, and that goes for F3 Energy.",
+        "F3 Pure is all-natural, and that is true of F3 Energy.",
+        "In line with F3 Energy, F3 Pure is clean.",
+        "Following F3 Energy's lead, F3 Pure is all-natural.",
+        "F3 Pure is clean; ditto F3 Energy.",
+        "F3 Pure is clean, and F3 Energy is no less so.",
+        "F3 Pure is clean, just as F3 Energy is bold.",
+        "Besides F3 Energy, F3 Pure is clean.",
+        "F3 Pure is clean, and F3 Energy carries it forward.",
+        "F3 Pure is clean-sweetened, and F3 Energy has it.",
+        "F3 Pure is clean-sweetened, and F3 Energy is one.",
+    )
+    CLAIMS_3 = (
+        "F3 Energy or F3 Pure is clean.",
+        "F3 Energy or F3 Pure is the clean pick.",
+        "F3 Mood or F3 Pure is the natural pick.",
+        "F3 Energy or F3 Pure is a clean way to start the day.",
+        "F3 Energy, F3 Pure are clean.",
+        "F3 Energy, F3 Mood, F3 Pure are all clean.",
+        "F3 Energy vs F3 Pure is the clean matchup.",
+        "F3 ENERGY OR F3 PURE IS CLEAN",
+        "F3 Energy Or F3 Pure Is The Clean Pick",
+    )
+    #: benign Energy/Mood clauses beside a Pure clean clause that must keep clearing
+    #: (beyond the pinned TestPositivePureAttachment.STILL_PASS rows)
+    STILL_PASS = (
+        "F3 Pure is clean-sweetened, and F3 Energy is great.",
+        "F3 Pure is clean-sweetened, and F3 Energy carries the stack that athletes want.",
+        "F3 Pure is clean-sweetened, and F3 Energy has one goal.",
+        "F3 Pure is clean-sweetened, and F3 Energy is different.",
+        "F3 Pure is clean-sweetened, but F3 Energy is not.",
+        "F3 Pure is clean-sweetened, and F3 Energy carries that stack.",
+        "F3 Energy hits hard, while F3 Pure is the clean-sweetened pick.",
+        "F3 Pure is clean-sweetened; F3 Mood keeps you calm.",
+        "F3 Mood is calm. F3 Pure is clean-sweetened, and we love it.",
+        "F3 Mood is calm. F3 Pure is clean-sweetened, and its flavor is bright.",
+        "F3 Mood is calm. F3 Pure is clean-sweetened, and it tastes great.",   # pinned (round 1)
+        "F3 Energy is the stack. F3 Pure is clean-sweetened, unlike it.",      # pinned (round 1)
+    )
+    #: accepted fail-closed consequences (each legacy-trips, or carries the round-1
+    #: back-reference): a comparison preposition, an object pronoun in the
+    #: Energy/Mood clause, a back-referring clause with its own subject
+    ACCEPTED_TRIPS = (
+        "Compared with F3 Energy, F3 Pure is clean.",
+        "F3 Pure is clean-sweetened; F3 Mood keeps it calm.",
+        "F3 Mood is calm. F3 Pure is clean-sweetened, and we made it that way.",
+    )
+
+    @pytest.mark.parametrize("sentence", CLAIMS_1 + CLAIMS_3)
+    def test_a_transfer_the_relation_list_missed_trips(self, sentence):
+        assert pf.rail2_attribution_hit(sentence) is not None, sentence
+        assert "R2" in _pf(sentence).tripped_rail_ids, sentence
+        assert pf.rail2_legacy_hit(sentence) is not None
+
+    def test_every_shape_is_in_the_gate(self):
+        probes = rh.CLAIMS_HOLE_PROBES["clean_natural_on_energy_mood"]
+        for s in self.CLAIMS_1 + self.CLAIMS_3:
+            assert s in probes, s
+
+    @pytest.mark.parametrize("sentence", STILL_PASS + TestPositivePureAttachment.STILL_PASS)
+    def test_a_self_contained_clause_beside_pure_still_clears(self, sentence):
+        r = _pf(sentence)
+        assert r.passed, r.render()
+
+    @pytest.mark.parametrize("sentence", ACCEPTED_TRIPS)
+    def test_accepted_fail_closed_consequences_trip(self, sentence):
+        assert "R2" in _pf(sentence).tripped_rail_ids, sentence
+
+    def test_the_carried_back_reference_shape_is_a_gated_hole(self):
+        label = "a back-referring clause beside Pure must stand alone (r143-claims-1)"
+        assert label in [lbl for lbl, _ in rh.CARRY_HOLE_PROBES]
+        assert "R2" in _pf("F3 Mood is calm. F3 Pure is clean, and that goes for it.").tripped_rail_ids
+
+    @pytest.mark.parametrize("field", ["title", "summary", "alt", "jsonld"])
+    def test_every_shipped_field_is_covered(self, field):
+        s = "F3 Energy Or F3 Pure Is The Clean Pick"
+        kw = {"title": "Post", "summary": "", "body_html": "<p>x</p>"}
+        if field == "title":
+            kw["title"] = s
+        elif field == "summary":
+            kw["summary"] = s
+        elif field == "alt":
+            kw["body_html"] = '<p><img src="a.png" alt="%s"></p>' % s
+        else:
+            kw["body_html"] = '<script type="application/ld+json">{"description":"%s"}</script><p>x</p>' % s
+        assert "R2" in pf.run_preflight(**kw).tripped_rail_ids
+
+    def test_the_stand_alone_detector(self):
+        yes = [(" and F3 Energy carries the stack.", False), ("F3 Energy is the full stack", False),
+               ("Unlike F3 Energy", False), ("If you like F3 Energy", False), (" F3 Mood keeps you calm.", False),
+               (" and it tastes great.", True), (" and its flavor is bright.", True), (" and we love it.", True),
+               (" unlike it.", True), (" F3 Energy has one goal.", False)]
+        no = [(" and F3 Energy is no different.", False), (" and that goes for F3 Energy.", False),
+              ("In line with F3 Energy", False), (" ditto F3 Energy.", False), (" and F3 Energy is no less so.", False),
+              (" just as F3 Energy is bold.", False), (" and F3 Energy carries it forward.", False),
+              (" and F3 Energy is one.", False), (" and F3 Energy has that.", False),
+              (" and that goes for it.", True), (" and we made it that way.", True),
+              (" and we love it because it is great.", True), ("Following F3 Energy's lead", False)]
+        for s, br in yes:
+            assert pf._clause_stands_alone(pf._words(s), back_referring=br), s
+        for s, br in no:
+            assert not pf._clause_stands_alone(pf._words(s), back_referring=br), s
+
+    def test_a_leading_bare_brand_folds_forward(self):
+        c = pf._rail2_clauses("F3 Energy or F3 Pure is clean.")
+        assert len(c) == 1 and c[0].host == " F3 Pure is clean." and c[0].bare == ["F3 Energy "]
+        c = pf._rail2_clauses("F3 Energy, F3 Mood, F3 Pure are all clean.")
+        assert len(c) == 1 and pf.brand_lines_in(" ".join([c[0].host] + c[0].bare)) == {"ENERGY", "MOOD", "PURE"}
+        c = pf._rail2_clauses("F3 Energy or F3 Pure.")               # nothing but bare brands
+        assert len(c) == 1 and c[0].host == "F3 Energy " and c[0].bare == [" F3 Pure."]
+        # a trailing fold is unchanged (round 1)
+        c = pf._rail2_clauses("Clean energy from F3 Pure, or F3 Energy.")
+        assert len(c) == 1 and c[0].bare == [" F3 Energy."]
+
+    DEGENERATE = (
+        "F3 Energy, " * 3700,
+        "F3 Energy or " * 3100,
+        "F3 Pure is clean, and F3 Energy is no " * 1000,
+        "and we love it " * 2600,
+        "F3 Pure is clean, and it is " * 1500,
+        "Unlike F3 Energy, " * 2300,
+    )
+
+    @pytest.mark.parametrize("text", DEGENERATE, ids=range(len(DEGENERATE)))
+    def test_d171_the_stand_alone_check_is_fast_at_40k(self, text):
+        for s in (text + "F3 Pure is clean.", "F3 Pure is clean, " + text):
+            dt = _best_of_3(lambda: pf.rail2_attribution_hit(s))
+            assert dt < 1.0, "%r...: %.3fs" % (s[:20], dt)
+            dt = _best_of_3(lambda: pf.rail2_attribution_hit(s, context_lines=frozenset({"MOOD"})))
+            assert dt < 1.0, "%r...: %.3fs" % (s[:20], dt)
+
+    @pytest.mark.parametrize("unit", ["F3 Energy, ", ", and F3 Energy carries the stack", ", and it tastes great",
+                                      "F3 Energy or "])
+    def test_d171_the_stand_alone_check_scales_linearly(self, unit):
+        def run(n):
+            sent = "F3 Pure is clean" + unit * n + "."
+            lead = unit * n + "F3 Pure is clean."
+            return _best_of_3(lambda: (pf.rail2_attribution_hit(sent, context_lines=frozenset({"MOOD"})),
+                                       pf.rail2_attribution_hit(lead)))
+        base, dbl = run(1200), run(2400)
+        assert dbl < base * 2.6 + 0.05, "superlinear: %.4fs -> %.4fs" % (base, dbl)
