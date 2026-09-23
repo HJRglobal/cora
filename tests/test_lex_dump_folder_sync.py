@@ -243,3 +243,62 @@ class TestGmLevelOptOut:
         assert any(r.source_id == "manual-4" for r in gm_results)
         llc_results = kb.search("EVV live-in caregivers", entity="LEX", sub_entity="LEX-LLC")
         assert not any(r.source_id == "manual-4" for r in llc_results)
+
+
+# ---------------------------------------------------------------------------
+# S6d (Code #14, cq-a5b3e6a2e844): unsupported mimes are COUNTED in DONE
+# ---------------------------------------------------------------------------
+
+_DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+_PPTX = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+_DOC = "application/msword"
+
+
+class _FakeKB:
+    def __init__(self, *_a, **_k):
+        self.set_calls = []
+
+    def get_sync_state(self, source):
+        return (0, 10 ** 12)          # watermark far in the future -> parseable files "unchanged"
+
+    def set_sync_state(self, *a):
+        self.set_calls.append(a)
+
+
+class TestDoneSummaryCountsUnsupported:
+    def _run(self, monkeypatch, caplog, *, dry_run):
+        import logging
+        import cora.knowledge_base.store as store_mod
+        ts = "2026-01-01T00:00:00Z"
+        files = [
+            {"id": "d1", "name": "SYNTH-NAME-A.docx", "mimeType": _DOCX, "modifiedTime": ts},
+            {"id": "d2", "name": "SYNTH-NAME-B.docx", "mimeType": _DOCX, "modifiedTime": ts},
+            {"id": "p1", "name": "SYNTH-NAME-C.pptx", "mimeType": _PPTX, "modifiedTime": ts},
+            {"id": "w1", "name": "SYNTH-NAME-D.doc", "mimeType": _DOC, "modifiedTime": ts},
+            {"id": "f1", "name": "SYNTH-NAME-E.pdf", "mimeType": _PDF, "modifiedTime": ts},
+        ]
+        kb = _FakeKB()
+        monkeypatch.setattr(store_mod, "KnowledgeBase", lambda *_a, **_k: kb)
+        monkeypatch.setattr(sync, "_build_drive_service", lambda email: MagicMock())
+        monkeypatch.setattr(sync, "walk_folder", lambda service, folder_id: files)
+        with caplog.at_level(logging.DEBUG):
+            summary = sync.run(dry_run=dry_run)
+        return summary, kb
+
+    def test_done_summary_counts_unsupported(self, monkeypatch, caplog):
+        summary, kb = self._run(monkeypatch, caplog, dry_run=True)
+        assert summary["files_found"] == 5
+        assert summary["skipped_unsupported"] == 4
+        assert summary["skipped_unchanged"] == 1
+        assert kb.set_calls == []                                   # dry-run writes nothing
+
+    def test_one_mime_breakdown_line_without_filenames(self, monkeypatch, caplog):
+        self._run(monkeypatch, caplog, dry_run=False)
+        msgs = [r.getMessage() for r in caplog.records]
+        breakdown = [m for m in msgs if "unsupported mime breakdown" in m]
+        assert len(breakdown) == 1
+        for tok in (f"{_DOCX}=2", f"{_PPTX}=1", f"{_DOC}=1"):
+            assert tok in breakdown[0]
+        assert not any("SYNTH-NAME" in m for m in msgs)             # LEX: ids only, never names
+        done = [m for m in msgs if m.startswith("DONE:")]
+        assert len(done) == 1 and "'skipped_unsupported': 4" in done[0]

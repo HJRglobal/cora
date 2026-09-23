@@ -51,6 +51,7 @@ import logging
 import os
 import sys
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -291,6 +292,8 @@ def run(dry_run: bool = False, backfill: bool = False) -> dict:
              len(all_files), sum(1 for f in all_files if f.get("policy_tree")))
 
     ingested = skipped_unchanged = skipped_large = skipped_empty = 0
+    skipped_unsupported = 0
+    unsupported_by_mime: Counter = Counter()
     total_chunks = 0
     max_modified = watermark
 
@@ -299,10 +302,18 @@ def run(dry_run: bool = False, backfill: bool = False) -> dict:
         fid = f["id"]
         mime = f.get("mimeType", "")
         modified_ts = _parse_drive_time(f.get("modifiedTime")) or 0
+        # WATERMARK TRAP for the Office-parser follow-up: max_modified advances
+        # BEFORE the mime check below, so the watermark already sits past every
+        # unsupported (.docx/.pptx/.doc) file. Once a parser lands, the FIRST run
+        # must be --backfill or those files are skipped as "unchanged" forever.
         max_modified = max(max_modified, modified_ts)
 
         if mime not in _PARSEABLE_MIMES:
-            log.info("SKIP (unsupported mime %s): %s", mime, name)
+            # Counted, not named: one aggregate per-mime line is logged after
+            # the loop (these are LEX files -- ids only, never names; D-145).
+            log.debug("SKIP (unsupported mime %s): file id %s", mime, fid)
+            skipped_unsupported += 1
+            unsupported_by_mime[mime or "unknown"] += 1
             continue
         if modified_ts and modified_ts <= watermark:
             skipped_unchanged += 1
@@ -384,12 +395,20 @@ def run(dry_run: bool = False, backfill: bool = False) -> dict:
     if not dry_run:
         kb.set_sync_state(SYNC_STATE_SOURCE, int(time.time()), max_modified)
 
+    if unsupported_by_mime:
+        log.info(
+            "SKIP unsupported mime breakdown (%d file(s), no parser): %s",
+            skipped_unsupported,
+            ", ".join(f"{m}={n}" for m, n in sorted(unsupported_by_mime.items())),
+        )
+
     summary = {
         "files_found": len(all_files),
         "ingested": ingested,
         "skipped_unchanged": skipped_unchanged,
         "skipped_large": skipped_large,
         "skipped_empty": skipped_empty,
+        "skipped_unsupported": skipped_unsupported,
         "total_chunks": total_chunks,
     }
     log.info("DONE: %s%s", summary, " [DRY RUN]" if dry_run else "")
