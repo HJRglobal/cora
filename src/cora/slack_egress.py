@@ -338,11 +338,24 @@ _WC_OBJ_NOT_HAB = r"(?!(?:[\w'’&-]++[ \t]++){0,3}" + _WC_HAB_WORD + r"\b)"
 # on a non-word char, so a staged prompt's dated FILENAME ("Staged: 2026-09-16_fndr_
 # cora-code-prompt.md") is still a claim. Receipts are untouched (a receipt label IS
 # the 9/15 phantom shape).
+#
+# Code #14 D-051 round 3 (R2-A2): a ':' label bails only when the date is the WHOLE
+# value -- after the date (or the "(per ...)" note) only an optional parenthetical, a
+# closing bold marker and the END OF THE LINE may follow (_WC_LABEL_VALUE_END). Round 2
+# bailed on any value that merely OPENED with a date, which silenced "Created: 9/24 at
+# 2pm with Justin -- the invite is on both calendars.", "Filed: 9/23 Cox invoice to the
+# Receipts & Invoices Inbox." and "Updated: 2026 budget tab now shows the new totals."
+# (the bare-year alternative matched any year). A bare year now bails only at the end
+# of the line or after a month ("March 2025", "March 1, 2025"). Fails toward FIRING: a
+# label with anything after its date ("Updated: 9/12 3:14pm", "Created: 2024-03-01 by
+# Justin") now counts -- accepted over-trips.
 _WC_DATE = (r"(?:\d{1,4}[/.-]\d{1,2}(?:[/.-]\d{2,4})?|(?:19|20)\d{2}"
-            r"|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]{0,6}\.?[ \t]++\d{1,4}(?:st|nd|rd|th)?)"
+            r"|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]{0,6}\.?[ \t]++\d{1,4}(?:st|nd|rd|th)?"
+            r"(?:,?[ \t]++(?:19|20)\d{2})?)"
             r"(?![\w/-])")
+_WC_LABEL_VALUE_END = r"[ \t]*+(?:\([^()\n]{0,80}\)[ \t]*+)?\*{0,2}[ \t]*+$"
 _WC_LABEL_COLON = (r":(?![ \t]*+\*{0,2}[ \t]*+(?:\n[ \t]*+(?:[-*•][ \t]++)?)?(?:" + _WC_DATE
-                   + r"|\(per\b))")
+                   + r"|\(per\b[^()\n]{0,80}\)[ \t]*+(?:" + _WC_DATE + r")?)" + _WC_LABEL_VALUE_END + r")")
 _WC_LABEL_PAREN = (r"\((?!(?:(?:per|last)\b[^()\n]{0,80}\)[ \t]*+\*{0,2}:[ \t]*+\*{0,2}[ \t]*+" + _WC_DATE
                    + r"|" + _WC_DATE + r"))")
 _WRITE_CLAIM_FORMS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
