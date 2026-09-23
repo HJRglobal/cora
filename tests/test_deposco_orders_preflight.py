@@ -91,6 +91,23 @@ class TestReferenceMiss:
         check = next(c for c in result.checks if c.name == "reference_miss")
         assert check.passed is True
 
+    def test_reference_search_uses_customerordernumber_not_otherreferencenumber(self):
+        """LIVE FINDING 2026-09-23 (prod): otherReferenceNumber is NOT a
+        configured search field for Order on the prod tenant -- it 400s.
+        customerOrderNumber IS configured on both tenants and carries the
+        same value. Using the wrong field here would 400 on EVERY prod
+        preflight, making the whole write path unusable in prod despite
+        working in UA rehearsal."""
+        class RecordingClient(FakeClient):
+            def search_orders(self, order_type, **criteria):
+                self.last_criteria = criteria
+                return super().search_orders(order_type, **criteria)
+
+        client = RecordingClient(atp={"PURE-Original": 500, "PURE-Citrus": 500})
+        preflight_mod.run_preflight(SPEC, client)
+        assert "customerOrderNumber" in client.last_criteria
+        assert "otherReferenceNumber" not in client.last_criteria
+
     def test_a_matching_reference_fails_even_with_a_different_number(self, monkeypatch):
         """Guards the scenario the number-miss check alone cannot: the same
         underlying PO already has an order, reachable under a different

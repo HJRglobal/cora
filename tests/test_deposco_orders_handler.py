@@ -177,6 +177,21 @@ class TestTTL:
         assert outcome == "stale_dismissed"
         assert pending.get_entry(entry["id"])["state"] == pending.STATE_DISMISSED
 
+    def test_a_malformed_created_at_does_not_crash_never_raises(self, monkeypatch):
+        """A corrupted-but-still-valid-JSON entry (not the get_entry-level
+        corruption test in test_deposco_orders_pending.py) must fail safe --
+        the TTL check is skipped, not raised, and the live re-preflight
+        (which independently re-checks ATP/existence) still runs."""
+        entry = _stage(created_at="not-a-real-timestamp")
+        _patch_clients(
+            monkeypatch, reference_hit=False,
+            read_client=FakeReadClient(find_order_detail_sequence=[None, _record(entry["number"])]),
+            push_client=FakePushClient(dpush.PushOutcome(env="prod", status=201, text="201 Created")),
+        )
+        outcome, _ = handler.process_push_tap(entry["id"], handler.HARRISON_ID)
+        assert outcome != "stale_dismissed"
+        assert outcome == "confirmed"
+
     def test_a_fresh_entry_is_not_treated_as_stale(self, monkeypatch):
         entry = _stage()  # created just now
         _patch_clients(

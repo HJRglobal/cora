@@ -39,6 +39,15 @@ class TestStagingAndRetrieval:
     def test_unknown_id_returns_none(self):
         assert pending.get_entry("deposco-doesnotexist") is None
 
+    def test_a_corrupted_entry_file_returns_none_rather_than_raising(self):
+        """Atomic writes (drive_io.write_text_atomic) make a torn file from a
+        crash mid-write unreachable in normal operation, but a corrupted file
+        can still land by other means (disk fault, manual edit) -- this must
+        fail safe (treated like a miss) rather than crash the tap handler."""
+        entry = _stage()
+        pending._entry_path(entry["id"]).write_text("{not valid json", encoding="utf-8")
+        assert pending.get_entry(entry["id"]) is None
+
     def test_payload_hash_is_recorded(self):
         entry = _stage()
         assert entry["payload_hash"] == pending.hash_payload(entry["payload"])
@@ -71,6 +80,34 @@ class TestClaimExactlyOnce:
         pending.claim_for_push(entry["id"], "U_HARRISON")
         pending.resolve(entry["id"], pending.STATE_CONFIRMED)
         assert pending.claim_for_push(entry["id"], "U_HARRISON") is None
+
+
+class TestClaimUnderRealConcurrency:
+    def test_twenty_threads_racing_for_one_claim_exactly_one_wins(self):
+        """The sequential double-claim test above proves the STATE MACHINE is
+        correct; it does not prove the LOCK actually serializes real
+        concurrent threads. This does."""
+        import threading
+
+        entry = _stage()
+        results: list[bool] = []
+        lock = threading.Lock()
+        barrier = threading.Barrier(20)
+
+        def worker():
+            barrier.wait()
+            claimed = pending.claim_for_push(entry["id"], "U_HARRISON")
+            with lock:
+                results.append(claimed is not None)
+
+        threads = [threading.Thread(target=worker) for _ in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(results) == 20
+        assert sum(results) == 1, "more than one thread claimed the same pending entry"
 
 
 class TestReleaseClaim:

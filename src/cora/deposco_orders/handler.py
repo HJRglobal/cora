@@ -155,11 +155,18 @@ def _is_authorized(actor_id: str, channel: str, authored_by: str) -> tuple[bool,
 
 
 def _age_seconds(entry: dict) -> float | None:
+    """None means "cannot determine age" (absent or malformed `created_at`),
+    which SKIPS the TTL check rather than crashing the tap -- the TTL is a
+    belt-and-suspenders control on top of the live re-preflight this function
+    gates, which independently re-checks ATP/existence regardless of age."""
     created_at = entry.get("created_at")
     if not created_at:
         return None
-    created = datetime.fromisoformat(created_at)
-    return (datetime.now(created.tzinfo) - created).total_seconds()
+    try:
+        created = datetime.fromisoformat(created_at)
+        return (datetime.now(created.tzinfo) - created).total_seconds()
+    except (TypeError, ValueError):
+        return None
 
 
 def _already_handled_message(entry: dict) -> str:

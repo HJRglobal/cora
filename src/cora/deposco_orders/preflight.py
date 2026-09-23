@@ -55,10 +55,23 @@ class PreflightResult:
 
 def _reference_exists(client: dc.DeposcoClient, reference: str) -> bool:
     """Client-side filtered, same defensive posture as `get_order_status`
-    against a server search whose filtering behaviour is not fully proven for
-    this query -- a miss here is only ever a MISS if we can actually see that
-    no returned record's `customerOrderNumber` matches."""
-    response = client.search_orders("Sales Order", otherReferenceNumber=reference)
+    against a server search -- a miss here is only ever a MISS if we can
+    actually see that no returned record's `customerOrderNumber` matches.
+
+    LIVE FINDING (2026-09-23, prod): `otherReferenceNumber` is NOT a
+    configured search field for the Order entity on the PROD tenant --
+    `/search/Order?otherReferenceNumber=...` returns a hard 400 ("Following
+    search fields [otherReferenceNumber] are not found or configured for
+    entity [Order]"), even though the SAME query works cleanly on UA (200,
+    empty/matching result). This is a tenant-configuration difference, not a
+    vendor-doc question. `customerOrderNumber` IS configured on both tenants
+    and carries the identical value (`payload.py` sets both fields from
+    `spec.reference`) -- verified live to genuinely filter server-side
+    (found exactly 1 record for a known real order, 081226, by
+    `customerOrderNumber`). Using it here is what makes this check work on
+    prod at all, not just in UA rehearsal.
+    """
+    response = client.search_orders("Sales Order", customerOrderNumber=reference)
     records = dc.parse_order_header_detail(response)
     return any(r.customer_order_number == reference for r in records)
 
