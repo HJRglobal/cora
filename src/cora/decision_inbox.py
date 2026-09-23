@@ -263,8 +263,11 @@ def _apply_decision_accept_inner(update: dict[str, Any],
     evidence = str((update or {}).get("source_evidence") or "").strip()
     try:  # cosmetic: resolve raw <U...> tokens for the Harrison-facing file
         from .tools.user_identity import resolve_slack_mentions
-        text = resolve_slack_mentions(text)
-        evidence = resolve_slack_mentions(evidence)
+        # Same options as the card (Code #14 S8) so the filed entry reads the way
+        # the tapped card did: Cora -> @Cora, an unmapped id -> @unknown user.
+        text = resolve_slack_mentions(text, unknown_label="unknown user", known_apps=True)
+        evidence = resolve_slack_mentions(evidence, unknown_label="unknown user",
+                                          known_apps=True)
     except Exception:  # noqa: BLE001
         pass
 

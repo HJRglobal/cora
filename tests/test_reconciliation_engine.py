@@ -445,6 +445,80 @@ class TestPass3UncapturedDecisions:
         gaps = _re.pass3_uncaptured_decisions(db_path=_make_db([]))
         assert gaps == []
 
+    # ── Code #14 S8: Cora's own replies are never a decision; ids resolved ──
+
+    @pytest.fixture
+    def roster(self, monkeypatch):
+        from cora.tools import user_identity
+        monkeypatch.setattr(
+            user_identity, "display_name",
+            lambda sid: {"U0B2RM2JYJ1": "Harrison Rogers"}.get(sid, sid),
+        )
+        monkeypatch.delenv("CORA_SLACK_USER_ID", raising=False)
+
+    def _slack_chunk(self, content: str) -> dict:
+        return {"source": "slack", "source_id": f"slack_C0TEST_{time.time():.6f}",
+                "entity": "F3E", "content": content, "title": "#f3e-test"}
+
+    def test_cora_speaker_sentence_not_flagged(self, roster):
+        """Verbatim 8/02 + 8/17 samples: Cora's own reply lines inside a mixed
+        human+Cora thread chunk were proposed as founder decisions."""
+        chunk = self._slack_chunk(
+            "#f3e-test\n"
+            "[2026-08-02 07:37 UTC] <U0B44MDGC5R>: Confirmed - nothing to act on here.\n"
+            "[2026-08-17 19:04 UTC] <U0B44MDGC5R>: _This expired before you confirmed."
+            " We decided nothing, it was approved by nobody.\n"
+            "a continuation line of that Cora message: the plan is confirmed for Friday."
+        )
+        gaps = _re.pass3_uncaptured_decisions(db_path=_make_db([chunk]))
+        assert gaps == []
+
+    def test_cora_skip_honours_env_override(self, roster, monkeypatch):
+        monkeypatch.setenv("CORA_SLACK_USER_ID", "U0CORA12345")
+        chunk = self._slack_chunk(
+            "[2026-08-02 07:37 UTC] <U0CORA12345>: Confirmed - the vendor is locked in now."
+        )
+        assert _re.pass3_uncaptured_decisions(db_path=_make_db([chunk])) == []
+
+    def test_human_line_after_cora_line_still_flagged_and_resolved(self, roster):
+        chunk = self._slack_chunk(
+            "[2026-07-28 14:20 UTC] <U0B44MDGC5R>: Confirmed - nothing to act on here.\n"
+            "[2026-07-28 14:21 UTC] <U0B2RM2JYJ1>: we decided to go with the new "
+            "packaging vendor <@U0B44MDGC5R> for the Pure relaunch"
+        )
+        gaps = _re.pass3_uncaptured_decisions(db_path=_make_db([chunk]))
+        assert len(gaps) == 1
+        g = gaps[0]
+        assert "nothing to act on" not in g.description
+        for field in (g.description, g.source_evidence):
+            assert "<U0B2RM2JYJ1>" not in field and "<@U0B44MDGC5R>" not in field
+            assert "@Harrison Rogers: we decided" in field
+            assert "vendor @Cora for" in field
+
+    def test_unknown_speaker_renders_unknown_user(self, roster):
+        chunk = self._slack_chunk(
+            "[2026-09-01 10:00 UTC] <U0ZZZZ99999>: we decided to ship the Mood cans Friday"
+        )
+        gaps = _re.pass3_uncaptured_decisions(db_path=_make_db([chunk]))
+        assert len(gaps) == 1
+        assert "@unknown user: we decided" in gaps[0].source_evidence
+        assert "U0ZZZZ99999" not in gaps[0].description
+
+    def test_speaker_prefix_regex_is_linear_on_degenerate_input(self):
+        import time as _t
+
+        def cost(n):
+            shapes = ["[" * n, "[" + "x" * n, "[x]" + " " * n, "[x] <@U" + "A" * n,
+                      ("[x] <U0B44MDGC5R>: a\n") * (n // 20), "\n" * n]
+            t0 = _t.perf_counter()
+            for s in shapes:
+                _re._sentences_not_by(s, "U0B44MDGC5R")
+            return _t.perf_counter() - t0
+
+        small, big = cost(10_000), cost(40_000)
+        assert big < 0.2, f"degenerate input took {big:.3f}s"
+        assert big < max(small, 5e-3) * 10
+
     def test_gap_has_decision_type(self):
         db_path = _make_db([
             self._make_fireflies_chunk(

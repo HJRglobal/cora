@@ -1056,20 +1056,57 @@ def build_mechanical_blocks(update: dict[str, Any]) -> tuple[str, list[dict[str,
     return safe, [{"type": "section", "text": {"type": "mrkdwn", "text": safe[:2900]}}]
 
 
+# Local last-resort matcher for a raw Slack user token, used ONLY when the roster
+# resolver cannot run. Same shape as user_identity's opt-in regex (label bounded,
+# no class can match a delimiter -> linear on degenerate input, D-171).
+_CARD_RAW_SLACK_ID_RE = re.compile(r"<(@?)(U[A-Z0-9]{6,})(?:\|[^<>|\n]{0,80})?>")
+_CARD_UNKNOWN_USER = "unknown user"
+
+
+def _strip_raw_slack_ids(text: str) -> str:
+    """Fail-closed fallback: every raw id -> '@unknown user' (the all-letters
+    ``<USERNAME>`` placeholder exemption is kept, exactly as the resolver keeps it)."""
+    def _sub(m: "re.Match[str]") -> str:
+        if not m.group(1) and not any(ch.isdigit() for ch in m.group(2)):
+            return m.group(0)
+        return f"@{_CARD_UNKNOWN_USER}"
+    return _CARD_RAW_SLACK_ID_RE.sub(_sub, text)
+
+
+def _card_resolve_slack_ids(text: str) -> str:
+    """Resolve raw Slack user tokens for a review card: roster people -> '@Name',
+    Cora / the Claude app -> '@Cora' / '@Claude', anything else -> '@unknown user'.
+
+    Code #14 S8: the old call stripped an unmapped id (a Cora speaker line rendered
+    as ``"[ts] : text"``) and the Source line was never resolved at all, so Cora's
+    own id showed raw. On ANY resolver failure this falls back to a local strip --
+    a raw id never renders (fail-closed; the old ``except: pass`` kept raw text)."""
+    if not text or "<" not in text:
+        return text
+    try:
+        from .tools.user_identity import resolve_slack_mentions
+        return resolve_slack_mentions(
+            text, unknown_label=_CARD_UNKNOWN_USER, known_apps=True
+        )
+    except Exception:  # noqa: BLE001 -- a card is never worth a crash
+        log.warning("review card: slack-id resolver unavailable; stripping ids",
+                    exc_info=True)
+        return _strip_raw_slack_ids(text)
+
+
 def format_decision_dm(update: dict[str, Any]) -> str:
     """One decision_capture card body (Fork 4). States the non-canon contract
     inline so a tap is never mistaken for a decisions.md write."""
     conf = update.get("confidence", "?")
     desc = (update.get("description") or "(no description)").strip()
-    try:  # defensive: no raw <U...> tokens on a Harrison-facing card
-        from .tools.user_identity import resolve_slack_mentions
-        desc = resolve_slack_mentions(desc)
-    except Exception:  # noqa: BLE001
-        pass
+    desc = _card_resolve_slack_ids(desc)  # no raw <U...> on a Harrison-facing card
     conf_emoji = {"HIGH": "🔴", "MED": "🟡", "LOW": "⚪"}.get(conf, "⚪")
     lines = [f"*[Decision capture]* {conf_emoji} `{conf}`\n{desc}"]
-    evidence = update.get("source_evidence", "")
+    evidence = str(update.get("source_evidence") or "")
     if evidence:
+        # Resolve BEFORE truncating, so the cut can never split an id into a
+        # half-token the matcher no longer recognises.
+        evidence = _card_resolve_slack_ids(evidence)
         lines.append(f"_Source: {evidence[:300].replace(chr(10), ' ')}_")
     lines.append(
         "_📥 Accept files this to your decisions inbox (NON-canon; promotion to "
@@ -1086,6 +1123,15 @@ def build_decision_blocks(update: dict[str, Any]) -> tuple[str, list[dict[str, A
     applier. The emoji 👍/👎 fallback still works via the scheduled executor's
     decision branch."""
     text = format_decision_dm(update)
+    # Sanitized HERE for the same reason build_mechanical_blocks does it (D-034):
+    # slack_egress patches only the text/markdown_text kwargs, Slack renders
+    # `blocks` and ignores `text`, and this card quotes swept content verbatim in
+    # both the description and the Source line. Code #14 S8 closed this residual.
+    try:
+        from .slack_egress import sanitize_text
+        text = sanitize_text(text)
+    except Exception:  # noqa: BLE001 -- a card is never worth a crash
+        log.warning("decision card: sanitize unavailable", exc_info=True)
     uid = str(update.get("update_id", ""))
     blocks: list[dict[str, Any]] = [
         {"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}},

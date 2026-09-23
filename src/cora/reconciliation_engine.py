@@ -372,6 +372,37 @@ def _extract_sentences(text: str) -> list[str]:
     return [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", text) if s.strip()]
 
 
+# The speaker prefix slack_connector.serialize_message writes at the head of each
+# message line: "[2026-08-02 07:37 UTC] <U0B44MDGC5R>: text". Bounded + anchored
+# (re.match), and no class can match its own delimiter -> linear (D-171).
+_SLACK_SPEAKER_PREFIX_RE = re.compile(
+    r"\[[^\]\n]{1,40}\][ \t]{0,4}<@?([UB][A-Z0-9]{6,20})>:"
+)
+
+
+def _sentences_not_by(text: str, excluded_speaker: str) -> list[str]:
+    """``_extract_sentences(text)`` minus every sentence of a message authored by
+    ``excluded_speaker`` (a Slack user id).
+
+    A serialized Slack chunk is one message per line, each opened by the speaker
+    prefix; a line with no prefix continues the previous message (a multi-line
+    message body), so it inherits that speaker. Same sentence set and order as
+    ``_extract_sentences`` for everything else -- that splits on newlines too.
+    Code #14 S8: both live "uncaptured decision" samples were Cora's own replies
+    ("Confirmed - nothing to act on here.") inside mixed human+Cora thread chunks.
+    """
+    out: list[str] = []
+    speaker: str | None = None
+    for line in re.split(r"\n+", text or ""):
+        m = _SLACK_SPEAKER_PREFIX_RE.match(line.lstrip())
+        if m:
+            speaker = m.group(1)
+        if excluded_speaker and speaker == excluded_speaker:
+            continue
+        out.extend(_extract_sentences(line))
+    return out
+
+
 def _attribution_unreliable(metadata_raw) -> bool:
     """True when a chunk's diarization collapsed (cq-e63feff3a0bf).
 
@@ -860,9 +891,17 @@ def pass3_uncaptured_decisions(
     decisions_full_text = " ".join(decisions_texts).lower()
 
     gaps: list[ReconciliationGap] = []
+    # Cora's own replies are never a founder decision (Code #14 S8), and the card
+    # quotes these sentences -- resolve raw <U...> tokens at build time as pass 4
+    # does, so the stored row is clean (the card re-resolves defensively too).
+    from cora.tools.user_identity import cora_slack_user_id, resolve_slack_mentions
+    cora_uid = cora_slack_user_id()
+
+    def _resolved(s: str) -> str:
+        return resolve_slack_mentions(s, unknown_label="unknown user", known_apps=True)
 
     for chunk in live_chunks:
-        for sentence in _extract_sentences(chunk["content"]):
+        for sentence in _sentences_not_by(chunk["content"] or "", cora_uid):
             if len(sentence) < 20:
                 continue
             if not _DECISION_RE.search(sentence):
@@ -892,16 +931,18 @@ def pass3_uncaptured_decisions(
             if confidence == "LOW":
                 continue
 
-            shown = _neutralize_speaker(sentence, unreliable)
+            shown = _neutralize_speaker(_resolved(sentence), unreliable)
             description = (
                 f"Possible uncaptured decision in {chunk['source']} "
                 f"({chunk['entity']}): \"{shown[:150]}\""
             )
             gaps.append(ReconciliationGap(
+                # gap_id stays keyed on the RAW sentence so rows already in the
+                # ledger keep deduplicating against re-found ones.
                 gap_id=_gap_id("uncaptured_decision", chunk["source_id"], sentence[:80]),
                 gap_type="uncaptured_decision",
                 description=description,
-                source_evidence=_neutralize_speaker(sentence, unreliable)[:400],
+                source_evidence=shown[:400],
                 source=chunk["source"],
                 source_id=chunk["source_id"],
                 entity=chunk["entity"],

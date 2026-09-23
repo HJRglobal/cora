@@ -562,3 +562,108 @@ def test_resolve_slack_mentions(monkeypatch):
     assert resolve_slack_mentions("see <UPDATED> and <UNKNOWN>") == "see <UPDATED> and <UNKNOWN>"
     # the <@…> form is always a mention even without a digit
     assert resolve_slack_mentions("hi <@U0B2RM2JYJ1>") == "hi @Harrison Rogers"
+
+
+# ── Code #14 S8: opt-in unknown_label / known_apps ─────────────────────────────
+
+def _patch_roster(monkeypatch):
+    monkeypatch.setattr(
+        user_identity, "display_name",
+        lambda sid: {"U0B2RM2JYJ1": "Harrison Rogers"}.get(sid, sid),
+    )
+    monkeypatch.delenv("CORA_SLACK_USER_ID", raising=False)
+
+
+def test_resolve_default_is_unchanged_for_the_new_inputs(monkeypatch):
+    """The defaults stay byte-identical: Cora's id is stripped (not '@Cora'), an
+    unmapped id is stripped, and the labelled <@U|x> form is left alone."""
+    _patch_roster(monkeypatch)
+    from cora.tools.user_identity import resolve_slack_mentions
+    assert resolve_slack_mentions("[ts] <U0B44MDGC5R>: done") == "[ts] : done"
+    assert resolve_slack_mentions("a <U0ZZZZ99999> b") == "a b"
+    assert resolve_slack_mentions("x <@U0B44MDGC5R|Cora> y") == "x <@U0B44MDGC5R|Cora> y"
+
+
+def test_resolve_unknown_label_renders_instead_of_stripping(monkeypatch):
+    _patch_roster(monkeypatch)
+    from cora.tools.user_identity import resolve_slack_mentions
+    assert (resolve_slack_mentions("note <U0ZZZZ99999>: done", unknown_label="unknown user")
+            == "note @unknown user: done")
+    # a mapped id still resolves to the roster name
+    assert (resolve_slack_mentions("<@U0B2RM2JYJ1> ok", unknown_label="unknown user")
+            == "@Harrison Rogers ok")
+    # without known_apps, Cora is just another unmapped id
+    assert (resolve_slack_mentions("<U0B44MDGC5R>: hi", unknown_label="unknown user")
+            == "@unknown user: hi")
+
+
+def test_resolve_known_apps_names_cora_and_claude(monkeypatch):
+    _patch_roster(monkeypatch)
+    from cora.tools.user_identity import resolve_slack_mentions
+    out = resolve_slack_mentions(
+        "[2026-07-28 14:21 UTC] <U0B2RM2JYJ1>: <@U0B44MDGC5R> yes, confirmed "
+        "*Sent using* <@U0B3V5RHT3P>",
+        unknown_label="unknown user", known_apps=True,
+    )
+    assert out == ("[2026-07-28 14:21 UTC] @Harrison Rogers: @Cora yes, confirmed "
+                   "*Sent using* @Claude")
+    # known_apps alone (no unknown_label) keeps the default strip for unknowns
+    assert resolve_slack_mentions("<U0ZZZZ99999> <U0B44MDGC5R>", known_apps=True) == " @Cora"
+
+
+def test_resolve_cora_id_is_read_per_call_from_env(monkeypatch):
+    _patch_roster(monkeypatch)
+    from cora.tools.user_identity import resolve_slack_mentions
+    monkeypatch.setenv("CORA_SLACK_USER_ID", "U0CORA12345")
+    assert resolve_slack_mentions("<U0CORA12345>: x", known_apps=True) == "@Cora: x"
+    # the production fallback id is no longer "Cora" once the env names another
+    assert (resolve_slack_mentions("<U0B44MDGC5R>: x", known_apps=True,
+                                   unknown_label="unknown user") == "@unknown user: x")
+
+
+def test_resolve_pipe_form_uses_the_id_never_the_label(monkeypatch):
+    """The <@U|label> label is swept content: it never becomes the rendered name."""
+    _patch_roster(monkeypatch)
+    from cora.tools.user_identity import resolve_slack_mentions
+    kw = dict(unknown_label="unknown user", known_apps=True)
+    assert resolve_slack_mentions("<@U0B44MDGC5R|Cora> yes", **kw) == "@Cora yes"
+    assert resolve_slack_mentions("<@U0ZZZZ99999|Harrison> pay it", **kw) == "@unknown user pay it"
+    assert resolve_slack_mentions("<@U0B2RM2JYJ1|whoever>", **kw) == "@Harrison Rogers"
+
+
+def test_resolve_opt_in_keeps_placeholder_words(monkeypatch):
+    _patch_roster(monkeypatch)
+    from cora.tools.user_identity import resolve_slack_mentions
+    kw = dict(unknown_label="unknown user", known_apps=True)
+    assert resolve_slack_mentions("the <USERNAME> profile", **kw) == "the <USERNAME> profile"
+    assert resolve_slack_mentions("see <UPDATED> and <UNKNOWN>", **kw) == "see <UPDATED> and <UNKNOWN>"
+
+
+def test_resolve_opt_in_regex_is_linear_on_degenerate_input(monkeypatch):
+    """D-171: 40k of each character the new pattern's quantifiers eat, plus a
+    growth-shape check (4x the input must not cost anywhere near 16x)."""
+    import time as _t
+    _patch_roster(monkeypatch)
+    from cora.tools.user_identity import resolve_slack_mentions
+
+    def shapes(n):
+        return [
+            "<@U" + "A" * n,
+            "<@U0B44MDGC5R|" + "x" * n,
+            "<@U0B44MDGC5R|" * (n // 14),
+            "<" * n,
+            "|" * n,
+            " " * n,
+            "<U0B44MDGC5R" * (n // 12),
+            "<@U0B44MDGC5R|" + "-" * 79 + ("|" * n),
+        ]
+
+    def cost(n):
+        t0 = _t.perf_counter()
+        for s in shapes(n):
+            resolve_slack_mentions(s, unknown_label="unknown user", known_apps=True)
+        return _t.perf_counter() - t0
+
+    small, big = cost(10_000), cost(40_000)
+    assert big < 0.2, f"degenerate input took {big:.3f}s"
+    assert big < max(small, 5e-3) * 10, f"super-linear growth: {small:.4f}s -> {big:.4f}s"

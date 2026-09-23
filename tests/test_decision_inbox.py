@@ -352,6 +352,85 @@ class TestDecisionCards:
         assert "never expires" in text.lower()
         assert "decisions.md" in text  # names where promotion actually happens
 
+    # ── Code #14 S8: raw Slack ids on the card (verbatim 9/11 + 9/15 samples) ──
+
+    @pytest.fixture
+    def roster(self, monkeypatch):
+        from cora.tools import user_identity
+        monkeypatch.setattr(
+            user_identity, "display_name",
+            lambda sid: {"U0B2RM2JYJ1": "Harrison Rogers"}.get(sid, sid),
+        )
+        monkeypatch.delenv("CORA_SLACK_USER_ID", raising=False)
+
+    def test_card_source_line_renders_bot_id_as_cora(self, roster):
+        d = _decision(
+            desc='Possible uncaptured decision in slack (F3E): "[2026-08-17 19:04 UTC] '
+                 '<U0B44MDGC5R>: _This expired before you confirmed."',
+            evidence="[2026-08-17 19:04 UTC] <U0B44MDGC5R>: _This expired before you confirmed.",
+            confidence="MED",
+        )
+        text = kr.format_decision_dm(d)
+        assert ("_Source: [2026-08-17 19:04 UTC] @Cora: _This expired before you "
+                "confirmed._") in text
+        assert "U0B44MDGC5R" not in text
+
+    def test_card_description_bot_id_is_cora_not_stripped(self, roster):
+        d = _decision(
+            desc='Possible uncaptured decision in slack (F3E): "[2026-08-17 19:04 UTC] '
+                 '<U0B44MDGC5R>: _This expired before you confirmed."',
+            evidence="",
+        )
+        text = kr.format_decision_dm(d)
+        assert "] @Cora: _This expired" in text
+        assert "] : _This" not in text  # the 9/15 card's dropped-speaker render
+
+    def test_card_source_line_resolves_roster_user_and_apps(self, roster):
+        d = _decision(evidence="[2026-07-28 14:21 UTC] <U0B2RM2JYJ1>: <@U0B44MDGC5R> yes, "
+                               "confirmed *Sent using* <@U0B3V5RHT3P>")
+        text = kr.format_decision_dm(d)
+        assert ("_Source: [2026-07-28 14:21 UTC] @Harrison Rogers: @Cora yes, confirmed "
+                "*Sent using* @Claude_") in text
+        assert "<U" not in text and "<@U" not in text
+
+    def test_card_unknown_id_renders_unknown_user_never_raw(self, roster):
+        d = _decision(desc="[2026-09-01 10:00 UTC] <U0ZZZZ99999>: we will ship Friday",
+                      evidence="[2026-09-01 10:00 UTC] <U0ZZZZ99999>: we will ship Friday")
+        text = kr.format_decision_dm(d)
+        assert text.count("@unknown user: we will ship Friday") == 2
+        assert "U0ZZZZ99999" not in text
+
+    def test_card_resolver_failure_never_leaks_raw_id(self, roster, monkeypatch):
+        from cora.tools import user_identity
+
+        def _boom(*a, **k):
+            raise RuntimeError("roster unavailable")
+        monkeypatch.setattr(user_identity, "resolve_slack_mentions", _boom)
+        d = _decision(desc="[ts] <U0B2RM2JYJ1>: we decided X",
+                      evidence="[ts] <U0B44MDGC5R>: <@U0B3V5RHT3P|Claude> ok <USERNAME>")
+        text = kr.format_decision_dm(d)
+        assert "<U" not in text.replace("<USERNAME>", "") and "<@U" not in text
+        assert "@unknown user: we decided X" in text
+        assert "<USERNAME>" in text  # placeholder exemption survives the fallback
+
+    def test_card_placeholder_words_untouched(self, roster):
+        text = kr.format_decision_dm(_decision(evidence="the <USERNAME> field"))
+        assert "the <USERNAME> field" in text
+
+    def test_decision_blocks_text_is_egress_sanitized(self, roster):
+        """D-034: blocks= bypass the class-level egress patch, so the card
+        sanitizes the text it puts IN the blocks (as the mechanical card does)."""
+        d = _decision(evidence="task gid 1209060959783860 at https://app.asana.com/0/1/2 "
+                               "was **approved**")
+        text, blocks = kr.build_decision_blocks(d)
+        section = blocks[0]["text"]["text"]
+        from cora.slack_egress import sanitize_text
+        assert section == sanitize_text(kr.format_decision_dm(d))[:2900]
+        assert "1209060959783860" not in section  # bare GID redacted
+        assert "app.asana.com" not in section     # bare tool URL redacted
+        assert "**approved**" not in section      # bold normalized
+        assert text == section                    # fallback text is the same safe string
+
     def test_send_individual_dms_default_builder_unchanged(self):
         client = MagicMock()
         client.conversations_open.return_value = {"channel": {"id": "D1"}}

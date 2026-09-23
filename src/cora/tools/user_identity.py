@@ -256,8 +256,40 @@ def slack_mention(slack_user_id: str) -> str:
 # sometimes carries (a synthesis line that quoted a user id without the @).
 _EMBEDDED_MENTION_RE = re.compile(r"<(@?)(U[A-Z0-9]{6,})>")
 
+# The same, also tolerating Slack's labelled form ``<@U…|label>``. Used ONLY in the
+# opt-in mode (unknown_label / known_apps) so the default output stays byte-identical.
+# The label is bounded ({0,80}) and neither class can match '|', '>' or '<', so no
+# quantifier can trade characters with its neighbour and a degenerate input (40k of
+# any one character) stays linear (D-171; pinned by a growth-shape timing test). The
+# id run keeps the default regex's {6,} so opt-in mode matches everything default does.
+_EMBEDDED_MENTION_PIPE_RE = re.compile(
+    r"<(@?)(U[A-Z0-9]{6,})(?:\|[^<>|\n]{0,80})?>"
+)
 
-def resolve_slack_mentions(text: str) -> str:
+# Cora's own Slack user id. Resolved PER CALL (an env override set after import is
+# honoured); the fallback mirrors scripts/incremental_sync_slack.CORA_FALLBACK_USER_ID.
+CORA_FALLBACK_SLACK_USER_ID = "U0B44MDGC5R"
+# The Claude app, which appears in "*Sent using* <@U0B3V5RHT3P>" message footers.
+CLAUDE_APP_SLACK_USER_ID = "U0B3V5RHT3P"
+
+
+def cora_slack_user_id() -> str:
+    """Cora's Slack user id: $CORA_SLACK_USER_ID, else the known production id."""
+    import os
+    return (os.environ.get("CORA_SLACK_USER_ID") or "").strip() or CORA_FALLBACK_SLACK_USER_ID
+
+
+def known_app_ids() -> dict[str, str]:
+    """App/bot user ids that are not on the people roster -> display label."""
+    return {cora_slack_user_id(): "Cora", CLAUDE_APP_SLACK_USER_ID: "Claude"}
+
+
+def resolve_slack_mentions(
+    text: str,
+    *,
+    unknown_label: Optional[str] = None,
+    known_apps: bool = False,
+) -> str:
     """Replace raw Slack user tokens embedded in free text -- both ``<@U…>`` and the
     bare ``<U…>`` form -- with a friendly ``@name``. An unmapped id is STRIPPED rather
     than leaked, so swept content quoted into a person-facing card never shows a raw
@@ -267,18 +299,35 @@ def resolve_slack_mentions(text: str) -> str:
     Slack id (contains a digit) -- so an angle-bracketed placeholder word like
     ``<USERNAME>`` / ``<UPDATED>`` / ``<UNKNOWN>`` is left intact, not silently deleted
     (D-051 remediation). The ``<@U…>`` form is always resolved (it is explicitly a
-    mention)."""
+    mention).
+
+    Opt-in options (Code #14 S8; the defaults keep every existing caller
+    byte-identical):
+      unknown_label -- an unmapped real id renders ``@<unknown_label>`` instead of
+                       being stripped (stripping left ``"[ts] : text"`` on a card,
+                       which reads as a dropped speaker, not an unknown one).
+      known_apps    -- consult :func:`known_app_ids` BEFORE the people roster, so
+                       Cora's own id renders ``@Cora`` and the Claude app ``@Claude``.
+    Either option also enables the labelled ``<@U…|label>`` form. The label is
+    NEVER trusted as a name (it is swept content); the id alone decides."""
     if not text or "<" not in text:
         return text
+    opt_in = unknown_label is not None or known_apps
+    apps = known_app_ids() if known_apps else {}
 
     def _sub(m: "re.Match[str]") -> str:
         at, sid = m.group(1), m.group(2)
         if not at and not any(ch.isdigit() for ch in sid):
             return m.group(0)  # a bare all-letters <UWORD> is not a real id -- keep it
+        if sid in apps:
+            return f"@{apps[sid]}"
         name = display_name(sid)
-        return f"@{name}" if name and name != sid else ""
+        if name and name != sid:
+            return f"@{name}"
+        return f"@{unknown_label}" if unknown_label is not None else ""
 
-    out = _EMBEDDED_MENTION_RE.sub(_sub, text)
+    regex = _EMBEDDED_MENTION_PIPE_RE if opt_in else _EMBEDDED_MENTION_RE
+    out = regex.sub(_sub, text)
     # Collapse the doubled spaces a stripped token can leave (spaces/tabs only, so
     # newlines in multi-line evidence survive).
     return re.sub(r"[ \t]{2,}", " ", out)
