@@ -53,6 +53,7 @@ from cora.knowledge_review import (  # noqa: E402
     HARRISON_SLACK_USER_ID,
     UPDATE_TYPE_DECISION as _kr_UPDATE_TYPE_DECISION,
     UPDATE_TYPE_GENERIC,
+    _card_resolve_slack_ids as _kr_card_resolve_slack_ids,  # D-051 redos-slack-surfaces-7
     _ack_repeat_signal as _kr_ack_repeat_signal,  # Code #13 EF-2: every terminal
     # resolution of a repeat-signal card acks the signal (fail-soft, no-op for
     # cards with no payload.signal_key)
@@ -869,7 +870,10 @@ def _build_mechanical_batch_card(pending: list[dict], now_dt, *, expired_this_ru
         if shown >= _BATCH_CARD_OLDEST_N:
             continue
         age = _age_days(u, now_dt)
-        desc = str(u.get("description") or "(no description)")[:140]
+        # D-051 redos-slack-surfaces-7: resolve raw <U...> / <@U...> ids BEFORE the
+        # cut, exactly as the per-item cards do -- the cut must never leave a raw id
+        # (or half of one) on the Monday card.
+        desc = _kr_card_resolve_slack_ids(str(u.get("description") or "(no description)"))[:140]
         shown += 1
         # Code #14 S7: an unresolved entity renders NOTHING (it used to print a
         # literal '?', the same defect class as the per-item mechanical card).
@@ -895,7 +899,7 @@ def _build_mechanical_batch_card(pending: list[dict], now_dt, *, expired_this_ru
     for u in renderable[:5]:
         age = _age_days(u, now_dt)
         lines.append(f"  - [{u.get('update_type')}] {'' if age is None else str(age) + 'd'} -- "
-                     f"{str(u.get('description') or '')[:120]}")
+                     f"{_kr_card_resolve_slack_ids(str(u.get('description') or ''))[:120]}")
     if len(judgment) > len(renderable):
         lines.append(f"  ({len(judgment) - len(renderable)} knowledge item(s) withheld by the "
                      f"content screen / LEX -- counted, never rendered)")
