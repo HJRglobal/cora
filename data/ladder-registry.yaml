@@ -392,13 +392,13 @@ lanes:
     tier: T2
     status: live
     promotion_criteria: "n/a -- acts by Harrison's 2026-09-08 R1 ruling (the ruling is the promotion tap)"
-    demotion_triggers: "any RSVP on a vetoed / carve-out / LEX-organizer-withheld event -> automatic back to propose-only + alarm"
+    demotion_triggers: "any RSVP on a vetoed / carve-out event -> automatic back to propose-only + alarm"
     evidence_monitor:
       description: "the 07:22 auditor diffing the Fireflies API (never the KB); the ensure ledger rsvp-accept rows carry (link, start); a ledger scan for an rsvp row whose event also has a same-day skip row is the demotion detector"
       failing_capable: true
     audit_surface: "logs/meeting-capture-ledger.jsonl action=rsvp-accept rows + the 07:22 audit post"
     authority: Harrison
-    confirmed_by: Harrison 2026-09-19
+    confirmed_by: "Harrison 2026-09-19 (T2 stands on the 2026-09-08 'THE fix' ruling: RSVP-accept as cora@, decisions.md R1)"
     acting_probe: ensure_mode
     events:
       - ts: 2026-09-19
@@ -410,6 +410,10 @@ lanes:
         event: confirmed
         by: Harrison
         evidence: "batch confirm: Code #13 ask block RULED 2026-09-19 (_shared/projects/cora/_notes/2026-09-19_fndr_RULINGS-code-13-ask-batch.md: registry confirmed as seeded except nightly-catchup); applied to this file by Cowork 2026-09-20 (decisions.md 2026-09-20 [FNDR/ORG+CORA])"
+      - ts: 2026-09-22
+        event: note
+        by: code-14
+        evidence: "ruling 9.3 (2026-09-19 ask batch, INCLUDE LEX): LEX invites are INCLUDED in cora@'s own RSVP (the is_lex_event withhold retired in _plan_rsvp + _rsvp_accept; outcome accepted:lex, counted apart by the 07:22 audit); recording, distribution and carve-out gates unchanged; D-247 tension accepted; Code #14 R14-4"
 
   - lane: meeting-recap-card
     title: "Meeting recap card -> organizer confirm -> internal attendees' DMs (meeting_recap; Code #13 slice 5)"

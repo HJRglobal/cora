@@ -574,18 +574,87 @@ def write_ledger(rows: list[dict[str, Any]]) -> None:
         log.error("meeting-capture ledger write failed: %s", exc)
 
 
+def rsvp_counts(day: str, *, path: Path | None = None) -> dict[str, Any]:
+    """READ-ONLY count of cora@'s own RSVP accepts for meetings on `day`.
+
+    Reads the ensure lane's `rsvp-accept` rows (lane=ensure, action=rsvp-accept,
+    day==day, applied) and counts DISTINCT meetings, keyed on the D-254 identity
+    (meeting_link, start_ts) with the event id as the fallback, because the lane
+    re-runs every 15 minutes and an erroring accept is re-ledgered each cycle:
+
+      accepted          -- non-LEX accepts
+      accepted_lex      -- LEX accepts (`accepted:lex`, ruled 2026-09-19 ask 9.3)
+      errors            -- meetings whose accept errored and was never accepted
+      notetaker_present -- meetings skipped because a legacy bot was already invited
+      available         -- False when the ledger cannot be read at all
+
+    Never writes, never raises, and returns counts only (no ids, no titles), so
+    the 07:22 audit may put them on a shared surface (D-145). A malformed line is
+    skipped, not fatal.
+    """
+    out: dict[str, Any] = {
+        "available": False, "accepted": 0, "accepted_lex": 0,
+        "errors": 0, "notetaker_present": 0,
+    }
+    p = Path(path) if path is not None else ledger_path()
+    outcomes: dict[tuple, set[str]] = {}
+    try:
+        if p.exists():
+            with p.open("r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(row, dict):
+                        continue
+                    if (row.get("lane") != "ensure" or row.get("action") != "rsvp-accept"
+                            or row.get("day") != day or row.get("applied") is not True):
+                        continue
+                    link = str(row.get("meeting_link") or "").strip().lower()
+                    start = row.get("start_ts") or 0
+                    key: tuple = (link, start) if link and start else ("id", str(row.get("event_id") or ""))
+                    outcomes.setdefault(key, set()).add(str(row.get("outcome") or ""))
+        out["available"] = True
+    except Exception as exc:  # noqa: BLE001
+        log.warning("rsvp_counts: ledger unreadable (%s)", type(exc).__name__)
+        return out
+    for seen in outcomes.values():
+        if "accepted:lex" in seen:
+            out["accepted_lex"] += 1
+        elif "accepted" in seen:
+            out["accepted"] += 1
+        elif "error" in seen:
+            out["errors"] += 1
+        elif "skipped:notetaker-present" in seen:
+            out["notetaker_present"] += 1
+    return out
+
+
 # ── the ensure lane ──────────────────────────────────────────────────────────
 
 #: RSVP sub-step outcomes (cq-19b0298cf5be, R1 2026-09-08). A SUB-STEP on an
 #: action row, deliberately NOT a fifth `action` value: EnsureResult's counts and
 #: the script's `_ledger_worthy` key on the four-word action vocabulary, and a new
 #: word there would silently fall out of every count.
+#:
+#: LEX IS INCLUDED (ruled 2026-09-19, ask 9.3). The old `skipped:lex-withheld`
+#: outcome is RETIRED for cora@'s OWN RSVP only: a LEX invite is accepted like any
+#: other and LABELLED `accepted:lex` so the 07:22 audit can count it separately.
+#: Nothing else about LEX changes here -- qualify_event's carve-outs, the
+#: veto-on-any-copy rule, the no-roster-copy skip, the notetaker check, the dual
+#: write gate, display_title's redaction and meeting_recap's custodians-only
+#: distribution are all untouched. The D-247 tension (attendance now == recording,
+#: because Fireflies dispatches only to an accepted invite) was accepted by Harrison.
 RSVP_OUTCOMES: frozenset[str] = frozenset({
     "",                          # no RSVP step (or not yet executed)
     "accepted",                  # cora@'s own entry set to accepted, read back verified
+    "accepted:lex",              # the same write on a LEX event (is_lex_event) -- a LABEL, never a withhold
     "already-accepted",          # no API write
     "skipped:notetaker-present", # one mechanism per event -- a bot is already invited
-    "skipped:lex-withheld",      # never RSVP a LEX event (is_lex_event, R1) -- NOT the display redaction
     "skipped:no-roster-copy",    # sweep found cora@ invited but no roster copy to veto-check
     "error",                     # fetch/patch/read-back failed; rsvp_error carries why
 })
@@ -671,18 +740,17 @@ def _plan_rsvp(event: dict[str, Any]) -> tuple[str, bool]:
     when the execute step should accept. Order mirrors the execute-time re-check in
     `_rsvp_accept` so plan mode shows what live mode would do.
 
-    The LEX withhold is keyed on `is_lex_event` -- the ONE LEX detector, i.e. the
-    R1 predicate ("never RSVP a LEX-organizer-withheld event") -- and deliberately
-    NOT on the redacted display title. `display_title` redacts on a STRICTER screen
-    (any client-agency attendee, any PHI-shaped title) because over-redacting an
-    ops line costs nothing; keying the withhold on it silently withheld the RSVP on
-    every non-LEX meeting with a city/county/state attendee (F3E/UFL/HJRP), leaving
-    cora@ guest-added but never joining (Code #13 review, C2-1).
+    There is NO LEX withhold (ruled 2026-09-19, ask 9.3). A LEX event plans an
+    accept exactly like any other; `_rsvp_accept` labels the outcome
+    `accepted:lex`. The consent gates that decide whether cora@ may be on a
+    meeting at all run BEFORE this -- qualify_event's carve-outs and the
+    veto-on-any-copy rule remove the meeting from `candidates`, and the sweep
+    remainder skips any invite with no roster copy -- so removing the withhold
+    widens nothing a carve-out forbids. `display_title` still redacts every LEX
+    row; that rail is independent of this one.
     """
     if LEGACY_NOTETAKER in event_emails(event):
         return "skipped:notetaker-present", False
-    if is_lex_event(event):
-        return "skipped:lex-withheld", False
     return "", True
 
 
@@ -851,7 +919,7 @@ def plan_ensure(
         # A guest-add is followed by an RSVP-accept as cora@ (R1). A copy is
         # organised BY cora@ and has no invite to answer. The guest-add runs the
         # same planner as the sweep (against the roster copy -- cora@ has no copy
-        # yet) so plan mode shows the withhold live mode would apply.
+        # yet) so plan mode shows the skip live mode would apply.
         rsvp, rsvp_planned = _plan_rsvp(ev) if action == "guest-add" else ("", False)
         result.actions.append(EnsureAction(
             member=member.name, calendar_email=member.calendar_email, event_id=eid,
@@ -958,7 +1026,7 @@ def execute_ensure(
                     act.action = "copy"
                     act.reason = f"guest-add refused ({str(exc)[:80]}) -> copy"
                     act.rsvp_planned = False   # cora@ organises the copy; nothing to accept
-                    act.rsvp = ""              # drop any plan-time withhold: no invite exists
+                    act.rsvp = ""              # drop any plan-time skip: no invite exists
 
             src = source_events.get(act.event_id)
             if src is None:
@@ -999,31 +1067,50 @@ def _rsvp_accept(act: EnsureAction, cfg: CaptureConfig, cc: Any, *, event_id: st
     copy first so the checks run against the event AS IT IS NOW, not as it was at
     plan time -- design v1 s4a's case is a notetaker@ added AFTER the lane's
     guest-add, which must turn the accept into a skip (one mechanism per event).
-    The LEX withhold is keyed on `is_lex_event(own)` -- the R1 predicate ("never
-    RSVP a LEX-organizer-withheld event"), re-derived against the fresh copy -- and
-    NOT on the redacted display title, whose stricter screen (any .gov attendee,
-    any PHI-shaped title) would withhold the accept on every non-LEX civic meeting
-    (see `_plan_rsvp`). The D-247 capture-yes tension is carried to Harrison, not
-    resolved here. Every failure is RECORDED, never raised -- the lane's other
-    actions and its ledger must complete.
+
+    LEX IS INCLUDED (ruled 2026-09-19, ask 9.3; the D-247 capture-yes tension was
+    accepted by Harrison). `is_lex_event(own)` is now a LABEL computed AFTER the
+    write: a LEX accept reads `accepted:lex` so the 07:22 audit can count it
+    apart. Its fail-safe True (a classifier error reads as LEX) can therefore only
+    MISLABEL a non-LEX accept as `accepted:lex`; it can never withhold or skip the
+    accept, because the write has already happened by the time it is asked.
+    Every failure is RECORDED, never raised -- the lane's other actions and its
+    ledger must complete.
     """
     try:
         own = cc.get_event(user_email=cfg.capture_identity, event_id=event_id)
         if LEGACY_NOTETAKER in event_emails(own):
             return "skipped:notetaker-present"
-        if is_lex_event(own):
-            return "skipped:lex-withheld"
         changed, outcome = cc.set_own_response(
             user_email=cfg.capture_identity, event_id=event_id,
         )
+        lex = False
+        if changed and outcome == "accepted":
+            lex = _lex_label(own)
+            if lex:
+                outcome = "accepted:lex"
         if changed:
-            log.info("rsvp_accepted event_id=%s link=%s start_ts=%s",
-                     event_id, act.meeting_link, act.meeting_start_ts)
+            log.info("rsvp_accepted event_id=%s link=%s start_ts=%s lex=%s",
+                     event_id, act.meeting_link, act.meeting_start_ts, lex)
         return outcome
     except Exception as exc:  # noqa: BLE001
         act.rsvp_error = str(exc)[:200]
         log.error("ensure: rsvp-accept failed for event %s: %s", event_id, exc)
         return "error"
+
+
+def _lex_label(event: dict[str, Any]) -> bool:
+    """`is_lex_event` as a LABEL for an accept that already happened.
+
+    is_lex_event already fails safe to True; this wrapper only makes sure that a
+    future change to it that lets an exception escape can still never turn a
+    completed accept into an `error` outcome -- the worst a classifier fault may
+    do on this path is label the accept `accepted:lex`.
+    """
+    try:
+        return bool(is_lex_event(event))
+    except Exception:  # noqa: BLE001
+        return True
 
 
 # ── the daily auditor (READ-ONLY, ships live) ────────────────────────────────
@@ -1103,6 +1190,10 @@ class AuditReport:
     failed_calendars: list[tuple[str, str]] = field(default_factory=list)
     transcript_error: str = ""
     seat_note: str = ""
+    #: cora@'s own RSVP accepts for the day (rsvp_counts), set by the audit SCRIPT
+    #: after audit_day returns -- audit_day itself never reads the ensure ledger.
+    #: None = not attached, and render_report then prints nothing for it.
+    rsvp: dict[str, Any] | None = None
 
 
 #: Marks an index key claimed by more than one meeting. Such a key can never
@@ -1570,6 +1661,20 @@ def _esc(text: str) -> str:
     return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _rsvp_line(counts: dict[str, Any] | None) -> str:
+    """One aggregate line for cora@'s own RSVP accepts, or "" when not attached."""
+    if not isinstance(counts, dict) or not counts.get("available"):
+        return ""
+    try:
+        plain = int(counts.get("accepted") or 0)
+        lex = int(counts.get("accepted_lex") or 0)
+        errors = int(counts.get("errors") or 0)
+    except (TypeError, ValueError):
+        return ""
+    return (f"_RSVP as cora@: {plain + lex} accepted ({lex} LEX), "
+            f"{errors} unresolved error(s)_")
+
+
 def render_report(report: AuditReport) -> str:
     """Plain mrkdwn, alarms first. No Block Kit -- this message carries no buttons,
     and adding blocks would impose a 2,900-char section cap on a body that has none.
@@ -1674,6 +1779,14 @@ def render_report(report: AuditReport) -> str:
             )
         else:
             lines.append("\n:white_check_mark: Every scheduled meeting captured exactly once.")
+
+    # INFORMATIONAL, below every alarm and after the clean-day verdict, and never
+    # part of that verdict: how many invites cora@ accepted as itself for this
+    # day (LEX counted apart, ruled 2026-09-19 ask 9.3). Counts only -- no ids,
+    # no titles, no organisers.
+    rsvp_line = _rsvp_line(report.rsvp)
+    if rsvp_line:
+        lines.append(f"\n{rsvp_line}")
 
     if report.seat_note:
         lines.append(f"\n_{report.seat_note}_")

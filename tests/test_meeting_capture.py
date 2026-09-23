@@ -808,8 +808,10 @@ class TestScriptsAndDeployment:
                                       rsvp="skipped:notetaker-present"))
         assert not mod._ledger_worthy(act(action="none", reason="already-covered",
                                           rsvp="already-accepted"))
-        assert not mod._ledger_worthy(act(action="none", reason="already-covered",
-                                          rsvp="skipped:lex-withheld"))
+        # DELIBERATE FLIP (Code #14 R14-4, ruling 9.3): the lex-withheld outcome is
+        # retired; a LEX accept is a real write and is kept like any accept.
+        assert mod._ledger_worthy(act(action="none", reason="already-covered",
+                                      rsvp="accepted:lex"))
         assert not mod._ledger_worthy(act(
             action="skip", reason=f"{mc.RSVP_NO_ROSTER_COPY_REASON}: no roster copy visible",
             rsvp="skipped:no-roster-copy"))
@@ -1561,15 +1563,18 @@ class TestRsvpPlan:
         assert len(rows) == 1
         assert rows[0].rsvp == "skipped:notetaker-present" and rows[0].rsvp_planned is False
 
-    def test_sweep_withholds_a_lex_redacted_invite(self):
-        """R1 as written: a LEX/PHI-redacted (organizer-withheld) event is never
-        RSVP'd. The row still names no organiser and no title."""
+    def test_sweep_plans_the_rsvp_on_a_lex_invite(self):
+        """DELIBERATE FLIP (Code #14 R14-4, ruling 9.3 INCLUDE LEX; was
+        test_sweep_withholds_a_lex_redacted_invite). A LEX invite with a
+        qualifying roster copy plans the accept like any other. The DISPLAY rail is
+        untouched: the row still names no organiser and no title."""
         own = _own("c1", **{"organizer": "ops@lexingtonservices.com",
                              "extra": ("intake@county.gov",)})
+        assert mc.is_lex_event(own) is True                                # precondition
         res = _sweep_plan(own, _ev("r1", link=LINK, **_lex_kwargs()))
         rows = [a for a in res.actions if a.action == "none"]
         assert len(rows) == 1
-        assert rows[0].rsvp == "skipped:lex-withheld" and rows[0].rsvp_planned is False
+        assert rows[0].rsvp == "" and rows[0].rsvp_planned is True
         assert rows[0].title.startswith("LEX/PHI") and "county.gov" not in rows[0].reason
 
     def test_gov_attendee_on_a_non_lex_meeting_does_not_withhold_the_rsvp(self):
@@ -1595,14 +1600,17 @@ class TestRsvpPlan:
         assert rows[0].rsvp == "" and rows[0].rsvp_planned is True
         assert "phoenix.gov" not in rows[0].reason
 
-    def test_lex_guest_add_plan_shows_the_withhold_live_would_apply(self):
-        """Plan mode runs the same RSVP planner as the sweep, so a LEX guest-add
-        row reads `skipped:lex-withheld` at plan time instead of `rsvp=planned`
-        (the plan/live disagreement the C2-1 sibling finding flagged)."""
+    def test_lex_guest_add_plan_plans_the_rsvp(self):
+        """DELIBERATE FLIP (Code #14 R14-4, ruling 9.3; was
+        test_lex_guest_add_plan_shows_the_withhold_live_would_apply). Plan mode
+        runs the same RSVP planner as the sweep, so a LEX guest-add row reads
+        `rsvp=planned` -- plan and live still agree -- and its reason still names
+        neither the LEX organiser nor the agency attendee."""
         ga = _guest_add_plan(**_lex_kwargs())
         rows = [a for a in ga.actions if a.action == "guest-add"]
         assert len(rows) == 1
-        assert rows[0].rsvp == "skipped:lex-withheld" and rows[0].rsvp_planned is False
+        assert rows[0].rsvp == "" and rows[0].rsvp_planned is True
+        assert rows[0].title.startswith("LEX/PHI")
         assert "lexingtonservices" not in rows[0].reason and "county.gov" not in rows[0].reason
 
 
@@ -1675,16 +1683,19 @@ class TestRsvpExecute:
         assert cal.rsvps == []
         assert [a.rsvp for a in res.actions if a.action == "guest-add"] == ["skipped:notetaker-present"]
 
-    def test_lex_redacted_event_is_withheld_without_write(self, monkeypatch):
-        """R1 as written: never RSVP a LEX-organizer-withheld event."""
+    def test_lex_event_is_accepted_as_cora_and_labelled_accepted_lex(self, monkeypatch):
+        """DELIBERATE FLIP (Code #14 R14-4, ruling 9.3 INCLUDE LEX; was
+        test_lex_redacted_event_is_withheld_without_write). A LEX guest-add is
+        followed by exactly one accept as cora@, labelled `accepted:lex`."""
         monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
         cal = _Cal(monkeypatch, own=_own("e1", organizer="ops@lexingtonservices.com",
                                          extra=("intake@county.gov",)))
         res = mc.execute_ensure(_guest_add_plan(**_lex_kwargs()), _cfg(), apply=True)
         act = [a for a in res.actions if a.action == "guest-add"][0]
-        assert act.title.startswith("LEX/PHI")
-        assert act.applied is True             # the guest-add itself still happened (D-247)
-        assert act.rsvp == "skipped:lex-withheld" and cal.rsvps == []
+        assert act.title.startswith("LEX/PHI")                    # display rail untouched
+        assert act.applied is True and len(cal.adds) == 1
+        assert cal.rsvps == [{"user_email": CORA, "event_id": "e1"}]
+        assert act.rsvp == "accepted:lex" and act.rsvp_error == ""
 
     def test_gov_attendee_non_lex_guest_add_accepts_as_cora(self, monkeypatch):
         """Code #13 review C2-1 at execute time: the UFL + city-attendee meeting is
@@ -1857,7 +1868,7 @@ class TestRsvpLedger:
         assert len([r for r in rows if r.get("action") == "rsvp-accept"]) == 1
         assert len([r for r in rows if r.get("row") == "summary"]) == 2
 
-    def test_notetaker_skip_and_error_are_ledgered_but_lex_and_no_roster_are_not(
+    def test_notetaker_skip_error_and_lex_accept_are_ledgered_but_no_roster_is_not(
             self, monkeypatch, tmp_path):
         mod, ledger = self._load(monkeypatch, tmp_path)
         from cora.tools import calendar_client as cc
@@ -1867,9 +1878,10 @@ class TestRsvpLedger:
         assert mod._rsvp_ledger_worthy(act(rsvp="skipped:notetaker-present"))
         assert mod._rsvp_ledger_worthy(act(rsvp="error", rsvp_error="x"))
         assert mod._rsvp_ledger_worthy(act(rsvp="accepted"))
-        # lex-withheld on the re-derived `none` row (every cycle after the guest-add)
-        # is NOT ledgered -- that is the 96-rows/day growth the ledger is costed against
-        assert not mod._rsvp_ledger_worthy(act(rsvp="skipped:lex-withheld"))
+        # DELIBERATE FLIP (Code #14 R14-4, ruling 9.3): a LEX accept is a real
+        # write and is ledgered like any accept, on the re-derived `none` row too.
+        assert mod._rsvp_ledger_worthy(act(rsvp="accepted:lex"))
+        assert not hasattr(mod, "_RSVP_LEDGERED_ONCE_ON_APPLY")
         assert not mod._rsvp_ledger_worthy(act(rsvp="already-accepted"))
         assert not mod._rsvp_ledger_worthy(act(rsvp="skipped:no-roster-copy"))
         # and the no-roster-copy SKIP row is structural for the action-row predicate too
@@ -1877,38 +1889,39 @@ class TestRsvpLedger:
             action="skip", reason=f"{mc.RSVP_NO_ROSTER_COPY_REASON}: x", rsvp="skipped:no-roster-copy"))
         assert cc is not None
 
-    def test_lex_withheld_is_ledgered_once_on_the_run_whose_guest_add_landed(
+    def test_lex_accept_is_ledgered_once_and_never_carries_a_title(
             self, monkeypatch, tmp_path):
-        """Code #13 review C2-1 (visibility half): a LEX withhold leaves cora@
-        guest-added but never joining. Before this it was excluded from the ledger
-        entirely, so the class read as a clean guest-add and surfaced only as a
-        next-day auditor miss. Now: ONE rsvp-accept row, outcome lex-withheld, on
-        the run whose guest-add landed; the next cycle's re-derived `none` row
-        adds nothing (idempotent, no growth)."""
+        """DELIBERATE FLIP (Code #14 R14-4, ruling 9.3; was
+        test_lex_withheld_is_ledgered_once_on_the_run_whose_guest_add_landed).
+        Run 1: the LEX guest-add lands and cora@ accepts -> ONE rsvp-accept row,
+        outcome accepted:lex, ids and (link, start) only. Run 2: the invite is
+        already accepted -> no write attempted to land, no second row. Neither the
+        LEX organiser nor the agency attendee nor the title reaches the ledger."""
         mod, ledger = self._load(monkeypatch, tmp_path)
+        outcomes = iter([(True, "accepted"), (False, "already-accepted")])
+        title = "Quiet Harbor Intake Review"
         cal = _Cal(monkeypatch, own=_own("e1", organizer="ops@lexingtonservices.com",
-                                         extra=("intake@county.gov",)))
-        # run 1: the guest-add lands, the accept is withheld
-        # run 2: cora@ now sits on the roster copy -> `none` row, withhold re-derived
-        roster_covered = _ev("r1", link=LINK, organizer="ops@lexingtonservices.com",
-                             attendees=["ops@lexingtonservices.com", "intake@county.gov", CORA])
-        own_covered = _own("c1", organizer="ops@lexingtonservices.com", extra=("intake@county.gov",))
-        plans = iter([_guest_add_plan(**_lex_kwargs()), _sweep_plan(own_covered, roster_covered)])
+                                         extra=("intake@county.gov",), summary=title))
+        monkeypatch.setattr(cal.cc, "set_own_response",
+                            lambda **k: cal.rsvps.append(k) or next(outcomes))
+        plans = iter([_guest_add_plan(summary=title, **_lex_kwargs()),
+                      _guest_add_plan(summary=title, **_lex_kwargs())])
         monkeypatch.setattr(mc, "plan_ensure", lambda d, c: next(plans))
         mod._run_day(DAY, _cfg(), apply=True)
         rows = self._rows(ledger)
         rsvp = [r for r in rows if r.get("action") == "rsvp-accept"]
         assert len(rsvp) == 1
-        assert rsvp[0]["outcome"] == "skipped:lex-withheld" and rsvp[0]["event_id"] == "e1"
+        assert rsvp[0]["outcome"] == "accepted:lex" and rsvp[0]["event_id"] == "e1"
         assert rsvp[0]["calendar"] == CORA and "title" not in rsvp[0]
-        assert cal.rsvps == []                              # withheld = no write, ever
+        assert rsvp[0]["meeting_link"] == LINK.lower() and rsvp[0]["start_ts"] > 0
         mod._run_day(DAY, _cfg(), apply=True)
         rows = self._rows(ledger)
         assert len([r for r in rows if r.get("action") == "rsvp-accept"]) == 1
         assert len([r for r in rows if r.get("row") == "summary"]) == 2
-        assert cal.rsvps == []
+        assert len(cal.rsvps) == 2                          # read both times, wrote once
         text = ledger.read_text(encoding="utf-8")
         assert "county.gov" not in text and "lexingtonservices" not in text
+        assert title not in text and "Quiet Harbor" not in text
 
     def test_error_row_carries_the_rsvp_error_not_the_action_error(self, monkeypatch, tmp_path):
         mod, ledger = self._load(monkeypatch, tmp_path)
@@ -1923,3 +1936,311 @@ class TestRsvpLedger:
         assert "read-back" in rsvp[0]["error"]
         ga = [r for r in rows if r.get("action") == "guest-add"][0]
         assert ga["error"] == "" and ga["was_applied"] is True
+
+
+# ── LEX INCLUDED in cora@'s own RSVP (Code #14 R14-4, ruling 2026-09-19 ask 9.3) ──
+#
+# The withhold is retired for the RSVP ONLY. Every gate that decides whether cora@
+# may be on a LEX meeting at all -- carve-outs, veto-on-any-copy, the no-roster-copy
+# skip, the notetaker check, the dual write gate, the display redaction -- must
+# behave exactly as before on a LEX fixture. One test per gate. Fixtures are
+# synthetic (D-145): random-word titles, placeholder addresses.
+
+def _lex_own(eid="e1", **kw):
+    return _own(eid, organizer="ops@lexingtonservices.com", extra=("intake@county.gov",), **kw)
+
+
+def _lex_roster(eid="r1", **kw):
+    return _ev(eid, link=LINK, **{**_lex_kwargs(), **kw})
+
+
+class TestRsvpLexIncluded:
+    def test_retired_outcome_is_gone_and_the_label_exists(self):
+        """Prevents: the withhold creeping back in under its old name."""
+        import inspect
+
+        assert "accepted:lex" in mc.RSVP_OUTCOMES
+        assert "skipped:lex-withheld" not in mc.RSVP_OUTCOMES
+        for fn in (mc._plan_rsvp, mc._rsvp_accept):
+            assert "lex-withheld" not in inspect.getsource(fn), fn.__name__
+
+    def test_sweep_accepts_a_lex_invite_as_cora_under_both_gates(self, monkeypatch):
+        """The sweep half: cora@ already on the LEX meeting (hand-invited), roster
+        copy visible and qualifying -> one accept, labelled accepted:lex."""
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        own = _lex_own("_cora-lex")
+        cal = _Cal(monkeypatch, own=own)
+        plan = _sweep_plan(own, _lex_roster(attendees=["ops@lexingtonservices.com",
+                                                      "intake@county.gov", CORA]))
+        res = mc.execute_ensure(plan, _cfg(), apply=True)
+        assert cal.rsvps == [{"user_email": CORA, "event_id": "_cora-lex"}]
+        assert cal.adds == [] and cal.copies == []
+        assert [a.rsvp for a in res.actions if a.action == "none"] == ["accepted:lex"]
+
+    def test_a_no_bot_marker_on_one_lex_copy_still_vetoes_the_meeting(self, monkeypatch):
+        """Gate: veto-on-any-copy. A [no-bot] on Harrison's copy of a LEX meeting
+        kills the meeting for BOTH halves, even with both write gates open."""
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        cal = _Cal(monkeypatch, own=_lex_own("c1"))
+        plan = mc.plan_ensure(DAY, _cfg(), list_events=_lister({
+            CORA: [_lex_own("c1")],
+            "harrison@hjrglobal.com": [_lex_roster("mine", summary="[no-bot] Quiet Harbor")],
+            "hannah@hjrglobal.com": [_lex_roster("theirs", summary="Quiet Harbor")],
+        }))
+        res = mc.execute_ensure(plan, _cfg(), apply=True)
+        assert cal.adds == [] and cal.rsvps == [] and cal.copies == []
+        assert [a.action for a in res.actions] == ["skip"]
+        assert not any(a.rsvp for a in res.actions)
+
+    def test_a_no_record_carve_out_on_a_lex_meeting_still_blocks_both_halves(self, monkeypatch):
+        """Gate: qualify_event's no-record carve-outs (domain, title) are evaluated
+        before any RSVP planning, LEX or not."""
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        cal = _Cal(monkeypatch, own=_lex_own("c1"))
+        for roster in (
+            _lex_roster(attendees=["ops@lexingtonservices.com", "partner@outsidefirm.com"]),
+            _lex_roster(summary="Quiet Harbor counsel review"),
+        ):
+            plan = _sweep_plan(_lex_own("c1"), roster)
+            res = mc.execute_ensure(plan, _cfg(), apply=True)
+            assert [a.action for a in res.actions] == ["skip"], roster["summary"]
+            assert res.actions[0].reason.startswith(("no-record-domain", "no-record-title"))
+        assert cal.adds == [] and cal.rsvps == []
+
+    def test_a_lex_invite_with_no_roster_copy_is_still_skipped(self, monkeypatch):
+        """Gate: never accept blind. Without a roster copy the veto set cannot be
+        evaluated, so a LEX invite is skipped exactly like any other."""
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        cal = _Cal(monkeypatch, own=_lex_own("lonely"))
+        res = mc.execute_ensure(_sweep_plan(_lex_own("lonely"), roster_events=[]),
+                                _cfg(), apply=True)
+        assert [a.rsvp for a in res.actions] == ["skipped:no-roster-copy"]
+        assert res.actions[0].title.startswith("LEX/PHI")
+        assert cal.rsvps == [] and cal.adds == []
+
+    def test_notetaker_on_a_lex_meeting_still_skips_at_plan_and_at_execute(self, monkeypatch):
+        """Gate: one mechanism per event, both halves. Plan: the sweep sees a bot
+        on the LEX invite. Execute: a bot was added AFTER the guest-add."""
+        res = _sweep_plan(
+            _own("c1", organizer="ops@lexingtonservices.com",
+                 extra=("intake@county.gov", mc.LEGACY_NOTETAKER)),
+            _lex_roster(attendees=["ops@lexingtonservices.com", "intake@county.gov",
+                                   mc.LEGACY_NOTETAKER]))
+        rows = [a for a in res.actions if a.action == "none"]
+        assert len(rows) == 1 and rows[0].rsvp == "skipped:notetaker-present"
+        assert rows[0].rsvp_planned is False
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        cal = _Cal(monkeypatch, own=_own("e1", organizer="ops@lexingtonservices.com",
+                                         extra=("intake@county.gov", mc.LEGACY_NOTETAKER)))
+        res = mc.execute_ensure(_guest_add_plan(**_lex_kwargs()), _cfg(), apply=True)
+        assert cal.rsvps == []
+        assert [a.rsvp for a in res.actions if a.action == "guest-add"] == ["skipped:notetaker-present"]
+
+    @pytest.mark.parametrize("mode,apply", [(None, True), ("plan", True), ("live", False)])
+    def test_the_dual_write_gate_still_holds_on_a_lex_meeting(self, monkeypatch, mode, apply):
+        """Gate: CORA_ONECORA_ENSURE=live AND --apply. Either alone writes nothing,
+        LEX included."""
+        if mode is None:
+            monkeypatch.delenv("CORA_ONECORA_ENSURE", raising=False)
+        else:
+            monkeypatch.setenv("CORA_ONECORA_ENSURE", mode)
+        cal = _Cal(monkeypatch, own=_lex_own("e1"))
+        plan = mc.plan_ensure(DAY, _cfg(), list_events=_lister({
+            CORA: [_lex_own("c2", link="https://meet.google.com/rsvp-test-bbb")],
+            "harrison@hjrglobal.com": [
+                _lex_roster("e1"),
+                _ev("r2", link="https://meet.google.com/rsvp-test-bbb", **_lex_kwargs()),
+            ],
+        }))
+        assert any(a.rsvp_planned for a in plan.actions)                  # precondition
+        res = mc.execute_ensure(plan, _cfg(), apply=apply)
+        assert res.applied is False
+        assert cal.rsvps == [] and cal.adds == [] and cal.copies == []
+        assert all(a.rsvp == "" for a in res.actions)
+
+    def test_display_rail_is_untouched_on_a_lex_meeting(self):
+        """Gate: display_title still redacts a LEX meeting to its shape and time."""
+        ev = _lex_roster(summary="Quiet Harbor Intake Review")
+        assert mc.display_title(ev) == f"LEX/PHI meeting, {mc.event_time_label(ev)}"
+        rows = [a for a in _guest_add_plan(summary="Quiet Harbor Intake Review",
+                                           **_lex_kwargs()).actions]
+        assert rows[0].title == mc.display_title(ev)
+        assert rows[0].reason == "in-domain organizer withheld"
+
+    def test_a_classifier_failure_can_only_mislabel_never_withhold(self, monkeypatch):
+        """is_lex_event fails SAFE to True. That used to WITHHOLD; now it may only
+        LABEL. A non-LEX meeting whose classifier raises is still accepted (the
+        write happens), and reads accepted:lex -- never an error, never a skip."""
+        from cora.connectors import fireflies_connector as ffc
+
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        cal = _Cal(monkeypatch)
+
+        def boom(_):
+            raise RuntimeError("classifier down")
+
+        monkeypatch.setattr(ffc, "classify_lex_meeting", boom)
+        res = mc.execute_ensure(_guest_add_plan(), _cfg(), apply=True)
+        act = [a for a in res.actions if a.action == "guest-add"][0]
+        assert cal.rsvps == [{"user_email": CORA, "event_id": "e1"}]
+        assert act.rsvp == "accepted:lex" and act.rsvp_error == ""
+        # and even an is_lex_event that itself raises cannot turn the accept into
+        # an error: the label wrapper fails toward the label, after the write.
+        plan2 = _guest_add_plan()   # planned first: display_title also calls is_lex_event
+        monkeypatch.setattr(mc, "is_lex_event", lambda ev: (_ for _ in ()).throw(ValueError("x")))
+        cal2 = _Cal(monkeypatch)
+        res2 = mc.execute_ensure(plan2, _cfg(), apply=True)
+        act2 = [a for a in res2.actions if a.action == "guest-add"][0]
+        assert len(cal2.rsvps) == 1 and act2.rsvp == "accepted:lex"
+
+    def test_already_accepted_lex_invite_is_not_relabelled_or_rewritten(self, monkeypatch):
+        """accepted:lex marks a WRITE. A LEX invite that was already accepted is
+        'already-accepted' like any other, so it earns no ledger row."""
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        cal = _Cal(monkeypatch, own=_lex_own("e1"), add=(False, "already-present"),
+                   rsvp=(False, "already-accepted"))
+        res = mc.execute_ensure(_guest_add_plan(**_lex_kwargs()), _cfg(), apply=True)
+        assert [a.rsvp for a in res.actions if a.action == "guest-add"] == ["already-accepted"]
+        assert len(cal.rsvps) == 1
+
+    def test_the_rsvp_log_line_keeps_its_pinned_prefix_and_labels_lex(self, monkeypatch, caplog):
+        """The observability key (pinned by test_rsvp_log_line_carries_link_and_start)
+        keeps its exact prefix; the LEX label rides after it. No title on the line."""
+        import logging
+
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        _Cal(monkeypatch, own=_lex_own("e1", summary="Quiet Harbor Intake Review"))
+        with caplog.at_level(logging.INFO, logger=mc.log.name):
+            mc.execute_ensure(_guest_add_plan(summary="Quiet Harbor Intake Review",
+                                              **_lex_kwargs()), _cfg(), apply=True)
+        lines = [r.getMessage() for r in caplog.records if "rsvp_accepted" in r.getMessage()]
+        assert len(lines) == 1
+        assert lines[0].startswith("rsvp_accepted event_id=e1 link=") and lines[0].endswith("lex=True")
+        assert "Quiet Harbor" not in lines[0] and "county.gov" not in lines[0]
+
+
+# ── the 07:22 audit counts cora@'s RSVP accepts, LEX apart (R14-4) ──────────────
+
+def _rsvp_rows(ledger_file, rows):
+    with ledger_file.open("a", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
+
+
+def _rr(outcome, *, day=DAY, link=LINK, start=1_000, eid="e1", applied=True, lane="ensure",
+        action="rsvp-accept"):
+    return {"ts": "2026-08-26T17:00:00+00:00", "lane": lane, "day": day, "mode": "live",
+            "applied": applied, "action": action, "outcome": outcome, "event_id": eid,
+            "calendar": CORA, "meeting_link": link, "start_ts": start, "error": ""}
+
+
+class TestRsvpCounts:
+    def test_counts_one_day_distinct_meetings_and_lex_apart(self, tmp_path):
+        ledger = tmp_path / "l.jsonl"
+        _rsvp_rows(ledger, [
+            _rr("accepted", link="https://meet.google.com/a-a-a"),
+            _rr("accepted:lex", link="https://meet.google.com/b-b-b"),
+            _rr("accepted:lex", link="https://meet.google.com/c-c-c"),
+            # an error re-ledgered every cycle, then accepted on the sweep (other id)
+            _rr("error", link="https://meet.google.com/d-d-d", eid="roster-id"),
+            _rr("error", link="https://meet.google.com/d-d-d", eid="roster-id"),
+            _rr("accepted", link="https://meet.google.com/d-d-d", eid="_cora-id"),
+            # an error never resolved, twice
+            _rr("error", link="https://meet.google.com/e-e-e"),
+            _rr("error", link="https://meet.google.com/e-e-e"),
+            _rr("skipped:notetaker-present", link="https://meet.google.com/f-f-f"),
+            # noise that must not count: another day, a plan-mode row, another lane,
+            # another action
+            _rr("accepted", day="2026-08-27", link="https://meet.google.com/g-g-g"),
+            _rr("accepted", applied=False, link="https://meet.google.com/h-h-h"),
+            _rr("accepted", lane="audit", link="https://meet.google.com/i-i-i"),
+            _rr("accepted", action="guest-add", link="https://meet.google.com/j-j-j"),
+        ])
+        with ledger.open("a", encoding="utf-8") as fh:
+            fh.write("{not json\n\n[1, 2]\n")
+        c = mc.rsvp_counts(DAY, path=ledger)
+        assert c == {"available": True, "accepted": 2, "accepted_lex": 2,
+                     "errors": 1, "notetaker_present": 1}
+
+    def test_default_path_is_the_redirected_ledger_and_a_missing_file_is_zero(self, tmp_path):
+        assert mc.rsvp_counts(DAY)["accepted"] == 0
+        mc.write_ledger([_rr("accepted:lex")])
+        assert mc.rsvp_counts(DAY)["accepted_lex"] == 1
+
+    def test_unreadable_ledger_is_unavailable_never_a_raise(self, tmp_path):
+        d = tmp_path / "a-directory"
+        d.mkdir()
+        c = mc.rsvp_counts(DAY, path=d)
+        assert c["available"] is False and c["accepted"] == 0
+
+    def test_counts_never_carry_ids_links_or_titles(self, tmp_path):
+        ledger = tmp_path / "l.jsonl"
+        _rsvp_rows(ledger, [_rr("accepted:lex")])
+        flat = json.dumps(mc.rsvp_counts(DAY, path=ledger))
+        assert "meet.google.com" not in flat and "e1" not in flat and "@" not in flat
+
+    def test_render_line_is_informational_below_the_verdict_and_never_vetoes(self):
+        """Counts only; after the clean-day line; a clean day stays clean."""
+        r = _audit({"harrison@hjrglobal.com": [_ev("evt-1")]}, [_t("t1", cal_id="evt-1")])
+        before = mc.render_report(r)
+        r.rsvp = {"available": True, "accepted": 3, "accepted_lex": 2, "errors": 1,
+                  "notetaker_present": 0}
+        out = mc.render_report(r)
+        line = "_RSVP as cora@: 5 accepted (2 LEX), 1 unresolved error(s)_"
+        assert line in out
+        assert "Every scheduled meeting captured exactly once." in out
+        assert out.index("captured exactly once") < out.index(line) < out.index(r.seat_note)
+        assert out.replace(f"\n\n{line}", "") == before
+
+    def test_render_line_absent_when_unattached_or_unavailable(self):
+        r = _audit({"harrison@hjrglobal.com": [_ev("evt-1")]}, [])
+        base = mc.render_report(r)
+        assert "RSVP as cora@" not in base
+        r.rsvp = {"available": False, "accepted": 9, "accepted_lex": 9, "errors": 9}
+        assert mc.render_report(r) == base
+
+    def test_render_line_sits_below_the_alarms_on_a_red_day(self):
+        r = _audit({"harrison@hjrglobal.com": [_ev("evt-1")]}, [])
+        r.rsvp = {"available": True, "accepted": 0, "accepted_lex": 1, "errors": 0}
+        out = mc.render_report(r)
+        assert out.index(":red_circle:") < out.index("_RSVP as cora@: 1 accepted (1 LEX)")
+
+    def test_audit_script_ledgers_rsvp_counts_and_stays_ids_only(self, monkeypatch, caplog):
+        """Behavioural: the 07:22 row carries rsvp_accepted / rsvp_accepted_lex /
+        rsvp_errors / rsvp_counts_available, the log line carries them, and no
+        title, link or address reaches the row."""
+        import importlib.util
+        import logging
+
+        spec = importlib.util.spec_from_file_location(
+            "_audit_script_rsvp", _REPO_ROOT / "scripts" / "run_meeting_capture_audit.py"
+        )
+        mod = importlib.util.module_from_spec(spec)
+        monkeypatch.setattr(sys, "argv", ["run_meeting_capture_audit.py", "--day", DAY])
+        spec.loader.exec_module(mod)
+
+        mc.write_ledger([
+            _rr("accepted", link="https://meet.google.com/a-a-a"),
+            _rr("accepted:lex", link="https://meet.google.com/b-b-b"),
+            _rr("error", link="https://meet.google.com/c-c-c"),
+        ])
+        report = _audit({"harrison@hjrglobal.com": [_ev("evt-1", summary="Vermilion Kestrel")]},
+                        [_t("t1", cal_id="evt-1")])
+        monkeypatch.setattr(mod.mc, "load_config", lambda: _cfg())
+        monkeypatch.setattr(mod.mc, "audit_day", lambda day, cfg: report)
+        monkeypatch.setattr(mod.run_marker, "write", lambda task, **kw: None)
+        printed: list[str] = []
+        monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(map(str, a))))
+        with caplog.at_level(logging.INFO, logger=mod.log.name):
+            assert mod.main() == 0
+        logged = [r.getMessage() for r in caplog.records]
+
+        rows = [json.loads(l) for l in mc.ledger_path().read_text(encoding="utf-8").splitlines()]
+        row = [r for r in rows if r.get("lane") == "audit"][-1]
+        assert row["rsvp_accepted"] == 1 and row["rsvp_accepted_lex"] == 1
+        assert row["rsvp_errors"] == 1 and row["rsvp_counts_available"] is True
+        flat = json.dumps({k: v for k, v in row.items() if k.startswith("rsvp")})
+        assert "meet.google.com" not in flat and "@" not in flat
+        assert "Vermilion Kestrel" not in json.dumps(row)
+        assert any("rsvp_accepted=1 rsvp_accepted_lex=1 rsvp_errors=1" in m for m in logged)
+        assert any("_RSVP as cora@: 2 accepted (1 LEX), 1 unresolved error(s)_" in p for p in printed)

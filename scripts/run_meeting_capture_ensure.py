@@ -25,6 +25,10 @@ HYBRID MECHANIC (plan of record, Option A + B):
                   lane ACCEPTS the invite AS cora@ (R1, 2026-09-08). Same dual
                   gate; read back before it counts; ledgered as action
                   `rsvp-accept` keyed on (meeting_link, start_ts), never a title.
+                  LEX invites are INCLUDED (ruled 2026-09-19, ask 9.3): a LEX
+                  accept is the same write, ledgered with outcome `accepted:lex`
+                  so the 07:22 audit counts it apart. Carve-outs, vetoes and the
+                  display redaction are unchanged.
 
 Run:  python scripts/run_meeting_capture_ensure.py [--day YYYY-MM-DD] [--apply]
       (default day: today AND tomorrow, matching the T+0/T+1 sweep)
@@ -66,26 +70,20 @@ _STRUCTURAL_SKIPS = ("not-a-meeting", "no-meeting-link", "cancelled",
                      mc.RSVP_NO_ROSTER_COPY_REASON)
 
 #: RSVP sub-step outcomes that earn an `rsvp-accept` ledger row. An accept is a
-#: real write; an error is a failure to diagnose; notetaker-present is the
-#: one-mechanism rule firing AFTER a guest-add (a second bot was averted). The
-#: rest -- already-accepted, no-roster-copy -- are re-derived every 15 minutes
-#: and would be pure ledger growth.
-_RSVP_LEDGERED = ("accepted", "error", "skipped:notetaker-present")
-
-#: lex-withheld is the one skip that leaves cora@ GUEST-ADDED but never joining
-#: (R1 withhold on a LEX event). Invisible, that class reads as a clean guest-add
-#: and surfaces only as a next-day auditor miss (Code #13 review, C2-1). It is
-#: ledgered ONCE -- on the run whose guest-add landed (`applied`), the write whose
-#: consequence it is -- not on the `none` row that re-derives it every cycle
-#: afterwards (that would be the ~96 rows/day growth the block above is costed
-#: against).
-_RSVP_LEDGERED_ONCE_ON_APPLY = ("skipped:lex-withheld",)
+#: real write (a LEX accept, `accepted:lex`, is the same write and is ledgered
+#: the same way -- ruled 2026-09-19, ask 9.3); an error is a failure to diagnose;
+#: notetaker-present is the one-mechanism rule firing AFTER a guest-add (a second
+#: bot was averted). The rest -- already-accepted, no-roster-copy -- are
+#: re-derived every 15 minutes and would be pure ledger growth.
+#:
+#: The former once-on-apply class (`skipped:lex-withheld`, a guest-add whose
+#: accept was withheld) is RETIRED with the withhold itself: no outcome now leaves
+#: cora@ guest-added but deliberately never joining.
+_RSVP_LEDGERED = ("accepted", "accepted:lex", "error", "skipped:notetaker-present")
 
 
 def _rsvp_ledger_worthy(act: mc.EnsureAction) -> bool:
-    if act.rsvp in _RSVP_LEDGERED:
-        return True
-    return act.rsvp in _RSVP_LEDGERED_ONCE_ON_APPLY and act.applied
+    return act.rsvp in _RSVP_LEDGERED
 
 
 def _action_row_worthy(act: mc.EnsureAction) -> bool:

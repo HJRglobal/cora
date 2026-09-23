@@ -107,15 +107,21 @@ def main() -> int:
 
     log.info("auditing %s across %d roster calendars", day, len(cfg.active_members))
     report = mc.audit_day(day, cfg)
+    # cora@'s own RSVP accepts for the audited day, LEX counted apart (ruled
+    # 2026-09-19, ask 9.3). A READ of the ensure lane's ledger rows -- counts only,
+    # informational, never part of the clean-day verdict.
+    rsvp = mc.rsvp_counts(day)
+    report.rsvp = rsvp
     text = mc.render_report(report)
 
     print("\n" + text + "\n")
     log.info(
         "audit %s: scheduled=%d captured=%d missed=%d unconvened=%d dup=%d unmatched=%d "
-        "skipped=%d failed_calendars=%d",
+        "skipped=%d failed_calendars=%d rsvp_accepted=%d rsvp_accepted_lex=%d rsvp_errors=%d",
         day, report.scheduled, report.captured, len(report.misses),
         len(report.unconvened), len(report.duplicates), len(report.unmatched_transcripts),
         len(report.skipped), len(report.failed_calendars),
+        rsvp["accepted"], rsvp["accepted_lex"], rsvp["errors"],
     )
 
     mc.write_ledger([{
@@ -144,6 +150,12 @@ def main() -> int:
         "missed_event_ids": [m.event_id for m in report.misses],
         "unconvened_event_ids": [m.event_id for m in report.unconvened],
         "duplicated_event_ids": [m.event_id for m in report.duplicates],
+        # cora@'s own RSVP accepts for this day (distinct meetings; counts only).
+        # rsvp_accepted is NON-LEX; LEX accepts are rsvp_accepted_lex.
+        "rsvp_accepted": rsvp["accepted"],
+        "rsvp_accepted_lex": rsvp["accepted_lex"],
+        "rsvp_errors": rsvp["errors"],
+        "rsvp_counts_available": rsvp["available"],
     }])
 
     if args.post:
