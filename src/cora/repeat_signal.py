@@ -246,15 +246,11 @@ def _card_update_id(signal_key: str, cycle: int) -> str:
     return base if cycle <= 0 else f"{base}-{cycle}"
 
 
-def _mint_card(signal_key: str, st: _State, *, subject: str, entity: str,
-               owner_slack_id: str, owner_name: str) -> str | None:
-    """Mint the ONE propose-only decision card, exactly like
-    gap_autofill.route_disputed_to_decision_lane: decision_inbox.screen_decision
-    first (LEX/PHI fail-closed), then knowledge_review.propose_update with
-    UPDATE_TYPE_DECISION, confidence MED, the three options as TEXT. The
-    existing Accept-to-inbox / Dismiss card IS the card; either tap acks.
-    Returns the update_id when a PENDING card exists for this cycle, else None
-    (and the caller must NOT suppress)."""
+def _card_candidate(signal_key: str, st: _State, *, subject: str, entity: str,
+                    owner_slack_id: str, owner_name: str) -> dict[str, Any]:
+    """The decision-card candidate a tier-3 fire would mint. ONE builder shared by
+    the real mint and the dry-run preview, so the preview screens exactly the
+    input the real run screens (R14-1)."""
     who = owner_name or owner_slack_id or "unassigned"
     tag = f"[{entity}] " if entity else ""
     description = (
@@ -277,17 +273,63 @@ def _mint_card(signal_key: str, st: _State, *, subject: str, entity: str,
         },
         "source_evidence": "",
     }
+    return candidate
+
+
+def _card_screened_out(signal_key: str, candidate: dict[str, Any]) -> bool:
+    """decision_inbox.screen_decision, fail-closed: True = no card may exist for
+    this candidate (LEX/PHI withheld, or the screen itself errored)."""
     try:
         from .decision_inbox import screen_decision
         excluded, why = screen_decision(candidate)
     except Exception:  # noqa: BLE001 -- fail closed
         log.warning("repeat_signal: decision screen errored for %s -- no card", signal_key,
                     exc_info=True)
-        return None
+        return True
     if excluded:
         log.warning("repeat_signal: tier-3 card for %s withheld by the decision screen "
                     "(%s) -- no suppression, the normal surface keeps alarming",
                     signal_key, why)
+        return True
+    return False
+
+
+def _preview_card(signal_key: str, st: _State, *, subject: str, entity: str,
+                  owner_slack_id: str, owner_name: str) -> str | None:
+    """The DRY-RUN twin of _mint_card: the same screen over the same candidate,
+    and the same "already resolved for this cycle -> no suppression" rule, with no
+    write. Without it a dry run over a LEX/PHI gate previewed "suppressed pending
+    ack" while the real run stayed CRITICAL (R14-1: a dry run must predict the
+    real run, not a friendlier one). Unreadable proposal file -> None (the
+    preview says "would alarm", the conservative prediction)."""
+    candidate = _card_candidate(signal_key, st, subject=subject, entity=entity,
+                                owner_slack_id=owner_slack_id, owner_name=owner_name)
+    if _card_screened_out(signal_key, candidate):
+        return None
+    update_id = _card_update_id(signal_key, st.cycle)
+    try:
+        from .knowledge_review import _find_update
+        existing = _find_update(update_id)
+    except Exception:  # noqa: BLE001 -- a preview never raises
+        log.warning("repeat_signal: preview could not read card %s", update_id, exc_info=True)
+        return None
+    if existing is not None and existing.get("state") != "PENDING":
+        return None
+    return update_id
+
+
+def _mint_card(signal_key: str, st: _State, *, subject: str, entity: str,
+               owner_slack_id: str, owner_name: str) -> str | None:
+    """Mint the ONE propose-only decision card, exactly like
+    gap_autofill.route_disputed_to_decision_lane: decision_inbox.screen_decision
+    first (LEX/PHI fail-closed), then knowledge_review.propose_update with
+    UPDATE_TYPE_DECISION, confidence MED, the three options as TEXT. The
+    existing Accept-to-inbox / Dismiss card IS the card; either tap acks.
+    Returns the update_id when a PENDING card exists for this cycle, else None
+    (and the caller must NOT suppress)."""
+    candidate = _card_candidate(signal_key, st, subject=subject, entity=entity,
+                                owner_slack_id=owner_slack_id, owner_name=owner_name)
+    if _card_screened_out(signal_key, candidate):
         return None
     update_id = _card_update_id(signal_key, st.cycle)
     try:
@@ -295,7 +337,7 @@ def _mint_card(signal_key: str, st: _State, *, subject: str, entity: str,
         proposed = propose_update(
             update_id=update_id,
             update_type=UPDATE_TYPE_DECISION,
-            description=description,
+            description=candidate["description"],
             payload=candidate["payload"],
             source_evidence="",
             confidence="MED",
@@ -395,8 +437,11 @@ def fire(signal_key: str, *, fire_id: str, subject: str, entity: str,
     suppressed = False
     if tier == TIER_CARD:
         if dry_run:
-            card_id = _card_update_id(key, st.cycle)
-            suppressed = True
+            card_id = _preview_card(key, st, subject=str(subject or ""),
+                                    entity=str(entity or ""),
+                                    owner_slack_id=str(owner_slack_id or ""),
+                                    owner_name=str(owner_name or ""))
+            suppressed = card_id is not None
         else:
             card_id = _mint_card(key, st, subject=str(subject or ""), entity=str(entity or ""),
                                  owner_slack_id=str(owner_slack_id or ""),

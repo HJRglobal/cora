@@ -864,8 +864,15 @@ def check_qbo_monitor(now: datetime | None = None) -> CheckResult:
     return CheckResult("QBO token monitor", "ok", f"Registered; last ran {age_h:.0f}h ago.")
 
 
-def check_decision_gates(today: date | None = None) -> CheckResult:
+def check_decision_gates(today: date | None = None, *, dry_run: bool = False) -> CheckResult:
     """An Open decision past its GATE date that no surface has delivered.
+
+    `dry_run=True` (the script's --dry-run, R14-1 / D-290) computes the SAME
+    verdict and writes NOTHING: no repeat-signal clear / ack / fire /
+    suppressed / implicit-ack row, no tier-3 card, no `ping:` delivery row. A
+    dry run is a claim about every write site; this check has five (the clear
+    reconciliation, the answered-alert ack, repeat_signal.fire's three row kinds,
+    the card mint inside fire, and the ping record).
 
     cq-232fe6a541ff. Five decisions (OSN data source, Jerry DW access, BDM
     department lock, Eric LEX Learning Center, LEX Phase 2) sat Open past their
@@ -908,7 +915,7 @@ def check_decision_gates(today: date | None = None) -> CheckResult:
     # The file WAS read: any gate signal whose row is no longer overdue-undelivered
     # (CLOSED heading, "Recently resolved" tail, gate re-dated, real delivery)
     # has cleared. Runs before the no-gates return so a removed gate clears too.
-    _gate_reconcile_clears(overdue)
+    _gate_reconcile_clears(overdue, dry_run=dry_run)
     if not gated:
         # Truthful, and the actionable half: with no gate dates recorded, this
         # control has nothing to enforce. Do NOT report "ok".
@@ -928,13 +935,17 @@ def check_decision_gates(today: date | None = None) -> CheckResult:
     # (decision_alerts ANSWERED), the CLOSED/RESOLVED heading or the "Recently
     # resolved" tail (fact clears), or Harrison's tap on the tier-3 card.
     if overdue:
-        alarmed, suppressed, acked = _gate_escalate(overdue, today=today)
-        try:
-            decision_lane.record_delivery(
-                [r.get("raw_topic") or r.get("topic", "") for r in alarmed],
-                decision_lane.PING_SURFACE_PREFIX + "health_check")
-        except Exception:  # noqa: BLE001 -- evidence never breaks the check
-            log.warning("check_decision_gates: ping record failed", exc_info=True)
+        alarmed, suppressed, acked = _gate_escalate(overdue, today=today, dry_run=dry_run)
+        if dry_run:
+            log.info("[DRY-RUN] check_decision_gates: would record %d ping row(s)",
+                     len(alarmed))
+        else:
+            try:
+                decision_lane.record_delivery(
+                    [r.get("raw_topic") or r.get("topic", "") for r in alarmed],
+                    decision_lane.PING_SURFACE_PREFIX + "health_check")
+            except Exception:  # noqa: BLE001 -- evidence never breaks the check
+                log.warning("check_decision_gates: ping record failed", exc_info=True)
         notes: list[str] = []
         for row in suppressed:
             notes.append(
@@ -986,23 +997,33 @@ def _gate_owner(row: dict) -> tuple[str, str]:
     return repeat_signal.HARRISON_SLACK_ID, "Harrison"
 
 
-def _gate_reconcile_clears(overdue: list[dict]) -> None:
+def _gate_reconcile_clears(overdue: list[dict], *, dry_run: bool = False) -> list[str]:
     """A gate signal whose fact has gone away -- the heading now carries CLOSED /
     RESOLVED, the entry moved under '## Recently resolved', the gate date moved,
     or a real surface delivered it -- is no longer in `overdue`. CLEAR it so the
-    ledger records the reset and the next blown gate starts at tier 1."""
+    ledger records the reset and the next blown gate starts at tier 1.
+
+    Returns the keys that cleared (or, under `dry_run`, WOULD clear -- nothing is
+    written)."""
+    cleared: list[str] = []
     try:
         from cora import repeat_signal
         live = {_gate_signal_key(r) for r in overdue}
         for key in repeat_signal.active_keys(prefix=_GATE_SIGNAL_TASK + "|"):
-            if key not in live:
-                repeat_signal.clear(key, why="gate no longer overdue-undelivered "
-                                             "(closed/resolved/delivered/re-dated)")
+            if key in live:
+                continue
+            cleared.append(key)
+            if dry_run:
+                log.info("[DRY-RUN] check_decision_gates: would clear %s", key)
+                continue
+            repeat_signal.clear(key, why="gate no longer overdue-undelivered "
+                                         "(closed/resolved/delivered/re-dated)")
     except Exception:  # noqa: BLE001 -- bookkeeping never breaks the check
         log.warning("check_decision_gates: clear reconciliation failed", exc_info=True)
+    return cleared
 
 
-def _gate_escalate(overdue: list[dict], *, today: date | None
+def _gate_escalate(overdue: list[dict], *, today: date | None, dry_run: bool = False
                    ) -> tuple[list[dict], list[dict], list[dict]]:
     """Route each overdue row through repeat_signal.fire (fire_id = today).
 
@@ -1011,7 +1032,10 @@ def _gate_escalate(overdue: list[dict], *, today: date | None
     each, `acked` (a human answered the decision alert in-thread) is excluded --
     a blown gate alarms daily until a HUMAN ack, and this IS the ack. If
     repeat_signal is unavailable the check falls back to pass-through: every row
-    alarms (the ladder row's demotion posture)."""
+    alarms (the ladder row's demotion posture).
+
+    `dry_run` classifies exactly as a real run would and writes nothing: the ack
+    is skipped (the row still counts as acked) and fire() previews."""
     try:
         from cora import decision_alerts, repeat_signal
     except Exception:  # noqa: BLE001
@@ -1031,7 +1055,8 @@ def _gate_escalate(overdue: list[dict], *, today: date | None
         try:
             raw_topic = str(row.get("raw_topic") or row.get("topic") or "")
             if decision_alerts.topic_key(raw_topic) in answered:
-                repeat_signal.ack(key, via="decision-alert-reply")
+                if not dry_run:
+                    repeat_signal.ack(key, via="decision-alert-reply")
                 acked.append(row)
                 continue
             owner_id, owner_name = _gate_owner(row)
@@ -1042,7 +1067,8 @@ def _gate_escalate(overdue: list[dict], *, today: date | None
                 subject=f"decision gate blown: {row.get('topic')}",
                 entity=str(row.get("entity") or ""),
                 owner_slack_id=owner_id, owner_name=owner_name,
-                normal_surface="#cora-health")
+                normal_surface="#cora-health",
+                dry_run=dry_run)
         except Exception:  # noqa: BLE001 -- escalation never silences the alarm
             log.warning("check_decision_gates: repeat_signal.fire failed for %s -- alarming",
                         key, exc_info=True)
@@ -1987,8 +2013,12 @@ def check_logs_24h() -> list[CheckResult]:
     return results
 
 
-def check_kb_health() -> list[CheckResult]:
-    """Check KB chunk counts by source; compare to yesterday's baseline."""
+def check_kb_health(*, dry_run: bool = False) -> list[CheckResult]:
+    """Check KB chunk counts by source; compare to yesterday's baseline.
+
+    `dry_run` compares but does NOT rewrite the baseline (R14-1 / D-290): a dry
+    run that overwrote "yesterday" would hide a >20% drop that happened before it
+    from the next real run."""
     results: list[CheckResult] = []
     if not _KB_DB.exists():
         return [CheckResult("KB database", "critical", "cora_kb.db not found.")]
@@ -2020,12 +2050,15 @@ def check_kb_health() -> list[CheckResult]:
         if prev > 50 and count < prev * 0.8:
             problems.append(f"{source}: {count} chunks (was {prev}, -{(prev-count)/prev*100:.0f}%)")
 
-    # Save new baseline
-    try:
-        _BASELINE.parent.mkdir(parents=True, exist_ok=True)
-        _BASELINE.write_text(json.dumps(counts))
-    except Exception:
-        pass
+    # Save new baseline (never under --dry-run)
+    if dry_run:
+        log.info("[DRY-RUN] check_kb_health: baseline not rewritten")
+    else:
+        try:
+            _BASELINE.parent.mkdir(parents=True, exist_ok=True)
+            _BASELINE.write_text(json.dumps(counts))
+        except Exception:
+            pass
 
     source_summary = " | ".join(f"{s}: {c:,}" for s, c in sorted(counts.items()))
 
@@ -2213,8 +2246,11 @@ def check_disk_space() -> CheckResult:
         return CheckResult("Disk space", "warn", f"Could not check disk: {exc}")
 
 
-def check_flywheel() -> list[CheckResult]:
+def check_flywheel(*, dry_run: bool = False) -> list[CheckResult]:
     """Knowledge-flywheel throughput (WS-2) — catch the loop silently dying.
+
+    `dry_run` reads metrics without appending today's pending-size baseline
+    (R14-1 / D-290: the only write this check makes).
 
     The flywheel flatlined for 2+ weeks in June 2026 (0 knowledge DMs, gap log
     dry since 6/15, zero shadow records) and nothing alarmed. Metrics +
@@ -2230,7 +2266,7 @@ def check_flywheel() -> list[CheckResult]:
     """
     try:
         from cora import flywheel_metrics as fm
-        metrics = fm.collect(update_baseline=True)
+        metrics = fm.collect(update_baseline=not dry_run)
         alarms = fm.evaluate(metrics)
         results = [
             CheckResult("Flywheel", "warn", msg) for _sev, msg in alarms
@@ -2543,7 +2579,7 @@ def main() -> int:
     all_results.append(check_windowless_launcher())
 
     log.info("Checking decision gate dates...")
-    all_results.append(check_decision_gates())
+    all_results.append(check_decision_gates(dry_run=args.dry_run))
 
     log.info("Checking QBO token monitor freshness...")
     all_results.append(check_qbo_monitor())
@@ -2575,7 +2611,7 @@ def main() -> int:
     all_results.extend(check_logs_24h())
 
     log.info("Checking KB health...")
-    all_results.extend(check_kb_health())
+    all_results.extend(check_kb_health(dry_run=args.dry_run))
 
     log.info("Checking API connectivity...")
     all_results.extend(check_api_connectivity())
@@ -2587,7 +2623,7 @@ def main() -> int:
     all_results.append(check_disk_space())
 
     log.info("Checking knowledge-flywheel throughput...")
-    all_results.extend(check_flywheel())
+    all_results.extend(check_flywheel(dry_run=args.dry_run))
 
     log.info("Checking for APPROVED P0/P1 items missing a kickoff prompt...")
     all_results.append(check_priority_kickoffs())
