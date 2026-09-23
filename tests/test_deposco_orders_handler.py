@@ -265,6 +265,61 @@ class TestLiveDriftReCheck:
 # ── Outcome classification ────────────────────────────────────────────────────
 
 
+class TestPushErrorBranches:
+    """D-051 review, 2026-09-23: three explicitly-handled error branches in
+    process_push_tap had zero test coverage in either handler test file."""
+
+    def test_deposco_push_refused_releases_the_claim_and_reports_error(self, monkeypatch):
+        entry = _stage()
+        _patch_clients(
+            monkeypatch, reference_hit=False,
+            read_client=FakeReadClient(find_order_detail_sequence=[None]),
+        )
+
+        class RefusingPushClient:
+            def push_order(self, payload, *, channel, claimed_pending_id):
+                raise dpush.DeposcoPushRefused("no channel allowlist")
+
+        monkeypatch.setattr(handler.dpush, "DeposcoPushClient", lambda **kw: RefusingPushClient())
+        outcome, msg = handler.process_push_tap(entry["id"], handler.HARRISON_ID)
+        assert outcome == "error"
+        assert "refused" in msg.lower()
+        assert pending.get_entry(entry["id"])["state"] == pending.STATE_STAGED
+
+    def test_deposco_auth_error_on_push_releases_the_claim_and_reports_error(self, monkeypatch):
+        entry = _stage()
+        _patch_clients(
+            monkeypatch, reference_hit=False,
+            read_client=FakeReadClient(find_order_detail_sequence=[None]),
+        )
+
+        class AuthFailingPushClient:
+            def push_order(self, payload, *, channel, claimed_pending_id):
+                raise dc.DeposcoAuthError("credentials rejected")
+
+        monkeypatch.setattr(handler.dpush, "DeposcoPushClient", lambda **kw: AuthFailingPushClient())
+        outcome, msg = handler.process_push_tap(entry["id"], handler.HARRISON_ID)
+        assert outcome == "error"
+        assert "credentials" in msg.lower()
+        assert pending.get_entry(entry["id"])["state"] == pending.STATE_STAGED
+
+    def test_a_live_preflight_recheck_error_releases_the_claim_never_pushes(self, monkeypatch):
+        monkeypatch.setattr(handler.preflight, "_reference_exists", lambda c, r: False)
+        entry = _stage()
+
+        class ExplodingReadClient:
+            def find_order_detail(self, order_type, number):
+                raise dc.DeposcoUnavailable("network down during recheck")
+
+        monkeypatch.setattr(handler.dc, "DeposcoClient", lambda **kw: ExplodingReadClient())
+        push_client = FakePushClient(dpush.PushOutcome(env="prod", status=201, text="201 Created"))
+        monkeypatch.setattr(handler.dpush, "DeposcoPushClient", lambda **kw: push_client)
+        outcome, msg = handler.process_push_tap(entry["id"], handler.HARRISON_ID)
+        assert outcome == "error"
+        assert push_client.calls == [], "a re-check failure must prevent the push entirely"
+        assert pending.get_entry(entry["id"])["state"] == pending.STATE_STAGED
+
+
 class TestOutcomeClassification:
     def test_201_plus_clean_readback_is_confirmed(self, monkeypatch):
         entry = _stage()
@@ -433,6 +488,83 @@ class TestOutcomeClassification:
         assert "Call Nimbl now" in msg
 
 
+# ── Standing-tier authority (D-051 review, 2026-09-23: zero coverage despite ──
+# ── the module's own docstring claiming "wired and tested so the code is READY") ─
+
+
+class TestStandingTierAuthority:
+    """Inert in THIS build (no channel is ever in CORA_DEPOSCO_STANDING_CHANNELS
+    by default), but the logic must still be correct for when it activates."""
+
+    def test_a_standing_approver_can_push(self, monkeypatch):
+        monkeypatch.setenv("CORA_DEPOSCO_STANDING_CHANNELS", "wholesale")
+        entry = _stage()  # authored_by="Harrison" per SPEC
+        _patch_clients(
+            monkeypatch, reference_hit=False,
+            read_client=FakeReadClient(find_order_detail_sequence=[None, _record(entry["number"])]),
+            push_client=FakePushClient(dpush.PushOutcome(env="prod", status=201, text="201 Created")),
+        )
+        outcome, _ = handler.process_push_tap(entry["id"], handler.ALEX_ID)
+        assert outcome == "confirmed"
+
+    def test_a_non_standing_approver_is_refused_in_standing_mode(self, monkeypatch):
+        monkeypatch.setenv("CORA_DEPOSCO_STANDING_CHANNELS", "wholesale")
+        entry = _stage()
+        outcome, _ = handler.process_push_tap(entry["id"], JUSTIN_ID)
+        assert outcome == "not_authorized"
+        assert pending.get_entry(entry["id"])["state"] == pending.STATE_STAGED
+
+    def test_the_author_cannot_approve_their_own_spec_in_standing_mode(self, monkeypatch):
+        """The two-person rule: author != approver."""
+        monkeypatch.setenv("CORA_DEPOSCO_STANDING_CHANNELS", "wholesale")
+        alex_authored_spec = spec_mod.OrderSpec(
+            channel="wholesale", buyer_or_fc_code="GOTHAM", reference="4472",
+            authored_by="Alex",
+            lines=[spec_mod.OrderSpecLine(sku="PURE-Original", qty=100, unit_price="21.70")],
+        )
+        entry = _stage(alex_authored_spec)
+        outcome, msg = handler.process_push_tap(entry["id"], handler.ALEX_ID)
+        assert outcome == "not_authorized"
+        assert "two-person rule" in msg
+        assert pending.get_entry(entry["id"])["state"] == pending.STATE_STAGED
+
+    def test_a_different_standing_approver_can_push_the_authors_spec(self, monkeypatch):
+        """Eric did not author it, so he may approve Alex's spec."""
+        monkeypatch.setenv("CORA_DEPOSCO_STANDING_CHANNELS", "wholesale")
+        alex_authored_spec = spec_mod.OrderSpec(
+            channel="wholesale", buyer_or_fc_code="GOTHAM", reference="4471",
+            authored_by="Alex",
+            lines=[spec_mod.OrderSpecLine(sku="PURE-Original", qty=208, unit_price="21.70")],
+        )
+        entry = _stage(alex_authored_spec)
+        _patch_clients(
+            monkeypatch, reference_hit=False,
+            read_client=FakeReadClient(find_order_detail_sequence=[None, _record(entry["number"])]),
+            push_client=FakePushClient(dpush.PushOutcome(env="prod", status=201, text="201 Created")),
+        )
+        outcome, _ = handler.process_push_tap(entry["id"], handler.ERIC_ID)
+        assert outcome == "confirmed"
+
+    def test_standing_requires_the_channel_to_actually_be_in_the_env_flag(self, monkeypatch):
+        """Alex is a standing approver in general, but this channel is not
+        (yet) in the env flag -- supervised (Harrison-only) still applies."""
+        monkeypatch.delenv("CORA_DEPOSCO_STANDING_CHANNELS", raising=False)
+        entry = _stage()
+        outcome, _ = handler.process_push_tap(entry["id"], handler.ALEX_ID)
+        assert outcome == "not_authorized"
+
+    def test_author_match_is_case_insensitive_on_the_stored_name(self, monkeypatch):
+        monkeypatch.setenv("CORA_DEPOSCO_STANDING_CHANNELS", "wholesale")
+        spec_with_mixed_case_author = spec_mod.OrderSpec(
+            channel="wholesale", buyer_or_fc_code="GOTHAM", reference="4473",
+            authored_by="ALEX",
+            lines=[spec_mod.OrderSpecLine(sku="PURE-Original", qty=100, unit_price="21.70")],
+        )
+        entry = _stage(spec_with_mixed_case_author)
+        outcome, _ = handler.process_push_tap(entry["id"], handler.ALEX_ID)
+        assert outcome == "not_authorized"
+
+
 # ── Integration: the REAL DeposcoPushClient's prod gate, reached through handler ──
 
 
@@ -523,6 +655,53 @@ class TestRealPushClientProdGateReachedThroughHandler:
 
 
 # ── Dismiss ───────────────────────────────────────────────────────────────────
+
+
+class TestDeliverCard:
+    """D-051 review, 2026-09-23: deliver_card had zero test coverage anywhere."""
+
+    def test_no_client_records_but_does_not_deliver(self, monkeypatch):
+        entry = _stage()
+        result = handler.deliver_card(
+            entry, "fallback text", [], client_factory=lambda: None,
+        )
+        assert result.get("dm_channel_id", "") == ""
+        assert result.get("dm_message_ts", "") == ""
+
+    def test_a_successful_send_records_delivery(self):
+        entry = _stage()
+
+        class FakeSlackClient:
+            def conversations_open(self, users):
+                assert users == [handler.HARRISON_ID]
+                return {"channel": {"id": "D0HARRISON"}}
+
+            def chat_postMessage(self, **kw):
+                return {"ts": "1700000000.000001"}
+
+        result = handler.deliver_card(
+            entry, "fallback text", [{"type": "section"}],
+            client_factory=lambda: FakeSlackClient(),
+        )
+        assert result["dm_channel_id"] == "D0HARRISON"
+        assert result["dm_message_ts"] == "1700000000.000001"
+        stored = pending.get_entry(entry["id"])
+        assert stored["dm_channel_id"] == "D0HARRISON"
+        assert stored["dm_message_ts"] == "1700000000.000001"
+
+    def test_a_slack_failure_is_fail_soft_entry_stays_recorded(self):
+        entry = _stage()
+
+        class ExplodingSlackClient:
+            def conversations_open(self, users):
+                raise RuntimeError("slack is down")
+
+        result = handler.deliver_card(
+            entry, "fallback text", [], client_factory=lambda: ExplodingSlackClient(),
+        )
+        assert result.get("dm_message_ts", "") == ""
+        # the entry itself must still exist, just undelivered
+        assert pending.get_entry(entry["id"]) is not None
 
 
 class TestDismissTap:

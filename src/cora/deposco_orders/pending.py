@@ -17,6 +17,19 @@ mid-write tearing the file, and a process-local `threading.Lock` around the
 CLAIM step guards the race THAT DOES exist: two near-simultaneous taps on the
 SAME running bot process (the same race `publish_cards._LOCK` guards).
 
+KNOWN, ACCEPTED LIMIT (D-051 review, 2026-09-23, flagged not fixed): the
+`threading.Lock` above is process-local, not a cross-process guard. If the
+stacked-instance failure mode CLAUDE.md doctrine #5 documents (two live
+`cowork-cora-service` processes briefly co-resident after a botched restart)
+recurs AND a tap is somehow delivered to both, each process's lock only
+serializes within itself -- both could read STAGED before either write
+lands, defeating exactly-once. This is the SAME limitation
+`f3e_blog.publish_cards._LOCK` already carries for the identical reason; a
+real fix (cross-process file lock or a DB transaction) is an architecture
+change beyond this build's scope, and this build does not widen the
+exposure relative to what already ships. The single-instance restart
+doctrine is the actual control; not re-derived here, flagged for Harrison.
+
 Ledger (`data/state/deposco-push-ledger.jsonl`) is append-only, one row per
 resolved pending entry. The per-channel CONSECUTIVE-CLEAN COUNTER is DERIVED
 from it, never stored separately (1kkkkkkk honesty rail).

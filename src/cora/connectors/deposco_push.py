@@ -135,7 +135,20 @@ class PushOutcome:
     @property
     def updated(self) -> bool:
         """True when the body says an existing order was silently UPDATED --
-        the D-182 alarm condition. Never true at the same time as `created`."""
+        the D-182 alarm condition. Never true at the same time as `created`.
+
+        DELIBERATELY BROADER than `created`/`conflict` (D-051 review,
+        2026-09-23, flagged not tightened): this is an unanchored substring
+        match with no paired status-code requirement, because an "Updated"
+        response has NEVER been observed live -- only `created` (multiple
+        times) and `conflict` (once) are pinned against real bodies. Adding a
+        status-code pairing here would be GUESSING that shape rather than
+        verifying it, and this is the alarm condition the whole pre-flight
+        existence check exists to make unreachable -- a false POSITIVE (an
+        unnecessary alarm) is the safe failure direction; a false NEGATIVE
+        (a real silent update read as something else) is not. Narrow this
+        only once a real "Updated" response body has been seen.
+        """
         if not self._has_body() or self.created:
             return False
         return "Updated" in self.text or "updated" in self.text
