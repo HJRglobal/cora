@@ -1948,3 +1948,54 @@ class TestRound2PureAttachmentStandsAlone:
                                        pf.rail2_attribution_hit(lead)))
         base, dbl = run(1200), run(2400)
         assert dbl < base * 2.6 + 0.05, "superlinear: %.4fs -> %.4fs" % (base, dbl)
+
+# ---------------------------------------------------------------------------
+# D-051 round 3 (Code #14 final check, scope B).
+# ---------------------------------------------------------------------------
+
+
+class TestRound3StandAloneIsLinear:
+    """B5 (MEDIUM): round 2 re-ran the stand-alone check for every other clause
+    inside the per-clause loop, so a body of alternating Pure and Energy/Mood
+    clauses was quadratic (3.9 s on 40 KB, 13.7 s on 81 KB through the rail). The
+    round-2 D-171 tests put ONE Pure clause beside many Energy clauses and never
+    reached it. Each clause's verdict is now computed once. Every unit below holds
+    BOTH a Pure clean clause and an Energy/Mood (or carried) clause."""
+
+    UNITS = (
+        ("F3 Pure is clean, F3 Energy hits, ", frozenset()),
+        ("F3 Pure is clean; F3 Energy hits; ", frozenset()),
+        ("F3 Pure is clean, and it tastes great, ", frozenset({"MOOD"})),
+        ("F3 Pure is clean, and we love it, ", frozenset({"MOOD"})),
+        ("Unlike F3 Energy, F3 Pure is clean, ", frozenset()),
+    )
+
+    @pytest.mark.parametrize("unit,ctx", UNITS, ids=range(len(UNITS)))
+    def test_d171_a_pure_and_an_energy_clause_per_unit_is_fast_at_40k(self, unit, ctx):
+        s = unit * (40000 // len(unit) + 1) + "done."
+        assert len(s) >= 40000
+        dt = _best_of_3(lambda: pf.rail2_attribution_hit(s, context_lines=ctx))
+        assert dt < 1.0, "%r x40k: %.3fs" % (unit, dt)
+        body = "<p>F3 Mood is our evening can. %s</p>" % s if ctx else "<p>%s</p>" % s
+        dt = _best_of_3(lambda: pf.run_preflight(title="Post", summary="", body_html=body))
+        assert dt < 2.0, "%r x40k through run_preflight: %.3fs" % (unit, dt)
+
+    @pytest.mark.parametrize("unit,ctx", UNITS, ids=range(len(UNITS)))
+    def test_d171_a_pure_and_an_energy_clause_per_unit_scales_linearly(self, unit, ctx):
+        def run(n):
+            s = unit * n + "done."
+            return _best_of_3(lambda: pf.rail2_attribution_hit(s, context_lines=ctx))
+        base, dbl = run(600), run(1200)
+        assert dbl < base * 2.6 + 0.05, "superlinear: %.4fs -> %.4fs" % (base, dbl)
+
+    def test_the_hoisted_verdict_keeps_every_stand_alone_answer(self):
+        """The round-2 per-clause loop's answers (pinned by its own tables) survive the
+        hoist, with and without a carried context."""
+        core = pf.rail2_attribution_hit
+        for s in (TestRound2PureAttachmentStandsAlone.CLAIMS_1 + TestRound2PureAttachmentStandsAlone.STILL_PASS
+                  + TestRound2PureAttachmentStandsAlone.ACCEPTED_TRIPS):
+            if ". " in s:
+                continue
+            for ctx in (frozenset(), frozenset({"MOOD"})):
+                got = core(s, context_lines=ctx)
+                assert (got is None) == (s in TestRound2PureAttachmentStandsAlone.STILL_PASS), (s, ctx, got)

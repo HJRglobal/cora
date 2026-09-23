@@ -1668,6 +1668,11 @@ def rail2_attribution_hit(sentence: str, *, context_lines: frozenset[str] = froz
     rows = []
     related = False
     ref_em = bool(ref & _RAIL2_EM)
+    # D-051 round 3 (B5): whether each clause must stand alone -- and whether it does
+    # -- is decided ONCE per clause here. Round 2 re-ran the check for every other
+    # clause inside the per-clause loop below, so a body of alternating Pure and
+    # Energy clauses was quadratic (3.9 s on 40 KB, 13.7 s on 81 KB).
+    lone_fails: list[bool] = []
     for c in clauses:
         text = " ".join([c.host] + c.bare) if c.bare else c.host
         host_own = brand_lines_in(c.host)
@@ -1675,6 +1680,10 @@ def rail2_attribution_hit(sentence: str, *, context_lines: frozenset[str] = froz
         if _has_relation(_words(text), weak=not (own or (c.pron and ref_em))):
             related = True
         rows.append((c, text, host_own, own))
+        needs = bool(own & _RAIL2_EM) or (c.pron and ref_em)
+        lone_fails.append(needs and not _clause_stands_alone(
+            _words(text), back_referring=not (own & _RAIL2_EM)))
+    n_lone_fails = sum(lone_fails)
     for idx, (c, text, host_own, own) in enumerate(rows):
         hit = _attribution_clean_hits(text)
         if not hit:
@@ -1682,10 +1691,7 @@ def rail2_attribution_hit(sentence: str, *, context_lines: frozenset[str] = froz
         if host_own == own == {"PURE"} and not related:
             host_words = _words(c.host)
             other = rows[idx - 1][1] if idx == n - 1 and idx > 0 else (rows[1][1] if n > 1 else "")
-            if _pure_is_subject(host_words) and all(
-                    _clause_stands_alone(_words(t2), back_referring=not (o2 & _RAIL2_EM))
-                    for j, (c2, t2, _h2, o2) in enumerate(rows)
-                    if j != idx and ((o2 & _RAIL2_EM) or (c2.pron and ref_em))):
+            if _pure_is_subject(host_words) and n_lone_fails - lone_fails[idx] == 0:
                 continue  # the clean word is positively Pure's, and nothing beside it takes it
             if _pure_locative_disjunct(host_words, idx, n, c.prev, c.next, _words(other)):
                 continue  # the 8/26 locative disjunct
