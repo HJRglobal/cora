@@ -3938,9 +3938,23 @@ _QS_CARD_BEFORE_RE = re.compile(
     r"rate|playing|trading|greeting|thank[\s-]you|birthday|loyalty|punch|fighter|id|key|wild|"
     r"score|index|recipe|preview|rewards?|membership|insurance|health|sd|memory|graphics|"
     r"tarot|flash|post|christmas|holiday|wedding|"
-    r"decisions?|knowledge|review|inbox|confirm(?:ation)?|blog|publish(?:ing)?|catch[\s-]?up|"
-    r"meeting|ask|menu|rack|promo(?:tional)?|shelf|price|pricing|sample|table|tasting)"
+    r"decisions?|knowledge|inbox|confirmation|blog|publish(?:ing)?|catch[\s-]?up|"
+    r"meeting|menu|rack|promo(?:tional)?|shelf|price|pricing|sample|table|tasting)"
     r"[ \t]+\Z", re.IGNORECASE)
+# D-051 F2-R5: `confirm` / `review` / `ask` name another card surface only in NOUN-
+# compound position ("my confirm cards", "the knowledge review cards", "which ask
+# cards"). As the REQUEST verb they are Harrison's own Q2 form ("can you confirm
+# cards have been responded to?", "please review cards still waiting on me"), and
+# the round-1 exclusion discarded the only card object. So they exclude unless a
+# request frame sits right before them: the message opening, you / to / please /
+# a "Cora" vocative / also / then / just, or a punctuation break. The frame is
+# tested on a bounded slice that ends at the verb; `\A[^\w\n]{0,8}\Z` can only
+# match a slice of <= 8 chars, i.e. one that really starts at the message start.
+_QS_CARD_BEFORE_VERBISH_RE = re.compile(r"\b(?:confirm|review|ask)[ \t]+\Z", re.IGNORECASE)
+_QS_VERB_FRAME_RE = re.compile(
+    r"(?:\A[^\w\n]{0,8}|\b(?:you|to|please|pls|plz|cora|also|then|just)[,:]?[ \t]{1,3}"
+    r"|[,:;.!?(>\-][ \t]{0,3})\Z", re.IGNORECASE)
+_QS_VERB_FRAME_SPAN = 20
 _QS_CARD_AFTER_RE = re.compile(
     r"\A[ \t]*(?:payments?|statements?|balances?|charges?|numbers?|readers?|terminals?|fees?|"
     r"limits?|transactions?|holders?|swipes?|processing|program|reader|slot)\b", re.IGNORECASE)
@@ -4048,7 +4062,14 @@ def _qs_card_hit_is_compound(text: str, m: re.Match) -> bool:
         return False
     before = text[max(0, m.start() - 25):m.start()]
     after = text[m.end():m.end() + 20]
-    return bool(_QS_CARD_BEFORE_RE.search(before) or _QS_CARD_AFTER_RE.match(after))
+    if _QS_CARD_BEFORE_RE.search(before) or _QS_CARD_AFTER_RE.match(after):
+        return True
+    vm = _QS_CARD_BEFORE_VERBISH_RE.search(before)
+    if vm is None:
+        return False
+    vstart = m.start() - len(before) + vm.start()
+    frame = text[max(0, vstart - _QS_VERB_FRAME_SPAN):vstart]
+    return not _QS_VERB_FRAME_RE.search(frame)   # a request verb, not a surface noun
 
 
 def _qs_paired(text: str, left: list[tuple[int, int]], right: list[tuple[int, int]]) -> bool:

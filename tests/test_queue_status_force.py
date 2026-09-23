@@ -69,6 +69,14 @@ MUST_FORCE = [
     "did my card button presses land?",
     "did my Monday menu button presses land?",
     "did the stage button presses land?",
+    # D-051 F2-R5: confirm / review as the REQUEST verb (Harrison's Q2 form) --
+    # round 1's surface exclusion read "confirm cards" as a noun compound
+    "can you confirm cards have been responded to?",
+    "confirm cards registered?",
+    "please confirm cards are all responded to?",
+    "can you review cards still waiting on me?",
+    "Cora, confirm cards registered?",
+    "I want you to confirm cards have landed?",
 ]
 
 # D-051 F2-R4: storefront / analytics / media questions. Every row forced the card
@@ -109,6 +117,11 @@ OTHER_CARD_AND_BACKLOG_SURFACES = [
     "did the meeting ask cards land?",
     "are the menu cards still showing the old prices?",
     "have the rack cards landed at Sprouts?",
+    # D-051 F2-R5: confirm / review / ask stay excluded in NOUN-compound position
+    "which ask cards are still waiting on me?",
+    "did the review cards land?",
+    "any confirm cards still waiting on me?",
+    "have the confirmation cards been responded to?",
 ]
 
 # D-051 forcing-seams-3: a queue verb NEXT TO an id is a command (or a compound
@@ -339,6 +352,9 @@ class TestPredicate:
         # (F2-R4 surface / weak-object patterns)
         "landing " * 5_000 + "x", "landing" + " " * 40_000 + "pages", "web" + " " * 40_000 + "x",
         "pop-" * 10_000, "my presses " * 3_000, "my" + "\t" * 40_000 + "presses",
+        # (F2-R5 verb-frame patterns)
+        "confirm " * 5_000 + "x", "you " * 10_000 + "x", "please," * 6_000,
+        "review" + " " * 40_000 + "x", "(" * 40_000,
     ], ids=["spaces", "card", "responded", "bang", "still", "cq",
             "any", "those", "any-tabs", "stage-cq", "stage-spaces-cq", "restage-tick",
             "the-rest", "monday-menu", "monday-tabs", "catch-up", "knowledge-spaces",
@@ -347,7 +363,8 @@ class TestPredicate:
             "those-landed", "did-any-land", "any-spaces-land", "those-actually",
             "those-take-spaces", "did-any", "these-dash",
             "landing", "landing-spaces-pages", "web-spaces", "pop-dash", "my-presses",
-            "my-tabs-presses"])
+            "my-tabs-presses",
+            "confirm", "you", "please-comma", "review-spaces", "parens"])
     def test_raw_regexes_are_linear_past_the_gate(self, shape):
         """D-171: the 500-char gate runs first, but each compiled pattern must stand
         on its own at Slack's 40k cap too. Best of 3: measured ~14ms worst shape on
@@ -356,7 +373,8 @@ class TestPredicate:
         rxs = (cq._QS_IMPERATIVE_RE, cq._QS_REQUEST_RE, cq._QS_OBJECT_RE,
                cq._QS_STATUS_RE, cq._QS_PRONOUN_RE, cq._QS_CARD_BEFORE_RE,
                cq._QS_ID_STATUS_RE, cq._QS_VERB_ID_RE, cq._QS_FOREIGN_RE, cq._QS_CQ_ID_RE,
-               cq._QS_SURFACE_RE, cq._QS_WEAK_OBJECT_RE)
+               cq._QS_SURFACE_RE, cq._QS_WEAK_OBJECT_RE, cq._QS_CARD_BEFORE_VERBISH_RE,
+               cq._QS_VERB_FRAME_RE)
         best = float("inf")
         for _ in range(3):
             t0 = time.perf_counter()
