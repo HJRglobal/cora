@@ -73,6 +73,81 @@ def fetch_thread_messages(mailbox: str, gmail_thread_id: str) -> list[dict[str, 
     return gmail_reader.get_full_thread_text(mailbox, gmail_thread_id)
 
 
+# A tracked thread whose Gmail id 404s is GONE (deleted / never existed in this
+# mailbox). It moves to 'hold' with this reason after the FIRST miss and is never
+# fetched again -- 'hold' is IMPORT_PROTECTED, so a re-import cannot resurrect it,
+# and the reason shows in the revops status tool + session snapshots. Before this,
+# harrison@hjrglobal.com:19fabbee97f4ca2b 404'd on 20 of 20 daily sweeps.
+GONE_HOLD_REASON = "gmail_thread_not_found"
+_GONE_HTTP_STATUSES = frozenset({404, 410})
+
+
+def _is_gmail_not_found(exc: BaseException) -> bool:
+    """True when exc, or anything on its __cause__/__context__ chain, is a
+    googleapiclient HttpError whose HTTP status is 404/410. Keys on the status
+    object, NEVER on message text (a 404 is the only evidence we act on)."""
+    try:
+        from googleapiclient.errors import HttpError
+    except Exception:  # noqa: BLE001 - no client lib -> cannot be a Gmail 404
+        return False
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen and len(seen) < 16:
+        seen.add(id(cur))
+        if isinstance(cur, HttpError):
+            status = getattr(getattr(cur, "resp", None), "status", None)
+            try:
+                if int(status) in _GONE_HTTP_STATUSES:
+                    return True
+            except (TypeError, ValueError):
+                pass
+        cur = cur.__cause__ if cur.__cause__ is not None else cur.__context__
+    return False
+
+
+def _hold_gone_thread(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    report: dict[str, Any],
+    *,
+    dry_run: bool,
+) -> None:
+    """First 404 on a thread: -> hold (hold_reason=GONE_HOLD_REASON). Writes
+    nothing under dry_run. A row already in 'hold' for another reason is a
+    human/safety decision -- its reason is never overwritten (today's
+    fetch_errors path instead)."""
+    key = row["thread_key"]
+    if row["state"] == "hold":
+        logger.warning(
+            "thread %s is gone (gmail 404) but already on hold for another reason; left as is", key
+        )
+        report["fetch_errors"] += 1
+        return
+    if dry_run:
+        report["would_hold"].append(key)
+        logger.info("thread %s is gone (gmail 404) -- would hold (dry-run)", key)
+        return
+    moved = ledger.transition(
+        conn,
+        key,
+        "hold",
+        actor="system",
+        source="sweep",
+        event_type="gmail_thread_not_found",
+        detail={"http_status": 404},
+    )
+    if not moved:
+        report["fetch_errors"] += 1
+        return
+    conn.execute(
+        "UPDATE threads SET hold_reason = ?, updated_at = ? WHERE thread_key = ?",
+        (GONE_HOLD_REASON, time.time(), key),
+    )
+    conn.commit()
+    report["gone_threads"].append(key)
+    logger.warning("thread %s is gone (gmail 404) -- moved to hold (%s)", key, GONE_HOLD_REASON)
+
+
 def sweep(
     conn: sqlite3.Connection,
     *,
@@ -101,6 +176,9 @@ def sweep(
         "surface_for_close": [],
         "expired_stashes": 0,
         "restored_nudge_due": 0,
+        "skipped_gone": 0,   # hold rows with GONE_HOLD_REASON, never re-fetched
+        "gone_threads": [],  # thread_keys moved to hold this run (keys only)
+        "would_hold": [],    # dry-run: keys that WOULD have moved to hold
     }
 
     if not dry_run:
@@ -112,10 +190,16 @@ def sweep(
         if r["state"] not in ledger.TERMINAL_STATES
     ]
     for row in rows:
+        if row["state"] == "hold" and (row["hold_reason"] or "") == GONE_HOLD_REASON:
+            report["skipped_gone"] += 1
+            continue
         report["checked"] += 1
         try:
             messages = fetch(row["mailbox"], row["gmail_thread_id"])
-        except Exception:  # noqa: BLE001 - fail soft per thread
+        except Exception as exc:  # noqa: BLE001 - fail soft per thread
+            if _is_gmail_not_found(exc):
+                _hold_gone_thread(conn, row, report, dry_run=dry_run)
+                continue
             logger.exception("thread fetch failed for %s", row["thread_key"])
             report["fetch_errors"] += 1
             continue

@@ -346,3 +346,136 @@ def test_template_first_name_fallbacks():
     assert nt.first_name_from_counterparty("T. Mannan (Farmers)") == "there"
     assert nt.first_name_from_counterparty(None) == "there"
     assert nt.first_name_from_counterparty("Shannon (Drink Labs)") == "Shannon"
+
+
+# ------------------------------------ S6b: a Gmail 404 retires the thread to hold
+
+def _http_error(status: int):
+    import httplib2
+    from googleapiclient.errors import HttpError
+
+    return HttpError(
+        httplib2.Response({"status": status}),
+        b'{"error":{"message":"Requested entity was not found."}}',
+    )
+
+
+def _raising_fetch(status: int, calls: list):
+    """Mirror gmail_reader: the HttpError rides __cause__ of a GmailReaderError."""
+    from cora.connectors.gmail_reader import GmailReaderError
+
+    def fetch(mailbox, tid):
+        calls.append(tid)
+        try:
+            raise _http_error(status)
+        except Exception as http_err:
+            raise GmailReaderError(f"Gmail threads.get failed for {tid}: synthetic") from http_err
+
+    return fetch
+
+
+def _events(conn, key):
+    return [dict(r) for r in ledger.get_events(conn, key)]
+
+
+def test_gmail_404_holds_thread_after_one_miss(conn):
+    key = _thread(conn, tid="gone1")
+    calls: list = []
+    report = sweep.sweep(conn, fetch=_raising_fetch(404, calls), now=NOW)
+    row = ledger.get_thread(conn, key)
+    assert row["state"] == "hold"
+    assert row["hold_reason"] == sweep.GONE_HOLD_REASON == "gmail_thread_not_found"
+    assert report["gone_threads"] == [key]
+    assert report["fetch_errors"] == 0
+    ev = _events(conn, key)[0]
+    assert ev["event_type"] == "gmail_thread_not_found"
+    assert ev["to_state"] == "hold" and ev["source"] == "sweep"
+
+
+def test_gmail_410_also_counts_as_gone(conn):
+    key = _thread(conn, tid="gone410")
+    sweep.sweep(conn, fetch=_raising_fetch(410, []), now=NOW)
+    assert ledger.get_thread(conn, key)["hold_reason"] == sweep.GONE_HOLD_REASON
+
+
+def test_gone_thread_not_refetched_next_run(conn):
+    _thread(conn, tid="gone1")
+    calls: list = []
+    sweep.sweep(conn, fetch=_raising_fetch(404, calls), now=NOW)
+    assert calls == ["gone1"]
+    report2 = sweep.sweep(conn, fetch=_raising_fetch(404, calls), now=NOW + 86400)
+    assert calls == ["gone1"]                       # never fetched again
+    assert report2["skipped_gone"] == 1
+    assert report2["checked"] == 0 and report2["fetch_errors"] == 0
+
+
+def test_non_404_error_still_retries(conn):
+    key = _thread(conn, tid="flaky")
+    calls: list = []
+    report = sweep.sweep(conn, fetch=_raising_fetch(500, calls), now=NOW)
+    assert report["fetch_errors"] == 1 and report["gone_threads"] == []
+    assert ledger.get_thread(conn, key)["state"] == "awaiting_reply"
+    sweep.sweep(conn, fetch=_raising_fetch(500, calls), now=NOW + 86400)
+    assert calls == ["flaky", "flaky"]
+
+
+def test_404_text_without_http_status_is_not_gone(conn):
+    """Keys on the HttpError status, never message text."""
+    key = _thread(conn, tid="texty")
+
+    def fetch(mailbox, tid):
+        raise RuntimeError("<HttpError 404 ... Requested entity was not found.>")
+
+    report = sweep.sweep(conn, fetch=fetch, now=NOW)
+    assert report["fetch_errors"] == 1
+    assert ledger.get_thread(conn, key)["state"] == "awaiting_reply"
+
+
+def test_404_dry_run_writes_nothing(conn):
+    key = _thread(conn, tid="gone1")
+    before = _events(conn, key)
+    report = sweep.sweep(conn, fetch=_raising_fetch(404, []), now=NOW, dry_run=True)
+    row = ledger.get_thread(conn, key)
+    assert row["state"] == "awaiting_reply" and row["hold_reason"] is None
+    assert _events(conn, key) == before
+    assert report["would_hold"] == [key] and report["gone_threads"] == []
+
+
+def test_404_on_existing_human_hold_keeps_its_reason(conn):
+    key = _thread(conn, tid="held", state="hold", hold_reason="harrison: pause")
+    report = sweep.sweep(conn, fetch=_raising_fetch(404, []), now=NOW)
+    row = ledger.get_thread(conn, key)
+    assert row["state"] == "hold" and row["hold_reason"] == "harrison: pause"
+    assert report["gone_threads"] == [] and report["fetch_errors"] == 1
+
+
+def test_import_cannot_resurrect_gone_hold(conn):
+    key = _thread(conn, tid="gone1")
+    sweep.sweep(conn, fetch=_raising_fetch(404, []), now=NOW)
+    ledger.upsert_thread(
+        conn,
+        mailbox=MAILBOX,
+        gmail_thread_id="gone1",
+        counterparty_name="Josh A. (Wham Foods)",
+        workstream="Retail",
+        entity="F3E",
+        state="awaiting_reply",
+        source="import",
+        observation_ts=NOW + 10 * 86400,
+    )
+    row = ledger.get_thread(conn, key)
+    assert row["state"] == "hold" and row["hold_reason"] == sweep.GONE_HOLD_REASON
+
+
+def test_is_gmail_not_found_walks_context_and_survives_cycles():
+    err = _http_error(404)
+    try:
+        try:
+            raise err
+        except Exception:
+            raise ValueError("wrapped without from")   # __context__ only
+    except ValueError as outer:
+        assert sweep._is_gmail_not_found(outer)
+    a, b = RuntimeError("a"), RuntimeError("b")
+    a.__cause__, b.__cause__ = b, a                     # a cycle must terminate
+    assert sweep._is_gmail_not_found(a) is False
