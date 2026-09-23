@@ -529,26 +529,128 @@ _CLEANUP_OBJECTS = (r"(?:beach|beaches|oceans?|coast(?:line)?s?|parks?|rivers?|s
                     r"shorelines?|waterways?|trails?|litter|trash|plastic|neighbou?rhoods?|"
                     r"communit(?:y|ies))")
 # A metaphorical environmental noun is a product claim wearing the environment's
-# clothes: "builds a cleaner world of flavor", "protects clean water in every
-# can". An environmental object followed by of / in / inside / within is never
-# redacted (fail closed: "supports clean communities in Mesa" trips too).
-_ENV_NOT_METAPHOR = r"(?!\s{1,3}(?:of|in|inside|within)\b)"
+# clothes: "builds a cleaner world of flavor", "protects clean water in every can",
+# "supports a clean environment for your mind", "restores clean earth to your
+# routine". The first cut refused only of / in / inside / within after the object:
+# a BLACKLIST, so every other continuation ("for your taste buds", "at every
+# workout", "to your routine") kept the redaction (D-051 r143-claims-4). The
+# continuation is now an ALLOWLIST (fail closed). The environmental phrase is
+# redacted only when it ends its clause, or when it runs on into a closed CSR
+# continuation: "with every case sold", "every spring", "for the oceans", "for
+# future generations", "around the world", "through CleanHub". Anything else keeps
+# the clean word in the scan ("supports clean communities in Mesa" trips too).
+_ENV_PURCHASE_NOUNS = r"(?:cases?|purchases?|orders?|sales?|packs?|box(?:es)?)"
+_ENV_WEEKDAYS = r"(?:mon|tues|wednes|thurs|fri|satur|sun)days?"
+_ENV_TIME_NOUNS = (r"(?:years?|months?|weeks?|weekends?|seasons?|spring|summer|fall|autumn|"
+                   r"winter|quarters?|" + _ENV_WEEKDAYS + r")")
+_ENV_CONTINUATION_OK = (
+    r"(?="
+    # the phrase ends its clause
+    r"\s{0,3}(?:[.;:!?)\]\"'”’]|$)"
+    # ...or a comma NOT followed by a second-person / metaphor / relative tail
+    r"|\s{0,3},(?!\s{0,3}(?:for|of|in|inside|within|into|to|at|on|one|your|my|that|which|where)\b)"
+    r"|\s{1,3}with\s{1,3}(?:every|each)\s{1,3}(?:" + _ENV_PURCHASE_NOUNS
+    + r"|(?:cans?|bottles?)\s{1,3}(?:sold|purchased|bought))\b"
+    r"|\s{1,3}(?:every|each|this|next)\s{1,3}(?:" + _ENV_PURCHASE_NOUNS + r"|" + _ENV_TIME_NOUNS + r")\b"
+    r"|\s{1,3}one\s{1,3}(?:case|can|purchase|order|pack)\s{1,3}at\s{1,3}a\s{1,3}time\b"
+    r"|\s{1,3}on\s{1,3}" + _ENV_WEEKDAYS + r"\b"
+    r"|\s{1,3}(?:today|tomorrow|yesterday|together|weekly|monthly|annually|yearly)\b"
+    r"|\s{1,3}for\s{1,3}(?:(?:future|next)\s{1,3}generations?|(?:the|our)\s{1,3}" + _ENV_NOUNS + r")\b"
+    r"|\s{1,3}(?:across|around|throughout)\s{1,3}(?:the\s{1,3})?"
+    r"(?:world|globe|country|nation|region|state|planet|coast)\b"
+    r"|\s{1,3}(?:through|via|with|alongside)\s{1,3}(?:F3|CleanHub|volunteers|fans"
+    r"|(?:our|the|a|its)\s{1,3}(?:partners?|partnerships?|team|crew|community|volunteers|fans))\b"
+    r"|\s{1,3}by\s{1,3}(?:removing|pulling|funding|planting|recycling|collecting|cleaning|"
+    r"restoring|protecting)\b"
+    r")"
+)
 _CLEAN_ENVIRONMENT_RES = (
     # "fund a cleaner planet", "supports clean water"
     re.compile(r"\b" + _ENV_ACTION_VERBS + r"\s{1,3}" + _ENV_DETERMINER
-               + r"clean(?:er|est)?\s{1,3}" + _ENV_NOUNS + r"\b" + _ENV_NOT_METAPHOR,
+               + r"clean(?:er|est)?\s{1,3}" + _ENV_NOUNS + r"\b" + _ENV_CONTINUATION_OK,
                re.IGNORECASE),
     # "supports a cleaner future for the oceans" -- "future" alone is a predicate
     re.compile(r"\b" + _ENV_ACTION_VERBS + r"\s{1,3}" + _ENV_DETERMINER
                + r"clean(?:er|est)?\s{1,3}future\s{1,3}for\s{1,3}(?:(?:the|our)\s{1,3})?"
-               + _ENV_NOUNS + r"\b" + _ENV_NOT_METAPHOR, re.IGNORECASE),
-    # "helps clean up the beaches" -- the activity, with an environmental object
+               + _ENV_NOUNS + r"\b" + _ENV_CONTINUATION_OK, re.IGNORECASE),
+    # "helps clean up the beaches" -- the activity, with an environmental object.
+    # The continuation allowlist also refuses a compound whose first half is the
+    # object ("cleans up trash talk", r143-claims-6).
     re.compile(r"\bclean(?:ed|ing|s)?[\s-]{1,3}ups?\s{1,3}(?:(?:the|our|local)\s{1,3})?"
-               + _CLEANUP_OBJECTS + r"\b" + _ENV_NOT_METAPHOR, re.IGNORECASE),
-    # "a beach clean-up" -- the noun form
-    re.compile(r"\b(?:beach|ocean|coastal|river|park|shoreline|community|neighbou?rhood|"
-               r"litter|trash|plastic)\s{1,3}clean[\s-]{0,3}ups?\b", re.IGNORECASE),
+               + _CLEANUP_OBJECTS + r"\b" + _ENV_CONTINUATION_OK, re.IGNORECASE),
 )
+
+# The NOUN form ("a beach clean-up") names an EVENT, and News copy names events
+# freely ("Join us at the F3 Energy beach clean-up this Saturday."), so its
+# continuation is not allowlisted. Its POSITION is checked in _env_event_referenced
+# instead: it is redacted only as a reference to the event (after a verb that runs
+# or backs one, after a preposition that points at one, with the brand as a
+# modifier, or opening the sentence). It is never redacted as a PREDICATE of the
+# brand (r143-claims-6: "F3 Energy is a beach clean-up in a can." and "F3 Energy is
+# the community clean-up crew for your afternoon slump." both passed BOTH rails).
+# The lookahead still refuses a head noun ("clean-up crew") and a second-person
+# or metaphor tail.
+_ENV_EVENT_RE = re.compile(
+    r"\b(?:beach|ocean|coastal|river|park|shoreline|community|neighbou?rhood|litter|trash|plastic)"
+    r"\s{1,3}clean[\s-]{0,3}ups?\b"
+    r"(?!\s{1,3}(?:crews?|kits?|modes?|machines?|squads?"
+    r"|in\s{1,3}(?:a|every|each)\s{1,3}(?:cans?|sips?|bottles?|glass|cups?)"
+    r"|inside|within|into|of\s{1,3}(?:your|you|my|flavor|taste)"
+    r"|(?:for|to|on|at)\s{1,3}(?:your|you|my)"
+    r"|for\s{1,3}the\s{1,3}(?:soul|mind|body|gut|palate))\b)",
+    re.IGNORECASE)
+#: Words skipped walking back from the event noun ("a", "our annual", "every").
+_ENV_EVENT_SKIP = frozenset({
+    "a", "an", "the", "our", "its", "their", "this", "next", "every", "each", "annual",
+    "local", "monthly", "weekly", "yearly", "big", "huge", "first", "spring", "summer",
+    "fall", "winter",
+})
+#: ...then the word that makes it a REFERENCE to the event, not a predicate.
+_ENV_EVENT_LEADS = frozenset({
+    "sponsor", "sponsors", "sponsored", "sponsoring", "host", "hosts", "hosted", "hosting",
+    "join", "joins", "joined", "joining", "organize", "organizes", "organized", "organizing",
+    "organise", "organises", "organised", "organising", "fund", "funds", "funded", "funding",
+    "support", "supports", "supported", "supporting", "run", "runs", "running", "ran",
+    "lead", "leads", "leading", "led", "fuel", "fuels", "fueled", "fueling", "power",
+    "powers", "powered", "powering", "at", "for", "during", "to", "after", "before", "from",
+})
+
+
+def _env_event_referenced(text: str, start: int) -> bool:
+    """True when the noun-form event at text[start:] is referenced (see above),
+    False when it could be predicated of the brand. Walks back at most 120
+    characters, so it is linear."""
+    lo = max(0, start - 120)
+    window = text[lo:start]
+    toks = list(_WORD_RE.finditer(window))
+    cut = len(window)
+    while toks:
+        tok = toks.pop()
+        if window[tok.end():cut].strip():
+            return False   # punctuation between: an apposition or a predicate, fail closed
+        word = tok.group(0)
+        wl = word.lower().strip("'&/-")
+        if wl in _ENV_EVENT_SKIP:
+            cut = tok.start()
+            continue
+        if wl in _ENV_EVENT_LEADS:
+            return True
+        # the brand as a modifier ("the F3 Energy beach clean-up", "F3 Energy's ...")
+        return wl in ("energy", "pure", "mood", "energy's", "pure's", "mood's") and _is_brandish(word)
+    return lo == 0 and not window[:cut].strip()   # the sentence opens with the event
+
+
+def _redact_env_events(text: str) -> str:
+    out: list[str] = []
+    pos = 0
+    for m in _ENV_EVENT_RE.finditer(text):
+        if not _env_event_referenced(text, m.start()):
+            continue
+        out.append(text[pos:m.start()])
+        out.append(" ")
+        pos = m.end()
+    out.append(text[pos:])
+    return "".join(out)
 
 # The two EXACT phrases Harrison cleared on 2026-09-19 (ESC 3(i)/(ii), D-329) --
 # (pattern, the rail-2-scoped lines the phrase may be said of). Nothing else is
@@ -775,6 +877,7 @@ def rail2_attribution_hit(sentence: str) -> tuple[str, str] | None:
     scan_sent = _redact_phrase_exemptions(sent, lines)
     scan_sent = _redact(scan_sent, _NATURAL_OCCURRENCE_RES + (_NATURAL_OCCURRENCE_HYPHEN_RE,))
     scan_sent = _redact(scan_sent, _CLEAN_ENVIRONMENT_RES)
+    scan_sent = _redact_env_events(scan_sent)
     # Segment, folding a bare coordinated brand into the clause before it. Parts
     # are kept as lists and joined once per segment so a long run of ", F3 Pure"
     # coordinations stays linear (no repeated string growth).

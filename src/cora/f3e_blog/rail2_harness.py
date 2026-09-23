@@ -112,6 +112,22 @@ CLAIMS_HOLE_PROBES: dict[str, tuple[str, ...]] = {
         # own first-cut gap: an action verb + environmental noun used as a figure)
         "F3 Energy builds a cleaner world of flavor.",
         "F3 Energy protects clean water in every can.",
+        # D-051 r143-claims-4: the metaphor guard was a blacklist (of/in/inside/
+        # within); every other continuation cleared a product metaphor
+        "F3 Energy builds a cleaner world for your taste buds.",
+        "F3 Energy restores clean earth to your routine.",
+        "F3 Energy builds a cleaner world at every workout.",
+        "F3 Energy protects clean air for your lungs.",
+        "F3 Mood restores a clean environment for your mind.",
+        "F3 Mood supports a clean environment for your mind.",
+        "F3 Mood supports a clean environment, for your mind.",
+        "F3 Energy builds a cleaner world with every sip.",
+        # D-051 r143-claims-6: the noun form after a copula, and a compound whose
+        # first half is the clean-up object (these passed BOTH rails)
+        "F3 Energy is the community clean-up crew for your afternoon slump.",
+        "F3 Energy is a beach clean-up in a can.",
+        "F3 Energy is a community clean-up for your gut.",
+        "F3 Energy cleans up trash talk in the gym.",
         # R14-3 holes that passed BOTH rails (verb form + hyphenated compounds)
         "F3 Energy cleans up your afternoon.",
         "F3 Energy is the clean-up crew for your afternoon slump.",

@@ -48,6 +48,10 @@ R143_LEGACY_MISSES = frozenset({
     "F3 Energy's cleanness sets it apart.",
     "F3 Energy's naturalness sets it apart.",
     "F3 Mood is one of the naturals.",
+    "F3 Energy is the community clean-up crew for your afternoon slump.",   # r143-claims-6
+    "F3 Energy is a beach clean-up in a can.",
+    "F3 Energy is a community clean-up for your gut.",
+    "F3 Energy cleans up trash talk in the gym.",
 })
 
 
@@ -767,6 +771,110 @@ class TestTokenizerGaps:
     def test_the_legacy_token_set_is_still_frozen(self):
         for tok in ("cleanly", "cleansed", "cleanliness", "cleanness", "naturalness", "naturals"):
             assert tok not in pf._CLEAN_TOKENS and tok in pf._ATTRIBUTION_CLEAN_TOKENS, tok
+
+
+class TestEnvironmentalContinuationIsAllowlisted:
+    """r143-claims-4 / r143-claims-6: the environmental redaction's metaphor guard was
+    a BLACKLIST (of / in / inside / within), so every other continuation kept the
+    redaction and cleared a product metaphor. The noun form had no position check at
+    all, and a copula before it cleared a predicate of the brand."""
+
+    MUST_TRIP = (
+        # r143-claims-4
+        "F3 Energy builds a cleaner world for your taste buds.",
+        "F3 Energy restores clean earth to your routine.",
+        "F3 Energy builds a cleaner world at every workout.",
+        "F3 Energy protects clean air for your lungs.",
+        "F3 Mood restores a clean environment for your mind.",
+        "F3 Mood supports a clean environment for your mind.",
+        "F3 Mood supports a clean environment, for your mind.",
+        "F3 Energy builds a cleaner world with every sip.",
+        "F3 Energy builds a cleaner world that tastes like citrus.",
+        "F3 Energy supports clean water and air for your lungs.",
+        # r143-claims-6
+        "F3 Energy is the community clean-up crew for your afternoon slump.",
+        "F3 Energy is a beach clean-up in a can.",
+        "F3 Energy is a community clean-up for your gut.",
+        "F3 Energy cleans up trash talk in the gym.",
+        "F3 Energy: a beach clean-up for the soul.",
+        "F3 Energy delivers a park clean-up for your mind.",
+    )
+    RELEASED = (
+        "F3 Energy supports clean water for the community.",
+        "F3 Energy funds a cleaner planet through CleanHub.",
+        "F3 Energy helps build a cleaner planet one case at a time.",
+        "F3 Energy funds cleaner oceans by removing plastic.",
+        "Join us at the F3 Energy beach clean-up this Saturday.",
+        "F3 Energy's annual beach clean-up pulled 400 pounds of trash off the shoreline.",
+        "Beach clean-ups are better with F3 Energy.",
+        "F3 Energy volunteers helped clean up the beach, pulling 400 pounds of trash.",
+        "Our team cleaned up the park with F3 Energy.",
+        "F3 Energy fuels the community clean-up every spring.",
+    )
+
+    @pytest.mark.parametrize("sentence", MUST_TRIP)
+    def test_a_metaphorical_or_predicated_environment_trips(self, sentence):
+        assert pf.rail2_attribution_hit(sentence) is not None, sentence
+        assert "R2" in _pf(sentence).tripped_rail_ids, sentence
+
+    def test_the_review_shapes_are_in_the_gate(self):
+        probes = rh.CLAIMS_HOLE_PROBES["clean_natural_on_energy_mood"]
+        for s in self.MUST_TRIP[:8] + self.MUST_TRIP[10:14]:
+            assert s in probes, s
+
+    @pytest.mark.parametrize("sentence", RELEASED
+                             + TestEnvironmentalRedactionIsPositionChecked.RELEASED
+                             + rh.FALSE_POSITIVE_SET[1:3])
+    def test_an_environmental_object_of_an_environmental_action_is_still_released(self, sentence):
+        assert pf.rail2_attribution_hit(sentence) is None, sentence
+        assert _pf(sentence).passed, _pf(sentence).render()
+
+    def test_the_event_noun_needs_a_reference_not_a_copula(self):
+        def ref(s):
+            m = pf._ENV_EVENT_RE.search(s)
+            assert m, s
+            return pf._env_event_referenced(s, m.start())
+        assert ref("F3 Energy sponsors a beach clean-up.")
+        assert ref("Join us at the F3 Energy beach clean-up.")
+        assert ref("Beach clean-ups are better with F3 Energy.")
+        assert not ref("F3 Energy is a beach clean-up.")
+        assert not ref("F3 Energy: a beach clean-up.")
+        assert not ref("F3 Energy delivers a beach clean-up.")
+
+    DEGENERATE = (
+        " " * 40000,
+        "\t" * 40000,
+        "fund a clean planet " * 2000,
+        "fund a clean planet ," * 2000,
+        "fund a clean planet with every " * 1300,
+        "fund a clean planet for the " * 1400,
+        "fund a cleaner future for the " * 1300,
+        "support clean water" + " " * 40000 + "for",
+        "clean up the beach " * 2100,
+        "clean up the beach with the " * 1400,
+        "beach clean-up " * 2600,
+        "beach clean-up in a " * 2000,
+        "a " * 20000 + "beach clean-up",
+        "the " * 10000 + "beach clean-up",
+        "sponsors a beach clean-up for the " * 1100,
+    )
+
+    @pytest.mark.parametrize("text", DEGENERATE, ids=range(len(DEGENERATE)))
+    def test_d171_environmental_patterns_are_fast_at_40k(self, text):
+        for pat in pf._CLEAN_ENVIRONMENT_RES + (pf._ENV_EVENT_RE,):
+            dt = _best_of_3(lambda: pat.sub(" ", text))
+            assert dt < 0.2, "%s on %r...: %.3fs" % (pat.pattern[:30], text[:20], dt)
+        dt = _best_of_3(lambda: pf._redact_env_events(text))
+        assert dt < 0.2, "_redact_env_events on %r...: %.3fs" % (text[:20], dt)
+
+    @pytest.mark.parametrize("unit", ["fund a clean planet with every ", "clean up the beach ",
+                                      "sponsors a beach clean-up ", "a ", "fund a clean planet , "])
+    def test_d171_environmental_redaction_scales_linearly(self, unit):
+        def run(n):
+            text = "F3 Energy " + unit * n + "clean."
+            return _best_of_3(lambda: pf.rail2_attribution_hit(text))
+        base, dbl = run(1500), run(3000)
+        assert dbl < base * 2.6 + 0.05, "superlinear: %.4fs -> %.4fs" % (base, dbl)
 
 
 class TestIdiomOverTripsAreFailClosed:
