@@ -732,6 +732,22 @@ def test_the_prompt_good_example_passes_and_its_rejected_example_trips_r2():
     assert "R2" in bad.tripped_rail_ids
 
 
+def test_the_prompt_scopes_the_rule_to_the_sentence_and_the_rail_agrees():
+    """D-051 round 3: the shipping rail is the LEGACY UNION -- a clean word anywhere in
+    a sentence that names Energy/Mood trips, outside the pinned release spans -- so
+    a prompt that allowed it in "a clause about Pure" was LOOSER than the rail (a
+    lane jam). The prompt now says sentence, and the rail agrees on its own example
+    joined into one sentence."""
+    prompt = _prompt_text()
+    assert "never use them anywhere in a sentence that names F3 Energy or F3 Mood" in prompt
+    assert "not even in a clause about F3 Pure" in prompt
+    assert "never in a clause that names F3 Pure together with" not in prompt
+    joined = drafting.RAIL2_GOOD_EXAMPLE.replace(". F3 Pure", "; F3 Pure")
+    assert joined != drafting.RAIL2_GOOD_EXAMPLE
+    assert "R2" in _run(joined).tripped_rail_ids
+    assert _run(drafting.RAIL2_GOOD_EXAMPLE).passed
+
+
 def test_the_prompt_states_the_pronoun_rule_and_the_rail_agrees():
     """D-051 round 2 (F3-R1): the rail carries a line across a sentence boundary, so
     the prompt must tell the model to NAME the line in a clean-word sentence. Its

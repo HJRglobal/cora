@@ -67,10 +67,11 @@ have, leave that point out entirely rather than estimating it.
 - No prices, no MSRP, no cost figures of any kind.
 - "clean", "cleaner", "clean-label", "clean-sweetened", "natural" (and any form or
   hyphenated compound of them) describe F3 Pure ONLY. Never say them of F3 Energy
-  or F3 Mood, and never in a clause that names F3 Pure together with F3 Energy or
-  F3 Mood: "{rail2_rejected}" is rejected. A quote is never an exemption.
+  or F3 Mood, and never use them anywhere in a sentence that names F3 Energy or
+  F3 Mood, not even in a clause about F3 Pure (the two exact phrases below are the
+  only exception): "{rail2_rejected}" is rejected. A quote is never an exemption.
   When a sentence would link two lines, split it: "{rail2_good}"
-  Two sentences, one line each, is the preferred style. In a sentence that uses
+  Two sentences, one line each, every time. In a sentence that uses
   one of those words, name the line; never point to it with it, its, they or
   this, which a reader (and the check) takes as the line the sentence before
   named: write "F3 Pure is clean-sweetened.", never "It is clean-sweetened."
