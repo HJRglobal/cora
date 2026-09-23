@@ -32,6 +32,9 @@ WHAT THIS MODULE HOLDS (data + pure functions; no network, no LLM):
   * CARRY_RELEASE_PROBES / CARRY_HOLE_PROBES -- D-051 round 2 (F3-R1): ARTICLE-level
                           must-PASS / must-TRIP probes for the cross-sentence carry
                           (title / summary / body fields, paragraphs), gated;
+  * CARRY_RESIDUALS    -- D-051 round 3: the carry's residuals relative to round 1
+                          (final check B1-B4; the legacy rail passes every one, so
+                          none is a hole relative to main): reported, never gated;
   * UNION_OVER_TRIPS   -- D-051 round 3: round-1/2 synthetic release probes the
                           LEGACY UNION takes back (each trips the frozen legacy rail
                           after the strict release redaction): reported, never gated;
@@ -554,6 +557,67 @@ CARRY_HOLE_PROBES: tuple[tuple[str, dict[str, str]], ...] = (
      _article("<p>F3 Mood is calm. F3 Pure is clean, and that goes for it.</p>")),
 )
 
+#: D-051 round 3: the carry's known residuals RELATIVE TO ROUND 1 (the final
+#: check's B1-B4). Round 1's forever carry, with no expletive / generic / care
+#: exclusions, tripped every row; round 2's decay and exclusions release them.
+#: None is a hole relative to main: the frozen legacy rail is single-sentence, so
+#: it passes every row too (pinned). Restoring the non-decaying carry was measured
+#: under the union and re-trips 11 of the 18 pinned CARRY_RELEASE_PROBES (the three
+#: queued live drafts among them), so the decay stays. Reported on every run, never
+#: gated: a row that starts tripping belongs in CARRY_HOLE_PROBES.
+_M = "<p>F3 Mood is our evening can. "
+_E = "<p>F3 Energy is our morning can. "
+_T = "<p>F3 Energy is our training can. "
+CARRY_RESIDUALS: tuple[tuple[str, dict[str, str]], ...] = (
+    # B1: a dropped expletive / generic pronoun hides the demonstrative after it
+    ("B1 it is true that this", _article(_M + "It is true that this is all-natural.</p>")),
+    ("B1 they say this", _article(_E + "They say this is the cleanest can in the cooler.</p>")),
+    ("B1 they call this", _article(_E + "They call this the cleanest can in the cooler.</p>")),
+    ("B1 it's no secret that this can", _article(_E + "It's no secret that this can is the cleanest in the cooler.</p>")),
+    ("B1 it turns out that's", _article(_M + "It turns out that's all-natural.</p>")),
+    ("B1 it turns out this one", _article(_M + "It turns out this one is all-natural.</p>")),
+    ("B1 they say that's", _article(_M + "They say that's all-natural.</p>")),
+    ("B1 it is clear that these", _article(_M + "It is clear that these are all-natural.</p>")),
+    ("B1 it seems that this", _article(_M + "It seems that this is all natural.</p>")),
+    ("B1 it goes without saying that this", _article(_M + "It goes without saying that this is all-natural.</p>")),
+    ("B1 it's worth noting that this blend", _article(_M + "It's worth noting that this blend is all-natural.</p>")),
+    # B2: an expletive frame matches a REFERENTIAL it / they
+    ("B2 it depends on (natural)", _article(_M + "It depends on natural ingredients, not caffeine.</p>")),
+    ("B2 it depends on (clean)", _article(_T + "It depends on clean ingredients and green tea.</p>")),
+    ("B2 worth considering, adjective", _article(_M + "It's worth considering, all-natural and caffeine-free.</p>")),
+    ("B2 worth considering if", _article(_M + "It's worth considering if you want an all-natural evening drink.</p>")),
+    ("B2 it turns out <adjective>", _article(_M + "It turns out smooth, calm and all-natural.</p>")),
+    ("B2 it is clear when", _article(_M + "It is clear when poured and all-natural.</p>")),
+    ("B2 it is essential when", _article(_T + "It is essential when you train, clean and simple.</p>")),
+    ("B2 it is crucial if", _article(_T + "It is crucial if you lift, and all-natural.</p>")),
+    ("B2 they said", _article("<p>We rebuilt F3 Energy and F3 Mood this year. They said goodbye to dyes and "
+                              "went all-natural.</p>")),
+    ("B2 they call for", _article("<p>F3 Energy and F3 Mood are our two daily cans. They call for all-natural "
+                                  "ingredients only.</p>")),
+    # B3: the household-care frame drops the pronoun in a reformulation claim
+    ("B3 cleaned it thoroughly of", _article(_M + "We cleaned it thoroughly of artificial dyes and junk.</p>")),
+    ("B3 cleansed it thoroughly of", _article(_M + "We cleansed it thoroughly of anything artificial.</p>")),
+    ("B3 clean it every batch", _article(_M + "We clean it every batch, with no artificial dyes.</p>")),
+    ("B3 cleanse it between batches", _article(_M + "We cleanse it between batches of anything artificial.</p>")),
+    ("B3 cleaned it properly", _article(_T + "We cleaned it properly this time, with no artificial dyes.</p>")),
+    ("B3 cleaned it once and for all", _article(_T + "We cleaned it once and for all, no dyes, no junk.</p>")),
+    # B4: the decay hides the only possible referent
+    ("B4 a heading names the line", _article("<h2>Why F3 Mood</h2><p>Crack one open after dinner. It is "
+                                             "all-natural and caffeine-free.</p>")),
+    ("B4 a sibling list item", _article("<ul><li>F3 Energy: 120 mg of caffeine.</li><li>Zero sugar. It is "
+                                        "clean-label.</li></ul>")),
+    ("B4 the title names the line",
+     _article("<p>Evenings are for winding down. It is all-natural and caffeine-free.</p>", "F3 Mood: The Evening Can")),
+    ("B4 title and summary", _article("<p>Evenings are for winding down. It is all-natural and caffeine-free.</p>",
+                                      "Meet F3 Mood", "Our caffeine-free evening can.")),
+    ("B4 the next paragraph's second sentence",
+     _article("<p>F3 Mood is our evening can.</p><p>Crack one open after dinner. It is all-natural.</p>")),
+    ("B4 two product-descriptive sentences between",
+     _article("<p>F3 Energy is built for the morning. Each can carries 120 mg of caffeine. The flavor is bright "
+              "citrus. It is clean fuel, all day.</p>")),
+)
+del _M, _E, _T
+
 # ── reported, never gated: needs a Harrison ruling ──────────────────────────────
 UNDECIDED: tuple[str, ...] = (
     # (the 9/14 green-tea sentence moved to FALSE_POSITIVE_SET: ruled 2026-09-19)
@@ -615,6 +679,7 @@ class Verdict:
     union_legacy_trips: int = 0                                             #   strict legacy leg read / tripped
     union_violations: list[str] = field(default_factory=list)              # legacy leg trips, shipping PASSES
     over_trips_passing: list[str] = field(default_factory=list)            # UNION_OVER_TRIPS rows that pass
+    carry_residuals_passing: list[str] = field(default_factory=list)       # CARRY_RESIDUALS still open
 
     def summary_lines(self) -> list[str]:
         out = [f"SHIP: {'YES' if self.ship else 'NO'}"]
@@ -662,6 +727,11 @@ class Verdict:
             out.append("  carry release probe still tripping: " + s)
         for s in self.carry_holes_missed:
             out.append("  carry hole probe PASSES the shipping preflight: " + s)
+        out.append(f"carry residuals (D-051 round 3; relative to round 1 -- the legacy rail passes every one "
+                   f"too): {len(self.carry_residuals_passing)}/{len(CARRY_RESIDUALS)} still pass the shipping "
+                   f"preflight (reported, never gated)")
+        for s in self.carry_residuals_passing:
+            out.append("  carry residual: " + s)
         for s, res in self.undecided.items():
             out.append(f"UNDECIDED (Harrison ruling): legacy={'TRIP' if res['legacy'] else 'pass'} "
                        f"attribution={'TRIP' if res['attribution'] else 'pass'} -- {s}")
@@ -721,6 +791,7 @@ def evaluate() -> Verdict:
     gated_uncaught = [s for cls, missed in uncaught.items() if cls not in RULED_OUT_CLASSES for s in missed]
     union_checked, union_tripped, union_bad = union_check()
     over_passing = [s for s in UNION_OVER_TRIPS if new_preflight(s).passed]
+    residuals = [label for label, kw in CARRY_RESIDUALS if pf.run_preflight(**kw).passed]
     ship = (not pinned_missed and not gated_uncaught and not fp_new and not release
             and not carry_release and not carry_missed and not union_bad)
     return Verdict(ship=ship, uncaught_by_class=uncaught, uncaught_legacy_by_class=uncaught_legacy,
@@ -728,7 +799,8 @@ def evaluate() -> Verdict:
                    pinned_missed=pinned_missed, undecided=undecided, release_tripping=release,
                    carry_release_tripping=carry_release, carry_holes_missed=carry_missed,
                    union_checked=union_checked, union_legacy_trips=union_tripped,
-                   union_violations=union_bad, over_trips_passing=over_passing)
+                   union_violations=union_bad, over_trips_passing=over_passing,
+                   carry_residuals_passing=residuals)
 
 
 @dataclass

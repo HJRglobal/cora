@@ -2218,3 +2218,38 @@ class TestRound3LegacyUnion:
         base, dbl = run(1200), run(2400)
         assert dbl < base * 2.6 + 0.05, "superlinear: %.4fs -> %.4fs" % (base, dbl)
 
+
+class TestRound3CarryResiduals:
+    """B1-B4 (the decaying carry) are residuals RELATIVE TO ROUND 1, not to main: the
+    frozen legacy rail is single-sentence and passes every row. They stay (reported,
+    never gated) because restoring the non-decaying carry re-trips the pinned
+    CARRY_RELEASE_PROBES -- measured here, not assumed."""
+
+    def test_no_residual_is_a_hole_relative_to_main(self):
+        for label, kw in rh.CARRY_RESIDUALS:
+            assert rh.legacy_run(**kw).passed, label
+
+    def test_the_residuals_are_reported_and_never_gated(self):
+        v = rh.evaluate()
+        assert v.ship is True
+        head = [ln for ln in v.summary_lines() if ln.startswith("carry residuals (D-051 round 3")]
+        assert head == ["carry residuals (D-051 round 3; relative to round 1 -- the legacy rail passes every one "
+                        "too): %d/%d still pass the shipping preflight (reported, never gated)"
+                        % (len(v.carry_residuals_passing), len(rh.CARRY_RESIDUALS))]
+        for label in v.carry_residuals_passing:
+            assert "  carry residual: " + label in v.summary_lines()
+        assert {lab.split()[0] for lab, _ in rh.CARRY_RESIDUALS} == {"B1", "B2", "B3", "B4"}
+
+    def test_restoring_the_non_decaying_carry_re_trips_the_pinned_release_rows(self, monkeypatch):
+        def forever(self):
+            seen = self.lines | (self.title if self.field_start else frozenset())
+            return frozenset(seen)
+        monkeypatch.setattr(pf.Rail2Carry, "visible", forever)
+        re_tripped = [label for label, kw in rh.CARRY_RELEASE_PROBES if not pf.run_preflight(**kw).passed]
+        assert len(re_tripped) == 11, re_tripped
+        assert {"queued row 8: green tea caffeine vs synthetic caffeine", "queued row 13: reading labels, Pure-led",
+                "queued row 12: an ingredients glossary under an Energy summary"} <= set(re_tripped)
+        # ...while it would close every B4 row
+        for label, kw in rh.CARRY_RESIDUALS:
+            if label.startswith("B4"):
+                assert not pf.run_preflight(**kw).passed, label
