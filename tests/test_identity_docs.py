@@ -301,8 +301,11 @@ def test_inventory_records_slack_user_token_absent_and_not_added():
     assert "`SLACK_USER_TOKEN`" in inv
     assert "ABSENT from the live `.env`" in inv
     assert "Do NOT add the key anywhere" in inv
-    # the recorded fallback fact is the LIVE one, not the kickoff's "fails if run"
-    assert "FALLS BACK to `SLACK_BOT_TOKEN`" in inv
+    # DELIBERATE FLIP (Code #14 R14-7c, ruled 2026-09-19 4b.4): the script now
+    # hard-fails without the key -- the recorded fact follows the live code.
+    assert "HARD-FAILS without it" in inv
+    assert "no bot-token fallback" in inv
+    assert "FALLS BACK" not in inv
     # and no bot module reads it (script-only stays true)
     readers = [p for p in (_REPO / "src").rglob("*.py") if "SLACK_USER_TOKEN" in p.read_text(encoding="utf-8", errors="ignore")]
     assert readers == [], f"src/ modules now read SLACK_USER_TOKEN: {readers}"

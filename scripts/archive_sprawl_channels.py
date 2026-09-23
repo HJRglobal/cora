@@ -16,8 +16,12 @@ Usage:
     # execute + also archive Harrison's chosen Group-2 channels (still keep-guarded)
     python scripts/archive_sprawl_channels.py --apply --also C0XXXX,C0YYYY
 
-Auth: prefers SLACK_USER_TOKEN (Harrison's owner token) from .env, falls back to
-SLACK_BOT_TOKEN. Writes a log to logs/archive-sprawl-<date>.jsonl.
+Auth: REQUIRES SLACK_USER_TOKEN (Harrison's owner token) from .env, in BOTH modes
+(dry-run included). There is NO fallback to SLACK_BOT_TOKEN (ruled 2026-09-19,
+4b.4; Code #14 R14-7c): without the key the script exits before any Slack client
+is built, so nothing is read or archived. The key is ABSENT from the live .env
+today and the runbook says not to add it -- so this script cannot run until
+Harrison deliberately provisions it. Writes a log to logs/archive-sprawl-<date>.jsonl.
 """
 from __future__ import annotations
 
@@ -251,17 +255,26 @@ def plan_target(label, channel_id, name_hint, ch, group):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+NO_USER_TOKEN_MESSAGE = (
+    "ERROR: SLACK_USER_TOKEN not set -- this script requires Harrison's owner token "
+    "and never falls back to SLACK_BOT_TOKEN (ruled 2026-09-19). "
+    "Nothing was read or archived."
+)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--apply", action="store_true", help="execute archives (default is dry-run)")
     ap.add_argument("--also", default="", help="comma-separated extra channel IDs to archive (Group-2 picks)")
     args = ap.parse_args()
 
-    user_token = os.environ.get("SLACK_USER_TOKEN")
-    token = user_token or os.environ.get("SLACK_BOT_TOKEN")
+    # Hard-fail BEFORE any WebClient construction, in BOTH modes: a dry-run still
+    # reads every channel (conversations.list/info/history), and those reads must
+    # not silently run as the bot either. Never read SLACK_BOT_TOKEN here.
+    token = (os.environ.get("SLACK_USER_TOKEN") or "").strip()
     if not token:
-        sys.exit("ERROR: no SLACK_USER_TOKEN or SLACK_BOT_TOKEN in .env")
-    token_kind = "SLACK_USER_TOKEN" if user_token else "SLACK_BOT_TOKEN"
+        sys.exit(NO_USER_TOKEN_MESSAGE)
+    token_kind = "SLACK_USER_TOKEN"
 
     client = WebClient(token=token, retry_handlers=[
         RateLimitErrorRetryHandler(max_retry_count=5),
