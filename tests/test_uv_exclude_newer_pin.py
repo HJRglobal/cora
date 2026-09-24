@@ -31,16 +31,19 @@ def _lock_cutoff() -> object:
 
 
 def test_pyproject_pins_the_cutoff_the_lock_records():
+    """Equal, or BOTH absent (a deliberately unpinned lock is consistent too: plain
+    `uv sync` does not re-resolve). Exactly one side set is the drift this guards."""
     pin, recorded = _pyproject_pin(), _lock_cutoff()
-    assert recorded is not None, "uv.lock records no exclude-newer; drop the [tool.uv] pin in the same commit"
     assert pin == recorded, (
         f"pyproject [tool.uv] exclude-newer={pin!r} but uv.lock [options] exclude-newer={recorded!r}: "
-        "edit the pyproject value, run plain `uv lock` (never --exclude-newer on the command line), "
-        "commit both files together")
+        "set the pyproject value (or remove it), run plain `uv lock` -- never --exclude-newer on the "
+        "command line -- and commit pyproject.toml + uv.lock together")
 
 
-def test_the_cutoff_is_a_full_utc_instant():
+def test_a_set_cutoff_is_a_full_utc_instant():
     for label, value in (("pyproject.toml", _pyproject_pin()), ("uv.lock", _lock_cutoff())):
+        if value is None:
+            continue
         assert isinstance(value, str) and _INSTANT.match(value), (
             f"{label} exclude-newer={value!r} must be a full instant like 2026-07-30T00:00:00Z "
             "(a date-only value means end-of-local-day and differs per host timezone)")
