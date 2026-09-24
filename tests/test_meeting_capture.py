@@ -2838,3 +2838,60 @@ class TestMeetJoinAuditHealthCheck:
         assert body.count(b) == 1
         i = body.index(a) + len(a)
         assert body[i:].lstrip(" ").startswith(b)
+
+
+# ── COPA carve-out (ruled by Harrison 2026-09-23, Code #14 close-out ask 1b) ────
+
+class TestCopaCarveOut:
+    """COPA (NDA'd deal) meetings are never recorded. The KB already excludes COPA
+    transcripts by whole-word title; since R14-4 cora@ also RSVPs to LEX invites
+    and its Fireflies seat joins what it accepts, so the carve-out must hold on
+    BOTH halves of the ensure lane (guest-add and cora@'s own RSVP). Every case
+    reads the REAL roster's patterns -- the data edit is what is under test."""
+
+    COPA_TITLES = (
+        "LBHS COPA Diligence",
+        "copa sync",
+        "COPA-review",
+        "Weekly (COPA) update",
+        "Re: COPA",
+        "COPA's data room walkthrough",
+    )
+    LOOKALIKES = ("Copacabana offsite", "copay reconciliation", "Copacetic retro")
+
+    @staticmethod
+    def _real_patterns() -> tuple[str, ...]:
+        return mc.load_config(force=True).no_record_title_patterns
+
+    def test_the_real_roster_carries_copa(self):
+        assert "copa" in self._real_patterns()
+
+    @pytest.mark.parametrize("title", COPA_TITLES)
+    def test_a_copa_titled_meeting_is_not_recorded(self, title):
+        q = mc.qualify_event(_ev("e1", summary=title), mc.load_config(force=True))
+        assert not q.qualifies and q.reason == "no-record-title:copa", (title, q)
+
+    @pytest.mark.parametrize("title", LOOKALIKES)
+    def test_whole_word_semantics_keep_lookalikes_recorded(self, title):
+        assert mc.qualify_event(_ev("e1", summary=title), mc.load_config(force=True)).qualifies, title
+
+    def test_neither_half_of_the_ensure_lane_acts_on_a_copa_lex_meeting(self, monkeypatch):
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        cfg = _cfg(no_record_title_patterns=self._real_patterns())
+        title = "LBHS COPA Diligence"
+        cal = _Cal(monkeypatch, own=_lex_own("c1", summary=title))
+        # guest-add half: only the roster copy exists; cora@ is not on it yet
+        plan = mc.plan_ensure(DAY, cfg, list_events=_lister({
+            CORA: [], "harrison@hjrglobal.com": [_lex_roster("r1", summary=title)]}))
+        res = mc.execute_ensure(plan, cfg, apply=True)
+        assert [a.action for a in res.actions] == ["skip"]
+        assert res.actions[0].reason == "no-record-title:copa"
+        # RSVP half: the invite already sits on cora@'s calendar at needsAction
+        plan = mc.plan_ensure(DAY, cfg, list_events=_lister({
+            CORA: [_lex_own("c1", summary=title)],
+            "harrison@hjrglobal.com": [_lex_roster("r1", summary=title)]}))
+        res = mc.execute_ensure(plan, cfg, apply=True)
+        assert [a.action for a in res.actions] == ["skip"]
+        assert res.actions[0].reason == "no-record-title:copa"
+        assert not any(a.rsvp_planned for a in res.actions)
+        assert cal.adds == [] and cal.rsvps == [] and cal.copies == []

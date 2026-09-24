@@ -127,6 +127,12 @@ carve_outs:
     # as a false MISS in the daily audit; the "Q2 401(k) sign electronically" row).
     - "docusign"
     - "sign electronically"
+    # COPA (NDA'd deal) meetings are never recorded -- ruled by Harrison 2026-09-23
+    # (Code #14 close-out ask 1b). COPA transcripts were PURGED with a permanent KB
+    # title exclusion (whole-word "copa"); since R14-4 cora@ also RSVPs to LEX
+    # invites and its Fireflies seat joins what it accepts, so recording has to
+    # match retention here. Whole-word like the rest: "Copacabana" / "copay" record.
+    - "copa"
 
   # Any event organized by, or attended by, one of these addresses is never captured.
   # Use this for outside counsel and personal advisors -- it is exact-match on the
