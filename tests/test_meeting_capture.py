@@ -2968,3 +2968,121 @@ class TestCarvedRecordingNeverPrintsItsTitle:
         for title in ("LBHS COPA Diligence", "[no-bot] x", "Copacabana offsite", "Call with counsel"):
             q = mc.qualify_event(_ev("e1", summary=title), cfg)
             assert (q.reason if not q.qualifies else "") == mc.title_carve_out_reason(title, cfg), title
+
+
+class TestCarveOutJoinsRoundThree:
+    """D-051 r4 re-review of bc61bc4 (all CONFIRMED 2/2): bc61-F1 a marker on ONE copy
+    left the other copies' plain title on the recording -> printed; bc61-F2 the link
+    fallback bound a recorded carved call to ANOTHER meeting on the same static room
+    link, even with the carved event's exact cal_id; bc61-F3 a false breach from a
+    link shared with ordinary meetings; bc61-F4 a roster decline raised the breach
+    alarm. The rule now: exact carved id before any fallback; a link/title shared with
+    a qualifying meeting binds neither side; consent carve-outs only."""
+
+    ROOM = "https://zoom.us/my/harrisonroom"
+    ORG = "rep@outside.example"
+
+    def _cfg(self):
+        return _cfg(no_record_title_patterns=mc.load_config(force=True).no_record_title_patterns)
+
+    def test_f1_a_marker_on_one_copy_still_catches_the_plain_titled_recording(self):
+        kw = dict(organizer=self.ORG, link=None, location="https://zoom.us/j/555",
+                  attendees=[self.ORG, "harrison@hjrglobal.com", "hannah@hjrglobal.com"])
+        events = {"harrison@hjrglobal.com": [_ev("h1", summary="[no-bot] Diligence call", **kw)],
+                  "hannah@hjrglobal.com": [_ev("_hannahcopy", summary="Diligence call", **kw)]}
+        t = _t("t1", title="Diligence call", cal_id=None, link="https://zoom.us/j/555?pwd=zz",
+               organizer=self.ORG)
+        r = _audit(events, [t], cfg=self._cfg())
+        assert [reason for _s, reason in r.carve_out_breaches] == ["title-marker:[no-bot]"]
+        assert r.unmatched_transcripts == []
+        out = mc.render_report(r)
+        assert "Diligence call" not in out and self.ORG not in out
+
+    def _room_day(self):
+        return {"harrison@hjrglobal.com": [
+            _ev("copa1", summary="COPA sync", hh=10, link=self.ROOM),
+            _ev("vend1", summary="Vendor walkthrough", hh=14, link=self.ROOM),
+        ]}
+
+    def test_f2_an_exact_carved_cal_id_is_a_breach_before_the_link_fallback(self):
+        t = _t("t1", title="COPA sync", hh=10, cal_id="copa1", link=self.ROOM)
+        r = _audit(self._room_day(), [t], cfg=self._cfg())
+        assert [reason for _s, reason in r.carve_out_breaches] == ["no-record-title:copa"]
+        assert r.captured == 0 and len(r.misses) == 1          # the vendor call was NOT recorded
+        out = mc.render_report(r)
+        assert "captured exactly once" not in out and "COPA sync" not in out
+
+    def test_f2_a_no_id_carved_recording_on_a_shared_room_link_is_a_breach(self):
+        t = _t("t1", title="COPA sync", hh=10, cal_id=None, link=self.ROOM)
+        r = _audit(self._room_day(), [t], cfg=self._cfg())
+        assert len(r.carve_out_breaches) == 1 and r.captured == 0
+
+    def test_f2_the_ordinary_meeting_on_the_shared_link_still_joins_by_title(self):
+        t = _t("t2", title="Vendor walkthrough", hh=14, cal_id=None, link=self.ROOM)
+        r = _audit(self._room_day(), [t], cfg=self._cfg())
+        assert r.carve_out_breaches == [] and r.captured == 1 and r.misses == []
+
+    def test_f3_a_generic_titled_recording_on_a_link_shared_with_ordinary_meetings_is_not_a_breach(self):
+        """The reviewer's shape: a carved call plus TWO ordinary meetings on one room
+        link (so the main link index already drops it as ambiguous); the 14:00
+        recording carries a Fireflies-generated title and no cal_id."""
+        events = {"harrison@hjrglobal.com": [
+            _ev("c1", summary="Call with counsel", hh=10, link=self.ROOM),
+            _ev("o1", summary="Vendor walkthrough", hh=14, link=self.ROOM),
+            _ev("o2", summary="Team sync", hh=16, link=self.ROOM),
+        ]}
+        t = _t("t2", title="Harrison's Personal Meeting Room", hh=14, cal_id=None, link=self.ROOM)
+        r = _audit(events, [t], cfg=self._cfg())
+        assert r.carve_out_breaches == []
+
+    def test_a_link_shared_only_by_carved_meetings_is_a_breach_naming_both_times(self):
+        events = {"harrison@hjrglobal.com": [
+            _ev("c1", summary="Call with counsel", hh=10, link=self.ROOM),
+            _ev("c2", summary="COPA sync", hh=15, link=self.ROOM),
+        ]}
+        t = _t("t1", title="Harrison's Personal Meeting Room", hh=10, cal_id=None, link=self.ROOM)
+        r = _audit(events, [t], cfg=self._cfg())
+        assert r.carve_out_breaches == [("a meeting at 10:00 or 15:00",
+                                         "no-record-title:copa, no-record-title:counsel")]
+        assert r.unmatched_transcripts == []
+
+    def test_f4_refuted_a_recorded_meeting_a_roster_member_declined_is_still_a_breach(self):
+        """bc61-F4 was REFUTED 0/2: a decline is a consent signal (qualify_event says
+        so), and the link path already alarmed on it. Pinned so the alarm stays."""
+        kw = dict(summary="Acme pitch", organizer=self.ORG, link=None, location="https://zoom.us/j/777")
+        mine = _ev("h1", **kw)
+        mine["attendees"] = [{"email": self.ORG},
+                             {"email": "harrison@hjrglobal.com", "self": True, "responseStatus": "declined"}]
+        theirs = _ev("_hannahcopy", **kw)
+        t = _t("t1", title="Acme pitch", cal_id="_hannahcopy", link="https://zoom.us/j/777?pwd=q",
+               organizer=self.ORG)
+        r = _audit({"harrison@hjrglobal.com": [mine], "hannah@hjrglobal.com": [theirs]}, [t],
+                   cfg=self._cfg())
+        assert [reason for _s, reason in r.carve_out_breaches] == ["roster-user-declined"]
+        assert "Acme pitch" not in mc.render_report(r)
+
+    def test_a_structural_veto_is_never_a_breach(self):
+        """A cancelled copy is not a ruling that the meeting must not be recorded."""
+        ev = _ev("x1", summary="Weekly Sync", status="cancelled", link=self.ROOM)
+        t = _t("t1", title="Weekly Sync", cal_id="x1", link=self.ROOM)
+        r = _audit({"harrison@hjrglobal.com": [ev]}, [t], cfg=self._cfg())
+        assert r.carve_out_breaches == []
+
+    def test_a_consent_carve_out_on_any_copy_names_the_meeting_even_after_a_decline(self):
+        kw = dict(organizer=self.ORG, link=None, location="https://zoom.us/j/888")
+        mine = _ev("h1", summary="Acme pitch", **kw)
+        mine["attendees"] = [{"email": self.ORG},
+                             {"email": "harrison@hjrglobal.com", "self": True, "responseStatus": "declined"}]
+        theirs = _ev("_hannahcopy", summary="[no-bot] Acme pitch", **kw)
+        t = _t("t1", title="Acme pitch", cal_id="_hannahcopy", link="", organizer=self.ORG)
+        r = _audit({"harrison@hjrglobal.com": [mine], "hannah@hjrglobal.com": [theirs]}, [t],
+                   cfg=self._cfg())
+        assert [reason for _s, reason in r.skipped] == ["title-marker:[no-bot]"]
+        assert [reason for _s, reason in r.carve_out_breaches] == ["title-marker:[no-bot]"]
+
+    def test_the_belt_covers_a_no_record_attendee_address(self):
+        t = _t("t1", title="Quarterly review", cal_id=None, link="https://zoom.us/j/4",
+               organizer="lawyer@outsidefirm.com")
+        r = _audit({"harrison@hjrglobal.com": []}, [t], cfg=self._cfg())
+        assert [reason for _s, reason in r.carve_out_breaches] == ["no-record-email:lawyer@outsidefirm.com"]
+        assert "Quarterly review" not in mc.render_report(r)
