@@ -34,3 +34,12 @@ packages = ["src/cora"]
 dev = [
     "pytest>=8.0",
 ]
+
+[tool.uv]
+# The resolver cutoff the lock was built with (DR/VM step 1 re-locked with
+# `uv lock --exclude-newer 2026-07-30`, so uv.lock records it under [options]).
+# Without this pin a plain `uv sync` reads that recorded value as a REMOVED global
+# setting ("Resolving despite existing lockfile due to removal of global exclude
+# newer"), re-resolves and silently upgrades packages (mcp 2.0.0 -> 2.2.0 et al.,
+# 2026-09-24). Move this date deliberately, then `uv lock`, in one commit.
+exclude-newer = "2026-07-30T00:00:00Z"
