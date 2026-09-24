@@ -26,7 +26,7 @@
 
 **Lower-probability threats:**
 - Ransomware (Windows Defender + patching + backups mitigate)
-- Supply-chain attack via a Python dependency (uv.lock pins versions; update regularly)
+- Supply-chain attack via a Python dependency (uv.lock pins versions and `[tool.uv] exclude-newer` pins the resolver cutoff; update regularly by moving the cutoff -- see the quarterly checklist)
 - Denial-of-service against the desktop (rate limiter in code already handles Slack floods)
 
 ---
@@ -249,4 +249,4 @@ After Stage 3: SSH into the EC2 instance from anywhere; auto-healing handles mos
 - [ ] GitHub: no unexpected collaborators on `HJRglobal/cora`
 - [ ] `.env` is in `.gitignore` and NOT tracked: `git ls-files .env` → empty output
 - [ ] `Get-ScheduledTask | Where-Object { $_.TaskName -like "cowork-cora-*" }` — all tasks Ready/Running
-- [ ] Python dependencies: run `uv lock --upgrade` quarterly to get patched versions
+- [ ] Python dependencies, quarterly: FIRST move `[tool.uv] exclude-newer` in `pyproject.toml` to today (full instant, e.g. `"2026-12-01T00:00:00Z"`), THEN `uv lock --upgrade`, review the package diff, commit `pyproject.toml` + `uv.lock` together. Without moving the pin the resolver cannot see any release newer than the pin, so `uv lock --upgrade` reports "No lockfile changes detected" and takes no patches.

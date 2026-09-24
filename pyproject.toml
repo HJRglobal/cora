@@ -36,10 +36,15 @@ dev = [
 ]
 
 [tool.uv]
-# The resolver cutoff the lock was built with (DR/VM step 1 re-locked with
-# `uv lock --exclude-newer 2026-07-30`, so uv.lock records it under [options]).
-# Without this pin a plain `uv sync` reads that recorded value as a REMOVED global
-# setting ("Resolving despite existing lockfile due to removal of global exclude
-# newer"), re-resolves and silently upgrades packages (mcp 2.0.0 -> 2.2.0 et al.,
-# 2026-09-24). Move this date deliberately, then `uv lock`, in one commit.
+# The resolver cutoff uv.lock was built with (recorded there under [options]; DR/VM
+# step 1, 2026-09-23). Without this pin a plain `uv sync` reads that recorded value
+# as a REMOVED global setting ("Resolving despite existing lockfile due to removal
+# of global exclude newer"), re-resolves and silently upgrades packages (mcp 2.0.0
+# -> 2.2.0 et al., 2026-09-24).
+# To move it: edit THIS value (always a full instant with Z -- a date-only value is
+# read as the end of the LOCAL day), then run plain `uv lock` (or `uv lock --upgrade`
+# for the quarterly patch pass, SECURITY.md), review the diff, and commit
+# pyproject.toml + uv.lock together. Never pass --exclude-newer on the command line:
+# the flag overrides this setting and writes a different cutoff into uv.lock.
+# tests/test_uv_exclude_newer_pin.py keeps the two values equal.
 exclude-newer = "2026-07-30T00:00:00Z"
