@@ -11,7 +11,7 @@ are in `deployment/manifest/task-estate.md`. The Monday digest
 manifest and prints `task-estate-drift:` lines. Do not hand-edit inside the markers.
 
 <!-- BEGIN GENERATED: task-registry -->
-_Generated 2026-09-23 by `scripts/generate_task_estate_manifest.py --update-docs` from the live registry (96 tasks, 78 enabled). Full columns: `deployment/manifest/task-estate.md`. Do not hand-edit._
+_Generated 2026-09-24 by `scripts/generate_task_estate_manifest.py --update-docs` from the live registry (99 tasks, 80 enabled). Full columns: `deployment/manifest/task-estate.md`. Do not hand-edit._
 
 | Task Name | Schedule | Script | State | Run level | Notes |
 |---|---|---|---|---|---|
@@ -71,7 +71,10 @@ _Generated 2026-09-23 by `scripts/generate_task_estate_manifest.py --update-docs
 | `cowork-cora-completion-sweep` | daily 14:00 | `scripts/run_completion_sweep.py` | Ready | Limited | SWA=false |
 | `cowork-cora-decision-capture` | daily 07:15 | `scripts/capture_decisions.py` | Ready | Limited | SWA=false |
 | `cowork-cora-delegated-work` | every PT15M for P3650D stop-at-end (from 2026-08-01T00:00) | `scripts/run_delegated_work_runner.py` | Ready | Limited |  |
+| `cowork-cora-deposco-inventory-sync` | daily 06:22 | `scripts/run_deposco_inventory_sync.py` | Ready | Limited |  |
+| `cowork-cora-deposco-lot-ledger` | daily 07:45 | `scripts/run_deposco_lot_ledger.py` | Ready | Limited |  |
 | `cowork-cora-digest` | daily 05:20 | `scripts/generate_knowledge_gaps_digest.py` | Disabled | Limited | intent: disabled; console action (not run_hidden-wrapped) |
+| `cowork-cora-drive-extractor` | daily 04:05 + at logon | `scripts/run_drive_extractor.py` | Disabled | Highest | DRIFT: host DISABLED, not in the disabled list; console action (not run_hidden-wrapped) |
 | `cowork-cora-feedback-health` | weekly Mon 08:30 | `scripts/run_feedback_health_report.py` | Ready | Limited | SWA=false |
 | `cowork-cora-finance-adherence` | weekly Mon 08:15 | `scripts/run_finance_adherence_check.py` | Ready | Limited |  |
 | `cowork-cora-finance-close-pack` | weekly Mon 09:00 | `scripts/run_finance_close_pack.py` | Ready | Limited |  |

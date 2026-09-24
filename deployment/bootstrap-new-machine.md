@@ -238,12 +238,12 @@ decision recorded in `deployment/DR-MANIFEST.md`, not something this phase sets.
 ### Scheduled estate (generated -- do not hand-edit)
 
 <!-- BEGIN GENERATED: scheduled-estate -->
-_Generated 2026-09-23 by `scripts/generate_task_estate_manifest.py --update-docs` from the live registry: **96 tasks** (78 enabled). Source of truth: `deployment/manifest/task-estate.json`. Do not hand-list tasks here -- regenerate._
+_Generated 2026-09-24 by `scripts/generate_task_estate_manifest.py --update-docs` from the live registry: **99 tasks** (80 enabled). Source of truth: `deployment/manifest/task-estate.json`. Do not hand-list tasks here -- regenerate._
 
 **Register the estate FROM THE MANIFEST** (from an ELEVATED PowerShell at the repo root; host time zone must be `US Mountain Standard Time` first -- `Set-TimeZone`):
-1. `.\deployment\register-estate-from-manifest.ps1` (dry-run plan) then `.\deployment\register-estate-from-manifest.ps1 -Apply` -- registers every task below from `deployment/manifest/tasks/<slug>.xml` (full-fidelity Task Scheduler exports: triggers, windowless action, settings, run level, and `Enabled=false` for the 18 intent-disabled tasks). The `setup-*.ps1` scripts are NOT run on a rebuild: several carry drifted clocks or would re-enable disabled tasks; they create NEW tasks only.
+1. `.\deployment\register-estate-from-manifest.ps1` (dry-run plan) then `.\deployment\register-estate-from-manifest.ps1 -Apply` -- registers every task below from `deployment/manifest/tasks/<slug>.xml` (full-fidelity Task Scheduler exports: triggers, windowless action, settings, run level, and `Enabled=false` for the 19 intent-disabled tasks). The `setup-*.ps1` scripts are NOT run on a rebuild: several carry drifted clocks or would re-enable disabled tasks; they create NEW tasks only.
 2. Restore `.env` (Phase 4) BEFORE starting anything; then `Start-ScheduledTask -TaskName cowork-cora-service` (the service otherwise starts at the next logon).
-3. Verify: `Get-ScheduledTask | Where-Object { $_.TaskName -like 'cowork-cora-*' -or $_.TaskName -like 'Cora - *' -or $_.TaskName -eq 'cora-watchdog' } | Measure-Object` -> expect **96**, then `.venv\Scripts\python.exe scripts\generate_task_estate_manifest.py --diff-only` -> expect ZERO `task-estate-drift` lines (cron / enabled / action / principal / settings / time zone are all compared).
+3. Verify: `Get-ScheduledTask | Where-Object { $_.TaskName -like 'cowork-cora-*' -or $_.TaskName -like 'Cora - *' -or $_.TaskName -eq 'cora-watchdog' } | Measure-Object` -> expect **99**, then `.venv\Scripts\python.exe scripts\generate_task_estate_manifest.py --diff-only` -> expect ZERO `task-estate-drift` lines (cron / enabled / action / principal / settings / time zone are all compared).
 4. The Cowork estate (Claude desktop scheduled tasks) is NOT registered by any of this: it stays on the office machine (charter D4); its weekly pin task is `cowork-model-pin-weekly`.
 
 | Task | Trigger | XML (restore form) | Created by (setup script, informational) | Run level / logon | SWA | Intent |
@@ -281,7 +281,7 @@ _Generated 2026-09-23 by `scripts/generate_task_estate_manifest.py --update-docs
 | `Cora - LEX Swept PHI Check` | daily 07:06 | `tasks/Cora-LEX-Swept-PHI-Check.xml` | `setup-lex-swept-phi-check-task.ps1` | Limited / Interactive | yes | enabled |
 | `Cora - Log Compaction` | monthly day 1 14:00 | `tasks/Cora-Log-Compaction.xml` | `setup-compaction-task.ps1` | Limited / Interactive | **no** | UNROWED |
 | `Cora - Meeting Action Capture` | every PT1H (from 2026-06-05T11:00) | `tasks/Cora-Meeting-Action-Capture.xml` | `setup-meeting-action-capture-task.ps1` | Limited / Interactive | yes | disabled |
-| `Cora - Meeting Ask Capture` | every PT15M for PT13H stop-at-end (daily 07:08) | `tasks/Cora-Meeting-Ask-Capture.xml` | `setup-meeting-ask-capture-task.ps1` | Limited / Interactive | **no** | UNROWED |
+| `Cora - Meeting Ask Capture` | every PT15M for PT13H stop-at-end (daily 07:08) | `tasks/Cora-Meeting-Ask-Capture.xml` | `setup-meeting-ask-capture-task.ps1` | Limited / Interactive | **no** | enabled |
 | `Cora - Missed Nightly Catch-Up` | daily 08:30 | `tasks/Cora-Missed-Nightly-Catch-Up.xml` | `setup-missed-nightly-catchup-task.ps1` | Limited / Interactive | yes | UNROWED |
 | `Cora - OSN Metrics Digest` | weekly Mon 15:00 | `tasks/Cora-OSN-Metrics-Digest.xml` | `setup-osn-metrics-digest-task.ps1` | Highest / Interactive | yes | UNROWED |
 | `Cora - QBO Monthly Reports` | monthly day 2 07:45 | `tasks/Cora-QBO-Monthly-Reports.xml` | `setup-qbo-monthly-reports-task.ps1` | Limited / Interactive | **no** | UNROWED |
@@ -304,7 +304,10 @@ _Generated 2026-09-23 by `scripts/generate_task_estate_manifest.py --update-docs
 | `cowork-cora-completion-sweep` | daily 14:00 | `tasks/cowork-cora-completion-sweep.xml` | (none -- manifest XML only) | Limited / Interactive | **no** | UNROWED |
 | `cowork-cora-decision-capture` | daily 07:15 | `tasks/cowork-cora-decision-capture.xml` | (none -- manifest XML only) | Limited / Interactive | **no** | UNROWED |
 | `cowork-cora-delegated-work` | every PT15M for P3650D stop-at-end (from 2026-08-01T00:00) | `tasks/cowork-cora-delegated-work.xml` | `setup-delegated-work-task.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-deposco-inventory-sync` | daily 06:22 | `tasks/cowork-cora-deposco-inventory-sync.xml` | `setup-deposco-sync-tasks.ps1` | Limited / Interactive | yes | UNROWED |
+| `cowork-cora-deposco-lot-ledger` | daily 07:45 | `tasks/cowork-cora-deposco-lot-ledger.xml` | `setup-deposco-sync-tasks.ps1` | Limited / Interactive | yes | UNROWED |
 | `cowork-cora-digest` | daily 05:20 | `tasks/cowork-cora-digest.xml` | `setup-digest-task.ps1` | Limited / Interactive | yes | disabled |
+| `cowork-cora-drive-extractor` | daily 04:05 + at logon | `tasks/cowork-cora-drive-extractor.xml` | `setup-drive-extractor-task.ps1` | Highest / ServiceAccount | yes | UNROWED |
 | `cowork-cora-feedback-health` | weekly Mon 08:30 | `tasks/cowork-cora-feedback-health.xml` | (none -- manifest XML only) | Limited / Interactive | **no** | UNROWED |
 | `cowork-cora-finance-adherence` | weekly Mon 08:15 | `tasks/cowork-cora-finance-adherence.xml` | `setup-finance-adherence-task.ps1` | Limited / Interactive | yes | enabled |
 | `cowork-cora-finance-close-pack` | weekly Mon 09:00 | `tasks/cowork-cora-finance-close-pack.xml` | `setup-finance-close-pack-task.ps1` | Limited / Interactive | yes | enabled |
