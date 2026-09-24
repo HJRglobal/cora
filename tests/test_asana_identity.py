@@ -162,6 +162,10 @@ class TestSeamsRouted:
 
 _DIRECT_READ_RE = re.compile(
     r"""(?:environ\.get|getenv)\s*\(\s*["']ASANA_PAT(?:_CORA)?["']|environ\s*\[\s*["']ASANA_PAT(?:_CORA)?["']\]""")
+# Code #15 rider (R1-03): the widened pin -- any quoted key literal, any use of
+# either resolver constant (see TestNoDirectReadsRemain).
+_KEY_LITERAL_RE = re.compile(r"""["']ASANA_PAT(?:_CORA)?["']""")
+_RESOLVER_CONST_RE = re.compile(r"\b(?:HARRISON_PAT_ENV|CORA_PAT_ENV)\b")
 
 
 class TestNoDirectReadsRemain:
@@ -183,6 +187,48 @@ class TestNoDirectReadsRemain:
         assert not offenders, (
             "direct ASANA_PAT / ASANA_PAT_CORA env read(s) outside cora.asana_identity "
             "-- route through resolve_pat(): " + ", ".join(sorted(offenders)))
+
+    def test_no_pat_key_literal_or_constant_outside_resolver_and_config(self):
+        """Code #15 rider (R1-03): the read pin above matches only a string-literal
+        key INSIDE environ.get / getenv / environ[], so a bypass through a constant
+        (``KEY = "ASANA_PAT"; os.environ[KEY]``), through ``dotenv_values(...)["ASANA_PAT"]``
+        or through the resolver's own ``HARRISON_PAT_ENV`` / ``CORA_PAT_ENV`` passed it.
+        Widened: ANY quoted key literal, and ANY use of either resolver constant, is
+        an offender outside src/cora/asana_identity.py (the resolver) and
+        src/cora/config.py (the boot-time placeholder validation)."""
+        literal, constant = _KEY_LITERAL_RE, _RESOLVER_CONST_RE
+        allowed = {"src/cora/asana_identity.py", "src/cora/config.py"}
+        offenders = []
+        for base in (_REPO_ROOT / "src" / "cora", _REPO_ROOT / "scripts"):
+            for path in base.rglob("*.py"):
+                if "__pycache__" in path.parts:
+                    continue
+                rel = path.relative_to(_REPO_ROOT).as_posix()
+                if rel in allowed:
+                    continue
+                text = path.read_text(encoding="utf-8", errors="ignore")
+                for rx, why in ((literal, "key literal"), (constant, "resolver constant")):
+                    if rx.search(text):
+                        offenders.append(f"{rel} ({why})")
+        assert not offenders, (
+            "ASANA_PAT / ASANA_PAT_CORA named outside cora.asana_identity + config "
+            "-- route through resolve_pat(): " + ", ".join(sorted(offenders)))
+
+    def test_the_widened_pin_catches_each_bypass_shape(self):
+        # the pin must actually fire on the shapes the narrow regex let through
+        literal, constant = _KEY_LITERAL_RE, _RESOLVER_CONST_RE
+        bypasses = (
+            'KEY = "ASANA_PAT"\ntok = os.environ[KEY]',
+            "tok = dotenv_values('.env')['ASANA_PAT_CORA']",
+            "tok = os.environ[asana_identity.CORA_PAT_ENV]",
+            "tok = os.getenv(ai.HARRISON_PAT_ENV)",
+        )
+        for src in bypasses:
+            assert not _DIRECT_READ_RE.search(src), src   # the narrow pin misses it...
+            assert literal.search(src) or constant.search(src), src   # ...the widened one does not
+        # ...and must not fire on an unrelated key
+        assert not literal.search('os.environ.get("ASANA_PAT_ROTATION_DAY")')
+        assert not constant.search("MY_HARRISON_PAT_ENVIRONMENT = 1")
 
     def test_config_py_keeps_only_its_validation_load(self):
         # config.py's get("ASANA_PAT") is the key-shape validator, not a consumer;

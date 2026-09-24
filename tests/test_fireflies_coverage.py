@@ -235,6 +235,38 @@ class TestLoadDwdHumans:
         humans = load_dwd_humans(fixture_yaml)
         assert len(humans) == 4
 
+    def test_system_intake_mailbox_is_never_a_human_in_zero_flag_mode(self, tmp_path):
+        """Code #15 rider (R1-07): the cora@ row ("Cora (system mailbox)", no
+        slack id) matched neither the shared-localpart set nor the 'inbox'-in-name
+        rule, so a flag-free (full-roster) file made it a nudge-eligible human.
+        Its intake_route marks it a SYSTEM mailbox. This fixture carries NO
+        fireflies_seat flag, so the loader is in full-roster mode."""
+        cora_row = """
+  - email: cora@hjrglobal.com
+    name: Cora (system mailbox)
+    enabled: true
+    dwd_eligible: true
+    thread_sweep: false
+    attachment_filer: false
+    drive_sweep: false
+    entity_default: FNDR
+    fireflies_seat: false
+    intake_route: knowledge_review
+"""
+        p = tmp_path / "monitored-email-accounts.yaml"
+        p.write_text(_FIXTURE_YAML.rstrip("\n") + "\n" + cora_row, encoding="utf-8")
+        assert "fireflies_seat: true" not in p.read_text(encoding="utf-8")   # zero-flag mode
+        humans = load_dwd_humans(p)
+        emails = {e for h in humans for e in h.all_emails}
+        assert "cora@hjrglobal.com" not in emails
+        assert len(humans) == 4                      # the four real humans, unchanged
+        assert fireflies_coverage._is_shared_inbox(
+            {"email": "cora@hjrglobal.com", "name": "Cora (system mailbox)",
+             "intake_route": "knowledge_review"}) is True
+        # ...and without the route key the same row WAS a human (the defect)
+        assert fireflies_coverage._is_shared_inbox(
+            {"email": "cora@hjrglobal.com", "name": "Cora (system mailbox)"}) is False
+
     def test_real_roster_collapses_harrison_once(self):
         # integration: the actual production roster
         humans = load_dwd_humans()

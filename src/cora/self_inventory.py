@@ -47,8 +47,10 @@ ROUTING. ``is_self_inventory_question`` is a grammar for questions about
 SOURCES and INGESTION -- "do you have access to the Cowork Cascade knowledge",
 "are you ingesting the session captures", "what's in your knowledge base" --
 and deliberately NOT for questions about CONTENT ("do you have the EVV docs",
-"have you seen the Sprouts contract", "what data do you have on Kroger") or
-about LIVE SYSTEMS ("can you access HubSpot"): the object must be a source
+"have you seen the Sprouts contract", "what data do you have on Kroger").
+Connector-ACCESS asks ("can you access HubSpot?") DO route here since Code #13
+slice 1 (see ``_P_CAN_ACCESS_CONNECTOR`` below; the tool lists live connectors
+as NOT-sources), but a connector TOOL-USE ask never does. The object must be a source
 zone or the knowledge base itself, an object followed by a specifier tail
 ("... transcript FROM the Gotham call", "... thread WHERE Matt approved") is
 content, and an imperative write ("complete the task -- the deck is in your

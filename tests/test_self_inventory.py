@@ -508,7 +508,17 @@ class TestWiring:
         defn = next(t for t in td.TOOL_DEFINITIONS if t["name"] == "cora_self_inventory")
         assert defn["input_schema"]["properties"] == {}
         assert "Read-only" in defn["description"] and "NEVER evidence of absence" in defn["description"]
-        assert "NOT for live systems" in defn["description"] and "NOT for content questions" in defn["description"]
+        assert "NOT for content questions" in defn["description"]
+        # Code #15 rider (C13-08): the routing half (cq-2e02f1fd0f65) FORCES
+        # "can you access HubSpot / QBO ..." into this tool, so the description
+        # must not tell the model the opposite. It says connector-ACCESS asks
+        # are answered here (live connectors listed as NOT-sources) and keeps
+        # tool-USE asks out of it.
+        desc = defn["description"]
+        assert "NOT for live systems" not in desc
+        assert "Connector-ACCESS questions ARE answered here" in desc
+        assert "NOT knowledge-base sources" in desc and "never 'not in my sources'" in desc
+        assert "NOT for USING a connector" in desc
         assert callable(td._TOOL_FUNCTIONS["cora_self_inventory"])
         assert "cora_self_inventory" in td._GLOBAL_CORE_TOOLS
         assert td._TOOL_TIMEOUTS["cora_self_inventory"] == 20

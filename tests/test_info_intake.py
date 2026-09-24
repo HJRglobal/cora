@@ -269,6 +269,32 @@ class TestIngest:
                             route="sweep", known_answers_dir=tmp_path)
         assert res.outcome == ii.ERROR
 
+    @pytest.mark.parametrize("route,label", [
+        ("mailbox", "cora@ mailbox from Tommy ("),
+        ("mention", "#info-for-cora from Tommy ("),
+        ("message", "#info-for-cora from Tommy ("),
+        ("sweep", "#info-for-cora from Tommy ("),
+    ])
+    def test_card_label_names_the_door_the_note_came_through(self, tmp_path, route, label):
+        """Code #15 rider (R1-06): a cora@ mailbox note's review card used to say
+        '#info-for-cora from ...'. The label now names the route; payload.source
+        -- the key every classifier reads -- is unchanged on every route."""
+        kr = _kr()
+        # the mailbox sweep passes channel_id="" + its own channel_name
+        # (scripts/run_mailbox_intake_sweep.py); the Slack routes use the defaults
+        chan = {"channel_id": "", "channel_name": "cora@ mailbox"} if route == "mailbox" else {}
+        with patch.object(ii, "knowledge_review", kr):
+            res = ii.ingest(text="The Tucson stove vendor is Apex Appliance",
+                            author_id="U_T", author_name="Tommy", ts="28.1",
+                            route=route, known_answers_dir=tmp_path, **chan)
+        assert res.outcome == ii.QUEUED
+        kwargs = kr.propose_update.call_args.kwargs
+        assert kwargs["description"].startswith(label)
+        if route == "mailbox":
+            assert "#info-for-cora" not in kwargs["description"]
+        assert kwargs["payload"]["source"] == "info-for-cora"
+        assert kwargs["payload"]["intake_route"] == route
+
     @pytest.mark.parametrize("bad", [
         {"text": "", "author_id": "U1", "ts": "1.1"},
         {"text": "fact", "author_id": "", "ts": "1.1"},

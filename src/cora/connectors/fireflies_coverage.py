@@ -121,6 +121,12 @@ def _norm_name(name: str) -> str:
 
 
 def _is_shared_inbox(acct: dict) -> bool:
+    # Code #15 rider (R1-07): a row with an intake_route is a SYSTEM intake
+    # mailbox (cora@, "Cora (system mailbox)"), never a human -- neither the
+    # localpart set nor the 'inbox'-in-name rule caught it, so a zero-flag
+    # (full-roster) load_dwd_humans would have treated cora@ as nudge-eligible.
+    if acct.get("intake_route"):
+        return True
     email = (acct.get("email") or "").lower()
     if _localpart(email) in _SHARED_LOCALPARTS:
         return True
@@ -161,7 +167,8 @@ def load_dwd_humans(path: Path | str | None = None) -> list[DwdHuman]:
     """Read monitored-email-accounts.yaml and return one DwdHuman per distinct human.
 
     - Keeps only entries with enabled && dwd_eligible.
-    - Drops shared inboxes (payables@/receipts@/service@, or no-slack + "Inbox" name).
+    - Drops shared inboxes (payables@/receipts@/service@, or no-slack + "Inbox" name)
+      and system intake mailboxes (any row with an ``intake_route``, e.g. cora@).
     - Collapses cross-domain aliases into one human via union-find over three edge
       types: shared slack_user_id, shared email (primary or alias), shared normalized
       name. Faithful to the spec ("collapse by slack_user_id, fall back to name").

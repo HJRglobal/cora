@@ -487,8 +487,12 @@ def test_an_acked_tier2_signal_drops_out_of_the_briefing():
 
 def test_briefing_appends_the_lines_after_synthesis_and_only_for_harrison():
     import run_daily_briefing as rdb
-    today = datetime.now(rs._AZ).date()
     _fire("2026-07"), _fire("2026-08")             # live tier 2, stamped now
+    # Read the AZ date AFTER the fires are stamped (Code #15 rider, C13-06): a
+    # read taken BEFORE could land on the prior AZ day across a midnight tick,
+    # putting the fire rows outside tier2_signals' [today-1, today] window. Read
+    # after, the window always contains the fire date (the clock-tick class).
+    today = datetime.now(rs._AZ).date()
     body = "SYNTHESIZED BODY\n"
     out = rdb._append_repeat_signal_lines(body, today=today)
     assert out.startswith("SYNTHESIZED BODY")

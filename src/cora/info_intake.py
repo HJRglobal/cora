@@ -678,7 +678,12 @@ def ingest(
         stored_text = safe[:STORED_TEXT_CAP]
         truncated = len(safe) > STORED_TEXT_CAP
 
-        label = f"#info-for-cora from {author_name or author_id} ({entity})"
+        # Code #15 rider (R1-06): the label names the door the note ACTUALLY came
+        # through -- a cora@ mailbox note's card used to read "#info-for-cora from",
+        # telling Harrison it was a Slack post. Presentation only: payload.source
+        # (what every classifier keys on) is unchanged.
+        src_label = "cora@ mailbox" if route == "mailbox" else "#info-for-cora"
+        label = f"{src_label} from {author_name or author_id} ({entity})"
         if ambiguous:
             label += " [entity ambiguous -- filed FNDR]"
         if verdict == "supersedes":

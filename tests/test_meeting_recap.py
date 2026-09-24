@@ -178,6 +178,31 @@ def test_org_roles_external_flag_is_a_belt_behind_the_roster(monkeypatch):
     assert INTERNAL_A not in pop["recipients"]
 
 
+def test_is_external_role_fails_closed_only_on_a_lookup_failure(monkeypatch):
+    """Code #15 rider (C13-18): the docstring was made true, the behaviour is
+    unchanged and pinned here. A lookup that RAISES reads as external (fail
+    closed); an id org-roles does not know (get_role -> None) reads as internal,
+    because the roster mapping already admitted it; an `external: true` row reads
+    as external."""
+    from cora import org_roles
+
+    def _boom(sid):
+        raise RuntimeError("org-roles unavailable")
+
+    monkeypatch.setattr(org_roles, "get_role", _boom)
+    assert mr._is_external_role(INTERNAL_A) is True
+    monkeypatch.setattr(org_roles, "get_role", lambda sid: None)
+    assert mr._is_external_role(INTERNAL_A) is False
+
+    class _Rec:
+        external = True
+
+    monkeypatch.setattr(org_roles, "get_role", lambda sid: _Rec())
+    assert mr._is_external_role(INTERNAL_A) is True
+    doc = mr._is_external_role.__doc__ or ""
+    assert "lookup FAILURE" in doc and "reads as INTERNAL" in doc
+
+
 def test_capture_identities_are_not_attendees():
     """Cora's own seat and the Fireflies bot sit on every invite. They are not
     people: not counted, not DM'd, even if somebody mapped them."""

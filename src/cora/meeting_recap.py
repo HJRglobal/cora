@@ -321,8 +321,17 @@ def _attendee_emails(transcript: dict | None) -> list[str]:
 
 
 def _is_external_role(slack_id: str) -> bool:
-    """org-roles `external: true` (guest / outside consultant). A lookup failure
-    reads as external -- fail closed on the only belt behind the roster."""
+    """org-roles `external: true` (guest / outside consultant).
+
+    Only a lookup FAILURE (org_roles unimportable / get_role raising) fails
+    closed and reads as external. An id org-roles simply does not know
+    (``get_role`` -> None) reads as INTERNAL: this is the SECOND belt, and the
+    primary one is the roster -- an attendee is considered here only after the
+    roster has already mapped their email to a workspace Slack id (see
+    ``resolve_recipients`` rule 1), so an unknown-to-org-roles id is a mapped
+    workspace member without an org-roles row, not a stranger. (Code #15 rider,
+    C13-18: the docstring is made true; no behaviour change. Unknown -> external
+    would be a policy change and a seed of its own.)"""
     try:
         from . import org_roles  # noqa: PLC0415
         rec = org_roles.get_role(slack_id)

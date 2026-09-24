@@ -40,8 +40,15 @@ def _load() -> "Config":
     # NOTE (S-B, 2026-09-19): nothing reads config.asana_pat -- every Asana caller
     # resolves its token per call through cora.asana_identity.resolve_pat(), which
     # honours CORA_ASANA_IDENTITY (harrison -> ASANA_PAT, cora -> ASANA_PAT_CORA).
-    # This load is retained only for the REPLACE_ME/prefix validation of the key.
+    # BOTH keys are loaded through get() only so its boot-time REPLACE_ME
+    # placeholder check applies to each (Code #15 rider, R1-02: before this only
+    # ASANA_PAT was checked, so a placeholder in the key the `cora` identity
+    # actually uses surfaced only as runtime 401s). There is NO prefix check for
+    # either key -- _PREFIX_RULES has no Asana entry. Both stay optional: an
+    # absent key boots, and the `cora` identity's own hard raise on an empty
+    # ASANA_PAT_CORA lives in asana_identity.resolve_pat().
     asana_pat = get("ASANA_PAT", required=False, default="")
+    get("ASANA_PAT_CORA", required=False, default="")  # validation only; never read from config
     # HubSpot Private App token -- optional, HubSpot tool-use disabled if missing
     hubspot_token = get("HUBSPOT_PRIVATE_APP_TOKEN", required=False, default="")
     # Google Service Account JSON path -- optional, Calendar tool-use disabled if missing
