@@ -1152,7 +1152,13 @@ class TestR1CleanLoadScrubsForCustodians:
             distance=0.4, author="", metadata=None)
         fake_kb = MagicMock()
         fake_kb.search.return_value = [chunk]
-        with patch.object(cl, "get_shared_kb", lambda: fake_kb), \
+        # Code #15 rider (a): _try_kb_retrieve returns None before any scrub when
+        # data/cora_kb.db is absent (gitignored -> every worktree), which made the
+        # control below fail AND the web-clean case pass VACUOUSLY on "". Point the
+        # existence check at a path that always exists (sibling pattern, l.~871).
+        from pathlib import Path
+        with patch.object(cl, "_KB_DB_PATH", Path(__file__).resolve().parent), \
+             patch.object(cl, "get_shared_kb", lambda: fake_kb), \
              patch.object(cl, "_format_kb_chunks", lambda r: " | ".join(
                  x.content for x in r)):
             return cl._try_kb_retrieve(
@@ -1164,6 +1170,9 @@ class TestR1CleanLoadScrubsForCustodians:
     def test_custodian_on_a_web_clean_load_is_scrubbed(self):
         out = self._run(phi_custodian=True, web_clean=True,
                         content=self.CLIENT_LINE)
+        # Non-vacuous: the retrieval must actually have run (the scrub keeps the
+        # rest of the line), or "Madison not in ''" certifies nothing (D-243 class).
+        assert out.strip(), "retrieval returned nothing -- the scrub was never exercised"
         assert "Madison" not in out, (
             "a custodian composing outbound web queries must see stranger "
             "posture -- forcing phi_custodian=False under web_clean is what "

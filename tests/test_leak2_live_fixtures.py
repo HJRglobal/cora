@@ -97,5 +97,10 @@ def test_misfiled_9_3_and_9_4_transcripts_pass_the_prose_screen(sid):
 
 
 def test_fixture_population_is_the_locked_one():
-    # 18 (9/4) + 5 (9/3) rows filed LEX phi=True; the genuine LEX session (phi=False) is not in the set
+    # 18 (9/4) + 5 (9/3) rows filed LEX phi=True; the genuine LEX session (phi=False) is not in the set.
+    # Host-only, like its siblings (Code #15 rider (a), cq-24b88a65a5ae item 2): the ledger is
+    # gitignored, so in a worktree / DR rebuild ROWS is [] and this read "20 <= 0" -- an
+    # environmental red, not a Leak #2 regression. It stays ARMED on the fixture host.
+    if not ON_FIXTURE_HOST:
+        pytest.skip("not the Cora desktop (no harvester ledger + Cowork store)")
     assert 20 <= len(ROWS) <= 23, [r["session_id"][:24] for r in ROWS]

@@ -367,7 +367,7 @@ class TestToolWiring:
         assert "do not" in desc and ("total" in desc or "rank" in desc)
 
     @pytest.mark.parametrize("name", ["qbo_get_expense_detail", "qbo_get_vendor_spend"])
-    def test_lex_account_and_vendor_names_are_refused(self, name):
+    def test_lex_account_and_vendor_names_are_refused(self, name, monkeypatch):
         """D-051 HIGH. finance_close opaques LEX ACCOUNT NAMES on finance
         surfaces (`_NAME_OPAQUE_REALMS`), on the premise that a LEX account title
         can carry a person's name and a human cannot reliably spot one. These
@@ -376,7 +376,16 @@ class TestToolWiring:
         #hjrg-finance routes to FNDR, is TIER_1, and lets any member pass
         entity='LEX'. So the branch withheld LEX names from that channel in one
         file and published them into it from another.
+
+        Hermetic (Code #15 rider (a)): the tool resolves the realm BEFORE the
+        opacity refusal, so without a provisioned-realms stub the call returned
+        "No QBO entities are provisioned" wherever the live
+        .credentials/qbo-tokens.json is absent (every worktree) -- and on the
+        primary the test silently depended on live credentials.
         """
+        import cora.connectors.qbo_oauth as oauth
+        monkeypatch.setattr(oauth, "list_provisioned_entities",
+                            lambda: ["F3E", "OSN", "LEX", "HJRP", "BDM"])
         out = td._TOOL_FUNCTIONS[name](
             "U1", "FNDR", {"_channel_name": "hjrg-finance", "entity": "LEX"})
         assert out == td._QBO_NAME_OPAQUE_REFUSAL
