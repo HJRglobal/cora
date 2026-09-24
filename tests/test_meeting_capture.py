@@ -2968,3 +2968,63 @@ class TestCarvedRecordingNeverPrintsItsTitle:
         for title in ("LBHS COPA Diligence", "[no-bot] x", "Copacabana offsite", "Call with counsel"):
             q = mc.qualify_event(_ev("e1", summary=title), cfg)
             assert (q.reason if not q.qualifies else "") == mc.title_carve_out_reason(title, cfg), title
+
+    ROOM = "https://zoom.us/my/harrisonroom"
+
+    def _room_day(self):
+        """A static personal-room link hosting a carved call AND an ordinary one."""
+        return {"harrison@hjrglobal.com": [
+            _ev("copa1", summary="COPA sync", hh=10, link=self.ROOM),
+            _ev("vend1", summary="Vendor walkthrough", hh=14, link=self.ROOM),
+        ]}
+
+    def test_an_exact_carved_cal_id_is_a_breach_before_the_link_fallback(self):
+        """bc61-F2 (confirmed 2/2): with the id join after the fallbacks, the link
+        fallback bound this recording to the 14:00 meeting -- breach silent, and the
+        un-recorded 14:00 meeting read as captured."""
+        t = _t("t1", title="COPA sync", hh=10, cal_id="copa1", link=self.ROOM)
+        r = _audit(self._room_day(), [t], cfg=self._cfg())
+        assert [reason for _s, reason in r.carve_out_breaches] == ["no-record-title:copa"]
+        assert r.captured == 0 and len(r.misses) == 1
+        out = mc.render_report(r)
+        assert "captured exactly once" not in out and "COPA sync" not in out
+
+    def test_the_ordinary_meeting_on_the_shared_room_still_joins(self):
+        t = _t("t2", title="Vendor walkthrough", hh=14, cal_id="vend1", link=self.ROOM)
+        r = _audit(self._room_day(), [t], cfg=self._cfg())
+        assert r.carve_out_breaches == [] and r.captured == 1 and r.misses == []
+
+    def test_the_ordinary_meeting_with_no_cal_id_still_joins_by_the_room_link(self):
+        """r4d R4-F3: the control above is claimed by the MAIN exact join, so it cannot
+        see a carved-link join moved ahead of the fallbacks. This one reaches fallback A
+        (no cal_id, a Fireflies-generated title) and must still bind to 14:00."""
+        t = _t("t2", title="Harrison's Personal Meeting Room", hh=14, cal_id=None, link=self.ROOM)
+        r = _audit(self._room_day(), [t], cfg=self._cfg())
+        assert r.carve_out_breaches == [] and r.captured == 1 and r.misses == []
+
+    def test_the_exact_carved_join_matches_every_copy_not_just_the_first(self):
+        """r4d R4-F2: an externally organised COPA call has one event id PER invitee
+        calendar; the recording names Hannah's copy (the second, not the first vetoing
+        one). A first-copy-only index reopens bc61-F2 (the link fallback wins)."""
+        ext = "ext@copa.example"
+        kw = dict(summary="COPA sync", hh=10, organizer=ext, link=self.ROOM,
+                  attendees=[ext, "harrison@hjrglobal.com", "hannah@hjrglobal.com"])
+        events = {
+            "harrison@hjrglobal.com": [_ev("_hc", **kw),
+                                       _ev("vend1", summary="Vendor walkthrough", hh=14, link=self.ROOM)],
+            "hannah@hjrglobal.com": [_ev("_nc", **kw)],
+        }
+        t = _t("t1", title="COPA sync", hh=10, cal_id="_nc", link=self.ROOM, organizer=ext)
+        r = _audit(events, [t], cfg=self._cfg())
+        assert [reason for _s, reason in r.carve_out_breaches] == ["no-record-title:copa"]
+        assert r.captured == 0 and len(r.misses) == 1
+
+    def test_residual_a_no_id_carved_recording_on_a_shared_room_binds_by_link(self):
+        """DOCUMENTED RESIDUAL (bc61-F2 no-id half; a join-order redesign is seeded):
+        with no cal_id, the link fallback still binds the carved call's recording to
+        the ordinary meeting on the same room. No title is printed; the breach is
+        silent. Pinned so the residual is visible, and so a fix flips it on purpose."""
+        t = _t("t1", title="COPA sync", hh=10, cal_id=None, link=self.ROOM)
+        r = _audit(self._room_day(), [t], cfg=self._cfg())
+        assert r.carve_out_breaches == [] and r.captured == 1
+        assert "COPA sync" not in mc.render_report(r)

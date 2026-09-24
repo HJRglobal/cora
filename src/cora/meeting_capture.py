@@ -1739,6 +1739,27 @@ def audit_day(
             by_meeting.setdefault(key, []).append(t)
             used.add(t.get("id") or "")
 
+    # A cal_id naming ANY copy of a CARVED meeting is exact evidence too: it is a
+    # breach, decided here -- BEFORE the link/title fallbacks. Deciding it after them
+    # (as 3b used to) let a recorded carved call on a static personal-room link be
+    # bound by link to ANOTHER meeting on that link: the breach went silent and a real
+    # miss could read as a clean day (Code #14 r4 re-review, bc61-F2). Only transcripts
+    # whose cal_id names a carved event are affected; every other join is unchanged.
+    carved_id_keys: dict[str, tuple] = {}
+    for c_key, c_copies in carved_copies.items():
+        for c_ev in c_copies:
+            c_eid = (c_ev.get("id") or "").strip()
+            if c_eid:
+                carved_id_keys.setdefault(c_eid, c_key)
+    for t in same_day:
+        if (t.get("id") or "") in used:
+            continue
+        hit = carved_id_keys.get((t.get("cal_id") or "").strip())
+        if hit is not None:
+            used.add(t.get("id") or "")
+            b_ev, b_reason = carved[hit]
+            report.carve_out_breaches.append((f"a meeting at {event_time_label(b_ev)}", b_reason))
+
     # Fallback A: meeting link. About half of live transcripts carry no cal_id at
     # all, so without this the auditor would report most captured meetings missed.
     # AMBIGUITY IS NOT A MATCH. setdefault would silently bind a shared link (a
