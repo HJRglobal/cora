@@ -775,7 +775,7 @@ AND a suffix, never rely on the guard alone.
 | MCP local-HTTP bridge (SHELVED) | Loopback bridge for Claude Code; the plugin won | `CORA_MCP_HTTP_TOKEN`, `CORA_MCP_HTTP_CERT`, `CORA_MCP_HTTP_KEY`, `CORA_MCP_HTTP_PORT` (all documented, unused) | n/a | n/a | 127.0.0.1 bind + Host allowlist; mode=ro |
 | healthchecks.io (dead-man heartbeat) | Outbound ping URL; the UUID INSIDE the URL is the credential (anyone holding it can keep the check green) | `HEALTH_PING_URL` (present; exactly ONE line -- the 2026-06-11 incident was a second, placeholder line that dotenv took as the value), `HEALTH_PING_INTERVAL_S` (interval only) | n/a | no | `health_endpoint` ping loop: off when blank; skips the ping while the heartbeat is stale so a wedged bot still trips the external alert |
 | DR secrets bundle (`backup_logs.py` / `restore_secrets.py`) | Passphrase that encrypts `.env` + the SA JSON into `secrets-YYYY-MM-DD.enc`; the ONLY way back into every other row after a machine loss | `CORA_BACKUP_PASSPHRASE` -- deliberately NOT in `.env` (count 0) and only `# `-commented in `.env.example`: `.env` is INSIDE the bundle, so the passphrase must live OUTSIDE what it encrypts. Held as a persistent User-scope Windows env var on the host + the canonical copy in the password manager (2026-06-09 DR hardening, D-040). | n/a | n/a | `backup_logs.py` SKIPS the secrets step when the key is unset (never writes plaintext); `restore_secrets.py` reads the env var, else prompts. A new machine cannot restore any credential in this table without it -- see the Bootstrap cross-reference below |
-| Other API keys (no identity surface) | vendor keys | `POLAR_API_KEY` / `POLAR_CLIENT_ID` / `POLAR_CLIENT_SECRET`, `PHOTOROOM_API_KEY`, `MAKE_SALES_DECK_WEBHOOK_URL`, `PERPLEXITY_API_KEY`, `GEMINI_API_KEY`, `OTTERLY_API_KEY` (present); `APOLLO_API_KEY` (LEGACY -- not read by current code) | n/a | n/a | per-connector caps and fail-soft |
+| Other API keys (no identity surface) | vendor keys | `POLAR_API_KEY`, `PHOTOROOM_API_KEY`, `MAKE_SALES_DECK_WEBHOOK_URL`, `PERPLEXITY_API_KEY`, `GEMINI_API_KEY`, `OTTERLY_API_KEY` (present); `POLAR_CLIENT_ID` / `POLAR_CLIENT_SECRET` (**ABSENT** -- count 0 each, re-counted 2026-09-24, Code #15 rider R1-09); `APOLLO_API_KEY` (LEGACY -- not read by current code) | n/a | n/a | per-connector caps and fail-soft |
 
 Bootstrap cross-reference: `deployment/bootstrap-new-machine.md` regenerates ONLY
 the 4 Slack/Anthropic secrets; every other row above is a Harrison-provisioned
@@ -823,8 +823,15 @@ the bot picks it up only at the next restart, scripts at their next fire.
 4. Restart from ELEVATED PowerShell: `deployment\restart-cora.ps1`. Proof of the
    restart = a NEW pid row in `logs/cora-instances.jsonl`, never the script's exit
    code.
-5. Smoke: one hygiene-nudge `--dry-run` shows author = Cora; a `users/me` probe
-   under the active token returns the cora@ user, not Harrison.
+5. Smoke: a `users/me` probe under the active token returns the cora@ user, not
+   Harrison -- the nightly health check's "Asana API" line
+   (`nightly_health_check.check_api_connectivity`; by hand:
+   `.venv\Scripts\python.exe scripts\nightly_health_check.py --dry-run --verbose`)
+   runs exactly that probe through `asana_identity.resolve_pat()` and classifies
+   the answer
+   (`asana_identity.classify_users_me`: CRITICAL if the email is not the cora@
+   seat under `CORA_ASANA_IDENTITY=cora`). (A hygiene-nudge `--dry-run` is NOT a
+   smoke for this: it posts no comment and prints no author or identity.)
 
 ### Rotating `ASANA_PAT_CORA` itself
 
@@ -955,18 +962,23 @@ the SA held `gmail.modify` and `https://mail.google.com/` and the draft path sti
 failed `unauthorized_client` because it requested `gmail.compose`, which was absent.
 When a code path adds a scope, add that EXACT string to the grant.
 
-**Scopes the CODE requests** (each builder verified at repo tip `7193b21`; keep this
-list in step with `grep -rn "googleapis.com/auth/" src/ scripts/`):
+**Scopes the CODE requests** (each builder re-verified 2026-09-24, Code #15 rider
+R1-11, and cited by SYMBOL -- the scope constant or the credential builder that
+passes `scopes=` -- never by line number, and never a docstring, comment or error
+f-string that merely MENTIONS a scope. Keep this list in step with
+`grep -rn "googleapis.com/auth/" src/ scripts/`; note that grep, like the
+`tests/test_identity_docs.py` drift guard, also counts those prose mentions, so a
+hit is a candidate, not a builder):
 
 | Scope (suffix of `https://www.googleapis.com/auth/`) | Builder(s) | Lane |
 |---|---|---|
-| `gmail.modify` | `src/cora/connectors/gmail_reader.py:36` | thread sweep, attachment filer, intake |
-| `gmail.compose` | `src/cora/tools/gmail_client.py:42` | draft lane; the scope itself permits `messages.send` -- draft-only is enforced by CODE (`CORA_SEND_LIVE`, see Provisioning: cora@hjrglobal.com item 3), not by the absence of `gmail.send` (NOT requested and NOT granted) |
-| `calendar.events` | `src/cora/tools/calendar_client.py:54`, `src/cora/tools/tool_dispatch.py:6989` | `events.list` + event create |
-| `calendar.freebusy` | `src/cora/tools/calendar_client.py:53` | `freebusy.query` only (`events.list` 403s under it) |
-| `drive.readonly` | `src/cora/connectors/drive_sweep.py:474`, `scripts/run_drive_sweep.py:27`, `scripts/backfill_drive_assets.py:22`, `scripts/run_lex_dump_folder_sync.py:115` | Drive sweeps |
-| `drive` (full) | `src/cora/connectors/drive_connector.py:46`, `scripts/run_retroactive_hashtag_scan.py:153` | attachment filer upload, finance-receipt filing |
-| `spreadsheets.readonly` | `src/cora/connectors/drive_sweep.py:475`, `src/cora/tools/fighter_tracker_client.py:43` (DWD); `src/cora/connectors/gsheets_financials.py` (`_DRIVE_SCOPES`) requests it on a DIRECT service-account credential (no impersonation), NOT via DWD | oversized-sheet fallback, fighter roster; cash sheet reads (direct SA) |
+| `gmail.modify` | `src/cora/connectors/gmail_reader.py` `_GMAIL_SCOPES` | thread sweep, attachment filer, intake |
+| `gmail.compose` | `src/cora/tools/gmail_client.py` `_SCOPES` | draft lane; the scope itself permits `messages.send` -- draft-only is enforced by CODE (`CORA_SEND_LIVE`, see Provisioning: cora@hjrglobal.com item 3), not by the absence of `gmail.send` (NOT requested and NOT granted) |
+| `calendar.events` | `src/cora/tools/calendar_client.py` `_SCOPES_WRITE` (selected when the credential builder is called with `write=True`) | `events.list` + event create |
+| `calendar.freebusy` | `src/cora/tools/calendar_client.py` `_SCOPES_READ` | `freebusy.query` only (`events.list` 403s under it) |
+| `drive.readonly` | `src/cora/connectors/drive_sweep.py` `_DRIVE_SCOPE` (used by `_build_drive_service` via DWD and by `_build_sa_drive_service_direct` on a direct SA credential; `scripts/run_drive_sweep.py` reaches it through `drive_sweep.run_sweep`); `scripts/run_lex_dump_folder_sync.py` `_build_drive_service` (inline `scopes=`) | Drive sweeps |
+| `drive` (full) | `src/cora/connectors/drive_connector.py` `_DRIVE_SCOPES` (used by its `_build_drive_service`; `scripts/backfill_drive_assets.py` reaches it through `drive_connector.backfill`, so it requests FULL `drive` -- the `drive.readonly` line in its docstring is prose, not a request); `scripts/run_retroactive_hashtag_scan.py` `_get_sheets_service` (inline `scopes`) | attachment filer upload, finance-receipt filing, Drive asset backfill |
+| `spreadsheets.readonly` | `src/cora/connectors/drive_sweep.py` `_SHEETS_SCOPE`, `src/cora/tools/fighter_tracker_client.py` `_SCOPES` (DWD); `src/cora/connectors/gsheets_financials.py` (`_DRIVE_SCOPES`) requests it on a DIRECT service-account credential (no impersonation), NOT via DWD | oversized-sheet fallback, fighter roster; cash sheet reads (direct SA) |
 | `drive.metadata.readonly` | `src/cora/connectors/gsheets_financials.py` (`_DRIVE_META_SCOPES`) | DIRECT service-account credential (no impersonation) -- NOT a DWD scope, needs NO Admin-console grant, never paste it into the DWD list; cashflow sheet modifiedTime (the "as of" label) only (Code #14 S5) |
 | `admin.reports.audit.readonly` | `src/cora/connectors/meet_audit.py` (`REPORTS_SCOPE`, its own credential) | Meet join audit (Code #14 R14-8): Reports `activities.list` `applicationName=meet` `eventName=call_ended` ONLY, admin subject (default harrison@, `CORA_REPORTS_IMPERSONATE`, never cora@), READ-ONLY; the second D-308 admin-level lane. NOT YET GRANTED -- ships dark until Harrison adds it (the lane self-detects `unauthorized_client`); after granting, run the read-only `scripts/probe_meet_audit.py` (the Identity inventory's Meet join audit row says what its lines must show) |
 

@@ -643,3 +643,63 @@ def test_probe_id_regex_is_linear_on_growth():
     small, big = _t(100), _t(10_000)
     assert big < max(small * 50, 0.5), (small, big)
     assert rx.match("U0B2RM2JYJ1") and not rx.match("u0b2rm2jyj1") and not rx.match("C0B6GT3117Y")
+
+
+# -- Code #15 rider (b): #13 Appendix-A doc LOWs R1-01 / R1-09 / R1-11 --
+
+def test_flip_smoke_is_the_users_me_probe_not_a_hygiene_dry_run():
+    """R1-01 (= R1-10): the flip's smoke said 'one hygiene-nudge --dry-run shows
+    author = Cora', but that dry-run posts no comment and prints no author, so the
+    step could not be performed. The users/me probe stays."""
+    text = _runbook()
+    assert "hygiene-nudge `--dry-run` shows author = Cora" not in text
+    step = text[text.index("5. Smoke: a `users/me` probe under the active token"):]
+    step = step[:step.index("### Rotating `ASANA_PAT_CORA` itself")]
+    assert "returns the cora@ user" in step
+    assert "check_api_connectivity" in step and "classify_users_me" in step
+    assert "NOT a\n   smoke for this" in step
+
+
+def test_other_api_keys_row_marks_the_polar_client_pair_absent():
+    """R1-09: POLAR_CLIENT_ID / POLAR_CLIENT_SECRET were marked '(present)' though
+    the live .env carries no line for either (count-only convention)."""
+    inv = _identity_sections()[SECTIONS[0]]
+    row = next(ln for ln in inv.splitlines() if ln.startswith("| Other API keys"))
+    present, _, rest = row.partition("(present)")
+    assert "`POLAR_API_KEY`" in present
+    assert "POLAR_CLIENT_ID" not in present and "POLAR_CLIENT_SECRET" not in present
+    assert "`POLAR_CLIENT_ID` / `POLAR_CLIENT_SECRET` (**ABSENT**" in rest
+
+
+def _dwd_builder_rows() -> list[str]:
+    sec = _identity_sections()[SECTIONS[3]]
+    head = sec.index("| Scope (suffix of `https://www.googleapis.com/auth/`) | Builder(s) | Lane |")
+    rows = []
+    for ln in sec[head:].splitlines()[2:]:
+        if not ln.startswith("| `"):
+            break
+        rows.append(ln)
+    assert len(rows) >= 8, rows
+    return rows
+
+
+def test_dwd_builder_table_cites_symbols_that_exist_never_line_numbers():
+    """R1-11: the Builder(s) column cited an error f-string (tool_dispatch.py:6989)
+    and two docstrings (run_drive_sweep.py:27, backfill_drive_assets.py:22) as
+    builders, by volatile line number. Every cited `path` `symbol` pair must name a
+    real definition or assignment in that file, and no row may cite a line."""
+    pair = re.compile(r"`((?:src|scripts)/[\w/]+\.py)` `(\w+)`")
+    checked = 0
+    for row in _dwd_builder_rows():
+        builder = row.split(" | ")[1]
+        assert not re.search(r"\.py:\d+", builder), row
+        assert "tool_dispatch.py" not in builder, row
+        for path, sym in pair.findall(builder):
+            text = (_REPO / path).read_text(encoding="utf-8", errors="ignore")
+            assert re.search(rf"^\s*(?:def\s+{sym}\b|{sym}\s*=)", text, flags=re.M), (path, sym)
+            checked += 1
+    assert checked >= 10, checked
+    # the two docstring-only scripts are named as REACHING a builder, never as one
+    rows = "\n".join(_dwd_builder_rows())
+    assert "`scripts/run_drive_sweep.py` reaches it through `drive_sweep.run_sweep`" in rows
+    assert "`scripts/backfill_drive_assets.py` reaches it through `drive_connector.backfill`" in rows
