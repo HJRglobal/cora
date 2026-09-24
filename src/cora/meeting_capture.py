@@ -385,6 +385,25 @@ def _matches_word(text: str, term: str) -> bool:
     return bool(pat.search(_norm_ws(text)))
 
 
+def title_carve_out_reason(title: str, cfg: CaptureConfig) -> str:
+    """The TITLE carve-outs, as one matcher: "title-marker:<m>" / "no-record-title:<term>",
+    or "" when no title carve-out applies.
+
+    One function so the event gate (qualify_event) and the auditor's transcript belt
+    can never disagree about what a no-record title is (Code #14 r4: the auditor
+    printed a carved COPA meeting's title because only the event side checked).
+    Markers are literal substrings (brackets are the point); patterns are whole words.
+    """
+    lowered = _norm_ws(title or "").lower()
+    for marker in cfg.skip_title_markers:
+        if _norm_ws(marker) in lowered:
+            return f"title-marker:{marker}"
+    for term in cfg.no_record_title_patterns:
+        if _matches_word(title or "", term):
+            return f"no-record-title:{term}"
+    return ""
+
+
 # ── LEX / PHI display rail ───────────────────────────────────────────────────
 
 def is_lex_event(event: dict[str, Any]) -> bool:
@@ -523,15 +542,9 @@ def qualify_event(
         if is_self and (att.get("responseStatus") or "").strip().lower() == "declined":
             return Qualification(False, "roster-user-declined")
 
-    title = (event.get("summary") or "")
-    lowered = _norm_ws(title).lower()
-    for marker in cfg.skip_title_markers:
-        if _norm_ws(marker) in lowered:
-            return Qualification(False, f"title-marker:{marker}")
-
-    for term in cfg.no_record_title_patterns:
-        if _matches_word(title, term):
-            return Qualification(False, f"no-record-title:{term}")
+    title_reason = title_carve_out_reason(event.get("summary") or "", cfg)
+    if title_reason:
+        return Qualification(False, title_reason)
 
     emails = event_emails(event)
     hit = emails & cfg.no_record_emails
@@ -1277,6 +1290,12 @@ def _transcript_ts(t: dict[str, Any]) -> int:
     return _parse_date(t.get("date")) or 0
 
 
+def _transcript_time_label(t: dict[str, Any]) -> str:
+    """HH:MM (AZ) of a transcript, "?" when it carries no usable date."""
+    ts = _transcript_ts(t)
+    return datetime.fromtimestamp(ts, _AZ).strftime("%H:%M") if ts else "?"
+
+
 def roster_attendee_accepted(
     copies: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None,
     roster_emails: frozenset[str] | set[str],
@@ -1629,6 +1648,12 @@ def audit_day(
     #: meetings a carve-out removed from scope, kept so we can still notice if one
     #: of them was recorded anyway.
     carved: dict[tuple, tuple[dict[str, Any], str]] = {}
+    #: EVERY copy of each carved meeting (one event id per invitee calendar), so the
+    #: breach join in 3b matches a transcript whose cal_id names ANY copy -- the main
+    #: join already does this (key_by_event_id); joining only the first vetoing copy
+    #: let a recorded carve-out fall through to section 4 and print its title
+    #: (Code #14 r4, D-051 copa-audit-fallthrough-leak).
+    carved_copies: dict[tuple, list[dict[str, Any]]] = {}
 
     for key, entries in grouped.items():
         veto: tuple[dict[str, Any], str] | None = None
@@ -1643,6 +1668,7 @@ def audit_day(
         if veto is not None:
             ev, reason = veto
             carved[key] = (ev, reason)
+            carved_copies[key] = [e for _m, e in entries]
             # Only report skips that reflect a DECISION. Structural non-meetings
             # (an out-of-office block, a focus-time hold) are noise in an ops
             # channel and would bury the carve-outs a human should actually see.
@@ -1796,13 +1822,14 @@ def audit_day(
     # prevent, so it is surfaced -- as a shape, never as a title.
     carved_event_ids: dict[str, tuple] = {}
     carved_links: dict[str, tuple] = {}
-    for c_key, (c_ev, _c_reason) in carved.items():
-        c_eid = (c_ev.get("id") or "").strip()
-        if c_eid:
-            carved_event_ids[c_eid] = c_key
-        c_link = extract_meeting_link(c_ev).strip().lower()
-        if c_link:
-            carved_links[c_link] = c_key
+    for c_key, c_copies in carved_copies.items():
+        for c_ev in c_copies:
+            c_eid = (c_ev.get("id") or "").strip()
+            if c_eid:
+                carved_event_ids.setdefault(c_eid, c_key)
+            c_link = extract_meeting_link(c_ev).strip().lower()
+            if c_link:
+                carved_links.setdefault(c_link, c_key)
     for t in same_day:
         if (t.get("id") or "") in used:
             continue
@@ -1821,6 +1848,18 @@ def audit_day(
     # ── 4. captured but not on any roster calendar ──
     for t in same_day:
         if (t.get("id") or "") in used:
+            continue
+        # Belt (Code #14 r4, D-051 copa-audit-fallthrough-leak): a transcript whose OWN
+        # title carries a title carve-out is a recording of exactly what the carve-out
+        # exists to keep out -- whether or not the joins above could tie it to a
+        # calendar copy (about half of transcripts carry no cal_id; links drift). It is
+        # a breach, rendered as a SHAPE; its title and organiser are never printed.
+        t_reason = title_carve_out_reason(t.get("title") or "", cfg)
+        if t_reason:
+            used.add(t.get("id") or "")
+            report.carve_out_breaches.append(
+                (f"a meeting at {_transcript_time_label(t)}", t_reason)
+            )
             continue
         safe_t = _transcript_display_title(t)
         report.unmatched_transcripts.append({
@@ -1873,10 +1912,7 @@ def _transcript_display_title(t: dict[str, Any]) -> str:
     display_title's event path does not apply. Route it through the same shared LEX
     detector in its native shape.
     """
-    when = (
-        datetime.fromtimestamp(_transcript_ts(t), _AZ).strftime("%H:%M")
-        if _transcript_ts(t) else "?"
-    )
+    when = _transcript_time_label(t)
     try:
         from cora.connectors.fireflies_connector import classify_lex_meeting
 

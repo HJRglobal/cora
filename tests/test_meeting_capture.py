@@ -2895,3 +2895,76 @@ class TestCopaCarveOut:
         assert res.actions[0].reason == "no-record-title:copa"
         assert not any(a.rsvp_planned for a in res.actions)
         assert cal.adds == [] and cal.rsvps == [] and cal.copies == []
+
+
+class TestCarvedRecordingNeverPrintsItsTitle:
+    """D-051 r4 (copa-audit-fallthrough-leak, confirmed 2/2): a COPA meeting recorded
+    by a HUMAN's Fireflies seat whose transcript did not join the FIRST vetoing copy
+    (cal_id naming another invitee's copy, or no cal_id and a drifted link) fell
+    through to 'captured but not on a roster calendar' and printed its full title and
+    external organiser to #founder-operations, with the breach alarm silent. The
+    breach join now covers EVERY copy, and a transcript whose own title carries a
+    title carve-out is a breach by itself -- always rendered as a shape."""
+
+    TITLE = "Copa Health diligence call"
+    ORG = "ceo@copahealth.example"
+    LINK = "https://zoom.us/j/1234567890"
+
+    def _cfg(self):
+        return _cfg(no_record_title_patterns=mc.load_config(force=True).no_record_title_patterns)
+
+    def _two_copies(self):
+        kw = dict(summary=self.TITLE, organizer=self.ORG, link=None, location=self.LINK,
+                  attendees=[self.ORG, "harrison@hjrglobal.com", "hannah@hjrglobal.com"])
+        return {"harrison@hjrglobal.com": [_ev("h_native", **kw)],
+                "hannah@hjrglobal.com": [_ev("_hannahcopy", **kw)]}
+
+    def _assert_breach_not_leak(self, r):
+        assert len(r.carve_out_breaches) == 1, r.carve_out_breaches
+        assert r.carve_out_breaches[0][1] == "no-record-title:copa"
+        assert r.unmatched_transcripts == []
+        out = mc.render_report(r)
+        assert "RECORDED DESPITE A CARVE-OUT" in out
+        assert "Copa Health" not in out and self.ORG not in out and "copahealth" not in out
+        assert "captured exactly once" not in out
+
+    @pytest.mark.parametrize("cal_id,link", [
+        ("_hannahcopy", ""),                       # the OTHER copy's id, no link
+        ("", "https://zoom.us/j/1234567890?pwd=zz"),  # no id, drifted link
+        ("", ""),                                  # nothing to join on at all
+    ])
+    def test_a_recorded_copa_meeting_is_a_breach_never_a_titled_unmatched_row(self, cal_id, link):
+        t = _t("t1", title=self.TITLE, cal_id=cal_id or None, link=link, organizer=self.ORG)
+        self._assert_breach_not_leak(_audit(self._two_copies(), [t], cfg=self._cfg()))
+
+    def test_the_breach_join_matches_any_copy_id_even_without_the_title(self):
+        """A transcript renamed in Fireflies still joins by the second copy's id."""
+        t = _t("t1", title="Diligence call", cal_id="_hannahcopy", link="", organizer=self.ORG)
+        r = _audit(self._two_copies(), [t], cfg=self._cfg())
+        assert len(r.carve_out_breaches) == 1 and r.unmatched_transcripts == []
+        assert "Diligence call" not in mc.render_report(r)
+
+    def test_a_copa_recording_on_no_roster_calendar_is_a_breach(self):
+        t = _t("t1", title="COPA sync", cal_id=None, link="https://zoom.us/j/9", organizer=self.ORG)
+        r = _audit({"harrison@hjrglobal.com": []}, [t], cfg=self._cfg())
+        self._assert_breach_not_leak(r)
+
+    def test_a_marker_titled_recording_is_a_breach_too(self):
+        t = _t("t1", title="[no-bot] private chat", cal_id=None, link="https://zoom.us/j/7")
+        r = _audit({"harrison@hjrglobal.com": []}, [t], cfg=self._cfg())
+        assert [reason for _s, reason in r.carve_out_breaches] == ["title-marker:[no-bot]"]
+        assert "private chat" not in mc.render_report(r)
+
+    def test_an_ordinary_unmatched_capture_still_lists_its_title(self):
+        """Control: the belt fires on carve-out titles only."""
+        t = _t("t1", title="Vendor walkthrough", cal_id=None, link="https://zoom.us/j/5",
+               organizer="rep@vendor.example")
+        r = _audit({"harrison@hjrglobal.com": []}, [t], cfg=self._cfg())
+        assert r.carve_out_breaches == []
+        assert [u["title"] for u in r.unmatched_transcripts] == ["Vendor walkthrough"]
+
+    def test_qualify_event_and_the_belt_share_one_matcher(self):
+        cfg = self._cfg()
+        for title in ("LBHS COPA Diligence", "[no-bot] x", "Copacabana offsite", "Call with counsel"):
+            q = mc.qualify_event(_ev("e1", summary=title), cfg)
+            assert (q.reason if not q.qualifies else "") == mc.title_carve_out_reason(title, cfg), title
