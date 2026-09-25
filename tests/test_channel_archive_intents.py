@@ -612,3 +612,52 @@ class TestAskGrammarR2:
             it.looks_like_archive_ask("archive the dead channels," + " " * 40000 + "x")
             best = min(best, time.perf_counter() - t0)
         assert best < 0.05
+
+
+#: r2:c1-intents-copy#1 (a) -- a coordinated modifier list right before the channel
+#: noun is still the archive verb's channel object (A21(b)): the attempt rail, not
+#: the model ...
+ATTEMPT_FIRE_R2 = [
+    "archive the promo and event channels", "archive the old promo and launch channels",
+    "archive the partner and retail channels", "archive the promo, event and launch channels",
+    "archive promo/event channels", "archive the promo or event channels", "archive it and the channel",
+    "can you archive the promo and event channels?",
+]
+#: ... never two objects ("the email and the channel") or a second clause.
+ATTEMPT_NOT_R2 = [
+    "archive it and tell the channel", "archive my inbox and the channel", "archive the thread and channel",
+    "archive the email or channel", "archive the email and the channel partners",
+    "archive the deals and tasks for the channel", "archive the old and new channel strategy docs",
+    "archive the dtc and retail channel deals", "archive this and ping the channel",
+    "archive it and the old channel", "archive the emails and notify the channel",
+    "archive the report and ping the channel", "archive the deal and post in the channel",
+    "archive the doc and share it to the channel", "archive the amazon and walmart channel reports",
+    "archive the retail and dtc channel tasks", "archive the email and message the channel",
+    "archive old emails and the channel history", "archive the task or meeting channel notes",
+    "archive it and email the channel", "archive my drafts and the #general channel pins",
+    "archive the deal and the channel's messages", "archive the promo and event channel deals",
+]
+
+
+class TestCoordinatedObjectR2:
+    @pytest.mark.parametrize("text", ATTEMPT_FIRE_R2)
+    def test_a_coordinated_channel_object_is_an_attempt(self, text):
+        assert it.looks_like_archive_attempt(text), text
+        assert not it.looks_like_archive_ask(text), text
+
+    @pytest.mark.parametrize("text", ATTEMPT_NOT_R2)
+    def test_two_objects_or_a_second_clause_are_not(self, text):
+        assert not it.looks_like_archive_attempt(text), text
+
+    @pytest.mark.parametrize("shape", ["archive " + "a and " * 49, "archive " + "a, " * 99,
+                                       "archive the " + "x/" * 140, "archive " + "a and b " * 37,
+                                       "archive the " + "a or " * 57 + "channels"],
+                             ids=["and-run", "comma-run", "slash-run", "pairs", "or-run"])
+    def test_the_coordinated_object_is_fast_on_capped_worst_cases(self, shape):
+        best = float("inf")
+        for _ in range(3):
+            t0 = time.perf_counter()
+            it.looks_like_archive_attempt(shape)
+            it.looks_like_archive_attempt("archive the a and" + " " * 40000 + "channels")
+            best = min(best, time.perf_counter() - t0)
+        assert best < 0.05

@@ -897,3 +897,21 @@ class TestAskGrammarR2:
     def test_the_slash_ask_starts_the_scan(self, text):
         client, dispatch, capture, start = TestFounderSlashAskR1()._run(text)
         assert start.called and not dispatch.called and not capture.called, text
+
+    @pytest.mark.parametrize("text", ["archive the promo and event channels", "archive promo/event channels",
+                                      "archive the promo, event and launch channels"])
+    def test_a_coordinated_channel_object_gets_the_attempt_reply_not_the_model(self, dm, text):
+        """r2:c1-intents-copy#1 (a): A21(b) -- an archive request whose object is channels."""
+        client = MagicMock()
+        app_module.handle_message_event(_event(text), client)
+        assert _texts(client) == [intents.ATTEMPT_REPLY] and not dm.qa.called and not dm.scans, text
+        client, dispatch, _, start = TestFounderMention()._run(text)
+        assert client.chat_postMessage.call_args.kwargs["text"] == intents.ATTEMPT_REPLY
+        assert not dispatch.called and not start.called, text
+
+    @pytest.mark.parametrize("text", ["archive it and tell the channel", "archive my inbox and the channel",
+                                      "archive the emails and notify the channel"])
+    def test_two_objects_or_a_second_clause_reach_the_model(self, dm, text):
+        client = MagicMock()
+        app_module.handle_message_event(_event(text), client)
+        assert dm.qa.called and _texts(client) == [], text

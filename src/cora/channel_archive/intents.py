@@ -125,10 +125,19 @@ _ARCHIVE_V = r"archive(?! " + _NOUN_SENSE + r"\b)(?![:;])"
 _CHAN_OBJ = (_CHANREF + r"\b(?!['\u2019]s?\b)(?! (?:" + _OBJ_NOUNS + "|" + _SALES_NOUNS
              + r")\b)")
 _OBJECT_NP = "(?:" + _DET + " ){0,3}(?:" + _FILLER + " ){0,3}?"
+#: ... or a COORDINATED modifier list right before the channel noun ("the promo and
+#: launch channels", "promo/event channels", "the promo, event and launch channels"):
+#: its first word is not another object ("the email and the channel" is two things)
+#: and nothing stands between the list and the noun ("archive it and tell the
+#: channel" is a second clause) -- D-051 r2 c1-intents-copy#1 (a).
+_COORD = "(?: ?[,/+&] ?| (?:and|or|and/or) )"
+_OBJECT_NP_COORD = ("(?:" + _DET + " ){0,3}(?:" + _FILLER + " ){0,2}?(?!" + _OBJ_NOUNS + r"\b)"
+                    + _FILLER + "(?:" + _COORD + _FILLER + "){1,2} ")
 #: A21(b), tightened (c1-intents-copy#6): the archive verb's DIRECT object is a
 #: channel -- "archive the old promo channels", "archive #x" -- never "archive the
 #: email from the channel" or "archive the retail channel deals".
-_ATTEMPT_RE = re.compile(r"\A" + _PREFIX + _ARCHIVE_V + " " + _OBJECT_NP + _CHAN_OBJ)
+_ATTEMPT_RE = re.compile(r"\A" + _PREFIX + _ARCHIVE_V + " (?:" + _OBJECT_NP + "|" + _OBJECT_NP_COORD
+                         + ")" + _CHAN_OBJ)
 
 _STATUS_START_RE = re.compile(
     r"\A" + _LEAD + _VOC +
