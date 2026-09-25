@@ -383,10 +383,11 @@ class TestB1WithholdOnTheRealDispatch:
     def test_a_lodging_ask_in_the_history_withholds_a_later_web_turn(self, lane):
         """Tessa's DM history keeps her ask (a guest's name, a loyalty number) and a
         non-custodian's prior turns are not dropped on a web turn: while it is in the
-        window, a later non-lodging web ask carries no web tools."""
+        window, a later non-lodging web ask carries no web tools. The live DM window
+        holds ONLY her ask: the ack and card are threaded under it (D-051 r1 c2-egress#0),
+        and the prior-turn leg reads a person's turns only (integration#2)."""
         prior = [{"role": "user", "content": "find hotels in scottsdale oct 17-21 for Jordan "
-                                             "Riverstone, our Hilton Honors account 123456789"},
-                 {"role": "assistant", "content": ts.ACK_TEXT}]
+                                             "Riverstone, our Hilton Honors account 123456789"}]
         seen = _drive_dispatch("google the latest Arizona heat advisory news", user=_tessa(),
                                channel_id="D0TESSA", channel_name="dm", entity="HJRG", prior=prior)
         assert seen and seen[-1].get("web_tools") is False

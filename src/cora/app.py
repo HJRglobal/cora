@@ -1616,13 +1616,16 @@ def _dispatch_qa(
     # named a guest or a loyalty account sits in the DM / thread history the model
     # composes search strings from, and a non-custodian's prior turns are NOT
     # dropped on a web turn -- so a later "google restaurants near there" must not
-    # carry web tools while that ask is in the window.
+    # carry web tools while that ask is in the window. A PERSON's turns only (D-051
+    # r1 integration#2): Cora's own prose ("full suite green", a card's text) is not
+    # a PII-bearing ask, and the person's ask is itself in the window.
     try:
         _travel_web_withhold = (
             _travel_lane_thread or _travel_store_error
             or travel_shortlist.is_lodging_shaped(user_message)
             or any(travel_shortlist.is_lodging_shaped(m.get("content", ""))
-                   for m in prior_messages if isinstance(m, dict))
+                   for m in prior_messages
+                   if isinstance(m, dict) and m.get("role") == "user")
         )
     except Exception:  # noqa: BLE001 -- fail closed: no web
         _travel_web_withhold = True
@@ -2096,6 +2099,12 @@ def _dispatch_qa(
     # gate_skipped:travel_lane whenever web_guard would have acted.
     elif _travel_web_withhold:
         web_gate_skip = "travel_lane"
+    # D-051 r1 (integration#2): the travel withhold forces web_clean False above, so
+    # on a custodian surface (Harrison's DM) the phi_custodian leg -- or the
+    # unstripped_personal belt -- fires FIRST and the ledger would blame a control the
+    # withhold itself tripped. Name both.
+    if _travel_web_withhold and web_gate_skip in ("phi_custodian", "unstripped_personal"):
+        web_gate_skip = f"{web_gate_skip}+travel_lane"
     # evaluate() runs even on excluded turns (it is read-only and fail-closed):
     # a withheld web ask must ALWAYS leave ledger/log evidence — the original
     # cq-49a7835f081c failure was three explicit web asks degrading silently.

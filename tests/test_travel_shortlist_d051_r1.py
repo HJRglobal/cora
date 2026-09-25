@@ -176,3 +176,41 @@ class TestB1RecallOnTheRealDispatch:
                                entity="HJRG", prior=prior)
         assert seen and seen[-1].get("web_tools") is False
         assert any(r.get("reason") == "gate_skipped:travel_lane" for r in _web_rows())
+
+
+# ── integration#2: the prior-turn leg reads the PERSON's turns only; both skips named ─
+
+HARRISON = "U0B2RM2JYJ1"
+
+
+class TestPriorTurnLegAndSkipLabel:
+    @pytest.mark.parametrize("user,channel,entity", [
+        (HARRISON, "D0HARRISON", "FNDR"),     # the founder DM (a custodian surface)
+        ("tessa", "D0TESSA", "HJRG"),         # Tessa's DM (non-custodian)
+    ])
+    def test_coras_own_lodging_words_in_the_window_do_not_withhold(self, lane, user, channel,
+                                                                    entity):
+        """Cora's replies ("full suite green", a hotel list she posted) are the bot's
+        prose, not a person's PII-bearing ask -- an unrelated explicit web ask attaches."""
+        user = _tessa() if user == "tessa" else user
+        prior = [{"role": "user", "content": "what did the test run say?"},
+                 {"role": "assistant", "content": "Full suite green: 19,342 passed. Earlier I "
+                                                  "listed three hotels in Scottsdale for Oct 17-21."}]
+        seen = _drive_dispatch("google the Deposco API changelog", user=user, channel_id=channel,
+                               channel_name="dm", entity=entity, prior=prior)
+        assert seen and seen[-1].get("web_tools") is True
+
+    def test_a_persons_lodging_ask_in_the_window_still_withholds(self, lane):
+        prior = [{"role": "user", "content": "rooms in scottsdale oct 17-21 for Jordan Riverstone"}]
+        seen = _drive_dispatch("google the Deposco API changelog", user=_tessa(),
+                               channel_id="D0TESSA", channel_name="dm", entity="HJRG", prior=prior)
+        assert seen and seen[-1].get("web_tools") is False
+
+    def test_a_custodian_turn_skipped_by_both_names_travel_lane_too(self, lane):
+        """Harrison's DM is phi_custodian; the travel withhold forces web_clean False, so
+        the phi_custodian leg fires FIRST -- the ledger must still name travel_lane."""
+        seen = _drive_dispatch("google hotels in scottsdale oct 17-21", user=HARRISON,
+                               channel_id="D0HARRISON", channel_name="dm", entity="FNDR")
+        assert seen and seen[-1].get("web_tools") is False
+        reasons = [r.get("reason") for r in _web_rows()]
+        assert "gate_skipped:phi_custodian+travel_lane" in reasons, reasons
