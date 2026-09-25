@@ -422,6 +422,23 @@ class TestUnresolvedReadsSlackHistory:
         assert any("UNRESOLVED" in f and "could not be searched" in f for f in out["findings"])
         assert _outcomes() == []
 
+    def test_a_failed_outcome_write_says_so_and_follows_nothing(self, monkeypatch):
+        _stage_t1_row()
+        its = NOW - 2 * DAY
+        intent(ARCH, its)
+        outcome(ARCH, its + 5, "unknown")
+        real = st.append_ledger
+        monkeypatch.setattr(st, "append_ledger",
+                            lambda event, **kw: False if event == "outcome" else real(event, **kw))
+        fake = MonSlack(archived={ARCH: {"is_archived": False}},
+                        events={ARCH: [arch_event(its + 3, user=BOT_UID)]},
+                        unarchives={ARCH: [{"ts": f"{NOW - DAY:.6f}", "subtype": "channel_unarchive",
+                                            "user": PERSON}]})
+        out = run(fake)
+        assert any("NOT recorded" in f and "ledger write FAILED" in f for f in out["findings"])
+        assert [r["event"] for r in st.read_ledger()] == ["intent", "outcome"]    # nothing else landed
+        assert st.fold(now=NOW).proposals[PID].state_of(ARCH) == st.UNKNOWN
+
     def test_dry_run_reconcile_copy_says_would_record(self):
         _stage_t1_row(state_event=None)
         intent(ARCH, NOW - 2 * DAY)

@@ -448,7 +448,7 @@ def reconcile(client: Any, *, now: float | None = None, dry_run: bool = False,
                 if ok is False:
                     findings.append(f"UNRESOLVED: {cid} intent {pid} -- Slack shows Cora archived it at "
                                     f"{first.get('ts')}, but it was {tail}")
-                if not c.get("is_archived"):   # archived by Cora, reopened since: by whom?
+                if not c.get("is_archived") and ok is not False:   # reopened since: by whom?
                     follow_unarchive(cid, fts, f"Cora archived it at {first.get('ts')} (intent {pid})")
                 continue
             if not aged:
