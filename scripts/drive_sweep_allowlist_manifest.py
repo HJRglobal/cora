@@ -23,8 +23,11 @@ The manifest has three decision sections:
     holds KB rows, with the yaml line to paste. The kickoff rule: a tree-adjacent
     BUSINESS folder is ADDED to drive_sweep_allowlist, never purged.
   * PURGE LINES -- per purgeable folder, the ready-to-run
-      scripts/purge_cora_internal_kb.py --folder-id <id> --expect-leaf <name> --impersonate <account>
-    line for the UNCHANGED positive-leaf gate (option (a): no new selector was
+      scripts/purge_cora_internal_kb.py --folder-id <id> --expect-leaf '<name>' --impersonate <account>
+    line (the leaf a PowerShell SINGLE-quoted literal, every single-quote character
+    doubled; a name PS 5.1 cannot pass intact -- a double quote, a trailing backslash,
+    a control character -- prints a REFUSED line instead; Code #15 C13-02) plus the
+    runbook 4e ``$kids`` row to paste as printed, for the UNCHANGED positive-leaf gate (option (a): no new selector was
     added to the purge script). The gate refuses a chain shorter than 3
     ([folder, ..., root]), so a TOP-LEVEL folder (depth 2 under My Drive) is
     itself REFUSED: the lines are emitted per CHILD folder (depth 3) -- the 9/9
@@ -255,11 +258,51 @@ def _chain_txt(chain: list[tuple[str, str]]) -> str:
     return " / ".join(name or "(unnamed)" for _fid, name in reversed(chain)) or "(none)"
 
 
+class UnsafeLeafName(ValueError):
+    """A folder name that cannot be passed through PowerShell 5.1 to a native exe
+    intact. Refused LOUDLY -- the manifest prints a REFUSED line, never a mangled one."""
+
+
+#: PowerShell treats ALL of these as single-quote characters (it also closes a
+#: single-quoted string on the typographic ones): inside '...' each is escaped by
+#: DOUBLING it (Code #15 C13-02 -- "Harrison's ..." folder names are common).
+_PS_SINGLE_QUOTES = ("'", "‘", "’", "‚", "‛")
+
+
+def ps_single_quote(value: str) -> str:
+    """``value`` as a PowerShell SINGLE-quoted literal (no ``$`` / backtick expansion;
+    every single-quote character doubled). Refuses (UnsafeLeafName) what PS 5.1 cannot
+    hand to a native exe intact: an ASCII double quote (5.1 does not escape an embedded
+    ``"`` when it re-quotes an argument), a trailing backslash (it would escape that
+    re-added closing quote), a CR / LF / NUL / other control character, or an empty name."""
+    raw = str(value or "")
+    if not raw:
+        raise UnsafeLeafName("empty folder name")
+    if '"' in raw:
+        raise UnsafeLeafName("the folder name contains a double quote")
+    if raw.endswith("\\"):
+        raise UnsafeLeafName("the folder name ends with a backslash")
+    if any(ord(c) < 32 or ord(c) == 127 for c in raw):
+        raise UnsafeLeafName("the folder name contains a control character")
+    out = raw
+    for q in _PS_SINGLE_QUOTES:
+        out = out.replace(q, q + q)
+    return f"'{out}'"
+
+
 def purge_line(folder_id: str, leaf_name: str, account: str) -> str:
     """The ready-to-run dry-run line for the UNCHANGED positive-leaf gate. ``--apply``
-    is added ONLY inside the stop window (deployment/runbook.md, slice-8 section)."""
+    is added ONLY inside the stop window (deployment/runbook.md, slice-8 section).
+    The leaf is a PowerShell single-quoted literal (ps_single_quote -- Code #15
+    C13-02); an unsafe name raises UnsafeLeafName (the renderer prints REFUSED)."""
     return (f".venv\\Scripts\\python.exe scripts\\purge_cora_internal_kb.py --folder-id {folder_id} "
-            f"--expect-leaf \"{leaf_name}\" --impersonate {account}")
+            f"--expect-leaf {ps_single_quote(leaf_name)} --impersonate {account}")
+
+
+def kids_row(folder_id: str, leaf_name: str) -> str:
+    """The runbook 4e ``$kids`` row for one purge folder, PS-safe (C13-02): paste it as
+    printed -- the name is already a single-quoted literal with its quotes doubled."""
+    return f"@{{id={ps_single_quote(folder_id)}; name={ps_single_quote(leaf_name)}}}"
 
 
 def render_manifest(report: dict[str, Any]) -> str:
@@ -322,7 +365,14 @@ def render_manifest(report: dict[str, Any]) -> str:
                      f"-- REFUSED by the gate as a --folder-id; purge per child below or move it under a folder in Drive first")
         for pf in sorted(g["purge_folders"].values(), key=lambda p: (-p["chunks"], p["name"].lower())):
             lines.append(f"# {pf['files']} files / {pf['chunks']} chunks under {g['name']} / {pf['name']}")
-            lines.append(purge_line(pf["id"], pf["name"], acct))
+            try:
+                line, row = purge_line(pf["id"], pf["name"], acct), kids_row(pf["id"], pf["name"])
+            except UnsafeLeafName as exc:
+                lines.append(f"# REFUSED: folder {pf['id']} -- {exc}; PowerShell 5.1 cannot pass it to "
+                             f"--expect-leaf intact. Rename the folder in Drive, then re-run this manifest.")
+                continue
+            lines.append(line)
+            lines.append(f"#   runbook 4e $kids row (paste as printed): {row}")
             any_line = True
         if g["unreachable_files"]:
             lines.append(f"# {g['unreachable_files']} files / {g['unreachable_chunks']} chunks sit DIRECTLY in "
@@ -442,7 +492,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
                         handlers=[logging.StreamHandler(sys.stdout)])
     from dotenv import load_dotenv
-    load_dotenv(_REPO_ROOT / ".env")
+    load_dotenv(_REPO_ROOT / ".env", override=True)   # D-021 (Code #15 C13-01)
 
     out_dir = Path(args.out_dir)
     cache_path = Path(args.cache) if args.cache else out_dir / CACHE_BASENAME

@@ -211,7 +211,8 @@ class TestManifestText:
         assert mod.purge_line("DLSUB", "2025", ACCOUNT) in text
         assert mod.purge_line("DLSUB2", "scans", ACCOUNT) in text
         assert "--apply" not in mod.purge_line("DLSUB", "2025", ACCOUNT)
-        assert "--expect-leaf \"2025\" --impersonate harrison@hjrglobal.com" in text
+        assert "--expect-leaf '2025' --impersonate harrison@hjrglobal.com" in text   # PS single-quoted (C13-02)
+        assert "runbook 4e $kids row (paste as printed): @{id='DLSUB'; name='2025'}" in text
         # the top-level folder itself is flagged refused; loose files flagged unreachable
         assert "Downloads [DL] is depth-2" in text and "REFUSED by the gate" in text
         assert "unreachable by the gate -- move in Drive first" in text
@@ -230,6 +231,56 @@ class TestManifestText:
         text = mod.render_manifest(rep)
         lines = [l for l in text.splitlines() if l.startswith(".venv")]
         assert lines and all(f"--folder-id {x} " not in l for l in lines for x in (FOS, "MY", "DL", "ACC", "HJRG"))
+
+
+class TestPowerShellSafeLeaves:
+    """Code #15 C13-02: an apostrophe (or a `$`) in a folder name broke the emitted
+    `--expect-leaf "<leaf>"` / runbook 4e `name='<leaf>'` lines in PowerShell. The
+    leaf is now a PS SINGLE-quoted literal with every single-quote character doubled;
+    what PS 5.1 cannot pass to a native exe intact is REFUSED loudly."""
+
+    def test_single_quote_doubling_and_no_expansion(self):
+        mod = _load()
+        assert mod.ps_single_quote("2025") == "'2025'"
+        assert mod.ps_single_quote("Harrison's Files") == "'Harrison''s Files'"
+        assert mod.ps_single_quote("it''s") == "'it''''s'"
+        assert mod.ps_single_quote("Harrison’s") == "'Harrison’’s'"   # typographic quote, also PS-special
+        assert mod.ps_single_quote("$env:X `n (1) [a] & b") == "'$env:X `n (1) [a] & b'"   # literal in '...'
+        assert mod.purge_line("F1", "Harrison's Files", ACCOUNT).endswith(
+            "--expect-leaf 'Harrison''s Files' --impersonate harrison@hjrglobal.com")
+        assert mod.kids_row("F1", "Harrison's Files") == "@{id='F1'; name='Harrison''s Files'}"
+
+    def test_unsafe_names_are_refused(self):
+        mod = _load()
+        for bad in ('say "hi"', "trailing\\", "line\nbreak", "cr\rhere", "nul\x00", ""):
+            with pytest.raises(mod.UnsafeLeafName):
+                mod.ps_single_quote(bad)
+            with pytest.raises(mod.UnsafeLeafName):
+                mod.purge_line("F1", bad, ACCOUNT)
+
+    def test_the_renderer_prints_refused_never_a_mangled_line(self, tmp_path):
+        mod = _load()
+        rep, _, _ = _report(mod, tmp_path)
+        rep["groups"]["DL"]["purge_folders"]["DLSUB"]["name"] = 'the "2025" scans'
+        rep["groups"]["DL"]["purge_folders"]["DLSUB2"]["name"] = "Harrison's scans"
+        text = mod.render_manifest(rep)
+        section = text.split("PURGE LINES", 1)[1].split("UNRESOLVED / STALE", 1)[0]
+        assert "# REFUSED: folder DLSUB -- the folder name contains a double quote" in section
+        assert "--folder-id DLSUB " not in section                         # no runnable line for it
+        assert "--expect-leaf 'Harrison''s scans' --impersonate" in section
+        assert "@{id='DLSUB2'; name='Harrison''s scans'}" in section
+
+    def test_main_loads_the_repo_env_with_override(self, tmp_path, monkeypatch):
+        # Code #15 C13-01 (D-021): load_dotenv(_REPO_ROOT / ".env", override=True).
+        import dotenv
+        mod = _load()
+        calls = []
+        monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: calls.append((a, k)) or True)
+        rc = mod.main(["--db", str(tmp_path / "absent.db"), "--out-dir", str(tmp_path / "out"),
+                       "--allowlist-id", FOS])
+        assert rc == 2                                          # stops at the missing KB, writes nothing
+        assert calls == [((mod._REPO_ROOT / ".env",), {"override": True})]
+        assert not (tmp_path / "out").exists()
 
 
 class TestFolderCache:

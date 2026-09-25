@@ -300,8 +300,10 @@ this section supersedes it for stop windows.)
    - `UNRESOLVED / STALE KB ROWS` (404 / trashed / API error): NEVER in a purge set
      here; they are stale rows for the monthly kb-hygiene sweep.
    - `PURGE LINES`: one ready-to-run `purge_cora_internal_kb.py --folder-id <id>
-     --expect-leaf <name> --impersonate harrison@hjrglobal.com` line per purgeable
-     folder, through the UNCHANGED positive-leaf gate (one folder per --apply,
+     --expect-leaf '<name>' --impersonate harrison@hjrglobal.com` line per purgeable
+     folder (the leaf a PowerShell single-quoted literal, apostrophes doubled, plus the
+     step-4e `$kids` row to paste; an unsafe name prints `# REFUSED` instead -- Code #15
+     C13-02), through the UNCHANGED positive-leaf gate (one folder per --apply,
      --expect-leaf must equal the resolved leaf, chain depth >= 3, complete
      enumeration, reviewed dry-run manifest). The gate REFUSES depth-2 folders
      (a folder directly under My Drive) and cannot reach loose files directly
@@ -353,12 +355,16 @@ Start-Sleep 310
 
 # 4e. The purges: the per-folder --apply loop, one folder per --apply (a depth-2 parent is refused by the depth floor;
 #     the PIN is on the parent, the PURGE is per child). Populate $kids from the manifest's PURGE LINES section (step 2):
-#     one row per emitted line, id + expect-leaf name EXACTLY as printed. Each REFUSES (nothing deleted) if its step-3
-#     dry-run manifest is missing, does not cover every selected file (files added since -> re-run step 3 first, or add
-#     --accept-delta only if you accept them), or --expect-leaf mismatches. A folder whose dry-run showed 0 chunks deletes nothing.
+#     paste each "runbook 4e $kids row (paste as printed)" line EXACTLY as printed -- the name is already a PowerShell
+#     single-quoted literal with every apostrophe doubled (Code #15 C13-02: "Harrison's ..." names broke the old
+#     hand-typed name='...' row). A "# REFUSED: folder <id>" line means the name cannot pass through PS 5.1 intact
+#     (a double quote, a trailing backslash, a control character): rename it in Drive and re-run step 1. Each apply
+#     REFUSES (nothing deleted) if its step-3 dry-run manifest is missing, does not cover every selected file (files
+#     added since -> re-run step 3 first, or add --accept-delta only if you accept them), or --expect-leaf mismatches.
+#     A folder whose dry-run showed 0 chunks deletes nothing.
 $env:PYTHONIOENCODING = 'utf-8'   # silences the cosmetic middle-dot logging error seen on 9/10
 $kids = @(
-  @{id='<folder id from PURGE LINES>'; name='<expect-leaf name from PURGE LINES>'}
+  @{id='<folder id>'; name='<leaf>'}   # <- replace with the manifest's printed $kids rows, verbatim
   # ... one row per PURGE LINE
 )
 foreach ($k in $kids) {
