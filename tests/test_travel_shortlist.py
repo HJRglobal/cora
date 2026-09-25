@@ -23,6 +23,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -213,6 +214,49 @@ class SdkStreamAnthropic:
                 return MessageStreamManager(_request, output_format=anthropic.NOT_GIVEN)
 
         self.messages = _Messages()
+
+
+def _sse_bytes(ev) -> bytes:
+    d = ev.model_dump(mode="json")
+    return f"event: {d['type']}\ndata: {json.dumps(d)}\n\n".encode()
+
+
+def _blocking_sdk_client(mode: str, *, honors_close: bool, block_for: float):
+    """A REAL anthropic.Anthropic over httpx.MockTransport (in-process; no socket, no
+    network). The body streams message_start + the fixture's first 3 content blocks
+    (2 web_search server_tool_use), then BLOCKS for ``block_for`` s or until released:
+    mode "pings" = a keep-alive ping SSE event every 50 ms (the SDK drops them before
+    iteration); "silent" = no bytes at all; "no_headers" = the handler itself blocks
+    before any response exists. ``honors_close`` False = closing the response does
+    NOT wake the blocked read (a transport whose recv ignores a cross-thread close).
+    Returns (client, release_event)."""
+    import httpx
+
+    release = threading.Event()
+    head = [_sse_bytes(e) for e in _sse_events(_fx(), blocks=3, finish=False)]
+
+    class _Body(httpx.SyncByteStream):
+        def __iter__(self):
+            yield from head
+            end = time.monotonic() + block_for
+            while time.monotonic() < end and not release.is_set():
+                if mode == "pings":
+                    yield b'event: ping\ndata: {"type": "ping"}\n\n'
+                release.wait(0.05)
+
+        def close(self):
+            if honors_close:
+                release.set()
+
+    def _handler(request):
+        if mode == "no_headers":
+            release.wait(block_for)
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=_Body())
+
+    client = anthropic.Anthropic(api_key="sk-test-not-a-key", base_url="http://anthropic.invalid",
+                                 max_retries=0,
+                                 http_client=httpx.Client(transport=httpx.MockTransport(_handler)))
+    return client, release
 
 
 def _slack_resp(data: dict) -> SlackResponse:
@@ -781,6 +825,37 @@ class TestRunSearch:
         assert elapsed < 1.0
         # whatever the cut create had searched is charged, never lost
         assert 0 <= out.searches <= 4 and ts.lane_searches_today() == out.searches
+
+    # D-051 r2 c2-webcall#1: the SDK drops keep-alive 'ping' SSE events BEFORE
+    # MessageStream iteration, and every ping resets httpx's per-read timer -- so an
+    # in-loop deadline check never ran during a ping-filled gap, and a silent stall
+    # was bounded only by the per-read timeout (~API_TIMEOUT again). These drive a
+    # REAL anthropic client over httpx.MockTransport (no network) whose body BLOCKS:
+    # pings every 50 ms / total silence / no response headers at all, for 4 s, and
+    # (honors_close=False) a blocked read that closing the response does NOT wake.
+    @pytest.mark.parametrize("mode", ["pings", "silent", "no_headers"])
+    @pytest.mark.parametrize("honors_close", [True, False])
+    def test_the_deadline_holds_whatever_the_stream_does(self, monkeypatch, mode, honors_close):
+        monkeypatch.setattr(ts, "API_TIMEOUT", 0.3)
+        client, release = _blocking_sdk_client(mode, honors_close=honors_close, block_for=4.0)
+        try:
+            t0 = time.monotonic()
+            out = ts.run_search(ts.build_request(_constraints(), max_uses=4, model=MODEL), budget=4,
+                                client_factory=lambda: client)
+            elapsed = time.monotonic() - t0
+        finally:
+            release.set()                  # let the abandoned reader thread finish
+        assert elapsed < 2.0, elapsed      # 4 s if the stream's own pace decided
+        assert out.status == "failed" and out.error == "api_error:WallClockTimeout"
+        # the cut create is charged: the two server_tool_use blocks it streamed (or 0
+        # when no response ever opened) -- never lost, never a fresh budget
+        want = 0 if mode == "no_headers" else 2
+        assert out.searches == want
+        for t in threading.enumerate():
+            if t.name == "travel-shortlist-create":
+                t.join(5)
+                assert not t.is_alive()
+        assert ts.lane_searches_today() == want     # the abandoned helper wrote nothing
 
     def test_one_deadline_spans_both_iterations(self, monkeypatch):
         monkeypatch.setattr(ts, "API_TIMEOUT", 5.0)

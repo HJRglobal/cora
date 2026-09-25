@@ -1535,6 +1535,52 @@ class WallClockTimeout(TimeoutError):
     """The lane's ONE wall-clock deadline (API_TIMEOUT across every create) passed."""
 
 
+def _stream_create(client: Any, kwargs: dict, *, timeout: float,
+                   deadline: float) -> tuple[Any, Any, BaseException | None]:
+    """ONE streamed create, held to the wall-clock deadline WHATEVER the stream does
+    (D-051 r2 c2-webcall#1). The create runs on a helper thread and the caller waits
+    at most until ``deadline``: the SDK drops keep-alive 'ping' SSE events before
+    MessageStream iteration and every ping resets httpx's per-read timer, so neither
+    an in-loop check nor the read timeout bounds a ping-filled gap, and a silent
+    stall is bounded only by the per-read timeout. Past the deadline the stream is
+    closed (best effort: it wakes a blocked read where the transport allows) and
+    abandoned; the helper only reads and never writes a ledger. Returns
+    (response, opened stream or None, exception or None) -- a WallClockTimeout
+    when the deadline won."""
+    box: dict[str, Any] = {}
+    done, abandoned = threading.Event(), threading.Event()
+
+    def _run() -> None:
+        try:
+            with client.messages.stream(**kwargs, timeout=timeout) as stream:
+                box["stream"] = stream
+                if abandoned.is_set():
+                    return
+                for _event in stream:
+                    if abandoned.is_set():
+                        return
+                box["resp"] = stream.get_final_message()
+        except BaseException as exc:  # noqa: BLE001 -- handed to the caller
+            box["exc"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=_run, name="travel-shortlist-create", daemon=True).start()
+    if not done.wait(max(0.0, deadline - time.monotonic())):
+        abandoned.set()                 # BEFORE reading the stream: one side always closes it
+        opened = box.get("stream")
+        if opened is not None:
+            try:
+                opened.close()
+            except Exception:  # noqa: BLE001
+                log.warning("travel_shortlist: closing the abandoned stream failed", exc_info=True)
+        return None, opened, WallClockTimeout("deadline passed mid-create")
+    exc = box.get("exc")
+    if exc is None and "resp" not in box:          # defensive: never a None response
+        exc = RuntimeError("create returned no response")
+    return box.get("resp"), box.get("stream"), exc
+
+
 @dataclass
 class SearchOutcome:
     status: str                    # ok | failed | unreadable | capped (no create: caps full)
@@ -1555,12 +1601,14 @@ def run_search(request: dict, *, budget: int, entity: str = "FNDR",
     snapshot (``_partial_searches``) -- with one llm usage line per create (a
     ``via=partial`` line for a raised create that has a snapshot).
 
-    ONE WALL-CLOCK DEADLINE (D-051 r1 c2-webcall#2): API_TIMEOUT across ALL creates.
-    The SDK's ``timeout`` is httpx's PER-READ timeout (the longest gap between
-    chunks), so a stream that keeps delivering events was never cut; the stream is
-    therefore iterated, closed and abandoned (WallClockTimeout) once the deadline
-    passes, and each create's per-read timeout is only the time LEFT (a stall is
-    cut too). Never raises."""
+    ONE WALL-CLOCK DEADLINE (D-051 r1 c2-webcall#2, r2 c2-webcall#1): API_TIMEOUT
+    across ALL creates. The SDK's ``timeout`` is httpx's PER-READ timeout (the
+    longest gap between chunks), and the SDK drops keep-alive pings before
+    iteration, so neither bounds a create; each create therefore runs under
+    ``_stream_create``, which returns at the deadline whatever the stream does
+    (events, pings, silence, no headers) and closes + abandons it
+    (WallClockTimeout). Each create's per-read timeout is only the time LEFT.
+    Never raises."""
     from .llm_usage import log_usage  # noqa: PLC0415 -- stdlib-only module
     responses: list = []
     contents: list[list] = []
@@ -1594,23 +1642,16 @@ def run_search(request: dict, *, budget: int, entity: str = "FNDR",
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise WallClockTimeout("deadline passed before a create")
-            opened = None
-            try:
-                with client.messages.stream(**kwargs, timeout=min(API_TIMEOUT, remaining)) as stream:
-                    opened = stream
-                    for _event in stream:
-                        if time.monotonic() > deadline:
-                            stream.close()
-                            raise WallClockTimeout("deadline passed mid-stream")
-                    resp = stream.get_final_message()
-            except Exception:
+            resp, opened, exc = _stream_create(client, kwargs, timeout=min(API_TIMEOUT, remaining),
+                                               deadline=deadline)
+            if exc is not None:
                 n, partial = _partial_searches(opened, _max_uses(kwargs))
                 searches += n
                 _record_searches(n, entity)
                 if partial is not None:
                     log_usage(partial, caller=CALLER, model=str(kwargs.get("model") or ""),
                               iteration=it + 1, via="partial")
-                raise
+                raise exc
             responses.append(resp)
             n = _searches_in(resp)
             searches += n
