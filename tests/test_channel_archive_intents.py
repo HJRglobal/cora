@@ -549,3 +549,66 @@ class TestAffirmativesR2:
             it.followup_shape("yes," + " " * 40000 + "x")
             best = min(best, time.perf_counter() - t0)
         assert best < 0.05
+
+
+#: r2:c1-intents-copy#1 -- the full ask with a trailing vocative, a 'thanks'
+#: sentence, 'again' / 'already' / 'when you can' / 'for us' / 'real quick' /
+#: 'in our slack', 'every' / 'all of our', and two deadness adjectives (adjacent or
+#: joined by and / or / '/' / ',' / '+') -- none of which contradicts the ask.
+ASK_FIRE_R2 = [
+    "archive the dead channels, cora", "archive the dead channels cora", "archive the dead channels please cora",
+    "archive dead channels for me cora", "archive the dead channels again", "archive the dead channels. thanks!",
+    "Archive the dead channels. Thanks", "archive the dead channels — thanks",
+    "archive the dead channels when you can", "archive the dead channels for us",
+    "archive the dead channels already", "archive the dead channels real quick", "archive the old dead channels",
+    "can you archive all of our dead channels?", "archive every dead channel",
+    "archive the dead channels in our slack", "archive the dead and inactive channels",
+    "archive the dead or inactive channels", "archive dead/inactive channels", "archive old and dead channels",
+    "archive the dead, inactive channels", "archive dead + inactive channels",
+    "archive all the dead and unused channels", "archive the dead channels thanks cora",
+    "archive the dead channels. thank you cora!", "archive the dead channels, cora! :pray:",
+    "archive the dead channels - thanks", "archive the dead channels please, thanks",
+]
+#: ... while an exception, a scope, another system, a second action or a
+#: non-deadness adjective still fails the ask (the attempt rail / the model).
+ASK_NOT_R2 = [
+    "archive the dead channels, cora, except #social", "archive the dead channels for osn",
+    "archive the dead channels in hubspot", "archive the dead channels again tomorrow",
+    "archive the dead channels. thanks, and dismiss cq-123456789012", "archive the dead channels. then post a summary",
+    "archive the dead and live channels", "archive the dead channels and the deals", "archive every dead deal",
+    "archive all of our dead deals", "archive the dead channels thanks to tommy", "archive the old dead promo channels",
+    "archive the dead channels, cora, then post a summary", "archive the dead channels only",
+    "archive the dead channels but not #social", "archive the dead or live channels",
+    "archive the dead channels cora's list", "archive the dead dead dead channels",
+]
+
+
+class TestAskGrammarR2:
+    @pytest.mark.parametrize("text", ASK_FIRE_R2)
+    def test_the_full_ask_with_a_benign_tail_is_the_ask(self, text):
+        assert it.looks_like_archive_ask(text), text
+        assert not it.looks_like_archive_attempt(text), text        # never the self-contradicting refusal
+
+    @pytest.mark.parametrize("text", ASK_NOT_R2)
+    def test_an_exception_scope_or_second_action_is_still_not_the_ask(self, text):
+        assert not it.looks_like_archive_ask(text), text
+
+    @pytest.mark.parametrize("shape", ["archive the dead channels" + ", cora" * 45,
+                                       "archive the dead channels" + " thanks" * 38,
+                                       "archive the dead channels." + " thanks." * 34,
+                                       "archive the dead channels" + " —" * 130 + " x",
+                                       "archive the dead" + " and dead" * 30 + " channels",
+                                       "archive the dead" + "/" * 280 + "old channels",
+                                       "archive the dead channels" + " again" * 38 + "!"],
+                             ids=["vocatives", "thanks-run", "thanks-sentences", "dashes", "adj-chain",
+                                  "slashes", "again-run"])
+    def test_the_ask_grammar_is_fast_on_capped_worst_cases(self, shape):
+        best = float("inf")
+        for _ in range(3):
+            t0 = time.perf_counter()
+            it.looks_like_archive_ask(shape)
+            it.looks_like_archive_attempt(shape)
+            it.looks_like_archive_ask(" " * 40000)
+            it.looks_like_archive_ask("archive the dead channels," + " " * 40000 + "x")
+            best = min(best, time.perf_counter() - t0)
+        assert best < 0.05

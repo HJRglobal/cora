@@ -69,16 +69,26 @@ _POLITE = ("(?:(?:can|could|would|will) (?:you|u|we) )?"
            "(?:(?:please|pls|plz|just|now|then|so|go ahead and|time to|let's|lets|let us) ){0,2}")
 _PREFIX = _LEAD + _VOC + _POLITE
 _ASK_VERB = "(?:archive|(?:do (?:you|u) )?mind archiving)"
-_TAIL_WORD = "(?:now|please|pls|plz|for me|in slack|thanks|thank you|thx|ty|today|asap)"
+_TAIL_WORD = ("(?:now|please|pls|plz|for me|for us|in slack|in our slack|thanks|thank you|thx|ty|"
+              "today|asap|again|already|when you can|when you get a chance|real quick|quickly)")
+_THANKS = "(?:thanks|thank you|thx|ty)"
+#: a trailing vocative ("..., cora" / "... please cora") -- D-051 r2 c1-intents-copy#1
+_VOC_END = "(?:,? @?cora)?"
 _EMOJI = ("(?::[a-z0-9_+'-]{1,40}:|"
           "[\u2600-\u27bf\U0001f300-\U0001faff\ufe0f\u200d]{1,8})")
-#: ", please" / " pls" / " thanks" (max two), then emoji or :shortcodes: (max three)
-_TAIL = "(?:,? " + _TAIL_WORD + "){0,2}[?.!]*(?: ?" + _EMOJI + "[?.!]*){0,3}"
+#: ", please" / " pls" / " thanks" / " again" (max three) and a trailing "cora", then
+#: one sentence-final thanks (". thanks!" / " \u2014 thanks"), then emoji or :shortcodes:
+#: (max three)
+_TAIL = ("(?:,? " + _TAIL_WORD + "){0,3}" + _VOC_END + "[?.!]*"
+         "(?:(?: [\u2014\u2013-]+| ?[,;])? " + _THANKS + _VOC_END + "[?.!]*)?"
+         "(?: ?" + _EMOJI + "[?.!]*){0,3}")
+_DEAD_ADJ = "(?:dead|inactive|stale|unused|quiet|old|abandoned|idle|silent)"
+#: one deadness adjective, or two -- adjacent or joined by and / or / '/' / ',' / '+'
+_DEAD_ADJS = _DEAD_ADJ + "(?:(?: ?[,/+&] ?| (?:and|or|and/or) | )" + _DEAD_ADJ + ")?"
 _ASK_RE = re.compile(
     r"\A" + _PREFIX + _ASK_VERB +
-    r" (?:(?:all of the|all the|all|any|our|my|the|those|these) )?"
-    r"(?:dead|inactive|stale|unused|quiet|old|abandoned|idle|silent) "
-    r"(?:slack )?channels?" + _TAIL + r"\Z")
+    r" (?:(?:all of the|all of our|all of my|all our|all my|all the|all|any|our|my|the|those|"
+    r"these|every) )?" + _DEAD_ADJS + r" (?:slack )?channels?" + _TAIL + r"\Z")
 
 #: a determiner run at the head of the verb's object
 _DET = "(?:the|these|those|this|that|my|our|all|any|some|every|each|both|a|an|of)"

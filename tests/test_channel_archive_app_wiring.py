@@ -856,3 +856,44 @@ class TestAffirmativesR2:
         app_module.handle_message_event(_event("yes, go ahead"), client)
         assert quiet_dm.qa.called
         assert intents.FOLLOWUP_REPLY_LEAD not in " ".join(t or "" for t in _texts(client))
+
+
+ASK_FIRE_R2 = [
+    "archive the dead channels, cora", "archive the dead channels please cora", "archive dead channels for me cora",
+    "archive the dead channels again", "archive the dead channels. thanks!", "archive the dead channels — thanks",
+    "archive the dead channels when you can", "archive the old dead channels",
+    "can you archive all of our dead channels?", "archive every dead channel",
+    "archive the dead and inactive channels", "archive dead/inactive channels", "archive the dead, inactive channels",
+]
+
+
+class TestAskGrammarR2:
+    """r2:c1-intents-copy#1: the full ask with a trailing vocative / 'thanks' sentence /
+    'again' / 'every' / two deadness adjectives starts the scan on every founder
+    surface -- never the refusal telling him to type what he typed."""
+
+    @pytest.mark.parametrize("text", ASK_FIRE_R2)
+    def test_the_dm_ask_starts_the_scan(self, dm, text):
+        client = MagicMock()
+        app_module.handle_message_event(_event(text), client)
+        assert dm.done.wait(5), text
+        assert _texts(client) == [intents.ACK_REPLY] and not dm.qa.called and not dm.capture.called, text
+
+    @pytest.mark.parametrize("text", ["archive the dead channels, cora, except #social",
+                                      "archive the dead channels for osn", "archive the dead or live channels"])
+    def test_an_exception_or_scope_in_a_dm_is_not_the_scan(self, dm, text):
+        client = MagicMock()
+        app_module.handle_message_event(_event(text), client)
+        assert not dm.scans and intents.ACK_REPLY not in _texts(client), text
+
+    @pytest.mark.parametrize("text", ASK_FIRE_R2)
+    def test_the_mention_ask_starts_the_scan(self, text):
+        client, dispatch, capture, start = TestFounderMention()._run(text)
+        assert start.called and start.call_args.kwargs["ack_text"] == intents.CHANNEL_ACK_REPLY, text
+        assert not dispatch.called and not capture.called and not client.chat_postMessage.called, text
+
+    @pytest.mark.parametrize("text", ["archive the dead channels. thanks!", "archive every dead channel",
+                                      "archive dead/inactive channels"])
+    def test_the_slash_ask_starts_the_scan(self, text):
+        client, dispatch, capture, start = TestFounderSlashAskR1()._run(text)
+        assert start.called and not dispatch.called and not capture.called, text
