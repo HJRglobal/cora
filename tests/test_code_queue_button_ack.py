@@ -16,8 +16,12 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 import cora.app as app_module
 from cora import code_queue as cq
+
+from test_code_queue import qenv  # noqa: F401 -- shared isolation fixture (TestApproveRouting)
 
 HARRISON = "U0B2RM2JYJ1"
 
@@ -119,6 +123,12 @@ class TestKickoffOffTheListenerPool:
         return _pqa
 
     def test_stage_and_queue_listeners_return_before_generation_finishes(self):
+        # s5s6#r2-0: only a GENERATING Queue press is offloaded, so the pressed row is a
+        # P1 PROPOSED item here (a P2/P3 approve runs inline -- TestApproveRouting).
+        # The autouse fixture has _EVENT_LEDGER on a tmp file.
+        cq._append_event({"event": "captured", "id": "cq-aaaaaaaaaaaa",
+                          "ts": "2026-09-20T10:00:00+00:00", "status": "PROPOSED",
+                          "title": "t", "entity": "F3E", "kind": "bug", "severity": "P1"})
         for handler, action in ((app_module.handle_cq_stage, cq.ACTION_STAGE),
                                 (app_module.handle_cq_approve, cq.ACTION_APPROVE)):
             gate, seen = threading.Event(), []
@@ -227,6 +237,109 @@ class TestKickoffOffTheListenerPool:
             time.sleep(0.02)
         assert [s for s, _t in results] == [200] * 6, results
         assert sorted(done) == sorted(f"cq-00000000000{i}" for i in range(6))   # every outcome posts
+
+
+class TestApproveRouting:
+    """D-051 Code #15 r2 s5s6#r2-0: s6#0 sent EVERY Queue press to the two-worker
+    kickoff pool, P2/P3 rows included, whose approve never generates. With both
+    workers busy (a Monday-menu Stage burst) the press sat invisible, a later inline
+    Later / Park on the same row committed first, and the late approve then folded the
+    SNOOZED / PARKED row back to APPROVED -- against the founder's last press. Only a
+    press that will generate is offloaded now; every other approve runs inline, in
+    press order. The pool is the conftest's per-test one, drained at teardown."""
+
+    def _occupy_pool(self, gate):
+        started: list[int] = []
+
+        def _hold():
+            started.append(1)
+            assert gate.wait(10)
+        futs = [app_module._CQ_KICKOFF_POOL.submit(_hold) for _ in range(2)]
+        deadline = time.monotonic() + 5
+        while len(started) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(started) == 2, "both kickoff workers should be busy"
+        return futs
+
+    @staticmethod
+    def _events(cid):
+        return [e.get("event") for e in cq._read_jsonl(cq._EVENT_LEDGER) if e.get("id") == cid]
+
+    def _race(self, cid, second_press):
+        """Queue on ``cid`` while both kickoff workers are busy, then the second
+        press; returns (status right after the Queue press, final record)."""
+        gate = threading.Event()
+        futs = self._occupy_pool(gate)
+        try:
+            app_module.handle_cq_approve(MagicMock(), _body(value=cid), MagicMock())
+            after_queue = cq.get_item(cid)["status"]
+            second_press()
+        finally:
+            gate.set()
+            for f in futs:
+                f.result(10)
+        app_module._CQ_KICKOFF_POOL.shutdown(wait=True)   # anything pooled has run
+        return after_queue, cq.get_item(cid)
+
+    def test_p3_queue_then_later_ends_snoozed(self, qenv):  # noqa: F811
+        cid = cq.seed_item(kind="bug", severity="P3", title="Routing probe row for later",
+                           summary="s", entity="F3E", signal="explicit", status="PROPOSED")
+        after_queue, rec = self._race(cid, lambda: app_module.handle_cq_later(
+            MagicMock(), _body(value=cid), MagicMock()))
+        # the founder's LAST press governs (the defect: a late approve folded it to APPROVED)
+        assert rec["status"] == "SNOOZED"
+        assert self._events(cid) == ["captured", "approved", "snoozed"]
+        assert after_queue == "APPROVED"      # inline: on the ledger before the next press
+
+    def test_p3_queue_then_park_ends_parked(self, qenv):  # noqa: F811
+        cid = cq.seed_item(kind="bug", severity="P3", title="Park race probe item",
+                           summary="s", entity="F3E", signal="explicit", status="PROPOSED")
+
+        def _park():
+            outcome, _msg = cq.park_item(cid, HARRISON, "waiting on the vendor",
+                                         trigger_event="vendor replies")
+            assert outcome == "parked"
+        after_queue, rec = self._race(cid, _park)
+        assert rec["status"] == "PARKED"
+        assert self._events(cid) == ["captured", "approved", "parked"]
+        assert after_queue == "APPROVED"
+
+    @pytest.mark.parametrize("severity", ["P0", "P1", "HIGH", "P2", "P3", "LOW", ""])
+    def test_routing_matches_exactly_when_process_queue_action_generates(
+            self, qenv, monkeypatch, severity):  # noqa: F811
+        """The routing predicate must never drift from process_queue_action: a press
+        is offloaded iff that approve reaches ensure_kickoff_staged."""
+        generated: list[str] = []
+        monkeypatch.setattr(cq, "ensure_kickoff_staged",
+                            lambda cq_id, **kw: (generated.append(cq_id), ("staged", "p"))[1])
+        statuses = ("PROPOSED", "SNOOZED", "PARKED", "BLOCKED", "APPROVED", "STAGED",
+                    "DISMISSED", "SHIPPED", "SUPERSEDED")
+        for i, status in enumerate(statuses):
+            cid = f"cq-{i:012x}"
+            cq._append_event({"event": "captured", "id": cid, "ts": "2026-09-20T10:00:00+00:00",
+                              "status": status, "title": f"t{i}", "entity": "F3E",
+                              "kind": "bug", "severity": severity})
+            predicted = app_module._cq_approve_will_generate(_body(value=cid))
+            cq.process_queue_action(cq.ACTION_APPROVE, cid, HARRISON)
+            assert predicted == (cid in generated), (severity, status, predicted)
+        assert app_module._cq_approve_will_generate(_body(value="cq-000000000000")) is False
+
+    def test_a_generating_approve_is_offloaded_and_a_p3_one_is_not(self, qenv, monkeypatch):  # noqa: F811
+        seen: list[tuple[str, str]] = []
+
+        def _record(body, client, action_id):
+            seen.append((body["actions"][0]["value"], threading.current_thread().name))
+        monkeypatch.setattr(app_module, "_handle_code_queue_button", _record)
+        p1 = cq.seed_item(kind="bug", severity="P1", title="Offload probe priority row",
+                          summary="s", entity="F3E", signal="explicit", status="PROPOSED")
+        p3 = cq.seed_item(kind="bug", severity="P3", title="Inline probe minor ask",
+                          summary="s", entity="F3E", signal="explicit", status="PROPOSED")
+        for cid in (p1, p3):
+            app_module.handle_cq_approve(MagicMock(), _body(value=cid), MagicMock())
+        app_module._CQ_KICKOFF_POOL.shutdown(wait=True)
+        names = dict(seen)
+        assert names[p1].startswith("cq-kickoff"), names
+        assert names[p3] == threading.current_thread().name, names
 
 
 class TestAckPointers:

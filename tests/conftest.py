@@ -711,6 +711,54 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
         pass
 
 
+# ── D-051 Code #15 r2 lens#r2-0: the cq-kickoff pool never outlives its test ──────
+# s6#0 moved the kickoff-generating presses (Stage, a Stage-bundle row, Queue on a
+# P0/P1 row) onto app._CQ_KICKOFF_POOL, a process-global ThreadPoolExecutor, so a
+# pressed body is no longer tied to its caller's lifetime. Every redirect a test
+# relies on (the autouse _LEDGER_CONSTS loop above, qenv's FOUNDER_OS_ROOT /
+# drive_io / _SYNC) is function-scoped monkeypatch, undone at teardown. A body still
+# queued or running then resumed against the REAL module state: on 2026-09-25
+# 04:54Z a scratch test's pooled Stage bodies appended an orphan `staged` event to a
+# real data/state/code-session-queue.jsonl and re-rendered the LIVE G: backlog as
+# "0 item(s)" (code_queue's own leak guard reads "not a test" once the ledger
+# constant is restored). Each test now gets its OWN two-worker pool (same thread
+# name prefix, so the thread-name pins still hold) and drains it in the post-yield.
+# This fixture requests monkeypatch, so it is set up after it and torn down BEFORE
+# monkeypatch undoes anything: every pooled body finishes while the test's
+# redirects are still in effect. A module first imported DURING the test submitted
+# to its import-time pool, so that one is drained too (and replaced, not restored).
+# Pinned by tests/test_cq_kickoff_pool_isolation.py.
+_CQ_APP_MODULES = ("cora.app", "src.cora.app")
+
+
+@pytest.fixture(autouse=True)
+def _cq_kickoff_pool_per_test(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _fresh():
+        return ThreadPoolExecutor(max_workers=2, thread_name_prefix="cq-kickoff")
+
+    swapped: list = []
+    for _name in _CQ_APP_MODULES:
+        _mod = sys.modules.get(_name)
+        if _mod is not None and hasattr(_mod, "_CQ_KICKOFF_POOL"):
+            _pool = _fresh()
+            monkeypatch.setattr(_mod, "_CQ_KICKOFF_POOL", _pool)
+            swapped.append((_name, _pool))
+    yield
+    for _name, _pool in swapped:
+        _pool.shutdown(wait=True)
+    done = {_name for _name, _pool in swapped}
+    for _name in _CQ_APP_MODULES:
+        _mod = sys.modules.get(_name)
+        if _name in done or _mod is None:
+            continue
+        _pool = getattr(_mod, "_CQ_KICKOFF_POOL", None)
+        if isinstance(_pool, ThreadPoolExecutor):
+            _mod._CQ_KICKOFF_POOL = _fresh()
+            _pool.shutdown(wait=True)
+
+
 # Real ledger/state files under logs/ and data/ that the test suite must NEVER
 # mutate (Slice 5, 2026-07-29 audit: generalized from the single shopify audit
 # file). Repo-relative; the autouse fixture above redirects each writer's module

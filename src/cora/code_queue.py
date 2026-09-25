@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -234,6 +235,26 @@ def _backlog_write_would_leak() -> bool:
     except OSError:
         target_is_real_default = True
     return target_is_real_default
+
+
+def _real_founder_os_target_under_pytest(target: Path, real: Path) -> bool:
+    """True when this process is a pytest run AND ``target`` IS the real Founder-OS
+    path ``real`` (D-051 Code #15 r2 lens#r2-0). _backlog_write_would_leak() cannot
+    see a HALF-TORN-DOWN test: once monkeypatch restores _EVENT_LEDGER it reads "not
+    a test", and on 2026-09-25 04:54Z a pooled Stage body that outlived its test
+    re-rendered the LIVE G: backlog as "0 item(s)" exactly that way. No test may
+    ever write the real target, so under pytest it is refused whatever the redirect
+    state (FOUNDER_OS_ROOT unset, or set to the real root). The bot and every
+    scheduled script never import pytest, so production is unaffected. A pure string
+    comparison -- no filesystem touch on a possibly-degraded G: -- and fail-CLOSED."""
+    if "pytest" not in sys.modules:
+        return False
+    try:
+        def _norm(p: Path) -> str:
+            return os.path.normcase(os.path.normpath(os.path.abspath(str(p))))
+        return _norm(target) == _norm(real)
+    except Exception:  # noqa: BLE001 -- unresolvable under pytest: refuse
+        return True
 
 
 def founder_os_notes_dir() -> Path:
@@ -1611,8 +1632,15 @@ def render_backlog(items: list[dict[str, Any]] | None = None) -> bool:
 
     2026-07-30 incident guard: refuses the write outright when the event ledger
     is redirected (test/sandbox) but the backlog target is STILL the real,
-    unredirected Founder-OS default -- see _backlog_write_would_leak()."""
+    unredirected Founder-OS default -- see _backlog_write_would_leak(). And under
+    pytest the real backlog is never written at all (r2 lens#r2-0 belt)."""
     try:
+        if _real_founder_os_target_under_pytest(backlog_path(), _real_backlog_path()):
+            log.warning(
+                "code_queue: refusing to write the real Founder-OS backlog under pytest "
+                "-- a test (or a body that outlived its test) reached the live target"
+            )
+            return False
         if _backlog_write_would_leak():
             log.warning(
                 "code_queue: refusing to write the real Founder-OS backlog -- "
@@ -1988,8 +2016,15 @@ def _write_prompt_file(body: str, fname: str) -> tuple[str | None, bool]:
     drive_io (mount-resilient). If G: is unavailable (DriveUnavailable) or the write
     otherwise fails, fail-soft to the repo ``_notes`` folder, log a WARNING, and flag
     the write ``mis_homed`` so the caller records it on the ledger event. Returns
-    ``(path, mis_homed)``; ``(None, False)`` only if BOTH targets fail."""
+    ``(path, mis_homed)``; ``(None, False)`` only if BOTH targets fail -- or, under
+    pytest, when the target is the real Founder-OS ``_notes`` (r2 lens#r2-0 belt:
+    that state is a missing or already-undone redirect, and the repo fallback is
+    then just as unredirected, so neither is written)."""
     fos = founder_os_notes_dir() / fname
+    if _real_founder_os_target_under_pytest(fos, _real_backlog_path().parent / "_notes" / fname):
+        log.warning("code_queue: refusing to write a kickoff into the real Founder-OS "
+                    "_notes under pytest")
+        return None, False
     try:
         drive_io.write_text_atomic(fos, body)
         return str(fos), False

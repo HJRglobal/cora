@@ -5838,11 +5838,41 @@ def handle_dw_dismiss(ack, body, client) -> None:
     _handle_delegated_work_button(body, client, delegated_work.ACTION_DISMISS)
 
 
+def _cq_approve_will_generate(body: dict) -> bool:
+    """True when this Queue press will GENERATE a kickoff: the row exists, is
+    P0/P1-class, and is not already APPROVED / STAGED / terminal -- the exact
+    conditions under which process_queue_action(ACTION_APPROVE) reaches
+    ensure_kickoff_staged. D-051 Code #15 r2 s5s6#r2-0: only those presses go to the
+    two-worker kickoff pool. A P2/P3 (or already-queued) approve used to wait there
+    behind generations, invisibly, while a later inline Later / Park on the same row
+    committed first -- and the late approve then folded a SNOOZED/PARKED row back to
+    APPROVED, against the founder's last press. Inline, it runs in press order again.
+    A ledger read error offloads (the s6#0 default: the listener must stay free)."""
+    try:
+        actions = body.get("actions") or []
+        value = (actions[0].get("value") if actions else "") or ""
+        rec = code_queue.get_item(value)
+    except Exception:  # noqa: BLE001 -- the body re-reads and reports the error itself
+        log.warning("code-queue approve routing: ledger read failed -- offloading",
+                    exc_info=True)
+        return True
+    if not rec:
+        return False
+    status = str(rec.get("status", "PROPOSED"))
+    if status in ("APPROVED", "STAGED") or status in code_queue._TERMINAL_STATUSES:
+        return False
+    return code_queue.is_priority_severity(rec.get("severity"))
+
+
 @app.action(code_queue.ACTION_APPROVE)
 def handle_cq_approve(ack, body, client) -> None:
     ack()
-    # s6#0: a P0/P1 Queue auto-stages a kickoff -> off the shared listener pool
-    _submit_code_queue_button(body, client, code_queue.ACTION_APPROVE)
+    # s6#0: a P0/P1 Queue auto-stages a kickoff -> off the shared listener pool.
+    # s5s6#r2-0: every other approve stays inline, in press order.
+    if _cq_approve_will_generate(body):
+        _submit_code_queue_button(body, client, code_queue.ACTION_APPROVE)
+    else:
+        _handle_code_queue_button(body, client, code_queue.ACTION_APPROVE)
 
 
 @app.action(code_queue.ACTION_DISMISS)
