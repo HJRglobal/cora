@@ -462,6 +462,8 @@ MUST_RERUN = [
     ("hotels within a short drive of old town scottsdale oct 20-22",
      {"check_in": date(2026, 10, 20)}),
     ("something with a pool and an airport shuttle", {"styles": ("pool",)}),
+    ("check in oct 20, check out oct 22", {"check_in": date(2026, 10, 20)}),
+    ("arriving oct 20th and leaving on the 23rd", {"check_out": date(2026, 10, 23)}),
 ]
 MUST_HELP = [
     "in the meantime, what's the weather in phoenix?",
@@ -475,6 +477,7 @@ MUST_HELP = [
     "can we do the meeting in mesa oct 20-22 instead?",
     "in any case, the offsite moved to oct 20-22 in tempe",
     "book the second one",
+    "what time is check in on oct 20-22?",
 ]
 
 
@@ -531,9 +534,9 @@ class TestRefinementGateRound2:
     @pytest.mark.parametrize("shape", [
         " " * 40000, "can you " * 5000, "also " * 8000, "$" * 40000, "1/" * 20000,
         "in the " * 6000, "something more " * 3000, "6 people " * 4000, "weather " * 5000,
-        "under " * 7000,
+        "under " * 7000, "check in oct 1 " * 2500, "arriving " * 5000,
     ], ids=["spaces", "can-you", "also", "dollars", "slashes", "in-the", "something", "people",
-            "weather", "under"])
+            "weather", "under", "check-in", "arriving"])
     def test_the_gate_is_linear(self, shape):
         def run():
             ts._REFINE_RE.search(shape)

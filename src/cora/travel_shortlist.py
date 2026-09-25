@@ -2142,7 +2142,7 @@ _REFINE_RE = re.compile(
     r"|two queens|\d{1,2}[- ]?(?:bedrooms?|br|bdrm)"
     r"|(?:can|could|would|will) (?:we|you|u) (?:please )?(?:do|try|check|search"
     r"|look (?:in|at|around|near|for))|also (?:check|try|look|search|do)"
-    r"|(?:search|look|check) (?:again|in|near|around)|re-?run|redo|run it again|re-?search"
+    r"|(?:search|look) (?:again|in|near|around)|check again|re-?run|redo|run it again|re-?search"
     r"|same (?:thing|search|again)|(?:what's|what is|anything) available"
     r"|change (?:the )?(?:dates?|area|city|location|budget) to|switch (?:it )?to"
     r"|(?:a|prefer(?:ably)?(?: a)?) (?:king|queen)|with a pool"
@@ -2184,7 +2184,10 @@ def _is_refinement(text: Any) -> bool:
     t = _norm(_clean(text))
     if _OFF_TOPIC_RE.search(t) and not _LODGING_NOUN_RE.search(t):
         return False
-    return bool(_REFINE_RE.search(t) or _refine_opener(t)) or is_lodging_shaped(text)
+    # an explicit arrive/check-in ... leave/check-out phrase is a stay by itself (P6);
+    # a bare "check in" is not ("what time is check in on oct 20-22?")
+    return bool(_REFINE_RE.search(t) or _refine_opener(t)
+                or _DATE_P6.search(_ORDINAL_RE.sub(r"\1", t))) or is_lodging_shaped(text)
 
 
 def route_turn(text: Any, *, user_id: str, channel_id: str, channel_name: str = "",
