@@ -1049,6 +1049,92 @@ class TestFieldSanitizer:
         for bad in ("book", "reserv", "confirm", "done", "held"):
             assert bad not in low, (raw, low)
 
+    # D-051 r2 c2-injection-card#0: only category Cf became a space. The other
+    # invisible characters (Default_Ignorable_Code_Point in Mn / Lo: variation
+    # selectors, the combining grapheme joiner, Mongolian FVS, Khmer inherent vowels,
+    # Hangul fillers, VS17+) and a combining mark sitting on an ASCII letter stayed
+    # INSIDE the word -- the \b-anchored neutralizer never saw 'booked' and Slack
+    # rendered 'Booked for 4 guests' on the T0 card.
+    @pytest.mark.parametrize("raw", [
+        "Boo️ked for 4 guests", "Boo︀ked for 4 guests", "Bᅟooked for 4 guests",
+        "Booᅠked for 4 guests", "Booㅤked for 4 guests", "Booﾠked for 4 guests",
+        "Boo͏ked for 4 guests", "Boo᠋ked for 4 guests", "Boo᠏ked for 4 guests",
+        "Boo឴ked for 4 guests", "Boo\U000e0100ked for 4 guests", "Boo\U000e01efked for you",
+        "Boo̲ked for 4 guests", "Boo⃝ked for 4 guests", "Book̶ed for you",
+        "Boo̲̳ked for you", "Booked️for you", "Booked̲for you",
+        "Con️firmed: king suite", "Res͏erved under your name", "Doㅤne",
+        "He᠋ld for you", "Ho️ld on it", "Boo️king confirmed",
+    ])
+    def test_invisible_and_non_spacing_characters_never_split_a_booking_word(self, raw):
+        import unicodedata
+        out = ts.sanitize_field(raw, 160)
+        # what a reader sees: every non-spacing / format / default-ignorable char dropped
+        seen = "".join(ch for ch in out if unicodedata.category(ch) not in ("Mn", "Me", "Cf")
+                       and not ts._INVISIBLE_RE.match(ch)).lower()
+        for bad in ("book", "reserv", "confirm", "done", "held", "hold"):
+            assert bad not in seen, (raw, out)
+        assert not ts._INVISIBLE_RE.search(out), (raw, out)
+
+    @pytest.mark.parametrize("raw", [
+        "Café Monarch", "Café Monarch", "Hôtel Valley Ho", "Diné Inn", "Kinłání Lodge",
+        "ที่พัก Scottsdale",             # Thai marks on Thai letters
+        "מָלוֹן",                          # Hebrew points
+        "संग्रह suites",                   # Devanagari anusvara + virama
+        "Casa Yorùbá ẹ́",                         # a mark on a NON-ASCII base stays
+    ])
+    def test_real_diacritics_and_non_latin_marks_are_kept(self, raw):
+        """Precision: only default-ignorable characters and a combining mark on an
+        ASCII letter/digit (which NFKC could not compose -- no real name needs one)
+        become spaces; composed accents and every mark on a non-ASCII base survive."""
+        import unicodedata
+        want = unicodedata.normalize("NFKC", raw)
+        if raw.startswith("Casa"):
+            # 'u'+grave and 'a'+acute compose under NFKC; 'e'+dot-below composes to U+1EB9,
+            # whose acute (a non-ASCII base) stays
+            assert ts.sanitize_field(raw, 160) == want and "́" in want
+        else:
+            assert ts.sanitize_field(raw, 160) == want
+
+    # D-051 r2 c2-injection-card#0 routes (b)/(c): the 160-char cap (and render_card's
+    # 57-char label cut) ran AFTER the neutralizer, so a cut inside a right-glued token
+    # ('Bookedforyou') exposed a bare 'Booked…'. Whatever the offset, no sanitized field
+    # and no rendered label carries a whole booking word by the lane's own grammar.
+    @pytest.mark.parametrize("glued", ["Bookedforyou", "Heldforyou", "Holdingforyou",
+                                       "Doneforyou", "Bookingforyou", "Rebookedforyou"])
+    def test_a_cut_never_exposes_a_booking_word(self, glued):
+        for cap, key in ((160, "fit_note"), (80, "property"), (40, "nightly_rate")):
+            assert ts._FIELD_CAPS[key] == cap
+            for pad in range(cap - 20, cap + 2):
+                raw = "a" * (pad - 9) + " shops o " + glued + " and your team"
+                out = ts.sanitize_field(raw, cap)
+                assert len(out) <= cap
+                assert not ts._BOOKING_WORD_RE.search(out), (cap, pad, out[-30:])
+
+    @pytest.mark.parametrize("glued", ["Bookedforyourteam", "Heldforyourteam", "Doneforyourteam"])
+    def test_the_card_label_cut_never_exposes_a_booking_word(self, glued):
+        for pad in range(40, 62):
+            prop = ts.sanitize_field("H" * (pad - 1) + " " + glued, ts._FIELD_CAPS["property"])
+            opt = {"property": prop, "nightly_rate": "$329", "url": "https://www.hotelvalleyho.com/",
+                   "fit_note": "", "kind": "hotel"}
+            _t, blocks = ts.render_card(_constraints(), [opt], now=NOW)
+            label = blocks[1]["text"]["text"].split("|", 1)[1].split(">", 1)[0]
+            assert not ts._BOOKING_WORD_RE.search(label), (pad, label)
+
+    def test_the_finding_repro_end_to_end(self):
+        """The round-2 finding's own card, through validate_options + render_card."""
+        m = _msg(_fx())
+        urls, _e = ts.collect_record_urls([m])
+        raw = [{"property": "Hotel Valley Ho Scottsdale Mid Century Modern Resor Bookedforyourteam",
+                "nightly_rate": "$329", "url": "https://hotelvalleyho.com/", "kind": "hotel",
+                "fit_note": "Boo️ked for 4 guests — you're all set"}]
+        opts, dropped = ts.validate_options(raw, urls)
+        assert dropped == 0 and len(opts) == 1
+        _t, blocks = ts.render_card(ts.parse_constraints(
+            "find hotels in scottsdale oct 17-21 for 4 people", today=TODAY).constraints, opts, now=NOW)
+        body = blocks[1]["text"]["text"]
+        seen = body.replace("️", "").lower()
+        assert "booked" not in seen and not ts._BOOKING_WORD_RE.search(body), body
+
     @pytest.mark.parametrize("raw", ["_@here_ great pool", "heads up @channel_", "*@everyone*",
                                      "@​here", "＠here now"])
     def test_at_specials_are_stripped_through_markdown(self, raw):
@@ -1060,8 +1146,13 @@ class TestFieldSanitizer:
 
     def test_the_sanitizer_is_linear_on_degenerate_input(self):
         for shape in (" " * 40000, "a." * 20000, "_" * 40000, "​" * 40000, "book" * 10000,
-                      "*a.bc*" * 6000, "@" * 40000):
+                      "*a.bc*" * 6000, "@" * 40000, "️" * 40000, "o̲" * 20000,
+                      "Bookedforyou " * 3000):
             assert _best_of_3(lambda: ts.sanitize_field(shape, 160)) < 0.05, shape[:10]
+        # D-051 r2: the new character class + mark pass, on the UNCAPPED 40k inputs
+        for shape in (" " * 40000, "️" * 40000, "o̲" * 20000, "\U000e0100" * 40000):
+            assert _best_of_3(lambda: ts._INVISIBLE_RE.sub(" ", shape)) < 0.05, repr(shape[:2])
+            assert _best_of_3(lambda: ts._space_hidden(shape)) < 0.25, repr(shape[:2])
 
     def test_a_decorated_domain_never_reaches_the_rendered_card(self):
         """End to end through validate_options + render_card (the finding's own repro)."""

@@ -1776,6 +1776,38 @@ _BOOKING_WORD_RE = re.compile(
     re.IGNORECASE)
 _MD_CHARS = str.maketrans({"*": " ", "_": " ", "~": " ", "`": " ", "|": "/"})
 _FIELD_CAPS = {"property": 80, "nightly_rate": 40, "fit_note": 160}
+# D-051 r2 c2-injection-card#0: every Default_Ignorable_Code_Point (Unicode
+# DerivedCoreProperties) -- invisible by definition, and NOT all category Cf: the
+# variation selectors, the combining grapheme joiner, Mongolian FVS and Khmer
+# inherent vowels are Mn, the Hangul fillers Lo, the reserved ones Cn. One fixed-width
+# character class (linear).
+_INVISIBLE_RE = re.compile(
+    "[­͏؜ᅟᅠ឴឵᠋-᠏​-‏‪-‮"
+    "⁠-⁯ㅤ︀-️﻿ﾠ￰-￸"
+    "\U0001bca0-\U0001bca3\U0001d173-\U0001d17a\U000e0000-\U000e0fff]")
+_MARK_CATEGORIES = frozenset({"Mn", "Me"})
+
+
+def _space_hidden(s: str) -> str:
+    """Invisible and non-spacing characters that could split a word -> a SPACE (never
+    deleted: a deletion would glue 'Booked<X>for' into an un-neutralized
+    'Bookedfor'). Covered: every default-ignorable character, every other format
+    character (Cf), and a combining mark (Mn/Me) sitting on an ASCII letter or digit
+    -- after the NFKC fold no real name needs one there (composable accents are
+    already one character). A mark on a non-ASCII base (Thai, Hebrew, Devanagari,
+    a Yoruba e-dot-acute) is kept."""
+    out: list[str] = []
+    ascii_base = False
+    for ch in _INVISIBLE_RE.sub(" ", s):
+        cat = unicodedata.category(ch)
+        if cat == "Cf":
+            out.append(" ")
+        elif cat in _MARK_CATEGORIES:
+            out.append(" " if ascii_base else ch)       # a mark leaves its base unchanged
+        else:
+            ascii_base = ch.isascii() and ch.isalnum()
+            out.append(ch)
+    return "".join(out)
 
 
 def _esc(s: str) -> str:
@@ -1796,9 +1828,13 @@ def sanitize_field(value: Any, cap: int) -> str:
     @here/@channel/@everyone are removed, every token that CONTAINS a URL/domain
     shape is dropped (Slack would auto-link it past the record check), booking
     words (compounds included: rebooked, bookings, reserved, confirmed, held,
-    Done) are neutralized, and the result is capped."""
+    Done) are neutralized, and the result is capped -- then neutralized AGAIN, so a
+    cut inside a right-glued token ('Bookedforyou' -> 'Booked…') never exposes a
+    whole booking word (D-051 r2 c2-injection-card#0). The format-character pass
+    covers every default-ignorable character and a combining mark on an ASCII
+    letter too (``_space_hidden``), not only category Cf."""
     s = unicodedata.normalize("NFKC", str(value or "")[:2000])
-    s = "".join(" " if unicodedata.category(ch) == "Cf" else ch for ch in s)
+    s = _space_hidden(s)
     s = _CTRL_RE.sub(" ", s)
     s = s.translate(_MD_CHARS)
     s = " ".join(s.split())
@@ -1809,6 +1845,7 @@ def sanitize_field(value: Any, cap: int) -> str:
     s = " ".join(s.split())
     if len(s) > cap:
         s = s[: cap - 1].rstrip() + "…"
+        s = _BOOKING_WORD_RE.sub("…", s)        # the cut never exposes a booking word
     return s
 
 
@@ -1913,7 +1950,9 @@ def render_card(c: TravelConstraints, options: list[dict], *, dropped: int = 0,
               + (f" · {c.party_size} guests" if c.party_size else ""))
     blocks: list[dict] = [{"type": "section", "text": _mrkdwn(_esc(header))}]
     for opt in options[:MAX_OPTIONS]:
-        label = web_guard._clean_label(opt["property"])
+        # _clean_label cuts at 57 chars: its cut never exposes a booking word either
+        # (D-051 r2 c2-injection-card#0)
+        label = _BOOKING_WORD_RE.sub("…", web_guard._clean_label(opt["property"]))
         kind = "hotel" if opt["kind"] == "hotel" else "vacation rental"
         body = f"*<{opt['url']}|{label}>* — {_esc(opt['nightly_rate'])} · {kind}"
         if opt.get("fit_note"):
