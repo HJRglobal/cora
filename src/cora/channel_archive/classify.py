@@ -116,6 +116,10 @@ class Verdict:
     created_days: int | None = None
     canvas: bool = False
     tabs: int = 0
+    #: A10 as a FLAG (r2:c1-false-inactive#1): the lane archived this channel and a person
+    #: reopened it -- set on EVERY section-B verdict with unarchive state, whatever the
+    #: primary reason, so a higher-ranked exemption never hides it
+    unarchived: bool = False
     unarchived_by: str = ""
     unarchived_at: float | None = None
     extra: dict = field(default_factory=dict)
@@ -462,6 +466,10 @@ def _classify(client: Any, meta: dict, ctx: reg.Context, *, now: float,
         # scan keeps them, the T1 re-verify retries on them (A5)
         v.extra["unreadable"] = ["members"]
     un = ctx.unarchive_state.get(cid) or {}
+    if un:
+        v.unarchived = True
+        v.unarchived_by = str(un.get("by") or "")
+        v.unarchived_at = float(un.get("at") or 0) or None
     in_registry = cid in ctx.registry.ids or (name.lower() in ctx.registry.names if name else False)
     if lex:
         v.kind, v.reason = SECTION_B, B_LEX
@@ -471,8 +479,6 @@ def _classify(client: Any, meta: dict, ctx: reg.Context, *, now: float,
         v.kind, v.reason = SECTION_B, B_KEEP_LIST
     elif un:
         v.kind, v.reason = SECTION_B, B_UNARCHIVED_BEFORE
-        v.unarchived_by = str(un.get("by") or "")
-        v.unarchived_at = float(un.get("at") or 0) or None
     elif meta.get("is_private") and harrison_member is not True:
         v.kind, v.reason = SECTION_B, B_PRIVATE_NOT_MEMBER
     elif v.bot_posts > 0:

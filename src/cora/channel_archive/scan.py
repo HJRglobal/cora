@@ -95,9 +95,16 @@ def row_from_verdict(meta: dict, v: cl.Verdict, *, keep_count: int = 0) -> dict:
     if not v.lex:
         row["name"] = name
         row["entity"] = reg.route_label(name)
-    if v.reason == cl.B_UNARCHIVED_BEFORE:
+    if v.unarchived or v.reason == cl.B_UNARCHIVED_BEFORE:
+        # r2:c1-false-inactive#1: persisted on EVERY row with unarchive state (the card
+        # discloses it under any primary reason; the T1 re-verify requires the same flag)
+        row["unarchived"] = True
         row["unarchived_by"] = v.unarchived_by
         row["unarchived_at"] = v.unarchived_at
+    if "members" in (v.extra.get("unreadable") or []):
+        # r2:c1-false-inactive#2: the fail-safe LEX / not-a-member came from a READ
+        # FAILURE -- the card says so instead of stating a membership fact
+        row["members_unreadable"] = True
     return row
 
 

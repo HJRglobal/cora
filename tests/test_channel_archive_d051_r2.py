@@ -395,9 +395,161 @@ class TestAChannelGoneSettlementIsTerminal:
         assert st.CHANNEL_GONE_OUTCOME in lits
 
     def test_the_channel_gone_line_passes_both_rails(self, monkeypatch):
-        from cora import slack_egress as se
-        s = cards.CHANNEL_GONE_LINE
-        assert se.screen_phantom_write_claims(s, tool_use_count=0) == s
-        assert se.sanitize_text(s) == s
-        monkeypatch.setenv("CORA_SENTINEL_ENFORCE", "enforce")
-        assert se.screen_phantom_write_claims(s, tool_use_count=0) == s
+        _assert_rails([cards.CHANNEL_GONE_LINE], monkeypatch)
+
+
+def _assert_rails(strings, monkeypatch):
+    from cora import slack_egress as se
+    for s in strings:
+        assert se.screen_phantom_write_claims(s, tool_use_count=0) == s, s
+        assert se.sanitize_text(s) == s, s
+    monkeypatch.setenv("CORA_SENTINEL_ENFORCE", "enforce")
+    for s in strings:
+        assert se.screen_phantom_write_claims(s, tool_use_count=0) == s, s
+    monkeypatch.delenv("CORA_SENTINEL_ENFORCE", raising=False)
+
+
+def _scan_row(fake, meta, ctx, tier="T0"):
+    """The REAL classifier -> row_from_verdict, as the scan builds a card row."""
+    v = cl.classify_channel(fake, meta, ctx, now=NOW, sleep=no_sleep)
+    assert v.kind == cl.SECTION_B, (v.kind, v.reason)
+    r = sc.row_from_verdict(meta, v)
+    r["tier"] = tier
+    return v, r
+
+
+def _card_body(rows, pid=PID):
+    stage(rows, pid=pid)
+    return "\n".join(_texts(cards.render_page(st.fold(now=NOW + 5), pid, 1, now=NOW + 5)[0]))
+
+
+PRIV = "C0PRIVQUIET1"
+
+
+# ── r2:c1-false-inactive#2 ─────────────────────────────────────────────────────────
+class TestAMembershipReadFailureIsNeverNotAMember:
+
+    @pytest.mark.parametrize("err", [TimeoutError("read timed out"), api_error("ratelimited"),
+                                     api_error("internal_error")],
+                             ids=["timeout", "ratelimited", "internal_error"])
+    def test_the_card_says_the_list_could_not_be_read(self, err):
+        meta = chan(PRIV, "fx-quiet-private", private=True)
+        f = FakeSlack(channels=[meta], history={PRIV: [msg(200)]}, members={PRIV: err})
+        v, r = _scan_row(f, meta, context())
+        assert v.reason == cl.B_LEX and v.harrison_member is None      # the A6 fail-safe stays
+        body = _card_body([r])
+        assert "you are not a member" not in body, body
+        assert cards.MEMBERS_UNREAD_LINE in body
+        assert "Exempt: LEX (custodian-owned)" in body                  # fail-safe section B kept
+
+    def test_a_known_non_member_still_says_not_a_member(self):
+        meta = chan(PRIV, "fx-quiet-private", private=True)
+        f = FakeSlack(channels=[meta], history={PRIV: [msg(200)]}, members={PRIV: [PERSON]})
+        v, r = _scan_row(f, meta, context())
+        assert v.reason == cl.B_PRIVATE_NOT_MEMBER
+        body = _card_body([r])
+        assert "Private, and you are not a member" in body and cards.MEMBERS_UNREAD_LINE not in body
+
+    def test_an_unreadable_primary_private_row_never_says_not_a_member(self):
+        r = _row(PRIV, "fx-quiet-private", section="B", reason=cl.B_PRIVATE_NOT_MEMBER, tier="T0",
+                 is_private=True, harrison_member=None, members_unreadable=True)
+        body = _card_body([r])
+        assert "you are not a member" not in body and "could not be read" in body, body
+
+    def test_a_tap_after_the_read_recovers_is_stale_with_an_honest_reason(self, fake, armed):
+        lexp = "C0LEXPRIV01"
+        meta = chan(lexp, "lex-quiet-room", private=True)
+        fake.channels.append(meta)
+        fake.history[lexp] = [msg(200)]
+        fake.members[lexp] = TimeoutError("read timed out")
+        _v, r = _scan_row(fake, meta, context(), tier="T1")
+        assert r["lex"] and "name" not in r and r["members_unreadable"]
+        stage([r])
+        fake.members[lexp] = [HARRISON, PERSON]                 # the read works at tap time
+        res = tap(cards.ACTION_OVERRIDE, f"{PID}:{lexp}:T1")
+        assert res.outcome == "stale_refused", res.msg
+        assert "membership of it changed" not in res.msg and "could not be read" in res.msg
+        assert "conversations_archive" not in fake.method_names() and not fake.posts
+
+    def test_the_new_lines_pass_both_rails(self, monkeypatch):
+        r = _row(PRIV, "fx-quiet-private", section="B", reason=cl.B_PRIVATE_NOT_MEMBER, tier="T0",
+                 is_private=True, harrison_member=None, members_unreadable=True)
+        _assert_rails([cards.MEMBERS_UNREAD_LINE, cards._b_line(r)], monkeypatch)
+
+
+# ── r2:c1-false-inactive#1 ─────────────────────────────────────────────────────────
+REGQ = "C0FXREGQ0001"          # in the synthetic registry fixture
+
+
+def _reopened_history():
+    """A person post at 300 d, Cora's archive at 200 d, a person's unarchive at 120 d."""
+    return [msg(120, user=PERSON, subtype="channel_unarchive"),
+            msg(200, user=BOT_UID, subtype="channel_archive"),
+            msg(300)]
+
+
+class TestAnUnarchiveIsDisclosedOnEveryBRow:
+
+    @pytest.mark.parametrize("cid,name,want_reason", [
+        (REGQ, "fx-registry-quiet", cl.B_REGISTRY),
+        ("C0LEXQUIET1", "lex-quiet-room", cl.B_LEX),
+        ("C0KEEPQUIET", "cora-old-room", cl.B_KEEP_LIST),
+    ], ids=["registry", "lex", "keep_list"])
+    def test_a_higher_ranked_reason_never_hides_the_unarchive(self, cid, name, want_reason):
+        meta = chan(cid, name)
+        f = FakeSlack(channels=[meta], history={cid: _reopened_history()})
+        ctx = context(unarchive_state={cid: {"at": NOW - 120 * DAY, "by": PERSON}})
+        v, r = _scan_row(f, meta, ctx)
+        assert v.reason == want_reason
+        body = _card_body([r])
+        assert f"Unarchived by <@{PERSON}> on {cards._date(NOW - 120 * DAY)} after an earlier archive" \
+            in body, body
+        assert r.get("unarchived") is True and r.get("unarchived_by") == PERSON
+
+    def test_the_fail_closed_unconfirmed_form_is_disclosed_honestly(self):
+        meta = chan(REGQ, "fx-registry-quiet")
+        f = FakeSlack(channels=[meta], history={REGQ: [msg(300)]})
+        ctx = context(unarchive_state={REGQ: {"at": None, "by": "", "unconfirmed": True}})
+        _v, r = _scan_row(f, meta, ctx)
+        body = _card_body([r])
+        assert "Reopened after an earlier archive — who reopened it, and when, is not known." in body
+        assert "on ?" not in body
+
+    def test_the_primary_unarchived_line_never_says_on_question_mark(self):
+        meta = chan("C0REOPEN001", "fx-reopened")
+        f = FakeSlack(channels=[meta], history={"C0REOPEN001": [msg(300)]})
+        ctx = context(unarchive_state={"C0REOPEN001": {"at": None, "by": "", "unconfirmed": True}})
+        v, r = _scan_row(f, meta, ctx)
+        assert v.reason == cl.B_UNARCHIVED_BEFORE
+        body = _card_body([r])
+        assert "someone on ?" not in body and body.count("Reopened after an earlier archive") == 1
+
+    def _stage_registry_t1(self, fake, unarchive_state=None):
+        meta = chan(REGQ, "fx-registry-quiet")
+        fake.channels.append(meta)
+        fake.history[REGQ] = [msg(300)]
+        _v, r = _scan_row(fake, meta, context(unarchive_state=unarchive_state or {}), tier="T1")
+        stage([r])
+
+    def test_a_t1_override_refuses_when_an_unarchive_appeared_since_the_card(self, fake, armed):
+        self._stage_registry_t1(fake)                        # the card showed no unarchive
+        # since the card: another card's archive of it, and it is open again (fail-closed form)
+        st.append_ledger("outcome", proposal_id="chanarch-000000000077", channel_id=REGQ,
+                         outcome="archived", ts=NOW - 100 * DAY)
+        res = tap(cards.ACTION_OVERRIDE, f"{PID}:{REGQ}:T1")
+        assert res.outcome == "stale_refused" and "archive history changed" in res.msg, res.msg
+        assert "conversations_archive" not in fake.method_names() and not fake.posts
+
+    def test_a_t1_override_with_the_same_disclosed_unarchive_proceeds(self, fake, armed):
+        st.append_ledger("outcome", proposal_id="chanarch-000000000077", channel_id=REGQ,
+                         outcome="archived", ts=NOW - 100 * DAY)
+        self._stage_registry_t1(fake, st.unarchive_state(st.read_ledger()))
+        res = tap(cards.ACTION_OVERRIDE, f"{PID}:{REGQ}:T1")
+        assert res.outcome == "archived", res.msg
+
+    def test_the_unarchive_lines_pass_both_rails(self, monkeypatch):
+        rows = [_row(REGQ, "fx-registry-quiet", section="B", reason=cl.B_REGISTRY, tier="T0",
+                     unarchived=True, unarchived_by=PERSON, unarchived_at=NOW - 120 * DAY),
+                _row(REGQ, "fx-registry-quiet", section="B", reason=cl.B_UNARCHIVED_BEFORE,
+                     tier="T0", unarchived=True, unarchived_by="", unarchived_at=None)]
+        _assert_rails([cards._b_line(r) for r in rows], monkeypatch)

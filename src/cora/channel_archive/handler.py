@@ -372,16 +372,26 @@ def _reverify_verdict(row: dict, read: Any, ctx: reg.Context, *, now: float,
         return "stale", "its class changed since the card", v
     if row.get("section") == cl.SECTION_B:
         # c1-false-inactive#0: the card disclosed these flags; archive only on the same
+        # (r2: + the unarchive flag and an unreadable member list -- a read that works now
+        # never turns the card's "could not be read" into a claimed membership change)
         fresh = {**row, "history_complete": v.history_complete,
-                 "is_private": bool(meta.get("is_private")), "harrison_member": v.harrison_member}
+                 "is_private": bool(meta.get("is_private")), "harrison_member": v.harrison_member,
+                 "members_unreadable": False, "unarchived": v.unarchived}
         if cards.threads_unchecked(fresh) != cards.threads_unchecked(row):
             now_capped = cards.threads_unchecked(fresh)
             return "stale", ("its older-thread check changed since the card ("
                              + ("its history is now longer than 2,000 messages, so older threads "
                                 "go unchecked" if now_capped else "every thread is checked now")
                              + ")"), v
+        if cards.members_unread(row):
+            return "stale", ("its member list could not be read when the card was built, so it "
+                             "needs a fresh scan"), v
         if cards.private_not_member(fresh) != cards.private_not_member(row):
             return "stale", "your membership of it changed since the card", v
+        if cards.unarchived_before(fresh) != cards.unarchived_before(row):
+            return "stale", ("its archive history changed since the card (it was reopened after "
+                             "an earlier archive)" if cards.unarchived_before(fresh)
+                             else "its archive history changed since the card"), v
     return "ok", "", v
 
 

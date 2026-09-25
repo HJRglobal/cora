@@ -149,14 +149,42 @@ def threads_unchecked(row: dict) -> bool:
     return row.get("section") == cl.SECTION_B and not row.get("history_complete")
 
 
+def members_unread(row: dict) -> bool:
+    """r2:c1-false-inactive#2: the scan could not read the member list -- the row's LEX
+    and membership classes are FAIL-SAFE substitutions, not facts."""
+    return bool(row.get("members_unreadable"))
+
+
 def private_not_member(row: dict) -> bool:
-    """A1: a private channel Harrison is not a member of (or membership unreadable)."""
-    return bool(row.get("is_private")) and row.get("harrison_member") is not True
+    """A1: a private channel Harrison is KNOWN not to be a member of. A member list that
+    could not be read is ``members_unread`` -- never stated as "not a member"."""
+    return (bool(row.get("is_private")) and row.get("harrison_member") is not True
+            and not members_unread(row))
+
+
+def unarchived_before(row: dict) -> bool:
+    """A10 as a FLAG (r2:c1-false-inactive#1): the lane archived this channel and it was
+    reopened -- disclosed on every B row, whatever the primary reason."""
+    return row.get("section") == cl.SECTION_B and (
+        bool(row.get("unarchived")) or row.get("reason") == cl.B_UNARCHIVED_BEFORE)
+
+
+def _unarchived_text(row: dict) -> str:
+    by = row.get("unarchived_by") or ""
+    at = row.get("unarchived_at")
+    if not by and not at:
+        # the fail-closed form (store.unarchive_state): the monitor has not seen who or when
+        return "Reopened after an earlier archive — who reopened it, and when, is not known."
+    who = f"<@{by}>" if by else "someone"
+    when = f" on {_date(at)}" if at else ""
+    return f"Unarchived by {who}{when} after an earlier archive."
 
 
 THREADS_UNCHECKED_LINE = ("Older threads not checked — history longer than 2,000 messages, so a "
                           "reply there could be newer than the age shown.")
 PRIVATE_NOT_MEMBER_LINE = "Private, and you are not a member — its name may not show for you."
+MEMBERS_UNREAD_LINE = ("Its member list could not be read, so it is treated as LEX (fail safe) "
+                       "and whether you are a member is unknown.")
 
 
 def _fields_line(row: dict) -> str:
@@ -203,10 +231,10 @@ def _b_line(row: dict) -> str:
                 f"{certainty}. Per-row only.")
         return line + _secondary_lines(row, r)
     if r == cl.B_UNARCHIVED_BEFORE:
-        by = row.get("unarchived_by") or ""
-        who = f"<@{by}>" if by else "someone"
-        line = (f"Unarchived by {who} on {_date(row.get('unarchived_at'))} after an earlier "
-                "archive. Per-row only.")
+        line = _unarchived_text(row) + " Per-row only."
+    elif r == cl.B_PRIVATE_NOT_MEMBER and members_unread(row):
+        line = ("Private, and its member list could not be read — whether you are a member is "
+                "unknown. Per-row only.")
     else:
         line = B_LINES.get(r, "Per-row only.")
     # Live-data finding (the 2026-09-25 preview): #cora-health / #cora-security /
@@ -223,14 +251,20 @@ def _b_line(row: dict) -> str:
 
 
 def _secondary_lines(row: dict, reason: str) -> str:
-    """c1-false-inactive#0: a higher-ranked reason never hides the A4 thread cap or a
-    private channel Harrison is not in -- every B row says both when they hold (the
-    d275085f always-disclose pattern). The primary reason's own line is not repeated."""
+    """c1-false-inactive#0: a higher-ranked reason never hides the A4 thread cap, a
+    private channel Harrison is not in, an earlier archive a person reopened (A10,
+    r2:c1-false-inactive#1) or a member list that could not be read (r2:c1-false-
+    inactive#2) -- every B row says each one that holds (the d275085f always-disclose
+    pattern). The primary reason's own line is not repeated."""
     out = ""
     if threads_unchecked(row) and reason != cl.B_THREADS_UNCHECKED:
         out += "\n" + THREADS_UNCHECKED_LINE
     if private_not_member(row) and reason != cl.B_PRIVATE_NOT_MEMBER:
         out += "\n" + PRIVATE_NOT_MEMBER_LINE
+    if members_unread(row) and reason != cl.B_PRIVATE_NOT_MEMBER:
+        out += "\n" + MEMBERS_UNREAD_LINE
+    if unarchived_before(row) and reason != cl.B_UNARCHIVED_BEFORE:
+        out += "\n" + _unarchived_text(row)
     return out
 
 
