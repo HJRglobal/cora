@@ -404,6 +404,67 @@ def title_carve_out_reason(title: str, cfg: CaptureConfig) -> str:
     return ""
 
 
+#: The reason PREFIXES that mean "somebody ruled this meeting must not be recorded"
+#: (Code #15 S4, cq-5f44ce934aeb). Only these make a recorded carved meeting a
+#: carve-out BREACH. The literal names ("no_record_title", "[no-bot]") match no real
+#: reason string -- every one of these is a prefix followed by a value, and the
+#: marker list is roster config -- so the match is on prefix, never on equality.
+NO_RECORD_REASON_PREFIXES: tuple[str, ...] = (
+    "title-marker:", "no-record-title:", "no-record-email:", "no-record-domain:",
+)
+
+#: Every OTHER reason qualify_event can produce: the meeting is out of scope for
+#: capture (not a meeting, no link, not attending), not ruled unrecordable. A
+#: recording of one is reported as information, never alarmed as a breach. Exact
+#: strings plus one prefix; anything in neither set is UNKNOWN and fails closed to a
+#: breach (see classify_carved_recording).
+QUALIFICATION_SKIP_REASONS: frozenset[str] = frozenset({
+    "cancelled", "no-meeting-link", "all-day", "roster-user-declined",
+})
+QUALIFICATION_SKIP_PREFIXES: tuple[str, ...] = ("not-a-meeting:",)
+
+
+def is_no_record_reason(reason: str) -> bool:
+    """True for a no-record carve-out reason (a breach if it was recorded anyway)."""
+    return (reason or "").startswith(NO_RECORD_REASON_PREFIXES)
+
+
+def is_qualification_skip_reason(reason: str) -> bool:
+    """True for a qualification skip (out of scope; a recording of it is no breach)."""
+    r = reason or ""
+    return r in QUALIFICATION_SKIP_REASONS or r.startswith(QUALIFICATION_SKIP_PREFIXES)
+
+
+def no_record_reason(event: dict[str, Any], cfg: CaptureConfig) -> str:
+    """The event's NO-RECORD carve-out reason, or "" when none applies.
+
+    Evaluated REGARDLESS of qualify_event's order. qualify_event returns the first
+    failing check, and a decline, a cancel or a missing link is checked before the
+    carve-outs -- so its single reason can hide a `[no-bot]` on the same copy. The
+    auditor asks this directly of every copy; qualify_event delegates to it, so the
+    two can never disagree about what a no-record meeting is (one matcher, as
+    title_carve_out_reason is for titles). Order and strings are qualify_event's:
+    title, then address, then domain.
+    """
+    title_reason = title_carve_out_reason(event.get("summary") or "", cfg)
+    if title_reason:
+        return title_reason
+
+    emails = event_emails(event)
+    hit = emails & cfg.no_record_emails
+    if hit:
+        return f"no-record-email:{sorted(hit)[0]}"
+
+    if cfg.no_record_attendee_domains:
+        # sorted: `emails` is a set, and with two matching domains the reason must
+        # not depend on string-hash order (the address branch above already sorts).
+        for addr in sorted(emails):
+            domain = addr.rsplit("@", 1)[-1]
+            if domain in cfg.no_record_attendee_domains:
+                return f"no-record-domain:{domain}"
+    return ""
+
+
 # ── LEX / PHI display rail ───────────────────────────────────────────────────
 
 def is_lex_event(event: dict[str, Any]) -> bool:
@@ -509,10 +570,13 @@ def qualify_event(
 ) -> Qualification:
     """Decide whether one calendar event is in scope for capture.
 
-    Order matters: cheap structural disqualifiers first, then consent carve-outs.
-    Every non-qualifying outcome carries a distinct reason string so the auditor can
-    report WHY a meeting was skipped -- an unexplained skip is indistinguishable
-    from a bug.
+    Order matters: cheap structural disqualifiers first, then the roster user's own
+    decline, then the no-record carve-outs. Every non-qualifying outcome carries a
+    distinct reason string so the auditor can report WHY a meeting was skipped -- an
+    unexplained skip is indistinguishable from a bug. Every reason is classified as
+    either a qualification skip (QUALIFICATION_SKIP_REASONS / _PREFIXES) or a
+    no-record carve-out (NO_RECORD_REASON_PREFIXES); a new reason must be added to
+    one of them (the suite pins this by source scan).
     """
     from cora.tools.calendar_client import extract_meeting_link
 
@@ -533,7 +597,12 @@ def qualify_event(
     if not (event.get("start") or {}).get("dateTime"):
         return Qualification(False, "all-day")
 
-    # The roster user declining is a consent signal, not a scheduling detail.
+    # The roster user declining is a QUALIFICATION skip -- they are not attending --
+    # not a no-record carve-out. It still vetoes ACTING on the meeting (the ensure
+    # lane never adds a bot to a meeting a roster member declined, and the auditor
+    # leaves it out of `scheduled`), but a recording of it is not a carve-out breach:
+    # nobody ruled the meeting unrecordable (Code #15 S4, cq-5f44ce934aeb; the 9/18
+    # false alarm on a standing weekly meeting one of four invitees declined).
     for att in (event.get("attendees") or []):
         if not isinstance(att, dict):
             continue
@@ -542,20 +611,11 @@ def qualify_event(
         if is_self and (att.get("responseStatus") or "").strip().lower() == "declined":
             return Qualification(False, "roster-user-declined")
 
-    title_reason = title_carve_out_reason(event.get("summary") or "", cfg)
-    if title_reason:
-        return Qualification(False, title_reason)
-
-    emails = event_emails(event)
-    hit = emails & cfg.no_record_emails
-    if hit:
-        return Qualification(False, f"no-record-email:{sorted(hit)[0]}")
-
-    if cfg.no_record_attendee_domains:
-        for addr in emails:
-            domain = addr.rsplit("@", 1)[-1]
-            if domain in cfg.no_record_attendee_domains:
-                return Qualification(False, f"no-record-domain:{domain}")
+    # The no-record carve-outs (title, address, domain) -- ONE matcher, shared with
+    # the auditor's breach check (no_record_reason).
+    no_record = no_record_reason(event, cfg)
+    if no_record:
+        return Qualification(False, no_record)
 
     return Qualification(True, "qualifies", meeting_link=link)
 
@@ -1240,10 +1300,25 @@ class AuditReport:
     duplicates: list[AuditedMeeting] = field(default_factory=list)
     unmatched_transcripts: list[dict[str, Any]] = field(default_factory=list)
     skipped: list[tuple[str, str]] = field(default_factory=list)
-    #: A meeting a carve-out removed from scope that WAS captured anyway. The most
-    #: serious thing this auditor can find: a recording exists of a meeting somebody
-    #: ruled must not be recorded. Suppress the TITLE, never the FACT.
-    carve_out_breaches: list[tuple[str, str]] = field(default_factory=list)   # (safe title, reason)
+    #: A meeting a NO-RECORD carve-out (NO_RECORD_REASON_PREFIXES: a title marker, a
+    #: no-record title / address / domain) removed from scope that WAS captured
+    #: anyway. The most serious thing this auditor can find: a recording exists of a
+    #: meeting somebody ruled must not be recorded. Suppress the TITLE, never the
+    #: FACT. A carved meeting skipped for a QUALIFICATION reason (declined, cancelled,
+    #: no link, ...) that was recorded is `carved_recordings`, never a breach (S4).
+    carve_out_breaches: list[tuple[str, str]] = field(default_factory=list)   # (shape, reason)
+    #: Positionally aligned with carve_out_breaches (appended only by
+    #: _record_carved_hit). The no-record copy's event id -- or, for a breach the
+    #: transcript-title belt found, the transcript's own cal_id ("" when it has
+    #: none) -- and the Fireflies transcript id, which is what finding and deleting
+    #: the recording needs. Ids only, never titles (D-082).
+    carve_out_breach_event_ids: list[str] = field(default_factory=list)
+    carve_out_breach_transcript_ids: list[str] = field(default_factory=list)
+    #: A carved meeting skipped for a QUALIFICATION reason that was recorded anyway:
+    #: information, not an alarm, and never part of the clean-day veto. (shape,
+    #: reason) plus the carved representative's event id, aligned the same way.
+    carved_recordings: list[tuple[str, str]] = field(default_factory=list)
+    carved_recording_event_ids: list[str] = field(default_factory=list)
     failed_calendars: list[tuple[str, str]] = field(default_factory=list)
     transcript_error: str = ""
     seat_note: str = ""
@@ -1580,6 +1655,62 @@ def _apply_meet_audit(
     report.unconvened = keep
 
 
+def classify_carved_recording(
+    veto: tuple[dict[str, Any], str],
+    no_record: tuple[dict[str, Any], str] | None,
+    transcript: dict[str, Any],
+    cfg: CaptureConfig,
+) -> tuple[bool, dict[str, Any], str]:
+    """Is a transcript joined to a CARVED meeting a breach? -> (is_breach, event, reason).
+
+    The ONE classifier for both breach joins in audit_day (the early exact-cal_id
+    join and 3b), so the two can never disagree (Code #15 S4, cq-5f44ce934aeb):
+
+      * `no_record` -- the first copy, over EVERY copy of the meeting, whose
+        no_record_reason is set. Never the stored veto reason alone: that is the
+        first non-qualifying copy's first failing check, and a decline or a missing
+        link checked first would hide a `[no-bot]` on the same or a later copy.
+      * the transcript's OWN title -- a Fireflies-side retitle to a no-record title
+        is a recording of exactly what the carve-out keeps out. This path consumes
+        the transcript, so section 4's title belt would never see it.
+      * a veto reason that is neither a known qualification skip nor a no-record
+        reason is UNKNOWN (a reason added to qualify_event and never classified):
+        FAIL CLOSED to a breach.
+
+    Only a known qualification skip (declined, cancelled, no link, all-day, not a
+    meeting) with none of the above is information, not an alarm.
+    """
+    if no_record is not None:
+        ev, why = no_record
+        return True, ev, why
+    ev, why = veto
+    t_why = title_carve_out_reason(transcript.get("title") or "", cfg)
+    if t_why:
+        return True, ev, t_why
+    if not is_qualification_skip_reason(why):
+        return True, ev, why
+    return False, ev, why
+
+
+def _record_carved_hit(
+    report: AuditReport,
+    *,
+    is_breach: bool,
+    shape: str,
+    reason: str,
+    event_id: str,
+    transcript_id: str,
+) -> None:
+    """The ONLY writer of the carved-hit lists, so their alignment cannot drift."""
+    if is_breach:
+        report.carve_out_breaches.append((shape, reason))
+        report.carve_out_breach_event_ids.append(event_id)
+        report.carve_out_breach_transcript_ids.append(transcript_id)
+    else:
+        report.carved_recordings.append((shape, reason))
+        report.carved_recording_event_ids.append(event_id)
+
+
 def audit_day(
     day: str,
     cfg: CaptureConfig,
@@ -1645,8 +1776,9 @@ def audit_day(
     roster_emails = frozenset(
         (m.calendar_email or "").strip().lower() for m in cfg.active_members if m.calendar_email
     )
-    #: meetings a carve-out removed from scope, kept so we can still notice if one
-    #: of them was recorded anyway.
+    #: meetings a veto on any copy removed from scope -- a qualification skip OR a
+    #: no-record carve-out -- kept so we can still notice if one of them was
+    #: recorded anyway. (first vetoing copy, its reason)
     carved: dict[tuple, tuple[dict[str, Any], str]] = {}
     #: EVERY copy of each carved meeting (one event id per invitee calendar), so the
     #: breach join in 3b matches a transcript whose cal_id names ANY copy -- the main
@@ -1654,9 +1786,16 @@ def audit_day(
     #: let a recorded carve-out fall through to section 4 and print its title
     #: (Code #14 r4, D-051 copa-audit-fallthrough-leak).
     carved_copies: dict[tuple, list[dict[str, Any]]] = {}
+    #: the first copy of each carved meeting (over EVERY copy, qualifying or not)
+    #: that carries a NO-RECORD carve-out, with that reason. `carved` keeps the FIRST
+    #: veto reason, which a decline / cancel / missing link checked earlier -- on the
+    #: same copy or an earlier one -- can hide; the breach decision reads this
+    #: instead (Code #15 S4, cq-5f44ce934aeb). `skipped` is unchanged.
+    carved_no_record: dict[tuple, tuple[dict[str, Any], str]] = {}
 
     for key, entries in grouped.items():
         veto: tuple[dict[str, Any], str] | None = None
+        no_record_hit: tuple[dict[str, Any], str] | None = None
         qualifying: list[tuple[RosterMember, dict[str, Any]]] = []
         for member, ev in entries:
             q = qualify_event(ev, cfg, roster_email=member.calendar_email)
@@ -1664,11 +1803,17 @@ def audit_day(
                 qualifying.append((member, ev))
             elif veto is None:
                 veto = (ev, q.reason)
+            if no_record_hit is None:
+                nr = no_record_reason(ev, cfg)
+                if nr:
+                    no_record_hit = (ev, nr)
 
         if veto is not None:
             ev, reason = veto
             carved[key] = (ev, reason)
             carved_copies[key] = [e for _m, e in entries]
+            if no_record_hit is not None:
+                carved_no_record[key] = no_record_hit
             # Only report skips that reflect a DECISION. Structural non-meetings
             # (an out-of-office block, a focus-time hold) are noise in an ops
             # channel and would bury the carve-outs a human should actually see.
@@ -1739,12 +1884,39 @@ def audit_day(
             by_meeting.setdefault(key, []).append(t)
             used.add(t.get("id") or "")
 
-    # A cal_id naming ANY copy of a CARVED meeting is exact evidence too: it is a
-    # breach, decided here -- BEFORE the link/title fallbacks. Deciding it after them
-    # (as 3b used to) let a recorded carved call on a static personal-room link be
-    # bound by link to ANOTHER meeting on that link: the breach went silent and a real
-    # miss could read as a clean day (Code #14 r4 re-review, bc61-F2). Only transcripts
-    # whose cal_id names a carved event are affected; every other join is unchanged.
+    def _carved_hit(c_keys: list[tuple], t: dict[str, Any]) -> None:
+        """A transcript joined to a carved meeting, at EITHER breach site: one
+        classifier (classify_carved_recording), one writer (_record_carved_hit). The
+        caller has already added it to `used` -- an informational hit must stay
+        consumed too, or section 4 would print its title.
+
+        `c_keys` is every carved meeting the join could mean -- one for an exact
+        cal_id, possibly several for a static room link shared by carved meetings at
+        different times (3b's link join is time-blind; the time-aware join is
+        cq-4df9da0cb483). AMBIGUITY FAILS CLOSED: if ANY claimant would make it a
+        breach, it is one. Binding the first claimant alone would let a declined
+        10:00 meeting on the room absorb the recording of a `[no-bot]` 15:00 one as
+        mere information -- a false negative the pre-S4 any-hit-is-a-breach rule
+        could not produce."""
+        results = [
+            classify_carved_recording(carved[k], carved_no_record.get(k), t, cfg)
+            for k in c_keys
+        ]
+        is_breach, h_ev, h_reason = next((res for res in results if res[0]), results[0])
+        _record_carved_hit(
+            report, is_breach=is_breach,
+            shape=f"a meeting at {event_time_label(h_ev)}", reason=h_reason,
+            event_id=(h_ev.get("id") or "").strip(), transcript_id=t.get("id") or "",
+        )
+
+    # A cal_id naming ANY copy of a CARVED meeting is exact evidence too: the join
+    # to that carved meeting is decided here -- BEFORE the link/title fallbacks.
+    # Deciding it after them (as 3b used to) let a recorded carved call on a static
+    # personal-room link be bound by link to ANOTHER meeting on that link: the breach
+    # went silent and a real miss could read as a clean day (Code #14 r4 re-review,
+    # bc61-F2). Only transcripts whose cal_id names a carved event are affected; every
+    # other join is unchanged. Whether the hit is a BREACH (a no-record carve-out) or
+    # information (a qualification skip) is _carved_hit's call, not this join's.
     carved_id_keys: dict[str, tuple] = {}
     for c_key, c_copies in carved_copies.items():
         for c_ev in c_copies:
@@ -1757,8 +1929,7 @@ def audit_day(
         hit = carved_id_keys.get((t.get("cal_id") or "").strip())
         if hit is not None:
             used.add(t.get("id") or "")
-            b_ev, b_reason = carved[hit]
-            report.carve_out_breaches.append((f"a meeting at {event_time_label(b_ev)}", b_reason))
+            _carved_hit([hit], t)
 
     # Fallback A: meeting link. About half of live transcripts carry no cal_id at
     # all, so without this the auditor would report most captured meetings missed.
@@ -1837,12 +2008,20 @@ def audit_day(
         fetch_meet_joins=fetch_meet_joins, clock=clock,
     )
 
-    # ── 3b. was anything captured that a carve-out excluded? ──
+    # ── 3b. was anything captured that the veto excluded? ──
     # Dropping carved meetings from the diff entirely would hide this: a bot
     # recording a no-record meeting is exactly what the carve-out exists to
-    # prevent, so it is surfaced -- as a shape, never as a title.
+    # prevent, so it is surfaced -- as a shape, never as a title. Only a NO-RECORD
+    # carve-out makes the recording a BREACH; a meeting vetoed for a qualification
+    # reason (a roster invitee declined, a copy was cancelled or carried no link)
+    # that was recorded anyway is reported as information (Code #15 S4,
+    # cq-5f44ce934aeb). The same classifier decides at the early cal_id join above.
+    # The VETO itself -- a decline on any copy keeps the meeting out of `scheduled`,
+    # exactly as it keeps the ensure lane off it -- is unchanged.
     carved_event_ids: dict[str, tuple] = {}
-    carved_links: dict[str, tuple] = {}
+    #: link -> EVERY carved meeting on it, first-seen first (a static room link can
+    #: carry several carved meetings in a day; see _carved_hit's fail-closed rule).
+    carved_links: dict[str, list[tuple]] = {}
     for c_key, c_copies in carved_copies.items():
         for c_ev in c_copies:
             c_eid = (c_ev.get("id") or "").strip()
@@ -1850,21 +2029,21 @@ def audit_day(
                 carved_event_ids.setdefault(c_eid, c_key)
             c_link = extract_meeting_link(c_ev).strip().lower()
             if c_link:
-                carved_links.setdefault(c_link, c_key)
+                claim = carved_links.setdefault(c_link, [])
+                if c_key not in claim:
+                    claim.append(c_key)
     for t in same_day:
         if (t.get("id") or "") in used:
             continue
         hit = carved_event_ids.get((t.get("cal_id") or "").strip())
-        if hit is None:
+        claimants: list[tuple] = [hit] if hit is not None else []
+        if not claimants:
             t_link = (t.get("meeting_link") or "").strip().lower()
-            hit = carved_links.get(t_link) if t_link else None
-        if hit is None:
+            claimants = list(carved_links.get(t_link) or []) if t_link else []
+        if not claimants:
             continue
         used.add(t.get("id") or "")
-        b_ev, b_reason = carved[hit]
-        report.carve_out_breaches.append(
-            (f"a meeting at {event_time_label(b_ev)}", b_reason)
-        )
+        _carved_hit(claimants, t)
 
     # ── 4. captured but not on any roster calendar ──
     for t in same_day:
@@ -1878,8 +2057,12 @@ def audit_day(
         t_reason = title_carve_out_reason(t.get("title") or "", cfg)
         if t_reason:
             used.add(t.get("id") or "")
-            report.carve_out_breaches.append(
-                (f"a meeting at {_transcript_time_label(t)}", t_reason)
+            # No calendar event: the ids are the transcript's own (its cal_id when
+            # it carries one, "" otherwise) -- enough to find and delete it.
+            _record_carved_hit(
+                report, is_breach=True,
+                shape=f"a meeting at {_transcript_time_label(t)}", reason=t_reason,
+                event_id=(t.get("cal_id") or "").strip(), transcript_id=t.get("id") or "",
             )
             continue
         safe_t = _transcript_display_title(t)
@@ -2108,6 +2291,22 @@ def render_report(report: AuditReport) -> str:
         if len(report.skipped) > 10:
             lines.append(f"  _...and {len(report.skipped) - 10} more_")
 
+    if report.carved_recordings:
+        # INFORMATIONAL (Code #15 S4): a meeting vetoed for a QUALIFICATION reason
+        # -- a roster invitee declined, a copy was cancelled or had no link -- that
+        # was recorded anyway. Not a breach (nobody ruled it unrecordable) and never
+        # part of the clean-day verdict; beside the skip line it explains. SHAPE +
+        # reason only, never the title or organiser, exactly as the breach block.
+        lines.append(
+            f"\n*:information_source: Recorded though skipped "
+            f"({len(report.carved_recordings)})* -- a qualification skip, not a "
+            "no-record carve-out"
+        )
+        for shape, reason in report.carved_recordings[:10]:
+            lines.append(f"  - {_esc(shape)}  _({_esc(reason)})_")
+        if len(report.carved_recordings) > 10:
+            lines.append(f"  _...and {len(report.carved_recordings) - 10} more_")
+
     if confirmed:
         # R14-8, live lane only: the Meet join log PROVED these group-calendar
         # blocks unconvened (no human joined, or only one person did). Same LEX
@@ -2153,6 +2352,8 @@ def render_report(report: AuditReport) -> str:
     # CLEAN-DAY CRITERION. Unconvened is deliberately NOT in this veto: a presumed
     # placeholder nobody joined is not a capture failure. Misses, duplicates,
     # unmatched captures, carve-out breaches and a degraded read all still are.
+    # carved_recordings (a qualification-skipped meeting recorded anyway) is
+    # information, not a failure, and is NOT in this veto either (Code #15 S4).
     if not (report.misses or report.duplicates or report.unmatched_transcripts
             or report.carve_out_breaches) and not degraded:
         # A weekend has no meetings, and "captured exactly once" over a denominator

@@ -3028,3 +3028,531 @@ class TestCarvedRecordingNeverPrintsItsTitle:
         r = _audit(self._room_day(), [t], cfg=self._cfg())
         assert r.carve_out_breaches == [] and r.captured == 1
         assert "COPA sync" not in mc.render_report(r)
+
+
+# ── Code #15 S4 (cq-5f44ce934aeb): a breach is a NO-RECORD carve-out only ──────
+#
+# The 9/18 audit alarmed "RECORDED DESPITE A CARVE-OUT -- a meeting at 10:00
+# (roster-user-declined)" on a standing weekly meeting ONE of four roster invitees
+# had declined; the 9/23 audit did the same for a link-less roster copy
+# (no-meeting-link). Neither is a no-record carve-out -- nobody ruled those meetings
+# unrecordable. The raw calendar + Fireflies input of those days is stored nowhere,
+# so the fixtures are SHAPES rebuilt from the ids-only ledger evidence, with
+# synthetic titles, ids and addresses (D-145/D-256).
+
+_S4_WK_ID = "wk1_20260826T170000Z"          # recurring instance id: 10:00 AZ = 17:00Z
+_S4_WK_LINK = "https://meet.google.com/saf-hern-std"
+_S4_WK_TITLE = "Saffron Heron Standup"
+_S4_ROSTER_ADDRS = ("harrison@hjrglobal.com", "hannah@hjrglobal.com",
+                    "alex@hjrglobal.com", "shaun@hjrglobal.com")
+_S4_EXT = "host@tawnyvendor.example"
+
+
+def _s4_cfg(**over) -> mc.CaptureConfig:
+    return _cfg(members=tuple(
+        mc.RosterMember(a.split("@")[0].title(), a) for a in _S4_ROSTER_ADDRS
+    ), **over)
+
+
+def _s4_real_cfg(**over) -> mc.CaptureConfig:
+    """The REAL roster's no-record title patterns (COPA among them)."""
+    return _s4_cfg(no_record_title_patterns=mc.load_config(force=True).no_record_title_patterns,
+                   **over)
+
+
+def _s4_decline(ev: dict, who: str) -> dict:
+    """`who`'s own attendee row on this copy is DECLINED (+ self), the shape Google
+    serves for the copy on that person's calendar."""
+    rows = [a for a in ev.get("attendees") or [] if (a.get("email") or "") != who]
+    rows.append({"email": who, "self": True, "responseStatus": "declined"})
+    ev["attendees"] = rows
+    return ev
+
+
+def _s4_weekly_copy(declined_by: str = "") -> dict:
+    ev = _ev(_S4_WK_ID, summary=_S4_WK_TITLE, hh=10, link=_S4_WK_LINK,
+             organizer="harrison@hjrglobal.com", attendees=[*_S4_ROSTER_ADDRS, CORA])
+    ev["recurringEventId"] = "wk1"
+    return _s4_decline(ev, declined_by) if declined_by else ev
+
+
+def _s4_sept18_day():
+    """The 9/18 shape (ledger row: scheduled 9, captured 1, missed 8, duplicated 1,
+    skipped 2, carve_out_breaches 1).
+
+    * 10:00 -- a standing weekly meeting, in-domain organiser, so every roster copy
+      shares ONE instance id; Alex's copy DECLINED, which vetoes the meeting. It was
+      recorded anyway: one transcript, bot joined, cal_id = the instance id (the
+      early exact-cal_id join since ab00c69).
+    * 11:00 -- a meeting Shaun declined, never recorded (skip only).
+    * 09:00 -- one meeting, two transcripts (the captured / duplicated pair).
+    * eight link-distinct meetings nobody recorded (the misses).
+    """
+    events = {a: [] for a in _S4_ROSTER_ADDRS}
+    events["harrison@hjrglobal.com"].append(_s4_weekly_copy())
+    events["hannah@hjrglobal.com"].append(_s4_weekly_copy())
+    events["alex@hjrglobal.com"].append(_s4_weekly_copy(declined_by="alex@hjrglobal.com"))
+    events["shaun@hjrglobal.com"].append(_s4_decline(
+        _ev("umb11", summary="Umber Finch Review", hh=11, link="https://meet.google.com/umb-finc-rvw",
+            organizer=_S4_EXT, attendees=[_S4_EXT, "shaun@hjrglobal.com"]),
+        "shaun@hjrglobal.com"))
+    nine_link = "https://meet.google.com/cob-wren-syn"
+    events["harrison@hjrglobal.com"].append(
+        _ev("nine1", summary="Cobalt Wren Sync", hh=9, link=nine_link))
+    for i in range(8):
+        events["hannah@hjrglobal.com"].append(_ev(
+            f"miss{i}", summary=f"Quill Moth {i}", hh=12 + i,
+            link=f"https://meet.google.com/qm{i}-moth-rvw", organizer="hannah@hjrglobal.com"))
+    transcripts = [
+        _t("t10", title=_S4_WK_TITLE, hh=10, cal_id=_S4_WK_ID, link=_S4_WK_LINK, fred=True),
+        _t("t9a", title="Cobalt Wren Sync", hh=9, cal_id="nine1", link=nine_link),
+        _t("t9b", title="Cobalt Wren Sync", hh=9, cal_id="nine1", link=nine_link),
+    ]
+    return events, transcripts
+
+
+#: the four no-record classes (+ the second real marker), each producing the REAL
+#: reason string: (event summary, extra attendees, cfg overrides, expected reason)
+_S4_NO_RECORD_CASES = [
+    ("[no-bot] Tawny Lark chat", (), {}, "title-marker:[no-bot]"),
+    ("[nobot] Tawny Lark chat", (), {"skip_title_markers": ("[no-bot]", "[nobot]")},
+     "title-marker:[nobot]"),
+    ("Tawny Lark call with counsel", (), {}, "no-record-title:counsel"),
+    ("Tawny Lark review", ("lawyer@outsidefirm.com",), {},
+     "no-record-email:lawyer@outsidefirm.com"),
+    ("Tawny Lark review", ("partner@outsidefirm.com",), {}, "no-record-domain:outsidefirm.com"),
+]
+
+_S4_ROOM = "https://zoom.us/my/tawnyroom"
+
+
+class TestBreachIsANoRecordCarveOutOnly:
+    """A carved meeting recorded anyway is a BREACH only for a no-record carve-out
+    (title-marker: / no-record-title: / no-record-email: / no-record-domain:). A
+    meeting vetoed for a QUALIFICATION reason (declined, cancelled, no link, all-day,
+    not a meeting) that was recorded is information -- still consumed, still a shape,
+    never a title, never in the clean-day veto."""
+
+    # ── the live regressions ──
+
+    def test_sept18_a_declined_weekly_meeting_recorded_is_information_not_a_breach(self):
+        events, transcripts = _s4_sept18_day()
+        r = _audit(events, transcripts, cfg=_s4_cfg())
+        # FIRST: the assertion the pre-S4 code fails (it alarmed this exact shape).
+        assert r.carve_out_breaches == [], r.carve_out_breaches
+        assert r.carved_recordings == [("a meeting at 10:00", "roster-user-declined")]
+        assert r.carved_recording_event_ids == [_S4_WK_ID]
+        assert r.carve_out_breach_event_ids == [] and r.carve_out_breach_transcript_ids == []
+        # the ledger-row shape of the day, unchanged apart from the breach
+        assert (r.scheduled, r.captured, len(r.misses), len(r.duplicates)) == (9, 1, 8, 1)
+        assert r.skipped == [("a meeting at 10:00", "roster-user-declined"),
+                             ("a meeting at 11:00", "roster-user-declined")]
+        # consumed: never falls through to section 4 (which would print its title)
+        assert r.unmatched_transcripts == []
+        out = mc.render_report(r)
+        assert "RECORDED DESPITE" not in out
+        assert "Recorded though skipped (1)" in out
+        assert "  - a meeting at 10:00  _(roster-user-declined)_" in out
+        assert _S4_WK_TITLE not in out and "Saffron" not in out and "Umber Finch" not in out
+
+    def test_sept23_a_link_less_roster_copy_recorded_is_information_not_a_breach(self):
+        ev = _ev("nolink1", summary="Garnet Moth Planning", hh=12, link=None)
+        t = _t("t12", title="Garnet Moth Planning", hh=12, cal_id="nolink1",
+               link="https://zoom.us/j/5550001")
+        r = _audit({"harrison@hjrglobal.com": [ev]}, [t])
+        assert r.carve_out_breaches == [], r.carve_out_breaches
+        assert r.carved_recordings == [("a meeting at 12:00", "no-meeting-link")]
+        assert r.carved_recording_event_ids == ["nolink1"]
+        assert r.skipped == [] and r.unmatched_transcripts == []
+        out = mc.render_report(r)
+        assert "RECORDED DESPITE" not in out and "Garnet Moth" not in out
+        assert "  - a meeting at 12:00  _(no-meeting-link)_" in out
+
+    # ── each no-record class still breaches, at BOTH breach sites ──
+
+    @staticmethod
+    def _site_day(summary, extra, site):
+        """site A = the early exact-cal_id join: the carved meeting shares a static
+        room with an ordinary 14:00 meeting, so if the early join did not decide it
+        the link fallback would bind the recording to 14:00 (bc61-F2). site B = 3b's
+        link join: no cal_id, the carved meeting's own link."""
+        if site == "A":
+            events = {"harrison@hjrglobal.com": [
+                _ev("nr1", summary=summary, hh=10, link=_S4_ROOM,
+                    attendees=["harrison@hjrglobal.com", *extra]),
+                _ev("ord14", summary="Vendor walkthrough", hh=14, link=_S4_ROOM),
+            ]}
+            t = _t("t1", title="Untitled recording", hh=10, cal_id="nr1", link=_S4_ROOM)
+        else:
+            own = "https://meet.google.com/taw-nyla-rkk"
+            events = {"harrison@hjrglobal.com": [
+                _ev("nr1", summary=summary, hh=10, link=own,
+                    attendees=["harrison@hjrglobal.com", *extra]),
+            ]}
+            t = _t("t1", title="Untitled recording", hh=10, cal_id=None, link=own)
+        return events, [t]
+
+    @pytest.mark.parametrize("site", ["A", "B"])
+    @pytest.mark.parametrize("summary,extra,over,reason", _S4_NO_RECORD_CASES)
+    def test_every_no_record_class_breaches_at_both_sites(self, summary, extra, over, reason, site):
+        events, transcripts = self._site_day(summary, extra, site)
+        r = _audit(events, transcripts, cfg=_cfg(**over))
+        assert r.carve_out_breaches == [("a meeting at 10:00", reason)]
+        assert r.carve_out_breach_event_ids == ["nr1"]
+        assert r.carve_out_breach_transcript_ids == ["t1"]
+        assert r.carved_recordings == [] and r.unmatched_transcripts == []
+        if site == "A":
+            assert r.captured == 0 and len(r.misses) == 1   # 14:00 was NOT recorded
+        out = mc.render_report(r)
+        assert "RECORDED DESPITE A CARVE-OUT (1)" in out
+        assert "Tawny" not in out and "captured exactly once" not in out
+
+    # ── false-negative hazards: the veto's ORDER must never hide a no-record carve-out ──
+
+    @staticmethod
+    def _two_copy_day(first: dict, second: dict) -> dict:
+        return {"harrison@hjrglobal.com": [first], "hannah@hjrglobal.com": [second]}
+
+    @staticmethod
+    def _ext(eid, summary, **kw):
+        kw.setdefault("link", _S4_ROOM)
+        kw.setdefault("attendees", [_S4_EXT, "harrison@hjrglobal.com", "hannah@hjrglobal.com"])
+        return _ev(eid, summary=summary, hh=10, organizer=_S4_EXT, **kw)
+
+    @staticmethod
+    def _t_at(site, cal_id):
+        if site == "A":
+            return _t("t1", title="Untitled recording", hh=10, cal_id=cal_id, link=_S4_ROOM)
+        return _t("t1", title="Untitled recording", hh=10, cal_id=None, link=_S4_ROOM)
+
+    def _assert_breach(self, r, reason, event_id):
+        assert r.carve_out_breaches == [("a meeting at 10:00", reason)], r.carve_out_breaches
+        assert r.carve_out_breach_event_ids == [event_id]
+        assert r.carve_out_breach_transcript_ids == ["t1"]
+        assert r.carved_recordings == [] and r.unmatched_transcripts == []
+        out = mc.render_report(r)
+        assert "RECORDED DESPITE A CARVE-OUT (1)" in out and "Tawny" not in out
+
+    @pytest.mark.parametrize("site", ["A", "B"])
+    def test_a_declined_copy_first_cannot_hide_a_no_bot_copy_second(self, site):
+        declined = _s4_decline(self._ext("_dec1", "Tawny Lark review"), "harrison@hjrglobal.com")
+        marked = self._ext("_nb2", "[no-bot] Tawny Lark review")
+        r = _audit(self._two_copy_day(declined, marked), [self._t_at(site, "_dec1")])
+        self._assert_breach(r, "title-marker:[no-bot]", "_nb2")
+        # `skipped` keeps the FIRST veto's reason, byte for byte (unchanged)
+        assert r.skipped == [("a meeting at 10:00", "roster-user-declined")]
+
+    @pytest.mark.parametrize("site", ["A", "B"])
+    def test_one_copy_both_declined_and_no_bot_is_a_breach(self, site):
+        both = _s4_decline(self._ext("_both", "[no-bot] Tawny Lark review"),
+                           "harrison@hjrglobal.com")
+        r = _audit({"harrison@hjrglobal.com": [both]}, [self._t_at(site, "_both")])
+        assert mc.qualify_event(both, _cfg(), roster_email="harrison@hjrglobal.com").reason \
+            == "roster-user-declined"          # precondition: the decline is checked first
+        self._assert_breach(r, "title-marker:[no-bot]", "_both")
+
+    @pytest.mark.parametrize("site", ["A", "B"])
+    def test_a_cancelled_copa_copy_beside_a_qualifying_copy_is_a_breach(self, site):
+        cancelled = self._ext("_can", "COPA Tawny sync", status="cancelled")
+        ok = self._ext("_ok", "Tawny sync")
+        r = _audit(self._two_copy_day(cancelled, ok), [self._t_at(site, "_ok")],
+                   cfg=_s4_real_cfg())
+        self._assert_breach(r, "no-record-title:copa", "_can")
+        assert r.skipped == []        # cancelled is structural: never listed as a skip
+
+    def test_a_link_less_copy_with_a_no_record_address_is_a_breach(self):
+        nl = _ev("_nl", summary="Tawny Lark review", hh=10, link=None,
+                 attendees=["harrison@hjrglobal.com", "lawyer@outsidefirm.com"])
+        t = _t("t1", title="Untitled recording", hh=10, cal_id="_nl", link="https://zoom.us/j/77")
+        r = _audit({"harrison@hjrglobal.com": [nl]}, [t])
+        self._assert_breach(r, "no-record-email:lawyer@outsidefirm.com", "_nl")
+
+    @pytest.mark.parametrize("site", ["A", "B"])
+    def test_a_declined_meeting_retitled_copa_in_fireflies_is_a_breach(self, site):
+        """The informational path consumes the transcript, so section 4's title belt
+        never sees it -- the classifier must read the transcript's own title."""
+        dec = _s4_decline(self._ext("_d5", "Tawny review"), "harrison@hjrglobal.com")
+        t = self._t_at(site, "_d5")
+        t["title"] = "COPA Tawny review"
+        r = _audit({"harrison@hjrglobal.com": [dec]}, [t], cfg=_s4_real_cfg())
+        self._assert_breach(r, "no-record-title:copa", "_d5")
+
+    def test_an_informational_link_join_is_consumed_never_a_titled_unmatched_row(self):
+        dec = _s4_decline(self._ext("_d6", "Tawny review"), "harrison@hjrglobal.com")
+        r = _audit({"harrison@hjrglobal.com": [dec]}, [self._t_at("B", None)])
+        assert r.carve_out_breaches == [] and r.unmatched_transcripts == []
+        assert r.carved_recordings == [("a meeting at 10:00", "roster-user-declined")]
+        assert r.carved_recording_event_ids == ["_d6"]
+        assert "Untitled recording" not in mc.render_report(r)
+
+    def test_residual_a_split_meeting_key_group_reads_informational(self):
+        """DOCUMENTED RESIDUAL (grouping limit R4-F1, cq-4df9da0cb483 -- not S4): a
+        `[no-bot]` copy WITH a link and a twin copy WITHOUT one land in DIFFERENT
+        meeting_key groups ("link", ...) vs ("event", id). A recording whose cal_id
+        names the link-less twin joins that group, which carries no no-record
+        carve-out, so it reads informational. No title is printed. Pinned so the
+        residual is visible, and so a grouping fix flips it on purpose."""
+        marked = self._ext("_nbk", "[no-bot] Tawny Lark review")
+        twin = self._ext("_twin", "Tawny Lark review", link=None)
+        t = _t("t1", title="Untitled recording", hh=10, cal_id="_twin", link="")
+        r = _audit(self._two_copy_day(marked, twin), [t])
+        assert r.carve_out_breaches == []
+        assert r.carved_recordings == [("a meeting at 10:00", "no-meeting-link")]
+        assert r.skipped == [("a meeting at 10:00", "title-marker:[no-bot]")]
+        assert "Tawny" not in mc.render_report(r)
+
+    # ── a room link shared by several CARVED meetings: ambiguity fails closed ──
+
+    @staticmethod
+    def _shared_room_day():
+        """A static room hosting a DECLINED 10:00 meeting (seen first) and a
+        `[no-bot]` 15:00 meeting. 3b's link join is time-blind."""
+        return {"harrison@hjrglobal.com": [
+            _s4_decline(_ev("dec10", summary="Tawny weekly", hh=10, link=_S4_ROOM),
+                        "harrison@hjrglobal.com"),
+            _ev("nb15", summary="[no-bot] Tawny private", hh=15, link=_S4_ROOM),
+        ]}
+
+    def test_a_no_bot_recording_on_a_room_shared_with_a_declined_meeting_is_a_breach(self):
+        """Self-review (S4): binding the link's FIRST carved claimant (the declined
+        10:00) would read the 15:00 `[no-bot]` recording as mere information -- a
+        false negative the narrowing created (pre-S4 every carved hit alarmed)."""
+        t = _t("t1", title="Tawny room", hh=15, cal_id=None, link=_S4_ROOM)
+        r = _audit(self._shared_room_day(), [t])
+        assert r.carve_out_breaches == [("a meeting at 15:00", "title-marker:[no-bot]")]
+        assert r.carve_out_breach_event_ids == ["nb15"]
+        assert r.carved_recordings == [] and r.unmatched_transcripts == []
+        assert "Tawny" not in mc.render_report(r)
+
+    def test_residual_the_declined_meetings_recording_on_that_room_also_alarms(self):
+        """DOCUMENTED RESIDUAL (fail-closed by design until the time-aware join,
+        cq-4df9da0cb483): with no cal_id the link cannot say WHICH carved meeting was
+        recorded, so the declined 10:00 meeting's recording alarms too. Over-alarm,
+        never under-alarm; the pre-S4 code alarmed this shape as well."""
+        t = _t("t1", title="Tawny room", hh=10, cal_id=None, link=_S4_ROOM)
+        r = _audit(self._shared_room_day(), [t])
+        assert r.carve_out_breaches == [("a meeting at 15:00", "title-marker:[no-bot]")]
+        assert r.carved_recordings == []
+
+    def test_an_exact_cal_id_on_that_room_is_not_ambiguous(self):
+        t = _t("t1", title="Tawny room", hh=10, cal_id="dec10", link=_S4_ROOM)
+        r = _audit(self._shared_room_day(), [t])
+        assert r.carve_out_breaches == []
+        assert r.carved_recordings == [("a meeting at 10:00", "roster-user-declined")]
+        assert r.carved_recording_event_ids == ["dec10"]
+
+    def test_a_room_shared_only_by_qualification_skips_stays_informational(self):
+        events = {"harrison@hjrglobal.com": [
+            _s4_decline(_ev("dec10", summary="Tawny weekly", hh=10, link=_S4_ROOM),
+                        "harrison@hjrglobal.com"),
+            _s4_decline(_ev("dec15", summary="Tawny later", hh=15, link=_S4_ROOM),
+                        "harrison@hjrglobal.com"),
+        ]}
+        t = _t("t1", title="Tawny room", hh=15, cal_id=None, link=_S4_ROOM)
+        r = _audit(events, [t])
+        assert r.carve_out_breaches == []
+        # the first claimant, as the single-key index bound it before (time-blind)
+        assert r.carved_recordings == [("a meeting at 10:00", "roster-user-declined")]
+
+    # ── fail closed on a reason nobody classified ──
+
+    @pytest.mark.parametrize("odd", ["future-reason:x", "roster-user-declined-v2", "cancelledish"])
+    def test_an_unknown_veto_reason_fails_closed_to_a_breach(self, monkeypatch, odd):
+        real = mc.qualify_event
+
+        def _qualify(ev, cfg, *, roster_email=""):
+            if ev.get("id") == "odd1":
+                return mc.Qualification(False, odd)
+            return real(ev, cfg, roster_email=roster_email)
+
+        monkeypatch.setattr(mc, "qualify_event", _qualify)
+        ev = _ev("odd1", summary="Tawny odd", hh=10)
+        r = _audit({"harrison@hjrglobal.com": [ev]},
+                   [_t("t1", title="Untitled recording", hh=10, cal_id="odd1")])
+        assert not mc.is_qualification_skip_reason(odd) and not mc.is_no_record_reason(odd)
+        assert r.carve_out_breaches == [("a meeting at 10:00", odd)]
+        assert r.carved_recordings == []
+
+    # ── exhaustiveness: every reason qualify_event can emit is in exactly ONE class ──
+
+    @staticmethod
+    def _reason_table():
+        allday = _ev("e1")
+        allday["start"] = {"date": "2026-08-26"}
+        allday["end"] = {"date": "2026-08-27"}
+        return [
+            (_ev("e1", status="cancelled"), "cancelled", "qualification"),
+            (_ev("e1", event_type="outOfOffice"), "not-a-meeting:outofoffice", "qualification"),
+            (_ev("e1", link=None), "no-meeting-link", "qualification"),
+            (allday, "all-day", "qualification"),
+            (_s4_decline(_ev("e1"), "harrison@hjrglobal.com"), "roster-user-declined",
+             "qualification"),
+            (_ev("e1", summary="[no-bot] x"), "title-marker:[no-bot]", "no-record"),
+            (_ev("e1", summary="Call with counsel"), "no-record-title:counsel", "no-record"),
+            (_ev("e1", attendees=["harrison@hjrglobal.com", "lawyer@outsidefirm.com"]),
+             "no-record-email:lawyer@outsidefirm.com", "no-record"),
+            (_ev("e1", attendees=["harrison@hjrglobal.com", "p@outsidefirm.com"]),
+             "no-record-domain:outsidefirm.com", "no-record"),
+        ]
+
+    def test_every_reason_lands_in_exactly_one_class(self):
+        table = self._reason_table()
+        for ev, reason, klass in table:
+            q = mc.qualify_event(ev, _cfg(), roster_email="harrison@hjrglobal.com")
+            assert not q.qualifies and q.reason == reason, (reason, q)
+            nr, qs = mc.is_no_record_reason(reason), mc.is_qualification_skip_reason(reason)
+            assert nr != qs, reason
+            assert (klass == "no-record") is nr, reason
+        # ...and the table covers every class member there is
+        heads = {reason.split(":", 1)[0] + (":" if ":" in reason else "") for _e, reason, _k in table}
+        assert heads == (set(mc.QUALIFICATION_SKIP_REASONS) | set(mc.QUALIFICATION_SKIP_PREFIXES)
+                         | set(mc.NO_RECORD_REASON_PREFIXES))
+
+    def test_source_scan_pins_the_reason_vocabulary(self):
+        """A reason added to qualify_event without classifying it fails HERE (it
+        would also fail closed to a breach at runtime -- never silently informational)."""
+        import inspect
+        import re as _re
+
+        src = inspect.getsource(mc.qualify_event)
+        args = _re.findall(r"Qualification\(False,\s*([^)]+?)\)", src)
+        assert len(args) == 6, args
+        delegated = [a for a in args if not a.lstrip("f").startswith('"')]
+        assert delegated == ["no_record"], "exactly ONE non-literal: the no_record_reason delegation"
+        heads = {_re.match(r'f?"([^"{]*)', a).group(1) for a in args if a not in delegated}
+        assert heads == set(mc.QUALIFICATION_SKIP_REASONS) | set(mc.QUALIFICATION_SKIP_PREFIXES)
+
+        nr_src = inspect.getsource(mc.no_record_reason) + inspect.getsource(mc.title_carve_out_reason)
+        returns = _re.findall(r"\breturn\s+(f?\"[^\"]*\"|\w+)", nr_src)
+        literal_heads = {_re.match(r'f"([^"{]*)', r).group(1) for r in returns if r.startswith('f"')}
+        assert literal_heads == set(mc.NO_RECORD_REASON_PREFIXES)
+        assert set(returns) - {r for r in returns if r.startswith('f"')} <= {'""', "title_reason"}
+
+    @pytest.mark.parametrize("summary,attendees", [
+        ("LBHS COPA Diligence", None), ("[no-bot] x", None), ("Copacabana offsite", None),
+        ("Call with counsel", None), ("Weekly Sync", ["harrison@hjrglobal.com", "lawyer@outsidefirm.com"]),
+        ("Weekly Sync", ["harrison@hjrglobal.com", "z@outsidefirm.com", "a@outsidefirm.com"]),
+        ("Weekly Sync", None),
+    ])
+    def test_no_record_reason_and_qualify_event_agree(self, summary, attendees):
+        cfg = _s4_real_cfg(no_record_emails=frozenset({"lawyer@outsidefirm.com"}),
+                           no_record_attendee_domains=("outsidefirm.com",))
+        ev = _ev("e1", summary=summary, attendees=attendees)
+        q = mc.qualify_event(ev, cfg)
+        assert (q.reason if not q.qualifies else "") == mc.no_record_reason(ev, cfg), summary
+
+    # ── the report + the script ──
+
+    def _info_day(self):
+        """A clean 09:00 meeting plus a declined 11:00 meeting recorded anyway."""
+        dec = _s4_decline(_ev("dec11", summary="Tawny review", hh=11,
+                              link="https://meet.google.com/taw-nyre-vww"),
+                          "harrison@hjrglobal.com")
+        return _audit(
+            {"harrison@hjrglobal.com": [_ev("evt-1", hh=9), dec]},
+            [_t("t1", hh=9, cal_id="evt-1"),
+             _t("t2", title="Tawny review", hh=11, cal_id="dec11")],
+        )
+
+    _INFO_BLOCK = ("\n\n*:information_source: Recorded though skipped (1)* -- a qualification "
+                   "skip, not a no-record carve-out\n  - a meeting at 11:00  _(roster-user-declined)_")
+
+    def test_informational_hits_alone_keep_the_clean_day_line(self):
+        r = self._info_day()
+        out = mc.render_report(r)
+        assert r.carve_out_breaches == [] and len(r.carved_recordings) == 1
+        assert "Every scheduled meeting captured exactly once." in out
+        assert self._INFO_BLOCK in out
+        assert out.index("Carve-outs applied") < out.index("Recorded though skipped") \
+            < out.index("captured exactly once")
+        assert "Tawny" not in out
+
+    def test_a_hit_free_render_is_byte_identical(self):
+        r = self._info_day()
+        out = mc.render_report(r)
+        r.carved_recordings, r.carved_recording_event_ids = [], []
+        assert out.replace(self._INFO_BLOCK, "") == mc.render_report(r)
+        assert "information_source" not in mc.render_report(r)
+
+    def test_a_breach_beside_an_informational_hit_still_suppresses_the_clean_line(self):
+        r = self._info_day()
+        r.carve_out_breaches.append(("a meeting at 15:00", "title-marker:[no-bot]"))
+        out = mc.render_report(r)
+        assert "RECORDED DESPITE A CARVE-OUT (1)" in out and "Recorded though skipped (1)" in out
+        assert "captured exactly once" not in out
+
+    def test_the_informational_block_is_capped_at_ten_lines(self):
+        r = self._info_day()
+        r.carved_recordings = [(f"a meeting at {h:02d}:00", "no-meeting-link") for h in range(12)]
+        out = mc.render_report(r)
+        assert "Recorded though skipped (12)" in out and "  _...and 2 more_" in out
+        assert "a meeting at 10:00" not in out and "a meeting at 09:00" in out
+
+    def test_audit_script_ledgers_breach_and_informational_ids_only(self, monkeypatch, caplog):
+        """Behavioural: the 07:22 row carries the new keys as IDS ONLY (no reason --
+        a no-record-email reason is an address), aligned with the count; no title
+        reaches the row, stdout or the log; run_marker counts the informational hit
+        and its detail string is unchanged."""
+        import importlib.util
+        import logging
+
+        spec = importlib.util.spec_from_file_location(
+            "_audit_script_s4", _REPO_ROOT / "scripts" / "run_meeting_capture_audit.py"
+        )
+        mod = importlib.util.module_from_spec(spec)
+        monkeypatch.setattr(sys, "argv", ["run_meeting_capture_audit.py", "--day", DAY])
+        spec.loader.exec_module(mod)
+
+        events = {"harrison@hjrglobal.com": [
+            _ev("e_br", summary="Tawny Lark review", hh=10, link="https://meet.google.com/br-aaa-bbb",
+                attendees=["harrison@hjrglobal.com", "lawyer@outsidefirm.com"]),
+            _s4_decline(_ev("e_inf", summary="Saffron Heron Standup", hh=11,
+                            link="https://meet.google.com/inf-ccc-ddd"), "harrison@hjrglobal.com"),
+        ]}
+        transcripts = [
+            _t("t_br", title="Tawny Lark review", hh=10, cal_id="e_br",
+               link="https://meet.google.com/br-aaa-bbb"),
+            _t("t_inf", title="Saffron Heron Standup", hh=11, cal_id="e_inf",
+               link="https://meet.google.com/inf-ccc-ddd"),
+            # the section-4 title belt: no calendar event, no cal_id at all
+            _t("t_belt", title="[no-bot] Umber Finch chat", hh=15, cal_id=None,
+               link="https://zoom.us/j/4440001"),
+        ]
+        report = _audit(events, transcripts)
+        assert [reason for _s, reason in report.carve_out_breaches] == [
+            "no-record-email:lawyer@outsidefirm.com", "title-marker:[no-bot]"]   # precondition
+
+        monkeypatch.setattr(mod.mc, "load_config", lambda: _cfg())
+        monkeypatch.setattr(mod.mc, "audit_day", lambda day, cfg: report)
+        markers: list[dict] = []
+        monkeypatch.setattr(mod.run_marker, "write",
+                            lambda task, **kw: markers.append(dict(task=task, **kw)))
+        printed: list[str] = []
+        monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(map(str, a))))
+        with caplog.at_level(logging.INFO, logger=mod.log.name):
+            assert mod.main() == 0
+        logged = [r.getMessage() for r in caplog.records]
+
+        rows = [json.loads(l) for l in mc.ledger_path().read_text(encoding="utf-8").splitlines()]
+        row = [r for r in rows if r.get("lane") == "audit"][-1]
+        assert row["carve_out_breaches"] == 2
+        assert row["carve_out_breach_event_ids"] == ["e_br", ""]
+        assert row["carve_out_breach_transcript_ids"] == ["t_br", "t_belt"]
+        assert row["carved_recorded"] == 1 and row["carved_recorded_event_ids"] == ["e_inf"]
+        new = {k: row[k] for k in ("carve_out_breach_event_ids", "carve_out_breach_transcript_ids",
+                                   "carved_recorded", "carved_recorded_event_ids")}
+        flat_new = json.dumps(new)
+        assert "@" not in flat_new and "meet.google.com" not in flat_new and "zoom.us" not in flat_new
+        flat = json.dumps(row)
+        for leak in ("Tawny", "Saffron", "Umber", "outsidefirm", "roster-user-declined",
+                     "title-marker", "no-record-email"):
+            assert leak not in flat, leak
+        for leak in ("Tawny", "Saffron", "Umber"):
+            assert not any(leak in p for p in printed), leak
+            assert not any(leak in m for m in logged), leak
+        assert any("breaches=2 carved_recorded=1" in m for m in logged)
+        assert any("Recorded though skipped (1)" in p for p in printed)
+
+        assert len(markers) == 1
+        assert markers[0]["outputs"] == 3, "2 breaches + 1 informational line"
+        assert markers[0]["detail"] == "scheduled=0 captured=0 missed=0 unconvened=0"

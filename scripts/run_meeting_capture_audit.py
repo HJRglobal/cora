@@ -117,11 +117,13 @@ def main() -> int:
     print("\n" + text + "\n")
     log.info(
         "audit %s: scheduled=%d captured=%d missed=%d unconvened=%d dup=%d unmatched=%d "
-        "skipped=%d failed_calendars=%d rsvp_accepted=%d rsvp_accepted_lex=%d rsvp_errors=%d "
+        "skipped=%d breaches=%d carved_recorded=%d failed_calendars=%d "
+        "rsvp_accepted=%d rsvp_accepted_lex=%d rsvp_errors=%d "
         "meet_audit_state=%s meet_events_read=%d",
         day, report.scheduled, report.captured, len(report.misses),
         len(report.unconvened), len(report.duplicates), len(report.unmatched_transcripts),
-        len(report.skipped), len(report.failed_calendars),
+        len(report.skipped), len(report.carve_out_breaches), len(report.carved_recordings),
+        len(report.failed_calendars),
         rsvp["accepted"], rsvp["accepted_lex"], rsvp["errors"],
         report.meet_audit_state or "none", report.meet_events_read,
     )
@@ -142,9 +144,24 @@ def main() -> int:
         "unmatched": len(report.unmatched_transcripts),
         "skipped": len(report.skipped),
         # The most serious finding this auditor can produce: a recording exists of
-        # a meeting a carve-out excluded. Counted here so a breach is durable even
-        # if the Slack post fails.
+        # a meeting a NO-RECORD carve-out excluded. Counted here so a breach is
+        # durable even if the Slack post fails. Since Code #15 S4 (cq-5f44ce934aeb)
+        # this counts no-record carve-outs ONLY (title marker, no-record title /
+        # address / domain); rows before that also counted recordings of meetings
+        # vetoed for a qualification reason (a decline, no link), which are now
+        # `carved_recorded`.
         "carve_out_breaches": len(report.carve_out_breaches),
+        # Ids only, aligned with the count above: the no-record copy's event id
+        # ("" for a transcript-title breach with no cal_id) and the Fireflies
+        # transcript id -- what finding and deleting the recording needs. The
+        # REASONS stay out of the ledger: a no-record-email reason carries an
+        # address (D-082).
+        "carve_out_breach_event_ids": list(report.carve_out_breach_event_ids),
+        "carve_out_breach_transcript_ids": list(report.carve_out_breach_transcript_ids),
+        # Recorded though vetoed for a qualification reason: information, not a
+        # breach. Count + the carved representative's event id only.
+        "carved_recorded": len(report.carved_recordings),
+        "carved_recorded_event_ids": list(report.carved_recording_event_ids),
         "failed_calendars": [e for e, _ in report.failed_calendars],
         "transcript_error": report.transcript_error,
         # Event ids only -- never titles. A LEX title must not reach an at-rest
@@ -199,9 +216,14 @@ def main() -> int:
     # whose only findings are five re-bucketed group-calendar blocks (the 9/7
     # Labor-Day shape) would otherwise read outputs=0 and trip the very
     # FIRED-BUT-WROTE-NOTHING alarm this count exists to make honest.
+    #
+    # Informational "recorded though skipped" lines (Code #15 S4) count for the
+    # same reason: they are reported lines, and before S4 they were breaches, so
+    # dropping them here would lower `outputs` on the very days they appear.
     findings_count = (
         len(report.misses) + len(report.unconvened) + len(report.duplicates)
         + len(report.carve_out_breaches) + len(report.unmatched_transcripts)
+        + len(report.carved_recordings)
     )
     run_marker.write("cowork-cora-meeting-capture-audit",
                      script="run_meeting_capture_audit.py", ok=True,
