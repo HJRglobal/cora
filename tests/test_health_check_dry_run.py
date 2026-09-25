@@ -306,3 +306,30 @@ def test_main_dry_run_holds_at_the_channel_archive_write_sites(monkeypatch, tmp_
     assert changed is demotes                   # the real run reconciles; the dry run cannot
     if not demotes:
         assert not ca_policy.demotion_path().exists()
+
+
+# ── Code #16 C2: the travel shortlist lane's monitor under main(--dry-run) ──────
+# check_travel_shortlist is READ-ONLY (it is deliberately NOT a _WRITE_SITE_CHECKS
+# member: it takes no dry_run because it has no write site). This pins that main()
+# calls it and that a --dry-run run over a store holding a refusal leaves the store
+# byte-identical and adds nothing beside it.
+def test_code16_c2_travel_check_is_called_by_main_and_writes_nothing_under_dry_run(
+        monkeypatch, tmp_path, capfd):
+    import nightly_health_check as hc
+    from cora import travel_shortlist as tsl
+    tsl.append_event("asked", channel="C0C145H84JZ", root_ts="1.1")
+    tsl.append_event("belt_refused", channel="C0C145H84JZ", root_ts="1.1", reason="content")
+    store = tsl.threads_path()
+    before = (store.read_bytes(), sorted(p.name for p in store.parent.iterdir() if "travel" in p.name))
+    calls: dict[str, dict] = {}
+    real = hc.check_travel_shortlist
+    _stub_every_check(hc, monkeypatch, calls)
+    seen: list = []
+    monkeypatch.setattr(hc, "check_travel_shortlist", lambda *a, **k: seen.append(real(*a, **k)) or seen[-1])
+    monkeypatch.setattr(hc, "_LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(hc, "_post_to_slack", lambda *a, **k: None)
+    monkeypatch.setattr(hc.logging, "basicConfig", lambda **_k: None)
+    monkeypatch.setattr(sys, "argv", ["nightly_health_check.py", "--dry-run"])
+    hc.main()
+    assert len(seen) == 1 and seen[0].status == "warn"
+    assert (store.read_bytes(), sorted(p.name for p in store.parent.iterdir() if "travel" in p.name)) == before

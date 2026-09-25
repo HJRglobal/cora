@@ -945,6 +945,53 @@ def check_channel_archive(*, dry_run: bool = False, client_factory=None,
     return CheckResult(name, "warn", f"{head} | {shown}{tail} | {cov}")
 
 
+# ── Code #16 C2: the travel shortlist lane's failing-capable monitor ─────────
+def check_travel_shortlist(now: datetime | None = None) -> CheckResult:
+    """Code #16 C2 (ladder row travel-shortlist, T0): READ the lane's thread store
+    (data/state/travel-shortlist-threads.jsonl -- structured fields + events, never
+    raw text) over the last 7 days. WARN on ANY belt_refused event (the allowlist
+    belt refused a request that carried a token outside the parsed fields -- the
+    lane's own egress regression, caught before anything was searched), on a
+    search_failed share above 50% of >= 4 asks, on unreadable store lines (counts
+    may be incomplete), and when the store exists but cannot be read (a blind read
+    never reads clean). An absent store is INFO (no asks yet). Read-only; writes
+    nothing (holds under --dry-run by construction). ONE CheckResult.
+    """
+    name = "Travel shortlist lane"
+    try:
+        sys.path.insert(0, str(_REPO_ROOT / "src"))
+        from cora import travel_shortlist as tsl  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(name, "warn", f"travel_shortlist module unavailable: {exc}")
+    try:
+        s = tsl.threads_summary(now=now)
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(name, "warn", f"thread store read failed ({type(exc).__name__}) "
+                                         "-- the lane's monitor is blind")
+    if not s.get("available"):
+        return CheckResult(name, "warn", f"thread store UNREADABLE ({s.get('reason')}) -- the "
+                                         "lane's monitor is blind; a belt refusal would be invisible")
+    if not s.get("exists"):
+        return CheckResult(name, "ok", "INFO: no lodging asks yet (thread store absent)")
+    asks, posted = int(s.get("asks") or 0), int(s.get("posted") or 0)
+    failed, refused = int(s.get("search_failed") or 0), int(s.get("belt_refused") or 0)
+    post_failed, bad = int(s.get("post_failed") or 0), int(s.get("bad_lines") or 0)
+    detail = (f"7d: {asks} ask(s), {posted} card(s) posted, {failed} search failure(s), "
+              f"{refused} belt refusal(s)" + (f", {post_failed} card post failure(s)" if post_failed else ""))
+    problems: list[str] = []
+    if refused:
+        problems.append(f"{refused} belt refusal(s) -- a lane request carried a token outside the "
+                        "parsed-field allowlist and was refused (nothing searched); find the path "
+                        "that built it before the next ask")
+    if asks >= 4 and failed * 2 > asks:
+        problems.append(f"search failures {failed}/{asks} (> 50%) -- the lane is mostly failing")
+    if bad:
+        problems.append(f"{bad} unreadable store line(s) -- counts may be incomplete")
+    if problems:
+        return CheckResult(name, "warn", detail + " | " + "; ".join(problems))
+    return CheckResult(name, "ok", detail)
+
+
 def check_qbo_monitor(now: datetime | None = None) -> CheckResult:
     """The QBO token monitor must keep FIRING daily -- if it silently stops, a
     realm could expire unnoticed and finance answers fail silently. WARN if it's
@@ -2985,6 +3032,10 @@ def main() -> int:
 
     log.info("Reading the egress-rail observe week (sentinel + phantom-write-claim + phantom-capability-claim)...")
     all_results.append(check_egress_rails())
+
+    # Code #16 C2: the travel shortlist lane's failing-capable monitor (read-only).
+    log.info("Reading the travel shortlist lane's thread store (Code #16 C2)...")
+    all_results.append(check_travel_shortlist())
 
     run_time = time.time() - t0
 
