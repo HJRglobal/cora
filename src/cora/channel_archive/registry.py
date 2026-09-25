@@ -140,6 +140,10 @@ def parse_registry(text: str, *, last_good_count: int = 0) -> Registry:
 #: registry-ops#1): a blind scan persists no count, so without it the floor never moves.
 REBASELINE_CMD = (r".venv\Scripts\python.exe scripts\run_channel_archive_proposal.py "
                   "--rebaseline-registry --apply")
+#: What clears a blind card once its cause is fixed (or the registry re-baselined): a
+#: fresh sighted scan (D-051 r2 c1-monitor#4).
+FRESH_SCAN_HINT = ("a fresh scan clears it: ask 'archive the dead channels' in the DM, or run "
+                   r"`.venv\Scripts\python.exe scripts\run_channel_archive_proposal.py --apply`")
 # Bounded digit runs around a literal: linear on any input (timed on 40k whitespace).
 _FLOOR_RE = re.compile(r"(\d{1,7}) ids < floor (\d{1,7})")
 

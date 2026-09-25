@@ -195,7 +195,8 @@ def _rebaseline(now: float, *, apply: bool) -> int:
                            by=deliver.HARRISON_ID, ts=now):
         _print("NOT re-baselined: the proposals store write failed.")
         return 1
-    _print(f"Registry RE-BASELINED: last good count {prev or 'none'} -> {r.count} (floor now {new_floor}).")
+    _print(f"Registry RE-BASELINED: last good count {prev or 'none'} -> {r.count} (floor now {new_floor}). "
+           f"The blind card stays the latest until a sighted scan is staged -- {reg.FRESH_SCAN_HINT}.")
     return 0
 
 

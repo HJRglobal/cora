@@ -237,7 +237,10 @@ any T0 card.**
   `.\.venv\Scripts\python.exe scripts\run_channel_archive_proposal.py --rebaseline-registry`
   shows the counts, and the same with `--apply` records the registry's current count as
   the new last good count (a `registry_rebaselined` store event; only a structurally
-  complete registry of >= 100 ids is accepted; no marker, no Slack call).
+  complete registry of >= 100 ids is accepted; no marker, no Slack call). Then run a
+  fresh scan (ask 'archive the dead channels' in the DM, or `--apply`): the blind card
+  stays the latest -- and the WARN stays up, naming that step -- until a sighted scan is
+  staged. Below the 100-id minimum no re-baseline is offered (it would be refused).
 - **T1 (after promotion ONLY):** a `promoted` event on the registry row (a Code/Cowork
   commit) + `CORA_CHANNEL_ARCHIVE=act` + one restart. Then a tap posts a one-line
   notice in the channel, archives it on a no-retry client, reads it back, and ledgers
@@ -254,15 +257,19 @@ any T0 card.**
   (lists every event) and the same with `--apply` (appends an `acknowledged` ledger row
   for EACH listed archive event, then deletes the file -- none of them re-demotes).
   An attempt with no settled outcome is settled from Slack's own history (the first
-  archive message after the intent), never from "open now": Cora's -> archived (and a
-  reopen is recorded as `unarchived_seen`), a person's -> already archived, none ->
-  failed, channel gone -> failed (channel gone); an unreadable history records nothing.
+  archive message in [intent - 2 min, intent + 1 h] -- the host clock may run ahead of
+  Slack's), never from "open now": Cora's -> archived (and a reopen is recorded as
+  `unarchived_seen`), a person's -> already archived, none -> failed, channel gone ->
+  failed (channel gone); an unreadable or malformed history records nothing. A channel
+  the ledger shows archived that is gone from Slack's list (deleted, or access lost) is
+  reported once (`gone_seen`), not every night.
   A channel the lane archived that is open again is section B `unarchived_before`
   (date unknown until the monitor finds the unarchive), never section A.
   A scan that started and never staged a card WARNs after 1 h; a crash the bot's scan
   pool or the script recorded (`scan_failed` in the proposals store -- the crash was
-  already said where the scan was asked) settles it, and a kill that recorded nothing
-  drops after 7 days. A monthly-run crash is `month_undelivered` + exit 1.
+  already said where the scan was asked) settles it, so does any LATER scan that staged
+  a card (a kill records nothing; re-asking is the fix), and otherwise it drops after 7
+  days. A monthly-run crash is `month_undelivered` + exit 1.
 - **Dry-run (reads Slack, writes nothing; prints the candidate IDS only + the archive
   scopes' state):** `.\.venv\Scripts\python.exe scripts\run_channel_archive_proposal.py`
 - **Register (elevated, AFTER the restart that loads the lane -- the card's buttons are

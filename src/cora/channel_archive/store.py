@@ -11,8 +11,8 @@ only adds a line, and the fold refuses to move a row out of a terminal state.
 THE ARCHIVE LEDGER (``logs/channel-archive-ledger.jsonl``) holds ONLY archive
 attempts: an ``intent`` row written, flushed and fsynced BEFORE any Slack write --
 ``append_ledger`` returns False when it did not land and the tap then REFUSES to act
--- and an ``outcome`` row after (fail-soft). The monitor adds ``unarchived_seen`` and
-reconciled outcomes; Harrison's ``--clear-demotion`` adds ``acknowledged``.
+-- and an ``outcome`` row after (fail-soft). The monitor adds ``unarchived_seen``,
+``gone_seen`` and reconciled outcomes; Harrison's ``--clear-demotion`` adds ``acknowledged``.
 
 CLAIMS are keyed by CHANNEL across proposals (A13): a ``claimed`` event carries the
 channel id, and the fold expires it (reader-side, lesson 26): claimed for more than

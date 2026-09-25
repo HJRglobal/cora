@@ -23,7 +23,9 @@ FAIL CLASSES
       windows (``_first_after``; newest-first paging missed an unarchive buried under
       1,000+ later messages): a person's unarchive -> an ``unarchived_seen`` row (the
       channel leaves the examined set); a BOT unarchive -> WARN (Cora has no unarchive
-      path); none found -> WARN.
+      path); none found -> WARN. A ledger-archived channel GONE from the list (deleted,
+      or Cora lost access) is said once and recorded as a ``gone_seen`` row, then skipped
+      while it stays gone (nothing can ever settle it -- lesson 52).
       A ledger ``failed`` outcome on an attempt whose archive Slack shows Cora made
       (an indeterminate error that landed) is reconciled ``archived`` once + WARN.
   (3) UNRESOLVED -- an intent older than 1 h with no outcome, or an ``unknown``
@@ -43,12 +45,14 @@ FAIL CLASSES
 Plus: an archived channel (in window) whose newest 20 messages hold no archive-type
 message -> "cannot attribute" WARN; a scan_started with no staged card after 1 h ->
 WARN, settled by a ``scan_failed`` the crash path recorded (the bot's scan pool and the
-monthly script; the crash was already said where the scan was asked) and dropped after
-7 days when nothing was recorded (a killed process) -- an alarm the right action cannot
+monthly script; the crash was already said where the scan was asked) or by ANY later
+scan that staged a card (a killed process records nothing; the re-ask that worked is the
+right action), and dropped after 7 days otherwise -- an alarm the right action cannot
 clear gets ignored (lesson 52); the LATEST staged proposal was blind -> "LATEST SCAN
 BLIND" WARN until a sighted scan is staged (with the re-baseline command when the
-registry merely shrank). The OK line carries coverage counts (lesson 63: a zero count
-certifies nothing without positive coverage).
+registry merely shrank, and the fresh-scan step instead once a newer re-baseline is
+recorded). The OK line carries coverage counts (lesson 63: a zero count certifies
+nothing without positive coverage).
 """
 from __future__ import annotations
 
@@ -258,6 +262,7 @@ def reconcile(client: Any, *, now: float | None = None, dry_run: bool = False,
     outcomes: dict[tuple, list[dict]] = {}
     acked: set[tuple] = set()
     unarch_seen: dict[str, float] = {}
+    gone_seen: dict[str, float] = {}
     for r in ledger:
         ev = r.get("event")
         cid = str(r.get("channel_id") or "")
@@ -270,6 +275,8 @@ def reconcile(client: Any, *, now: float | None = None, dry_run: bool = False,
         elif ev == "unarchived_seen":
             unarch_seen[cid] = max(unarch_seen.get(cid, 0.0),
                                    float(r.get("unarchive_ts") or r.get("ts") or 0))
+        elif ev == "gone_seen":
+            gone_seen[cid] = max(gone_seen.get(cid, 0.0), float(r.get("ts") or 0))
     ledger_archived: dict[str, float] = {}
     for (pid, cid), rows in outcomes.items():
         for r in rows:
@@ -416,7 +423,19 @@ def reconcile(client: Any, *, now: float | None = None, dry_run: bool = False,
             continue
         c = by_id.get(cid)
         if c is None:
-            findings.append(f"MISMATCH: {cid} has a ledger archive but is not in Slack's list")
+            # deleted, or Cora lost access: nothing more can ever be checked, so it is
+            # said ONCE (a gone_seen row newer than its latest lane archive), never a
+            # WARN that no action can clear (D-051 r2 c1-monitor#2, lesson 52)
+            if gone_seen.get(cid, 0.0) >= arch_ts:
+                continue
+            what = (f"{cid} has a ledger archive but is no longer in Slack's list (deleted, or Cora "
+                    "lost access), so nothing more can be checked")
+            if dry_run:
+                findings.append(f"RECONCILED: {what}; would be recorded (dry run: nothing written)")
+            elif st.append_ledger("gone_seen", channel_id=cid, ts=now):
+                findings.append(f"RECONCILED: {what}; recorded once")
+            else:
+                findings.append(f"MISMATCH: {what}; recording that FAILED (the next nightly retries)")
             continue
         if c.get("is_archived"):
             continue
@@ -502,18 +521,25 @@ def reconcile(client: Any, *, now: float | None = None, dry_run: bool = False,
             findings.append(f"RECONCILED: {cid} intent {pid} never archived by this attempt ({why}) -- "
                             f"{tail}; the channel may still carry the notice")
 
-    # -- scan stall: settled by a staged card OR a recorded crash (scan_failed, already
-    # DM'd where the scan was asked); a kill that recorded nothing drops after 7 days --
+    # -- scan stall: settled by its staged card, a recorded crash (scan_failed, already
+    # DM'd where the scan was asked), or ANY LATER scan that staged a card (a killed scan
+    # records nothing; the re-ask that worked is the right action -- D-051 r2
+    # c1-monitor#3); an unsettled stall drops after 7 days --
     settled = {str(e.get("scan_id")) for e in events
                if e.get("event") in ("staged", "scan_failed") and e.get("scan_id")}
+    last_staged = max((float(e.get("ts") or 0) for e in events if e.get("event") == "staged"),
+                      default=0.0)
     for e in events:
         if e.get("event") != "scan_started" or str(e.get("scan_id") or "") in settled:
             continue
-        age = now - float(e.get("ts") or 0)
+        started = float(e.get("ts") or 0)
+        if last_staged > started:
+            continue
+        age = now - started
         if SCAN_STALL_S < age <= SCAN_STALL_MAX_S:
             findings.append(f"a scan started {e.get('at') or '?'} and never staged a card (no crash "
-                            f"was recorded; this finding drops {SCAN_STALL_MAX_S // st.DAY_S:.0f} days "
-                            "after the start)")
+                            "was recorded and no later scan has staged; this finding drops "
+                            f"{SCAN_STALL_MAX_S // st.DAY_S:.0f} days after the start)")
 
     # -- the latest staged proposal was BLIND: a lane that can only propose nothing must
     # not read green until a sighted scan is staged (D-051 r1 registry-ops#1) --
@@ -522,6 +548,18 @@ def reconcile(client: Any, *, now: float | None = None, dry_run: bool = False,
         detail = str(last.get("blind_detail") or "")
         shrink = reg.shrink_copy(detail) if last.get("blind") == "registry_unreadable" else None
         hint = f" {shrink[0]}. {shrink[1]}".rstrip() if shrink is not None else ""
+        # the re-baseline the hint asks for is DONE when a newer one is recorded: never
+        # repeat the stale floor and the same command, name what clears it (r2 c1-monitor#4)
+        rebased = next((e for e in reversed(events) if e.get("event") == st.REBASELINE_EVENT), None)
+        if (shrink is not None and rebased is not None
+                and float(rebased.get("ts") or 0) > float(last.get("ts") or 0)):
+            try:
+                rb_n = int(rebased.get("registry_count") or 0)
+            except (TypeError, ValueError):
+                rb_n = 0
+            detail = "the channel registry had shrunk below its floor"
+            hint = (f" It was re-baselined {rebased.get('at') or '?'} (floor now "
+                    f"{reg.registry_floor(rb_n)}); {reg.FRESH_SCAN_HINT}.")
         findings.append(f"LATEST SCAN BLIND: the dead-channel scan staged {last.get('at') or '?'} "
                         f"({last.get('trigger') or '?'}) proposed nothing -- {last.get('blind')}"
                         f"{': ' + detail if detail else ''}.{hint}")

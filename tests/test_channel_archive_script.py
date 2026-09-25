@@ -257,7 +257,10 @@ class TestRegistryRebaseline:
         assert f"{n} ids" in out and f"{n + 13}" in out and "--apply" in out
         assert len(st.read_events()) == before                # a dry run writes nothing
         assert SCRIPT.main(["--rebaseline-registry", "--apply"], now=az(2026, 10, 5)) == 0
-        assert "RE-BASELINED" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "RE-BASELINED" in out
+        # D-051 r2 c1-monitor#4: the success line names the step that clears the blind card
+        assert "fresh scan" in out and "archive the dead channels" in out
         ev = st.read_events()[-1]
         assert ev["event"] == "registry_rebaselined" and ev["registry_count"] == n
         assert ev["previous"] == n + 13 and ev["by"] == HARRISON

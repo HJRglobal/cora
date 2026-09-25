@@ -622,6 +622,115 @@ class TestUnarchiveSearchWalksForward:
         assert len(reads) <= mon.FORWARD_SEARCH_CALLS
 
 
+class TestGoneChannelSettlesOnceD051R2:
+    """D-051 r2 c1-monitor#2: a lane-archived channel an owner later deleted (or Cora lost
+    access to) is gone from Slack's list. Nothing can ever settle it, so the finding is
+    recorded ONCE (a ``gone_seen`` ledger row) instead of pinning the lane's health row at
+    WARN forever (lesson 52) -- and a channel that comes back into the list is examined
+    again."""
+
+    def _gone(self):
+        return [r for r in st.read_ledger() if r["event"] == "gone_seen"]
+
+    def test_a_ledger_archived_channel_gone_from_the_list_is_recorded_once(self):
+        outcome(ARCH, NOW - 5 * DAY, "archived")
+        out = run(MonSlack())
+        line = next(f for f in out["findings"] if ARCH in f)
+        assert line.startswith("RECONCILED") and "no longer in Slack's list" in line, out["findings"]
+        assert [r["channel_id"] for r in self._gone()] == [ARCH]
+        assert run(MonSlack())["status"] == "ok"
+        later = mon.reconcile(MonSlack(), now=NOW + 200 * DAY, sleep=lambda s: None)
+        assert later["status"] == "ok", later["findings"]
+        assert len(self._gone()) == 1
+
+    def test_dry_run_says_would_record_and_writes_nothing(self):
+        outcome(ARCH, NOW - 5 * DAY, "archived")
+        out = run(MonSlack(), dry_run=True)
+        line = next(f for f in out["findings"] if ARCH in f)
+        assert "would be recorded" in line and "dry run" in line and self._gone() == []
+
+    def test_a_failed_record_says_so_and_the_next_nightly_retries(self, monkeypatch):
+        outcome(ARCH, NOW - 5 * DAY, "archived")
+        real = st.append_ledger
+        monkeypatch.setattr(st, "append_ledger",
+                            lambda event, **kw: False if event == "gone_seen" else real(event, **kw))
+        out = run(MonSlack())
+        assert any(ARCH in f and "FAILED" in f for f in out["findings"]), out["findings"]
+        monkeypatch.setattr(st, "append_ledger", real)
+        assert any(ARCH in f and f.startswith("RECONCILED") for f in run(MonSlack())["findings"])
+
+    def test_a_channel_back_in_the_list_and_open_is_followed_again(self):
+        outcome(ARCH, NOW - 5 * DAY, "archived")
+        st.append_ledger("gone_seen", channel_id=ARCH, ts=NOW - 4 * DAY)
+        fake = MonSlack(archived={ARCH: {"is_archived": False}},
+                        unarchives={ARCH: [{"ts": f"{NOW - 2 * DAY:.6f}", "subtype": "channel_unarchive",
+                                            "user": PERSON}]})
+        out = run(fake)
+        assert out["status"] == "ok", out["findings"]
+        assert [r["by"] for r in st.read_ledger() if r["event"] == "unarchived_seen"] == [PERSON]
+
+    def test_a_newer_lane_archive_after_the_gone_row_is_checked_again(self):
+        outcome(ARCH, NOW - 30 * DAY, "archived")
+        st.append_ledger("gone_seen", channel_id=ARCH, ts=NOW - 20 * DAY)
+        outcome(ARCH, NOW - 5 * DAY, "archived", pid="chanarch-bbbbbbbbbbbb")
+        out = run(MonSlack())
+        assert any(ARCH in f and f.startswith("RECONCILED") for f in out["findings"]), out["findings"]
+
+
+class TestScanStallSettlesOnALaterStagedScanD051R2:
+    """D-051 r2 c1-monitor#3: a scan killed by a restart records nothing; once a LATER
+    scan stages a card the lane has shown it works, so the old stall stops WARNing at
+    once (the re-ask is the right action -- lesson 52)."""
+
+    def test_a_killed_scan_then_a_later_staged_scan_reads_ok(self):
+        st.append_event("scan_started", scan_id="killed0001", trigger="ask", ts=NOW - 2 * DAY)
+        st.append_event("scan_started", scan_id="good000002", trigger="ask", ts=NOW - 2 * DAY + 900)
+        st.append_event("staged", proposal_id="chanarch-aaaaaaaaaaaa", scan_id="good000002",
+                        ts=NOW - 2 * DAY + 900, rows=[])
+        out = run(MonSlack())
+        assert out["status"] == "ok", out["findings"]
+
+    def test_a_later_scan_that_never_staged_settles_nothing(self):
+        st.append_event("scan_started", scan_id="killed0001", trigger="ask", ts=NOW - 2 * DAY)
+        st.append_event("scan_started", scan_id="killed0002", trigger="ask", ts=NOW - DAY)
+        out = run(MonSlack())
+        assert sum("never staged a card" in f for f in out["findings"]) == 2
+
+    def test_a_card_staged_before_the_stall_does_not_settle_it(self):
+        st.append_event("staged", proposal_id="chanarch-aaaaaaaaaaaa", scan_id="old0000001",
+                        ts=NOW - 3 * DAY, rows=[])
+        st.append_event("scan_started", scan_id="killed0001", trigger="ask", ts=NOW - 2 * DAY)
+        assert any("never staged a card" in f for f in run(MonSlack())["findings"])
+
+
+class TestBlindWarnAfterARebaselineD051R2:
+    """D-051 r2 c1-monitor#4: after Harrison runs the re-baseline the WARN asked for, the
+    LATEST SCAN BLIND line stops repeating the stale floor and the same command, and
+    names the step that clears it: a fresh scan."""
+
+    def _blind(self, ts):
+        st.append_event("staged", proposal_id="chanarch-bbbbbbbbbbbb", trigger="monthly",
+                        blind="registry_unreadable",
+                        blind_detail="registry_unreadable: 125 ids < floor 126", rows=[], ts=ts)
+
+    def test_a_newer_rebaseline_drops_the_stale_floor_and_names_the_fresh_scan(self):
+        self._blind(NOW - DAY)
+        st.append_event(st.REBASELINE_EVENT, registry_count=125, previous=140, by=HARRISON,
+                        ts=NOW - 3600)
+        out = run(MonSlack())
+        line = next(f for f in out["findings"] if f.startswith("LATEST SCAN BLIND"))
+        assert "floor 126" not in line and "--rebaseline-registry" not in line, line
+        assert "re-baselined" in line and "floor now 113" in line and "fresh scan" in line
+        assert "archive the dead channels" in line and out["status"] == "warn"
+
+    def test_a_rebaseline_older_than_the_blind_scan_keeps_the_hint(self):
+        st.append_event(st.REBASELINE_EVENT, registry_count=140, previous=160, by=HARRISON,
+                        ts=NOW - 3 * DAY)
+        self._blind(NOW - DAY)
+        line = next(f for f in run(MonSlack())["findings"] if f.startswith("LATEST SCAN BLIND"))
+        assert "floor 126" in line and "--rebaseline-registry --apply" in line
+
+
 class TestLatestProposalBlind:
     """D-051 r1 registry-ops#1: a lane whose latest staged proposal was BLIND proposes
     nothing -- it must not read green until a sighted scan is staged."""
