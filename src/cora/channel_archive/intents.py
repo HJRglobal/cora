@@ -36,6 +36,8 @@ import re
 import time
 from typing import Any
 
+from .deliver import MISSING_PARTS_LEAD
+
 MAX_CHARS = 300
 FOLLOWUP_WINDOW_S = 30 * 60
 #: A card ts is SLACK's clock and ``now`` is the host's (and a .6f stamp rounds up
@@ -258,13 +260,15 @@ ATTEMPT_REPLY = ("I only run the full dead-channel scan — nothing was archived
                  "the dead channels' here; exceptions are the Keep buttons.")
 CATCHUP_DRAFT = "This was a dead-channel request — ask again live; nothing was archived."
 EVAL_NOOP = ""
-#: how every line this lane posts in the DM begins (the card's text= included):
+#: how every line this lane posts in the DM begins (the card's text= included, and
+#: deliver's partial-delivery line -- its own constant, D-051 r2 c1-intents-copy#2):
 #: a newer bot message that is one of THESE does not take a bare "yes" from the card
 _LANE_REPLY_PREFIXES = ("That reply archived nothing", "Typed replies don't act",
                         "Dead-channel lane:", "Dead-channel proposal", "I only run the full dead-channel",
                         "Scanning the channels I belong to", "Scanning now — the proposal card",
                         "A scan is already running", "The dead-channel scan stopped",
-                        "The dead-channel lane is switched off", "This was a dead-channel request")
+                        "The dead-channel lane is switched off", "This was a dead-channel request",
+                        MISSING_PARTS_LEAD)
 
 
 def is_lane_reply(text: str) -> bool:

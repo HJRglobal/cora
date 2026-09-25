@@ -166,12 +166,17 @@ def deliver_proposal(*, trigger: str, now: float | None = None,
         st.release_scan_lock(token)
 
 
+#: How the missing-parts DM line begins. intents.is_lane_reply imports it (D-051 r2
+#: c1-intents-copy#2): a lane line newer than the card never takes a bare "yes" from it.
+MISSING_PARTS_LEAD = "The dead-channel card is incomplete"
+
+
 def _say_missing_parts(write: Any, dm: str, posted: int, total: int, reason: str) -> None:
     missing = list(range(posted + 1, total + 1))
     names = (f"part {missing[0]}" if len(missing) == 1
              else "parts " + ", ".join(str(n) for n in missing[:-1]) + f" and {missing[-1]}")
     code = reason.split(":", 1)[1] if ":" in reason else reason
-    text = (f"The dead-channel card is incomplete: {names} of {total} did not post ({code}), so "
+    text = (f"{MISSING_PARTS_LEAD}: {names} of {total} did not post ({code}), so "
             "those rows can't be acted on from this card. Ask 'archive the dead channels' for "
             "a fresh scan — nothing was archived.")
     try:

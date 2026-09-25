@@ -728,3 +728,56 @@ class TestCatchup:
         monkeypatch.setattr(mmc.user_access, "check_access", lambda *a, **k: None)
         out = mmc.generate_draft(MagicMock(), _cand(mmc, "archive the dead channels", PERSON))
         assert out.draft_text == "a model draft"
+
+
+# ── D-051 round 2 (Code #16) ────────────────────────────────────────────────
+PID2 = "chanarch-111122223333"
+
+
+def _rows(*cids):
+    return [{"cid": c, "section": "A", "tier": "T0", "name": f"fx-{c.lower()}",
+             "name_fp": reg.name_fp(f"fx-{c.lower()}"), "is_private": False, "last_person_days": 200,
+             "history_complete": True, "keep_count": 0, "lex": False} for c in cids]
+
+
+def _partial_card(pid, *, created, page1_ts, n_pages=2):
+    """A card whose page 1 posted and whose later pages did not (c1-state-machine#6)."""
+    st.append_event("staged", proposal_id=pid, ts=created, expires_ts=created + 14 * DAY,
+                    rows=_rows("C0PARTAAA1", "C0PARTAAA2"), counts={}, n_pages=n_pages)
+    st.append_event("delivered", proposal_id=pid, page=1, dm_channel="DHARRISON1",
+                    message_ts=page1_ts, rendered_cids=["C0PARTAAA1"], buttons=True, ts=created)
+    st.append_event("delivery_failed", proposal_id=pid, page=2, error="post_failed:ratelimited", ts=created)
+
+
+def _real_missing_parts_line():
+    seen: list[dict] = []
+    writer = MagicMock()
+    writer.chat_postMessage.side_effect = lambda **kw: seen.append(kw) or {"ok": True}
+    deliver._say_missing_parts(writer, "DHARRISON1", 1, 2, "post_failed:ratelimited")
+    return seen[0]["text"]
+
+
+@pytest.fixture
+def quiet_dm(dm, monkeypatch):
+    """No live gap ask / knowledge-check cycle: a bare 'yes' can only be the card's."""
+    monkeypatch.setattr(app_module.gap_autofill, "has_live_ask", lambda uid: False)
+    monkeypatch.setattr(app_module.knowledge_check, "has_live_cycle", lambda uid: False)
+    return dm
+
+
+class TestPartialCardR2:
+    """r2:c1-intents-copy#2 / c1-state-machine#1 / harness-isolation#1 / integration#1:
+    after a partly delivered card, deliver's own 'card is incomplete' line is the
+    newest bot message in the DM -- it is a LANE line, so a bare 'yes' is still the
+    card's and never reaches the model."""
+
+    def test_a_bare_yes_after_the_missing_parts_line_gets_the_code_reply(self, quiet_dm):
+        now = time.time()
+        _partial_card(PID2, created=now - 10, page1_ts=f"{now - 5:.6f}")
+        client = MagicMock()
+        client.conversations_history.return_value = _history(
+            {"ts": f"{now - 4:.6f}", "bot_id": "BCORA", "user": BOT, "text": _real_missing_parts_line()})
+        before = quiet_dm.qa.call_count
+        app_module.handle_message_event(_event("yes"), client)
+        assert _texts(client) == [intents.followup_reply()]
+        assert quiet_dm.qa.call_count == before and not quiet_dm.capture.called

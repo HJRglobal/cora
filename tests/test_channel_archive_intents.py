@@ -387,3 +387,33 @@ class TestClockSkew:
 
     def test_a_card_far_in_the_future_is_not_live(self):
         assert not it.looks_like_live_followup("yes", card_ts=NOW + 10 * 60, now=NOW)
+
+
+# ── D-051 round 2 (Code #16) ────────────────────────────────────────────────
+def _missing_parts_line(posted: int, total: int, reason: str = "post_failed:ratelimited") -> str:
+    """The REAL deliver._say_missing_parts text, captured from a fake writer."""
+    from cora.channel_archive import deliver
+    seen: list[dict] = []
+
+    class _Writer:
+        def chat_postMessage(self, **kw):
+            seen.append(kw)
+            return {"ok": True, "ts": "1790000001.000100"}
+    deliver._say_missing_parts(_Writer(), "DH", posted, total, reason)
+    assert len(seen) == 1 and not seen[0].get("thread_ts")      # a TOP-LEVEL DM line
+    return seen[0]["text"]
+
+
+class TestLaneRepliesR2:
+    """r2:c1-intents-copy#2 / c1-state-machine#1 / harness-isolation#1 / integration#1:
+    the partial-delivery line deliver posts is one of the lane's own DM lines, so a
+    newer copy of it never takes a bare 'yes' from the card it reports on."""
+
+    @pytest.mark.parametrize("posted,total", [(1, 2), (1, 4), (2, 3)])
+    def test_the_missing_parts_line_is_a_lane_line(self, posted, total):
+        assert it.is_lane_reply(_missing_parts_line(posted, total))
+
+    def test_the_prefix_is_delivers_own_constant(self):
+        from cora.channel_archive import deliver
+        assert deliver.MISSING_PARTS_LEAD in it._LANE_REPLY_PREFIXES
+        assert _missing_parts_line(1, 2).startswith(deliver.MISSING_PARTS_LEAD)
