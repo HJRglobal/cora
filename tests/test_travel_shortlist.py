@@ -818,13 +818,14 @@ class TestCopyPins:
 class TestThreadStore:
     def test_append_read_and_lane_thread(self):
         c = _constraints()
-        assert not ts.is_lane_thread(TRAVEL_CHANNEL, "1790000000.000100")
+        assert not ts.is_lane_thread(TRAVEL_CHANNEL, "1790000000.000100", now=NOW)
         assert ts.append_event("asked", channel=TRAVEL_CHANNEL, root_ts="1790000000.000100",
                                constraints=c.to_record(), now=NOW)
-        assert ts.is_lane_thread(TRAVEL_CHANNEL, "1790000000.000100")
-        assert not ts.is_lane_thread(TRAVEL_CHANNEL, "1790000000.000200")
-        assert not ts.is_lane_thread("C0OTHER", "1790000000.000100")
-        assert ts.latest_constraints(TRAVEL_CHANNEL, "1790000000.000100") == c
+        # the 48 h lane-thread bound (D-051 r1) is read against an injected clock here
+        assert ts.is_lane_thread(TRAVEL_CHANNEL, "1790000000.000100", now=NOW)
+        assert not ts.is_lane_thread(TRAVEL_CHANNEL, "1790000000.000200", now=NOW)
+        assert not ts.is_lane_thread("C0OTHER", "1790000000.000100", now=NOW)
+        assert ts.latest_constraints(TRAVEL_CHANNEL, "1790000000.000100", now=NOW) == c
         raw = ts.threads_path().read_text(encoding="utf-8")
         assert "scottsdale" in raw and "Jordan" not in raw
 
@@ -832,7 +833,7 @@ class TestThreadStore:
         rec = _constraints().to_record()
         rec["areas"] = ["Jordan Riverstone's house"]
         ts.append_event("asked", channel=TRAVEL_CHANNEL, root_ts="1.1", constraints=rec, now=NOW)
-        assert ts.latest_constraints(TRAVEL_CHANNEL, "1.1") is None
+        assert ts.latest_constraints(TRAVEL_CHANNEL, "1.1", now=NOW) is None
         rec2 = _constraints().to_record()
         rec2["party_size"] = "4"
         assert ts.TravelConstraints.from_record(rec2) is None
@@ -936,8 +937,9 @@ class TestRouteTurn:
 
     def test_lane_thread_follow_ups(self, monkeypatch):
         root = "1790000000.000900"
+        # written at the REAL clock: route_turn reads the 48 h lane-thread bound at now
         ts.append_event("asked", channel="D0HARRISON", root_ts=root,
-                        constraints=_constraints().to_record(), now=NOW)
+                        constraints=_constraints().to_record())
         kw = dict(thread_root_ts=root, lane_thread=True)
         r = _route("same dates but 6 people", **kw)
         assert r.kind == "search" and r.followup and r.constraints.party_size == 6
@@ -960,7 +962,7 @@ class TestRouteTurn:
     def test_the_named_loyalty_follow_up_re_runs_on_fields_only(self):
         root = "1790000000.000901"
         ts.append_event("asked", channel=TRAVEL_CHANNEL, root_ts=root,
-                        constraints=_constraints(areas=("mesa",)).to_record(), now=NOW)
+                        constraints=_constraints(areas=("mesa",)).to_record())
         r = ts.route_turn("google hotels in scottsdale oct 18-22 for me, Tessa and the crew, use our "
                           "Hilton Honors 123456789", user_id="U_ANY", channel_id=TRAVEL_CHANNEL,
                           thread_root_ts=root, lane_thread=True, today=TODAY)
@@ -1000,13 +1002,19 @@ class TestExecuteRoute:
     def test_a_search_acks_registers_and_submits(self):
         client = _slack_client()
         route = ts.Route("search", constraints=_constraints(), budget=3)
-        subs = self._exec(route, client)
+        submitted = []
+        ts.execute_route(route, channel_id=TRAVEL_CHANNEL, thread_root_ts="1790000000.000500",
+                         entity="FNDR", user_id=HARRISON, client=client, say=MagicMock(),
+                         submit=lambda fn, *a, **k: submitted.append((fn, a, k)) or True,
+                         now=NOW, ask_ts="1790000000.000500")     # a top-level ask
         assert client.chat_postMessage.call_args.kwargs["text"] == ts.ACK_TEXT
-        (fn, args, kw), = subs
+        (fn, args, kw), = submitted
         assert fn is ts._search_job and args[1] == _constraints()
         assert args[0]["tools"][0]["max_uses"] == 3 and kw["root_ts"] == "1790000000.000500"
         (row,) = _rows()
         assert row["event"] == "asked" and row["constraints"] == _constraints().to_record()
+        assert row["registered"] is True
+        assert ts.is_lane_thread(TRAVEL_CHANNEL, "1790000000.000500", now=NOW)
 
     def test_no_thread_root_threads_the_card_under_the_ack(self):
         client = _slack_client()

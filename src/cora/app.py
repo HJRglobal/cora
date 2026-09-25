@@ -1181,6 +1181,7 @@ def _dispatch_qa(
     say,
     prior_messages: list[dict] | None = None,
     root_thread_ts: str | None = None,
+    event_ts: str | None = None,
 ) -> None:
     """Core Q&A pipeline — intent → cache → KB → Claude → post response.
 
@@ -1202,6 +1203,9 @@ def _dispatch_qa(
         prior_messages:   List of prior {role, content} dicts for thread context.
         root_thread_ts:   Thread root to register in active_thread_store after
                           responding. Defaults to reply_thread_ts if None.
+        event_ts:         The triggering message's OWN ts (None when unknown). The
+                          travel lane registers a lane thread only when the ask
+                          was top-level (its own ts is the root).
     """
     # FIRST statement on purpose (D-051 lens-1 MEDIUM). This is the reference
     # point for "did a sibling turn mint this pending after my turn began", so
@@ -1603,7 +1607,7 @@ def _dispatch_qa(
             travel_shortlist.execute_route(
                 _travel_route, channel_id=channel_id, thread_root_ts=register_ts,
                 entity=entity, user_id=user_id or "", client=client, say=say,
-                submit=_submit_travel_shortlist,
+                submit=_submit_travel_shortlist, ask_ts=event_ts,
             )
         except Exception:  # noqa: BLE001 -- handled means handled: never the model
             log.exception("travel_shortlist: execute_route failed channel=#%s", channel_name)
@@ -2822,6 +2826,7 @@ def handle_mention(event: dict, say: callable, client) -> None:
         say=say,
         prior_messages=prior_messages,
         root_thread_ts=root_thread_ts,
+        event_ts=thread_ts,          # this message's own ts (the travel lane's registration)
     )
 
 
@@ -3258,6 +3263,7 @@ def _handle_dm_qa(event: dict, client, user_id: str, text: str) -> None:
         say=_say,
         prior_messages=prior_messages,
         root_thread_ts=dm_thread_ts or current_ts,
+        event_ts=current_ts,
     )
 
 
@@ -4295,6 +4301,7 @@ def handle_message_event(event: dict, client) -> None:
         say=lambda **kw: client.chat_postMessage(channel=channel_id, **kw),
         prior_messages=prior_messages,
         root_thread_ts=thread_ts,
+        event_ts=msg_ts,
     )
 
 

@@ -1575,26 +1575,67 @@ def _read_rows() -> tuple[list[dict], int]:
     return rows, bad
 
 
-def is_lane_thread(channel_id: str, root_ts: str | None) -> bool:
-    """Is (channel, root) a thread the lane registered? Raises OSError when the
+# D-051 r1 (integration#0 / c2-trigger#3): a lane thread is one the LANE CREATED --
+# its latest "asked" row carries registered != False (a top-level ask, the ask's own
+# ts as root, or the /cora-ask ack) -- and it lapses LANE_THREAD_TTL after its last
+# asked/posted row. An ask made inside someone else's thread (an assistant-pane chat,
+# an existing channel thread) posts its card there but never turns that whole
+# conversation into a deterministic lane thread.
+LANE_THREAD_TTL = timedelta(hours=48)
+
+
+def _row_time(r: dict) -> datetime | None:
+    try:
+        t = datetime.fromisoformat(str(r.get("ts")))
+    except (ValueError, TypeError):
+        return None
+    return t if t.tzinfo is not None else t.replace(tzinfo=_AZ)
+
+
+def _lane_thread_state(rows: list[dict], channel_id: str, root_ts: str,
+                       now: datetime | None) -> tuple[bool, Any]:
+    """(is_lane_thread, the latest asked row's constraints record)."""
+    last_asked: dict | None = None
+    rec = None
+    last_seen: datetime | None = None
+    for r in rows:
+        if r.get("channel") != channel_id or r.get("root_ts") != root_ts:
+            continue
+        ev = r.get("event")
+        if ev not in ("asked", "posted"):
+            continue
+        if ev == "asked":
+            last_asked = r
+            if "constraints" in r:
+                rec = r.get("constraints")
+        t = _row_time(r)
+        if t is not None and (last_seen is None or t > last_seen):
+            last_seen = t
+    if last_asked is None or last_asked.get("registered") is False or last_seen is None:
+        return False, None
+    if (now or datetime.now(_AZ)) - last_seen > LANE_THREAD_TTL:
+        return False, None
+    return True, rec
+
+
+def is_lane_thread(channel_id: str, root_ts: str | None, *, now: datetime | None = None) -> bool:
+    """Is (channel, root) a live thread the lane registered? Raises OSError when the
     store exists but cannot be read (the caller decides: B1 withholds web on an
     error, routing does not hijack)."""
     if not channel_id or not root_ts:
         return False
     rows, _bad = _read_rows()
-    return any(r.get("channel") == channel_id and r.get("root_ts") == str(root_ts) for r in rows)
+    return _lane_thread_state(rows, channel_id, str(root_ts), now)[0]
 
 
-def latest_constraints(channel_id: str, root_ts: str) -> TravelConstraints | None:
+def latest_constraints(channel_id: str, root_ts: str, *,
+                       now: datetime | None = None) -> TravelConstraints | None:
     try:
         rows, _bad = _read_rows()
     except OSError:
         return None
-    found = None
-    for r in rows:
-        if r.get("channel") == channel_id and r.get("root_ts") == str(root_ts) and "constraints" in r:
-            found = r.get("constraints")
-    return TravelConstraints.from_record(found) if found is not None else None
+    live, found = _lane_thread_state(rows, channel_id, str(root_ts), now)
+    return TravelConstraints.from_record(found) if live and found is not None else None
 
 
 def threads_summary(now: datetime | None = None, days: int = 7) -> dict:
@@ -1743,9 +1784,12 @@ def execute_route(route: Route, *, channel_id: str, thread_root_ts: str | None, 
                   user_id: str, client: Any, say: Callable[..., Any],
                   submit: Callable[..., bool],
                   client_factory: Callable[[], Any] | None = None,
-                  now: datetime | None = None) -> None:
+                  now: datetime | None = None, ask_ts: str | None = None) -> None:
     """Carry a Route out. Every live post goes THREADED under the ask via the
-    client (DM included: thread_ts = the ask's thread root). Under EVAL_MODE
+    client (DM included: thread_ts = the ask's thread root). ``ask_ts`` is the
+    ask's OWN message ts: the thread is registered as a lane thread only when the
+    lane created it (root == ask_ts, no root at all, or a follow-up in a thread
+    that already is one) -- D-051 r1 integration#0. Under EVAL_MODE
     (missed-message catch-up) only ``say`` is used -- the catch-up's capture
     client overrides chat_update alone, so a raw chat_postMessage would reach real
     Slack -- and nothing is written to the store."""
@@ -1779,8 +1823,10 @@ def execute_route(route: Route, *, channel_id: str, thread_root_ts: str | None, 
     except Exception:  # noqa: BLE001 -- the ack is a courtesy; the search still runs
         log.warning("travel_shortlist: ack post failed", exc_info=True)
     thread_root = root or ack_ts or ""
+    registered = bool(route.followup or root is None or (ask_ts and str(ask_ts) == root))
     append_event("asked", channel=channel_id, root_ts=thread_root, constraints=c.to_record(),
-                 followup=bool(route.followup), budget=route.budget, now=now)
+                 followup=bool(route.followup), budget=route.budget, registered=registered,
+                 now=now)
     ok = False
     try:
         ok = bool(submit(_search_job, request, c, channel_id=channel_id, root_ts=thread_root,

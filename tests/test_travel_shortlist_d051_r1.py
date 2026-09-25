@@ -10,6 +10,7 @@ SYNTHETIC ("Jordan Riverstone"); the loyalty number is a made-up digit run.
 from __future__ import annotations
 
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -316,3 +317,102 @@ class TestStrictFrameThroughRealHandlers:
         _dm(client, _wire(text), user=HARRISON)
         _drain()
         assert _card_call(client)["thread_ts"] == ASK_TS
+
+
+# ── integration#0 + c2-trigger#3: a lane thread is one the LANE created; 48 h bound ─
+
+PANE_ROOT = "1790000000.000050"      # an existing thread (a pane chat / a channel thread)
+IN_THREAD_ASK_TS = "1790000000.000300"
+
+
+def _now():
+    return datetime.now(timezone(timedelta(hours=-7)))
+
+
+def _constraints():
+    return ts.parse_constraints(ASK).constraints
+
+
+class TestLaneThreadRegistration:
+    def _exec(self, *, root, ask_ts, followup=False):
+        route = ts.Route("search", constraints=_constraints(), budget=4, followup=followup)
+        client = _slack_client()
+        ts.execute_route(route, channel_id=TRAVEL_CHANNEL, thread_root_ts=root, entity="FNDR",
+                         user_id=HARRISON, client=client, say=MagicMock(),
+                         submit=lambda *a, **k: True, ask_ts=ask_ts)
+        return client
+
+    def test_a_top_level_ask_registers_its_own_thread(self):
+        self._exec(root=ASK_TS, ask_ts=ASK_TS)
+        assert ts.is_lane_thread(TRAVEL_CHANNEL, ASK_TS)
+        assert ts.latest_constraints(TRAVEL_CHANNEL, ASK_TS) == _constraints()
+
+    def test_an_ask_inside_an_existing_thread_posts_there_but_never_registers_it(self):
+        client = self._exec(root=PANE_ROOT, ask_ts=IN_THREAD_ASK_TS)
+        assert client.chat_postMessage.call_args.kwargs["thread_ts"] == PANE_ROOT
+        # the card's own "posted" row (written by the pooled job) does not register it either
+        ts.append_event("posted", channel=TRAVEL_CHANNEL, root_ts=PANE_ROOT, options=5)
+        assert not ts.is_lane_thread(TRAVEL_CHANNEL, PANE_ROOT)
+        assert ts.latest_constraints(TRAVEL_CHANNEL, PANE_ROOT) is None
+        # ...while the monitor still counts the ask
+        assert ts.threads_summary()["asks"] == 1
+
+    def test_a_follow_up_in_a_lane_thread_keeps_it_registered(self):
+        self._exec(root=ASK_TS, ask_ts=ASK_TS)
+        self._exec(root=ASK_TS, ask_ts=IN_THREAD_ASK_TS, followup=True)
+        assert ts.is_lane_thread(TRAVEL_CHANNEL, ASK_TS)
+
+    def test_no_root_means_the_ack_is_the_lanes_own_thread(self):
+        client = self._exec(root=None, ask_ts=None)          # /cora-ask
+        ack_ts = client.chat_postMessage.call_args.kwargs.get("thread_ts") or "1790000000.000001"
+        assert ts.is_lane_thread(TRAVEL_CHANNEL, ack_ts)
+
+    def test_the_lane_thread_expires_48_hours_after_its_last_asked_or_posted_row(self):
+        c = _constraints().to_record()
+        t0 = _now() - timedelta(hours=60)
+        ts.append_event("asked", channel=TRAVEL_CHANNEL, root_ts="9.1", constraints=c, now=t0)
+        assert not ts.is_lane_thread(TRAVEL_CHANNEL, "9.1")
+        assert ts.latest_constraints(TRAVEL_CHANNEL, "9.1") is None
+        # a card posted 13 h later refreshes the clock...
+        ts.append_event("posted", channel=TRAVEL_CHANNEL, root_ts="9.1", options=5,
+                        now=t0 + timedelta(hours=13))
+        assert ts.is_lane_thread(TRAVEL_CHANNEL, "9.1")
+        assert ts.latest_constraints(TRAVEL_CHANNEL, "9.1") == _constraints()
+        # ...and the bound is read against the caller's clock
+        assert not ts.is_lane_thread(TRAVEL_CHANNEL, "9.1", now=_now() + timedelta(hours=2))
+
+
+class TestLaneThreadScopeThroughRealHandlers:
+    def test_an_ask_inside_a_dm_pane_chat_does_not_hijack_the_chat(self, lane):
+        """Agents & AI Apps pane: every message in one chat carries the chat root as
+        thread_ts. The ask's card posts in the chat, but the chat is NOT a lane thread
+        -- a later ordinary question reaches the model, never the help line."""
+        client = _slack_client()
+        _dm(client, ASK, user=HARRISON, ts_=IN_THREAD_ASK_TS, thread_ts=PANE_ROOT)
+        _drain()
+        assert _card_call(client)["thread_ts"] == PANE_ROOT
+        assert not ts.is_lane_thread("D0TRAVELDM", PANE_ROOT)
+        seen: list = []
+        client2 = _slack_client()
+        client2.chat_postMessage.side_effect = None
+        client2.chat_postMessage.return_value = {"ok": True}
+        with _model_path(seen):
+            _dm(client2, "what's our cash position this week?", user=HARRISON,
+                ts_="1790000000.000400", thread_ts=PANE_ROOT)
+        texts = [c.kwargs.get("text") for c in client2.chat_postMessage.call_args_list]
+        assert ts.FOLLOWUP_HELP_REPLY not in texts
+        assert seen                                   # the ordinary pipeline answered
+
+    def test_an_in_thread_channel_mention_ask_does_not_register_the_thread(self, lane):
+        client = _slack_client()
+        _mention(client, MagicMock(), ASK, user=_tessa(), ts_=IN_THREAD_ASK_TS,
+                 thread_ts=PANE_ROOT)
+        _drain()
+        assert _card_call(client)["thread_ts"] == PANE_ROOT
+        assert not ts.is_lane_thread(TRAVEL_CHANNEL, PANE_ROOT)
+
+    def test_a_top_level_dm_ask_registers_its_thread(self, lane):
+        client = _slack_client()
+        _dm(client, ASK, user=HARRISON)
+        _drain()
+        assert ts.is_lane_thread("D0TRAVELDM", ASK_TS)
