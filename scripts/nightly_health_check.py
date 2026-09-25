@@ -941,7 +941,10 @@ def check_channel_archive(*, dry_run: bool = False, client_factory=None,
         return CheckResult(name, "ok", f"{head} | ledger reconciled against Slack | {cov}")
     findings = list(out.get("findings") or [])
     shown = "; ".join(findings[:6]) + (f"; +{len(findings) - 6} more" if len(findings) > 6 else "")
-    tail = " | demotion WRITTEN" if out.get("demotion_written") else ""
+    how = str(out.get("demotion") or "")          # the tail says what really happened
+    tail = (" | demotion WRITTEN" if out.get("demotion_written")
+            else " | demotion NOT written (dry run)" if how.startswith("dry_run")
+            else " | DEMOTION WRITE FAILED" if how in ("failed", "update_failed") else "")
     return CheckResult(name, "warn", f"{head} | {shown}{tail} | {cov}")
 
 

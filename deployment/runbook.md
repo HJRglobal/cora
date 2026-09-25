@@ -233,10 +233,14 @@ any T0 card.**
 - **Evidence monitor:** `check_channel_archive` in the 08:45 health check reconciles the
   ledger against Slack. An archive by Cora the ledger cannot attribute to a tap WRITES
   `data/state/channel-archive-demotion.json` (the lane acts at T0 whatever the flag
-  says) and WARNs daily. **Clearing is Harrison's:** investigate, then
+  says) and WARNs daily. The file lists EVERY unattributed archive event, including ones
+  found while already demoted. The WARN line says what happened to the demotion
+  (WRITTEN / would demote under `--dry-run` / DEMOTION WRITE FAILED with the tier the lane
+  is really acting at). No channel is exempt by id: the pre-lane sprawl archives predate
+  the lane epoch. **Clearing is Harrison's:** investigate, then
   `.\.venv\Scripts\python.exe scripts\run_channel_archive_proposal.py --clear-demotion`
-  (shows it) and the same with `--apply` (appends an `acknowledged` ledger row for that
-  exact archive event, then deletes the file -- the same event never re-demotes).
+  (lists every event) and the same with `--apply` (appends an `acknowledged` ledger row
+  for EACH listed archive event, then deletes the file -- none of them re-demotes).
   A scan that started and never staged a card WARNs after 1 h; a crash the bot's scan
   pool or the script recorded (`scan_failed` in the proposals store -- the crash was
   already said where the scan was asked) settles it, and a kill that recorded nothing

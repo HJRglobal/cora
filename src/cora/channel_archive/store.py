@@ -654,22 +654,42 @@ def write_demotion(record: dict, *, dry_run: bool) -> bool:
     return True
 
 
+def demotion_events(state: dict | None) -> list[dict]:
+    """Every unattributed archive event a demotion record lists (D-051 r1
+    c1-monitor#2): its ``events`` list plus the legacy single top-level
+    (channel_id, archive_ts) pair, de-duplicated, in order."""
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    raw = (state or {}).get("events")
+    pairs = [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+    pairs.append({"channel_id": (state or {}).get("channel_id"),
+                  "archive_ts": (state or {}).get("archive_ts")})
+    for e in pairs:
+        cid, ats = str(e.get("channel_id") or ""), str(e.get("archive_ts") or "")
+        if cid and ats and (cid, ats) not in seen:
+            seen.add((cid, ats))
+            out.append({"channel_id": cid, "archive_ts": ats})
+    return out
+
+
 def clear_demotion(*, actor: str, dry_run: bool) -> dict:
-    """Harrison's clear. Appends an ``acknowledged`` ledger row for the demotion's
-    exact (channel_id, archive_ts) so that archive event can never re-demote the
-    lane, then deletes the file. Returns what was (or would be) cleared."""
+    """Harrison's clear. Appends an ``acknowledged`` ledger row for EVERY archive event
+    the demotion lists (its exact (channel_id, archive_ts) pairs) so none of them can
+    re-demote the lane, then deletes the file. Returns what was (or would be) cleared,
+    ``events`` included."""
     state = policy.demotion_state()
     if state is None:
         return {"cleared": False, "reason": "not demoted"}
+    events = demotion_events(state)
     out = {"cleared": False, "channel_id": state.get("channel_id"),
            "archive_ts": state.get("archive_ts"), "since": state.get("since"),
-           "reason": state.get("reason")}
+           "reason": state.get("reason"), "events": events}
     if dry_run:
         out["would_clear"] = True
         return out
-    if state.get("channel_id") and state.get("archive_ts"):
-        if not append_ledger("acknowledged", channel_id=state.get("channel_id"),
-                             archive_ts=state.get("archive_ts"), by=actor,
+    for e in events:
+        if not append_ledger("acknowledged", channel_id=e["channel_id"],
+                             archive_ts=e["archive_ts"], by=actor,
                              demoted_since=state.get("since")):
             out["reason"] = "ledger write failed -- the demotion stays"
             return out

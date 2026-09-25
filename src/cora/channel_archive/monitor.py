@@ -10,7 +10,14 @@ FAIL CLASSES
       [archive - 15 min, archive + 2 min], tapped by Harrison, with no failed outcome
       before the archive, and not ``acknowledged`` by Harrison's --clear-demotion.
       -> the demotion file is written (the lane acts at T0 whatever its flag says)
-      + WARN. Never from a blind read; never under --dry-run.
+      + WARN. Never from a blind read; never under --dry-run. The file lists EVERY
+      such (channel_id, archive_ts) -- appended even while already demoted -- and
+      --clear-demotion acknowledges each one. There is no per-channel legacy
+      exemption: LANE_EPOCH already excludes every pre-lane archive, and the sprawl
+      script archives on Harrison's user token (never Cora's), so an id-level clause
+      only hid a later untapped archive of those channels (D-051 r1 c1-monitor#4).
+      The finding says what happened to the demotion: WRITTEN / would demote (dry
+      run) / DEMOTION WRITE FAILED with the tier the lane is really acting at.
   (2) MISMATCH -- a ledger ``archived`` channel that Slack lists as NOT archived.
       The unarchive is searched from the archive time forward (bounded): a person's
       unarchive -> an ``unarchived_seen`` row (the channel leaves the examined set);
@@ -31,12 +38,9 @@ count certifies nothing without positive coverage).
 """
 from __future__ import annotations
 
-import glob
-import json
 import logging
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Callable
 
 from . import classify as cl
@@ -61,7 +65,6 @@ LIST_MAX_PAGES = 20
 PACE_S = 1.0
 ARCHIVE_SUBTYPES = ("channel_archive", "group_archive")
 UNARCHIVE_SUBTYPES = ("channel_unarchive", "group_unarchive")
-_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _harrison() -> str:
@@ -128,37 +131,50 @@ def _unarchive_after(client: Any, cid: str, since: float) -> tuple[dict | None, 
     return None, "page_cap"
 
 
-def _legacy_archived_ids() -> set[str]:
-    """Channels the pre-lane sprawl script archived (logs/archive-sprawl-*.jsonl)."""
-    ids: set[str] = set()
-    for path in glob.glob(str(_REPO_ROOT / "logs" / "archive-sprawl-*.jsonl")):
-        try:
-            for line in Path(path).read_text(encoding="utf-8").splitlines():
-                try:
-                    row = json.loads(line)
-                except (ValueError, TypeError):
-                    continue
-                if isinstance(row, dict) and str(row.get("status") or "") == "archived" and row.get("id"):
-                    ids.add(str(row["id"]))
-        except Exception:  # noqa: BLE001
-            continue
-    return ids
-
-
 def _is_cora(m: dict, bot_uid: str, bot_id: str) -> bool:
     return (bool(bot_uid) and m.get("user") == bot_uid) or (bool(bot_id) and m.get("bot_id") == bot_id)
 
 
+def _record_demotion(dem: dict | None, found: list[tuple[str, str]], *, now: float,
+                     dry_run: bool) -> str:
+    """Put EVERY unattributed (channel_id, archive_ts) on the demotion file (D-051 r1
+    c1-monitor#2): a new demotion lists them all; an existing one gets the missing ones
+    appended (atomic replace, its ``since`` kept). Returns what happened: written /
+    updated / listed / unreadable / dry_run / dry_run_update / failed (a NEW demotion
+    did not land) / update_failed (the lane is already demoted; the event is not listed)."""
+    new = [{"channel_id": c, "archive_ts": t} for c, t in found]
+    if dem is None:
+        if dry_run:
+            return "dry_run"
+        rec = {"since": datetime.fromtimestamp(now, _AZ).isoformat(timespec="seconds"),
+               "channel_id": new[0]["channel_id"], "archive_ts": new[0]["archive_ts"],
+               "reason": "an archive by Cora with no tap-attributed ledger intent", "events": new}
+        return "written" if st.write_demotion(rec, dry_run=False) else "failed"
+    if dem.get("unreadable"):
+        return "unreadable"              # never overwrite a demotion we cannot read
+    listed = st.demotion_events(dem)
+    have = {(e["channel_id"], e["archive_ts"]) for e in listed}
+    missing = [e for e in new if (e["channel_id"], e["archive_ts"]) not in have]
+    if not missing:
+        return "listed"
+    if dry_run:
+        return "dry_run_update"
+    rec = {k: v for k, v in dem.items() if k != "demoted"}
+    rec["events"] = listed + missing
+    return "updated" if st.write_demotion(rec, dry_run=False) else "update_failed"
+
+
 def reconcile(client: Any, *, now: float | None = None, dry_run: bool = False,
               sleep: Callable[[float], None] | None = None) -> dict:
-    """Run every class. Returns {status: ok|warn, findings[], coverage{}, demotion_written}."""
+    """Run every class. Returns {status: ok|warn, findings[], coverage{}, demotion_written,
+    demotion (what happened to the demotion file: see ``_record_demotion``), blind}."""
     now = time.time() if now is None else float(now)
     sleep = time.sleep if sleep is None else sleep
     findings: list[str] = []
     cov = {"list_rows": 0, "archived_in_list": 0, "examined": 0, "histories": 0,
            "ledger_rows": 0}
     out: dict[str, Any] = {"status": "ok", "findings": findings, "coverage": cov,
-                           "demotion_written": False, "blind": ""}
+                           "demotion_written": False, "demotion": "", "blind": ""}
 
     def blind(why: str) -> dict:
         out["blind"] = why
@@ -168,9 +184,12 @@ def reconcile(client: Any, *, now: float | None = None, dry_run: bool = False,
 
     dem = policy.demotion_state()
     if dem is not None:
-        findings.append(f"DEMOTED since {dem.get('since') or '?'} (channel {dem.get('channel_id') or '?'}: "
-                        f"{dem.get('reason') or 'unattributed archive'}) -- the lane acts at T0 until "
-                        "Harrison clears it (run_channel_archive_proposal.py --clear-demotion --apply)")
+        listed = st.demotion_events(dem)
+        ids = ", ".join(e["channel_id"] for e in listed[:4]) + (f" +{len(listed) - 4}" if len(listed) > 4 else "")
+        findings.append(f"DEMOTED since {dem.get('since') or '?'} ({len(listed)} unattributed archive "
+                        f"event(s): {ids or '?'}; {dem.get('reason') or 'unattributed archive'}) -- the "
+                        "lane acts at T0 until Harrison clears it (run_channel_archive_proposal.py "
+                        "--clear-demotion --apply)")
     ledger = st.read_ledger()
     if ledger is None:
         return blind("archive ledger unreadable")
@@ -215,7 +234,6 @@ def reconcile(client: Any, *, now: float | None = None, dry_run: bool = False,
         for r in rows:
             if str(r.get("outcome") or "").startswith("archived"):
                 ledger_archived[cid] = max(ledger_archived.get(cid, 0.0), float(r.get("ts") or 0))
-    legacy = _legacy_archived_ids()
     floor_ts = max(now - WINDOW_DAYS * st.DAY_S, LANE_EPOCH)
     harrison = _harrison()
 
@@ -234,6 +252,7 @@ def reconcile(client: Any, *, now: float | None = None, dry_run: bool = False,
             examine.add(cid)
     examine |= {cid for cid in intents if cid in archived_ids}
     used_intents: set[int] = set()
+    unattributed: list[tuple[str, str, int]] = []     # (cid, archive ts, findings index)
     for cid in sorted(examine):
         cov["examined"] += 1
         sleep(PACE_S)
@@ -256,9 +275,7 @@ def reconcile(client: Any, *, now: float | None = None, dry_run: bool = False,
         if not _is_cora(ev, bot_uid, bot_id):
             continue                          # a person archived it: not this lane's act
         if ats < floor_ts:
-            continue                          # predates the window / the lane
-        if cid in legacy:
-            continue                          # the pre-lane sprawl script's archive
+            continue                          # predates the window / the lane (incl. the sprawl runs)
         if (cid, str(ev.get("ts") or "")) in acked:
             continue                          # Harrison acknowledged this exact event
         match = None
@@ -279,16 +296,32 @@ def reconcile(client: Any, *, now: float | None = None, dry_run: bool = False,
         if match is not None:
             used_intents.add(id(match))
             continue
-        findings.append(f"UNATTRIBUTED: {cid} was archived by Cora at {ev.get('ts')} with no "
-                        "tap-attributed intent in the ledger -- the lane is DEMOTED to T0")
-        if dem is None and not out["demotion_written"]:
-            wrote = st.write_demotion({
-                "since": datetime.fromtimestamp(now, _AZ).isoformat(timespec="seconds"),
-                "channel_id": cid, "archive_ts": str(ev.get("ts") or ""),
-                "reason": "an archive by Cora with no tap-attributed ledger intent"},
-                dry_run=dry_run)
-            out["demotion_written"] = wrote
-            dem = {"channel_id": cid}         # one demotion record per run
+        findings.append("")                   # filled once the demotion's fate is known
+        unattributed.append((cid, str(ev.get("ts") or ""), len(findings) - 1))
+    if unattributed:
+        how = _record_demotion(dem, [(c, t) for c, t, _i in unattributed], now=now, dry_run=dry_run)
+        out["demotion"] = how
+        out["demotion_written"] = how in ("written", "updated")
+        tier = policy.acting_tier()
+        tails = {
+            "written": "-- demotion WRITTEN: the lane acts at T0 until Harrison clears it",
+            "updated": "-- added to the existing demotion (the lane stays at T0)",
+            "listed": "-- already listed on the demotion (the lane stays at T0)",
+            "unreadable": "-- the demotion file is unreadable, so the lane stays at T0; this event "
+                          "could not be added to it",
+            "dry_run": "-- would demote the lane to T0 (dry run: nothing written)",
+            "dry_run_update": "-- would be added to the existing demotion (dry run: nothing written)",
+            "failed": f"-- DEMOTION WRITE FAILED: the lane is still acting {tier}",
+            "update_failed": "-- could NOT be added to the existing demotion (write FAILED); the "
+                             "lane stays at T0 and the next nightly retries",
+        }
+        for cid, ats_s, i in unattributed:
+            findings[i] = (f"UNATTRIBUTED: {cid} was archived by Cora at {ats_s} with no "
+                           f"tap-attributed intent in the ledger {tails[how]}")
+        if how == "failed":
+            findings.insert(0, f"DEMOTION WRITE FAILED ({policy.demotion_path().name}) -- the lane is "
+                               f"still acting {tier} despite {len(unattributed)} unattributed archive(s); "
+                               "the next nightly retries")
 
     # -- (2) MISMATCH --
     for cid, arch_ts in sorted(ledger_archived.items()):

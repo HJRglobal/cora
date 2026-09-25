@@ -61,6 +61,24 @@ def test_dry_run_warns_but_writes_nothing():
     assert not policy.is_demoted() and not st.ledger_path().exists()
 
 
+def test_dry_run_never_claims_the_lane_is_demoted():
+    """D-051 r1 c1-monitor#5: under --dry-run nothing is written, so the line must not
+    say DEMOTED -- it says what a real run would do and that nothing was written."""
+    r = hc.check_channel_archive(dry_run=True, client_factory=_demoting, now=NOWX)
+    assert "is DEMOTED" not in r.detail and "would demote" in r.detail
+    assert "demotion NOT written (dry run)" in r.detail
+
+
+def test_a_failed_demotion_write_is_named_in_the_tail(monkeypatch, tmp_path):
+    blocker = tmp_path / "afile"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setenv("CORA_CHANNEL_ARCHIVE_DEMOTION_PATH", str(blocker / "demotion.json"))
+    monkeypatch.setenv("CORA_CHANNEL_ARCHIVE", "act")
+    r = hc.check_channel_archive(client_factory=_demoting, now=NOWX)
+    assert r.status == "warn" and r.detail.startswith("acting T1")
+    assert "DEMOTION WRITE FAILED" in r.detail and "demotion WRITTEN" not in r.detail
+
+
 def test_no_client_is_blind_never_ok():
     r = hc.check_channel_archive()          # default factory refuses under pytest
     assert r.status == "warn" and r.detail.startswith("BLIND: no Slack client")

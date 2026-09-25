@@ -149,9 +149,30 @@ class TestUnattributed:
         out = run(self._cora_archive(ts=mon.LANE_EPOCH - 3600))
         assert not out["demotion_written"] and out["status"] == "ok"
 
-    def test_legacy_sprawl_channels_are_attributed(self, monkeypatch):
-        monkeypatch.setattr(mon, "_legacy_archived_ids", lambda: {ARCH})
-        assert not run(self._cora_archive())["demotion_written"]
+    def test_a_legacy_sprawl_id_archived_by_cora_after_the_epoch_still_demotes(self, monkeypatch, tmp_path):
+        """D-051 r1 c1-monitor#4: the per-id legacy-sprawl clause exempted ~115 channels
+        forever. LANE_EPOCH already excludes every pre-lane archive (the 6/24 + 7/12
+        sprawl runs predate it), so a POST-epoch Cora archive of a sprawl id with no
+        intent is exactly the regression the monitor guards -> it demotes."""
+        logs = tmp_path / "logs"
+        logs.mkdir()
+        (logs / "archive-sprawl-2026-06-24.jsonl").write_text(
+            '{"id": "%s", "status": "archived", "run_ts": "2026-06-24T21:00:00-07:00"}\n' % ARCH,
+            encoding="utf-8")
+        monkeypatch.setattr(mon, "_REPO_ROOT", tmp_path, raising=False)
+        out = run(self._cora_archive())
+        assert out["demotion_written"] and any("UNATTRIBUTED" in f and ARCH in f for f in out["findings"])
+
+    def test_the_monitor_reads_no_sprawl_log(self):
+        import ast
+        import inspect
+        tree = ast.parse(inspect.getsource(mon))
+        docs = {id(n.body[0].value) for n in ast.walk(tree)
+                if isinstance(n, (ast.Module, ast.FunctionDef, ast.ClassDef)) and n.body
+                and isinstance(n.body[0], ast.Expr) and isinstance(n.body[0].value, ast.Constant)}
+        consts = [n.value for n in ast.walk(tree) if isinstance(n, ast.Constant)
+                  and isinstance(n.value, str) and id(n) not in docs]
+        assert not any("archive-sprawl" in c for c in consts)
 
     def test_an_acknowledged_event_never_re_demotes(self):
         st.append_ledger("acknowledged", channel_id=ARCH, archive_ts=f"{NOW - DAY:.6f}", by=HARRISON)
@@ -182,6 +203,83 @@ class TestUnattributed:
         policy.demotion_path().write_text('{"since": "2026-09-26", "channel_id": "C1"}', encoding="utf-8")
         out = run(MonSlack())
         assert out["status"] == "warn" and any("DEMOTED since 2026-09-26" in f for f in out["findings"])
+
+
+ARCH2 = "C0ARCHIVE02"
+
+
+def _two_rogue(second=True):
+    archived = {ARCH: {}}
+    events = {ARCH: [arch_event(NOW - DAY, user=BOT_UID)]}
+    if second:
+        archived[ARCH2] = {}
+        events[ARCH2] = [arch_event(NOW - 2 * DAY, user=BOT_UID)]
+    return MonSlack(archived=archived, events=events)
+
+
+class TestDemotionEvents:
+    """D-051 r1 c1-monitor#2: the demotion file lists EVERY unattributed archive event
+    (appended even while already demoted), and --clear-demotion acknowledges each one,
+    so a clear never re-arms T1 while the monitor knows of another unacked event."""
+
+    def _pairs(self):
+        dem = policy.demotion_state()
+        return sorted((e["channel_id"], e["archive_ts"]) for e in dem["events"])
+
+    def test_two_unattributed_archives_in_one_run_are_both_listed_and_both_acked(self):
+        out = run(_two_rogue())
+        assert out["demotion_written"]
+        assert self._pairs() == sorted([(ARCH, f"{NOW - DAY:.6f}"), (ARCH2, f"{NOW - 2 * DAY:.6f}")])
+        cleared = st.clear_demotion(actor=HARRISON, dry_run=False)
+        assert cleared["cleared"] and len(cleared["events"]) == 2
+        acks = sorted((r["channel_id"], r["archive_ts"]) for r in st.read_ledger() if r["event"] == "acknowledged")
+        assert acks == sorted([(ARCH, f"{NOW - DAY:.6f}"), (ARCH2, f"{NOW - 2 * DAY:.6f}")])
+        again = run(_two_rogue())
+        assert not policy.is_demoted() and again["status"] == "ok", again["findings"]
+
+    def test_an_event_found_while_already_demoted_is_appended(self):
+        run(_two_rogue(second=False))
+        assert self._pairs() == [(ARCH, f"{NOW - DAY:.6f}")]
+        since = policy.demotion_state()["since"]
+        out = run(_two_rogue())
+        assert self._pairs() == sorted([(ARCH, f"{NOW - DAY:.6f}"), (ARCH2, f"{NOW - 2 * DAY:.6f}")])
+        assert policy.demotion_state()["since"] == since          # the original demotion is kept
+        assert any(ARCH2 in f and "added to the existing demotion" in f for f in out["findings"])
+        st.clear_demotion(actor=HARRISON, dry_run=False)
+        assert run(_two_rogue())["status"] == "ok"
+
+    def test_a_legacy_single_record_file_still_clears_its_event(self):
+        st.write_demotion({"since": "2026-10-01", "channel_id": ARCH, "archive_ts": f"{NOW - DAY:.6f}",
+                           "reason": "old shape"}, dry_run=False)
+        out = st.clear_demotion(actor=HARRISON, dry_run=False)
+        assert out["cleared"] and [e["channel_id"] for e in out["events"]] == [ARCH]
+
+
+class TestDemotionCopyIsHonest:
+    """D-051 r1 c1-monitor#5: the UNATTRIBUTED line says what actually happened to the
+    demotion -- written / would demote (dry run) / WRITE FAILED with the real tier."""
+
+    def test_dry_run_says_would_demote_not_demoted(self):
+        out = run(_two_rogue(second=False), dry_run=True)
+        line = next(f for f in out["findings"] if "UNATTRIBUTED" in f)
+        assert "would demote" in line and "dry run" in line and "DEMOTED" not in line
+        assert not policy.is_demoted() and out["demotion"] == "dry_run"
+
+    def test_a_failed_demotion_write_is_loud_and_names_the_real_tier(self, monkeypatch, tmp_path):
+        blocker = tmp_path / "afile"
+        blocker.write_text("x", encoding="utf-8")
+        monkeypatch.setenv("CORA_CHANNEL_ARCHIVE_DEMOTION_PATH", str(blocker / "demotion.json"))
+        monkeypatch.setenv("CORA_CHANNEL_ARCHIVE", "act")
+        out = run(_two_rogue(second=False))
+        assert not policy.is_demoted() and not out["demotion_written"] and out["demotion"] == "failed"
+        line = next(f for f in out["findings"] if "UNATTRIBUTED" in f)
+        assert "DEMOTION WRITE FAILED" in line and "still acting T1" in line and "is DEMOTED" not in line
+        assert out["findings"][0].startswith("DEMOTION WRITE FAILED")
+
+    def test_a_written_demotion_says_written(self):
+        out = run(_two_rogue(second=False))
+        line = next(f for f in out["findings"] if "UNATTRIBUTED" in f)
+        assert "demotion WRITTEN" in line and out["demotion"] == "written"
 
 
 class TestMismatch:

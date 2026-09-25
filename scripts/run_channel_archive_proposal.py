@@ -24,7 +24,7 @@ Usage (from the repo root, main's tree checked out):
     .venv\\Scripts\\python.exe scripts\\run_channel_archive_proposal.py --apply --monthly
 
     # Harrison only: show / clear the automatic demotion (clearing appends an
-    # `acknowledged` ledger row for that exact archive event first)
+    # `acknowledged` ledger row for EVERY archive event the demotion lists first)
     .venv\\Scripts\\python.exe scripts\\run_channel_archive_proposal.py --clear-demotion
     .venv\\Scripts\\python.exe scripts\\run_channel_archive_proposal.py --clear-demotion --apply
 
@@ -132,13 +132,18 @@ def main(argv: list[str] | None = None, *, now: float | None = None) -> int:
         if out.get("reason") == "not demoted" and not out.get("cleared"):
             _print("The dead-channel lane is not demoted -- nothing to clear.")
             return 0
+        events = out.get("events") or []
+        listing = "; ".join(f"{e['channel_id']} archive {e['archive_ts']}" for e in events) or "none listed"
         if not args.apply:
-            _print(f"DEMOTED since {out.get('since')} -- channel {out.get('channel_id')} archive "
-                   f"{out.get('archive_ts')}: {out.get('reason')}. Re-run with --apply to clear it "
-                   "(an `acknowledged` ledger row is written for that archive event first).")
+            _print(f"DEMOTED since {out.get('since')} -- {len(events)} unattributed archive event(s): "
+                   f"{listing} ({out.get('reason')}). Re-run with --apply to clear it (an "
+                   "`acknowledged` ledger row is written for EVERY listed archive event first).")
             return 0
-        _print("Demotion CLEARED." if out.get("cleared") else f"NOT cleared: {out.get('reason')}")
-        return 0 if out.get("cleared") else 1
+        if out.get("cleared"):
+            _print(f"Demotion CLEARED -- acknowledged {len(events)} archive event(s): {listing}.")
+            return 0
+        _print(f"NOT cleared: {out.get('reason')}")
+        return 1
 
     if not args.apply:
         return _dry_run(now)

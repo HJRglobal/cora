@@ -173,6 +173,24 @@ class TestManualAndClear:
         assert st.read_ledger()[-1]["by"] == HARRISON and markers() == []
 
 
+def test_clear_demotion_names_and_acks_every_listed_event(capsys):
+    """D-051 r1 c1-monitor#2: the preview names every unattributed event and --apply
+    acknowledges each one (and prints them all)."""
+    st.write_demotion({"since": "2026-10-06", "channel_id": "C0ROGUE001", "archive_ts": "1790.5",
+                       "reason": "unattributed",
+                       "events": [{"channel_id": "C0ROGUE001", "archive_ts": "1790.5"},
+                                  {"channel_id": "C0ROGUE002", "archive_ts": "1791.5"}]},
+                      dry_run=False)
+    assert SCRIPT.main(["--clear-demotion"]) == 0
+    out = capsys.readouterr().out
+    assert "C0ROGUE001" in out and "C0ROGUE002" in out and "2 unattributed" in out
+    assert SCRIPT.main(["--clear-demotion", "--apply"]) == 0
+    out = capsys.readouterr().out
+    assert "CLEARED" in out and "C0ROGUE001" in out and "C0ROGUE002" in out
+    acks = [(r["channel_id"], r["archive_ts"]) for r in st.read_ledger() if r["event"] == "acknowledged"]
+    assert acks == [("C0ROGUE001", "1790.5"), ("C0ROGUE002", "1791.5")] and not policy.is_demoted()
+
+
 def test_the_script_never_archives_or_imports_the_bot():
     import ast
     tree = ast.parse((REPO / "scripts" / "run_channel_archive_proposal.py").read_text(encoding="utf-8"))
