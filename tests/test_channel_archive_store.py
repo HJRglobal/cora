@@ -131,6 +131,53 @@ class TestClaims:
         ok, why, _ = st.decide_row(pid, "C0AAAAAAA1", st.AGREED, actor=HARRISON, now=NOW + 3600)
         assert not ok and why == "already_handled"
 
+    def test_an_in_flight_archive_is_in_progress_until_the_bound(self):
+        """c1-state-machine#2 (A13): claimed + a FRESH intent with no outcome yet is an
+        archive in flight -- CLAIMED ('In progress…', taps refused in_progress), not a
+        locked UNKNOWN; UNKNOWN only once the intent is older than the bound."""
+        pid = stage()
+        st.append_event(st.CLAIMED, proposal_id=pid, cid="C0AAAAAAA1", kind="archive", ts=NOW)
+        st.append_ledger("intent", proposal_id=pid, channel_id="C0AAAAAAA1", ts=NOW + 20)
+        f = st.fold(now=NOW + 21)
+        assert f.proposals[pid].state_of("C0AAAAAAA1") == st.CLAIMED
+        assert f.channel_claim("C0AAAAAAA1") == (pid, "archive")
+        ok, why, _ = st.decide_row(pid, "C0AAAAAAA1", st.KEPT, actor=HARRISON, now=NOW + 21)
+        assert not ok and why == "in_progress"
+        late = NOW + 20 + st.INFLIGHT_S + 1
+        assert st.fold(now=late).proposals[pid].state_of("C0AAAAAAA1") == st.UNKNOWN
+
+    def test_a_retry_claim_right_after_a_failed_attempt_is_its_own_live_claim(self):
+        """c1-state-machine#3: the intent tolerance is anchored to the claim's own ts --
+        a retry claimed within 1 s of the previous attempt's intent is NOT shadowed by
+        that attempt's FAILED outcome (so a Keep cannot slip in under it)."""
+        pid = stage()
+        st.append_event(st.CLAIMED, proposal_id=pid, cid="C0AAAAAAA1", kind="archive", ts=NOW)
+        st.append_ledger("intent", proposal_id=pid, channel_id="C0AAAAAAA1", ts=NOW + 1.0)
+        st.append_ledger("outcome", proposal_id=pid, channel_id="C0AAAAAAA1",
+                         outcome="notice_failed:not_in_channel", ts=NOW + 1.2)
+        st.append_event(st.FAILED, proposal_id=pid, cid="C0AAAAAAA1", code="x", ts=NOW + 1.2)
+        st.append_event(st.CLAIMED, proposal_id=pid, cid="C0AAAAAAA1", kind="archive", ts=NOW + 1.5)
+        f = st.fold(now=NOW + 5)
+        assert f.proposals[pid].state_of("C0AAAAAAA1") == st.CLAIMED
+        ok, why, _ = st.decide_row(pid, "C0AAAAAAA1", st.KEPT, actor=HARRISON, now=NOW + 5)
+        assert not ok and why == "in_progress"
+
+    def test_an_unreadable_ledger_folds_not_ok_and_never_reopens_a_claim(self, monkeypatch, tmp_path):
+        """c1-state-machine#4: an unreadable archive ledger is not 'empty' -- the fold is
+        not ok (decide_row refuses) and an unresolved claim is never expired open."""
+        pid = stage()
+        st.append_event(st.CLAIMED, proposal_id=pid, cid="C0AAAAAAA1", kind="archive", ts=NOW)
+        st.append_ledger("intent", proposal_id=pid, channel_id="C0AAAAAAA1", ts=NOW + 1)
+        d = tmp_path / "isadir"
+        d.mkdir()
+        monkeypatch.setenv("CORA_CHANNEL_ARCHIVE_LEDGER_PATH", str(d))
+        f = st.fold(now=NOW + st.CLAIM_TTL_S + 100)
+        assert f.ok is False and pid in f.proposals          # renderable, never actionable
+        assert f.proposals[pid].state_of("C0AAAAAAA1") == st.CLAIMED
+        ok, why, _ = st.decide_row(pid, "C0AAAAAAA1", st.KEPT, actor=HARRISON,
+                                   now=NOW + st.CLAIM_TTL_S + 100)
+        assert not ok and why == "store_unreadable"
+
     def test_claim_plus_ledger_outcome_folds_as_that_outcome(self):
         """The store append failed after a successful archive: the ledger still tells."""
         pid = stage()

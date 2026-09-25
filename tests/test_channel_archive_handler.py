@@ -242,7 +242,8 @@ class TestArchivePath:
         d.mkdir()
         monkeypatch.setenv("CORA_CHANNEL_ARCHIVE_LEDGER_PATH", str(d))
         r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
-        assert r.outcome == "failed" and "reverify_store_unreadable" in r.msg
+        # c1-state-machine#4: an unreadable ledger makes the fold not ok -- refused at once
+        assert r.outcome == "store_error" and "archive ledger" in r.msg and r.ephemeral
         assert not fake.posts and "conversations_archive" not in fake.method_names()
 
     def test_a_lex_row_ledgers_no_name(self, fake, armed):
@@ -649,6 +650,38 @@ class TestIndeterminateWrites:
         assert "I could not post a correction" in r.msg and "I posted a correction" not in r.msg
 
 
+class TestClaimRecheckBeforeTheIntent:
+    """c1-state-machine#3: just before the ledger intent (under the claim lock) the row
+    must still be CLAIMED by THIS attempt -- a Keep / Mark that landed during the
+    re-verify (an expired or shadowed claim) stops the archive before any Slack write."""
+
+    def test_a_keep_that_landed_during_the_reverify_stops_the_archive(self, fake, armed):
+        stage(tier="T1")
+        real = fake.pins_list
+
+        def _pins(channel, **kw):          # mid-reverify: a Keep lands on the row
+            st.append_event(st.KEPT, proposal_id=PID, cid=A1, by=HARRISON, ts=NOW + 11)
+            return real(channel, **kw)
+        fake.pins_list = _pins
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
+        assert r.outcome == "claim_lost" and "nothing was posted or archived" in r.msg, r.msg
+        assert st.read_ledger() == [] and not fake.posts
+        assert "conversations_archive" not in fake.method_names()
+        assert state(A1) == st.KEPT
+
+    def test_a_demotion_on_record_after_the_gate_records_instead(self, fake, armed):
+        stage(tier="T1")
+        real = fake.pins_list
+
+        def _pins(channel, **kw):          # mid-reverify: another tap observed a demotion
+            st.append_event(st.DEMOTED_SEEN, proposal_id=PID, ts=NOW + 11)
+            return real(channel, **kw)
+        fake.pins_list = _pins
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
+        assert r.outcome == "agreed" and "demoted after this card went out" in r.msg, r.msg
+        assert st.read_ledger() == [] and not fake.posts and state(A1) == st.AGREED
+
+
 BUSY = "C0BUSYBOT01"
 
 
@@ -912,4 +945,17 @@ class TestRoundOneRepliesPassTheRails:
         fake.members[A1] = api_error("ratelimited")
         out.append(tap(cards.ACTION_ROW, f"{PID}:{A1}:T1").msg)            # members unknown
         assert len(out) == 4 and all(out)
+        _assert_rails(out, monkeypatch, caplog)
+
+
+    def test_claim_recheck_and_store_replies(self, fake, armed, monkeypatch, caplog):
+        stage(tier="T1")
+        real = fake.pins_list
+
+        def _pins(channel, **kw):
+            st.append_event(st.KEPT, proposal_id=PID, cid=A1, by=HARRISON, ts=NOW + 11)
+            return real(channel, **kw)
+        fake.pins_list = _pins
+        out = [tap(cards.ACTION_ROW, f"{PID}:{A1}:T1").msg, handler.MSG_STORE]
+        assert "decided while I was re-checking it" in out[0]
         _assert_rails(out, monkeypatch, caplog)

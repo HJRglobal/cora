@@ -45,6 +45,10 @@ EXPIRY_DAYS = 14
 KEEP_WINDOW_DAYS = 90
 KEEP_CAP = 2
 CLAIM_TTL_S = 600
+#: A13: a claim with a ledger intent but no outcome YET is an archive in flight for this
+#: long (the no-retry write client's 30 s timeout on the notice and on the archive, plus
+#: the read-back) -- CLAIMED, "In progress…" -- and only then a locked UNKNOWN.
+INFLIGHT_S = 120
 SCAN_LOCK_STALE_S = 1800
 DAY_S = 86400.0
 
@@ -266,7 +270,9 @@ class Fold:
 def fold(events: list[dict] | None = None, ledger: list[dict] | None = None, *,
          now: float | None = None) -> Fold:
     """Replay the store (+ the ledger, for claim expiry) into state. A store that
-    cannot be read returns ``Fold(ok=False)`` -- callers refuse to act on it."""
+    cannot be read returns ``Fold(ok=False)`` -- callers refuse to act on it. An archive
+    ledger that cannot be read is NOT an empty one: the fold still builds the proposals
+    (a card can render) but is ``ok=False`` (nothing acts) and no claim is expired."""
     now = time.time() if now is None else float(now)
     if events is None:
         events = read_events()
@@ -276,6 +282,9 @@ def fold(events: list[dict] | None = None, ledger: list[dict] | None = None, *,
     if events is None:
         f.ok = False
         return f
+    ledger_ok = ledger is not None
+    if not ledger_ok:
+        f.ok = False
     intents: dict[tuple, list[float]] = {}
     outcomes: dict[tuple, list[tuple[float, str]]] = {}
     demotion_marks: list[float] = []     # A12: every card created at/before one is T0 for good
@@ -361,21 +370,25 @@ def fold(events: list[dict] | None = None, ledger: list[dict] | None = None, *,
     for p in f.proposals.values():
         if p.proposal_id in demoted_seen or any(m >= p.created for m in demotion_marks):
             p.demoted = True
-    # reader-side claim expiry (A13)
-    for p in f.proposals.values():
+    # reader-side claim expiry (A13) -- never from a ledger we could not read
+    for p in (f.proposals.values() if ledger_ok else ()):
         for cid, st in list(p.row_state.items()):
             if st.get("state") != CLAIMED:
                 continue
             key = (p.proposal_id, cid)
             cts = float(st.get("ts") or 0)
-            its = [t for t in intents.get(key, []) if t >= cts - 1]
+            # only THIS claim's intents: an earlier attempt's intent (even 0.5 s before a
+            # retry's claim) must never shadow the retry as that attempt's outcome
+            its = [t for t in intents.get(key, []) if t >= cts]
             if not its:
                 if now - cts > CLAIM_TTL_S:
                     p.row_state[cid] = {"state": OPEN, "ts": now, "code": "claim_expired"}
                 continue
             outs = [o for t, o in outcomes.get(key, []) if t >= min(its)]
             if not outs:
-                p.row_state[cid] = {**st, "state": UNKNOWN, "code": "no_outcome"}
+                if now - max(its) >= INFLIGHT_S:
+                    p.row_state[cid] = {**st, "state": UNKNOWN, "code": "no_outcome"}
+                # else: an archive in flight -- stays CLAIMED ("In progress…")
             else:
                 p.row_state[cid] = {**st, "state": _state_from_outcome(outs[-1]),
                                     "code": outs[-1]}
@@ -480,6 +493,31 @@ def claim_row(pid: str, cid: str, kind: str, *, actor: str, now: float | None = 
               check: Any = None) -> tuple[bool, str, Fold | None]:
     """The durable T1 claim: a ``claimed`` event keyed by the channel (A13)."""
     return decide_row(pid, cid, CLAIMED, actor=actor, now=now, check=check, kind=kind)
+
+
+def append_intent_if_claimed(pid: str, cid: str, claim_ts: float, *, now: float,
+                             **intent: Any) -> tuple[str, Fold | None]:
+    """The archive path's last check-then-write before any Slack write (c1-state-
+    machine#3), in ONE acquisition of CLAIM_LOCK: re-fold; the row must still be
+    CLAIMED by THIS attempt (its own claim ts, kind ``archive``) and the card must not
+    have outlived a demotion (A12); only then is the ledger ``intent`` appended. A Keep
+    or Mark that landed during the re-verify (an expired or shadowed claim) therefore
+    stops the archive here. Returns ("ok" | "store_unreadable" | "claim_lost" |
+    "demoted" | "ledger_write_failed", fold)."""
+    with CLAIM_LOCK:
+        f = fold(now=now)
+        if not f.ok:
+            return "store_unreadable", f
+        p = f.proposals.get(pid)
+        cur = (p.row_state.get(cid) if p is not None else None) or {}
+        if (cur.get("state") != CLAIMED or cur.get("kind") != "archive"
+                or abs(float(cur.get("ts") or 0) - float(claim_ts)) > 1e-3):
+            return "claim_lost", f
+        if p.demoted:
+            return "demoted", f
+        if not append_ledger("intent", proposal_id=pid, channel_id=cid, **intent):
+            return "ledger_write_failed", f
+    return "ok", f
 
 
 # ── the cross-process scan lock (A18) ────────────────────────────────────────

@@ -68,7 +68,8 @@ MSG_ORPHANED = ("I don't have a record of that proposal anymore — ask 'archive
                 "channels' for a fresh scan.")
 MSG_ALREADY = "That channel was already decided on this card."
 MSG_IN_PROGRESS = "That channel is in progress — the outcome will post in this thread."
-MSG_STORE = "I couldn't read the proposal store, so nothing was recorded or archived."
+MSG_STORE = ("I couldn't read the proposal store or the archive ledger, so nothing was "
+             "recorded or archived.")
 RACE_OUTCOMES: frozenset = frozenset({"not_authorized", "orphaned", "already_handled",
                                       "in_progress", "store_error"})
 
@@ -523,6 +524,7 @@ def _archive_one(p: st.Proposal, row: dict, actor: str, *, now: float,
     """The ONLY caller of conversations_archive. Returns (result, systemic_code|None)."""
     cid = row["cid"]
     pid = p.proposal_id
+    wall0 = time.time()
     ok, why, _f = st.claim_row(pid, cid, "archive", actor=actor, now=now)
     if not ok:
         return _refusal(why, pid), None
@@ -540,11 +542,39 @@ def _archive_one(p: st.Proposal, row: dict, actor: str, *, now: float,
         return TapResult("refused_transient", f"Nothing was archived — {gwhy}.", pid), None
     # the age as of THIS tap (the card's figure can be up to 14 days old)
     age = fresh.last_person_days if fresh is not None else row.get("last_person_days")
-    prior = _prior_attempt_ts(cid, time.time())      # read BEFORE this attempt's own intent
-    if not st.append_ledger("intent", proposal_id=pid, channel_id=cid,
-                            channel_name=None if row.get("lex") else row.get("name"),
-                            lex=True if row.get("lex") else None, age_days=age,
-                            tapped_by=actor, override=bool(override), ts=time.time()):
+    # The intent, the claim re-check and the prior-attempt window run on the CLAIM's
+    # clock (`now` + elapsed wall time): in the bot `now` is the tap's own time.time(),
+    # and the claim, the intent and a retry's claim can never be misordered by a clock
+    # that restarted from a different origin.
+    clock = now + max(0.0, time.time() - wall0)
+    prior = _prior_attempt_ts(cid, clock)            # read BEFORE this attempt's own intent
+    # c1-state-machine#3: the claim must still be THIS attempt's (a Keep / Mark may have
+    # landed during the re-verify) -- re-checked and the intent written in ONE claim-lock
+    # acquisition.
+    got, _f2 = st.append_intent_if_claimed(
+        pid, cid, now, now=clock,
+        channel_name=None if row.get("lex") else row.get("name"),
+        lex=True if row.get("lex") else None, age_days=age, tapped_by=actor,
+        override=bool(override), ts=clock)
+    if got == "claim_lost":
+        return TapResult("claim_lost", (f"Not archived: {_label(row)} was decided while I was "
+                                        "re-checking it (a Keep or a Mark landed, or my claim "
+                                        "lapsed) — nothing was posted or archived. Check the "
+                                        "row."), pid), None
+    if got == "demoted":
+        st.append_event(st.AGREED, proposal_id=pid, cid=cid, by=actor, override=bool(override),
+                        ts=time.time())
+        ov = f" (override of its {row.get('reason') or 'exemption'} exemption)" if override else ""
+        return TapResult("agreed", (f"Marked {_label(row)} to archive{ov} — recorded as T1 "
+                                    "promotion evidence. Nothing was archived: "
+                                    f"{gates.DEMOTED_AFTER_CARD}."), pid), None
+    if got == "store_unreadable":
+        st.append_event("released", proposal_id=pid, cid=cid, code="store_unreadable",
+                        ts=time.time())
+        return TapResult("failed", ("Not archived: I couldn't read the proposal store or the "
+                                    "archive ledger just now, so nothing was posted. The "
+                                    "buttons stay; tap again."), pid), None
+    if got != "ok":
         st.append_event("released", proposal_id=pid, cid=cid, code="ledger_write_failed",
                         ts=time.time())
         return TapResult("failed", ("Nothing was done: the archive ledger write failed, and an "
