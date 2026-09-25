@@ -281,8 +281,11 @@ FOLLOWUP_REPLY_LEAD = "That reply archived nothing — only the card's buttons a
 
 
 def _lane_never_archived() -> bool:
-    """True only when the ledger is readable, holds no archive intent or outcome at
-    all, and the lane is not demoted (a demotion means the monitor found an archive)."""
+    """True only when the ledger is readable and EMPTY and the lane is not demoted (a
+    demotion means the monitor found an archive). Every ledger row is archive history:
+    an intent / outcome, an ``unarchived_seen``, and the ``acknowledged`` rows
+    Harrison's demotion clear writes for the archives it listed (D-051 r2
+    c1-intents-copy#3) -- none of those may be followed by 'nothing has been archived'."""
     from . import policy  # noqa: PLC0415
     from . import store as st  # noqa: PLC0415
     try:
@@ -291,8 +294,7 @@ def _lane_never_archived() -> bool:
         ledger = st.read_ledger()
     except Exception:  # noqa: BLE001
         return False
-    return ledger is not None and not any(
-        r.get("event") in ("intent", "outcome") for r in ledger)
+    return ledger is not None and not ledger
 
 
 def followup_reply() -> str:

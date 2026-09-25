@@ -459,3 +459,38 @@ class TestEveryLiveCardR2:
         assert it.live_card_message_ts("DH", now=NOW) == {c_ts}
         assert it.live_card_ts("DH", now=NOW) == pytest.approx(NOW - 60)
         assert it.live_card_message_ts("DOTHER", now=NOW) == {o_ts}
+
+
+class TestClearedDemotionR2:
+    """r2:c1-intents-copy#3: a demotion means the monitor found an archive of Cora's
+    that no tap explains. Harrison's clear turns it into ``acknowledged`` ledger rows
+    and deletes the file -- the follow-up reply must still never say 'nothing has been
+    archived' about that history."""
+
+    @pytest.mark.parametrize("record", [
+        {"since": NOW - DAY, "reason": "unattributed archive", "channel_id": "C0ROGUE0001",
+         "archive_ts": f"{NOW - DAY:.6f}",
+         "events": [{"channel_id": "C0ROGUE0001", "archive_ts": f"{NOW - DAY:.6f}"},
+                    {"channel_id": "C0ROGUE0002", "archive_ts": f"{NOW - DAY + 5:.6f}"}]},
+        {"since": NOW - DAY, "reason": "unreadable -- no event listed"},
+    ], ids=["listed-events", "bare-demoted-since"])
+    def test_the_follow_up_reply_after_a_cleared_demotion(self, record):
+        import json
+        from cora.channel_archive import policy
+        policy.demotion_path().write_text(json.dumps(record), encoding="utf-8")
+        assert "nothing has been archived" not in it.followup_reply()          # while demoted
+        out = st.clear_demotion(actor=HARRISON, dry_run=False)
+        assert out["cleared"] and not policy.is_demoted()
+        ledger = st.read_ledger()
+        assert ledger and {r["event"] for r in ledger} == {"acknowledged"}
+        r = it.followup_reply()
+        assert r.startswith(it.FOLLOWUP_REPLY_LEAD) and "Lane at T0" in r
+        assert "nothing has been archived" not in r and "nothing was archived" not in r
+
+    def test_an_unarchive_seen_row_is_history_too(self):
+        st.append_ledger("unarchived_seen", channel_id="C0AAAAAAA1", unarchive_ts=NOW, ts=NOW)
+        assert "nothing has been archived" not in it.followup_reply()
+
+    def test_an_empty_ledger_still_says_nothing_has_been_archived(self):
+        assert st.read_ledger() == []
+        assert it.followup_reply().endswith("Lane at T0: nothing has been archived.")
