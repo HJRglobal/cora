@@ -230,5 +230,33 @@ class TestLexBelt:
         assert not reg.lex_by_members([HARRISON])
 
 
+class TestRegistryShrinkCopy:
+    """D-051 r1 registry-ops#1 + c1-false-inactive#2: a registry that parsed complete but
+    below the 90% floor is named as a SHRINK (not "could not be read completely"), with
+    the operator's re-baseline command; the 100-id minimum is not re-baselinable."""
+
+    def test_the_shrink_case_names_the_counts_and_the_command(self):
+        cause, hint = reg.shrink_copy("registry_unreadable: 125 ids < floor 126")
+        assert "125 ids" in cause and "90%" in cause and "126" in cause
+        assert "--rebaseline-registry --apply" in hint
+
+    def test_below_the_hard_minimum_is_not_offered_a_rebaseline(self):
+        cause, hint = reg.shrink_copy("registry_unreadable: 95 ids < floor 100")
+        assert "minimum" in cause and hint == ""
+
+    def test_other_blind_details_are_not_a_shrink(self):
+        assert reg.shrink_copy("registry_unreadable: coverage sentinel missing (truncated?)") is None
+        assert reg.shrink_copy("") is None and reg.shrink_copy(None) is None
+
+    def test_the_shrink_regex_is_linear_on_whitespace(self):
+        for shape in (" " * 40000, "1" * 40000, "1 ids < floor " * 3000):
+            best = float("inf")
+            for _ in range(3):
+                t0 = time.perf_counter()
+                reg._FLOOR_RE.search(shape)
+                best = min(best, time.perf_counter() - t0)
+            assert best < 0.05
+
+
 def test_name_fp_is_stable_and_case_insensitive():
     assert reg.name_fp("Old-Promo") == reg.name_fp("old-promo") and len(reg.name_fp("x")) == 12

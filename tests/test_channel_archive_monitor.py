@@ -483,6 +483,22 @@ class TestUnarchiveSearchWalksForward:
         assert len(reads) <= mon.FORWARD_SEARCH_CALLS
 
 
+class TestLatestProposalBlind:
+    """D-051 r1 registry-ops#1: a lane whose latest staged proposal was BLIND proposes
+    nothing -- it must not read green until a sighted scan is staged."""
+
+    def test_a_blind_latest_proposal_warns_until_a_sighted_one_is_staged(self):
+        st.append_event("staged", proposal_id="chanarch-bbbbbbbbbbbb", trigger="monthly",
+                        blind="registry_unreadable",
+                        blind_detail="registry_unreadable: 125 ids < floor 126", rows=[], ts=NOW - DAY)
+        out = run(MonSlack())
+        line = next(f for f in out["findings"] if f.startswith("LATEST SCAN BLIND"))
+        assert "125 ids" in line and "--rebaseline-registry --apply" in line
+        assert out["status"] == "warn" and not out["blind"]        # the monitor itself read fine
+        st.append_event("staged", proposal_id="chanarch-cccccccccccc", trigger="ask", rows=[], ts=NOW - 3600)
+        assert run(MonSlack())["status"] == "ok"
+
+
 def test_a_scan_that_started_and_never_staged_warns():
     st.append_event("scan_started", scan_id="abc123", trigger="ask", ts=NOW - 2 * 3600)
     out = run(MonSlack())

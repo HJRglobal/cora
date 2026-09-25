@@ -136,6 +136,30 @@ def parse_registry(text: str, *, last_good_count: int = 0) -> Registry:
                     lex_ids=frozenset(lex_ids), lex_names=frozenset(lex_names), count=len(ids))
 
 
+#: The operator's escape hatch for a LEGITIMATE registry trim of more than 10% (D-051 r1
+#: registry-ops#1): a blind scan persists no count, so without it the floor never moves.
+REBASELINE_CMD = (r".venv\Scripts\python.exe scripts\run_channel_archive_proposal.py "
+                  "--rebaseline-registry --apply")
+# Bounded digit runs around a literal: linear on any input (timed on 40k whitespace).
+_FLOOR_RE = re.compile(r"(\d{1,7}) ids < floor (\d{1,7})")
+
+
+def shrink_copy(blind_detail: str | None) -> tuple[str, str] | None:
+    """(cause, hint) when a registry parsed COMPLETE (every section + the sentinel) but
+    below its id floor -- the file shrank, it was not "read incompletely". Above the
+    100-id minimum the hint names the re-baseline command; below it there is no hint (a
+    re-baseline cannot lower the minimum). None for every other blind detail."""
+    m = _FLOOR_RE.search(str(blind_detail or ""))
+    if m is None:
+        return None
+    n, floor = int(m.group(1)), int(m.group(2))
+    if floor <= MIN_REGISTRY_IDS:
+        return (f"the channel registry has {n} ids, below the {MIN_REGISTRY_IDS}-id minimum", "")
+    return (f"the channel registry has {n} ids, fewer than 90% of the last good read "
+            f"(floor {floor})",
+            f"If the registry was trimmed on purpose, Harrison re-baselines it: `{REBASELINE_CMD}`.")
+
+
 def load_registry(*, last_good_count: int = 0, path: Path | None = None,
                   reader: Callable[[Path], str] | None = None) -> Registry:
     """Read + parse, timeout-bounded through drive_io (the default path is on G:)."""

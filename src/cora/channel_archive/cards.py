@@ -29,6 +29,7 @@ from typing import Any
 from .. import slack_egress
 from . import classify as cl
 from . import policy
+from . import registry as reg
 from . import store as st
 
 ACTION_ROW = "cora_channel_archive_row"            # Mark to archive (T0) / Archive (T1)
@@ -410,8 +411,13 @@ def render_page(fold: st.Fold, proposal_id: str, page: int, *, now: float | None
     if page == 1:
         if p.blind:
             cause = BLIND_CAUSES.get(p.blind, p.blind)
+            # a registry that parsed complete but shrank is named as such, with the
+            # re-baseline command (D-051 r1 registry-ops#1 / c1-false-inactive#2)
+            shrink = reg.shrink_copy(p.blind_detail) if p.blind == "registry_unreadable" else None
+            cause, hint = shrink if shrink is not None else (cause, "")
             blocks.append(_section(f"I could not complete the dead-channel scan ({cause}), so I am "
-                                   "proposing nothing this time — nothing was archived."))
+                                   "proposing nothing this time — nothing was archived."
+                                   + (f" {hint}" if hint else "")))
             return blocks, fallback_text(p)
         if not p.rows:
             unread = int((p.counts or {}).get("unreadable") or 0)

@@ -43,8 +43,10 @@ message -> "cannot attribute" WARN; a scan_started with no staged card after 1 h
 WARN, settled by a ``scan_failed`` the crash path recorded (the bot's scan pool and the
 monthly script; the crash was already said where the scan was asked) and dropped after
 7 days when nothing was recorded (a killed process) -- an alarm the right action cannot
-clear gets ignored (lesson 52). The OK line carries coverage counts (lesson 63: a zero
-count certifies nothing without positive coverage).
+clear gets ignored (lesson 52); the LATEST staged proposal was blind -> "LATEST SCAN
+BLIND" WARN until a sighted scan is staged (with the re-baseline command when the
+registry merely shrank). The OK line carries coverage counts (lesson 63: a zero count
+certifies nothing without positive coverage).
 """
 from __future__ import annotations
 
@@ -55,6 +57,7 @@ from typing import Any, Callable
 
 from . import classify as cl
 from . import policy
+from . import registry as reg
 from . import store as st
 
 log = logging.getLogger(__name__)
@@ -476,6 +479,17 @@ def reconcile(client: Any, *, now: float | None = None, dry_run: bool = False,
             findings.append(f"a scan started {e.get('at') or '?'} and never staged a card (no crash "
                             f"was recorded; this finding drops {SCAN_STALL_MAX_S // st.DAY_S:.0f} days "
                             "after the start)")
+
+    # -- the latest staged proposal was BLIND: a lane that can only propose nothing must
+    # not read green until a sighted scan is staged (D-051 r1 registry-ops#1) --
+    last = next((e for e in reversed(events) if e.get("event") == "staged"), None)
+    if last is not None and last.get("blind"):
+        detail = str(last.get("blind_detail") or "")
+        shrink = reg.shrink_copy(detail) if last.get("blind") == "registry_unreadable" else None
+        hint = f" {shrink[0]}. {shrink[1]}".rstrip() if shrink is not None else ""
+        findings.append(f"LATEST SCAN BLIND: the dead-channel scan staged {last.get('at') or '?'} "
+                        f"({last.get('trigger') or '?'}) proposed nothing -- {last.get('blind')}"
+                        f"{': ' + detail if detail else ''}.{hint}")
     if findings:
         out["status"] = "warn"
     log.info("channel_archive monitor status=%s findings=%d coverage=%s dry_run=%s",

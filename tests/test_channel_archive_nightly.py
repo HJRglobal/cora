@@ -79,6 +79,17 @@ def test_a_failed_demotion_write_is_named_in_the_tail(monkeypatch, tmp_path):
     assert "DEMOTION WRITE FAILED" in r.detail and "demotion WRITTEN" not in r.detail
 
 
+def test_a_blind_latest_proposal_warns_in_the_nightly_row():
+    """D-051 r1 registry-ops#1: a permanently blind lane cannot read green."""
+    st.append_event("staged", proposal_id="chanarch-bbbbbbbbbbbb", trigger="monthly",
+                    blind="policy_unreadable", rows=[], ts=NOWX - 86400)
+    fake = MonSlack(archived={"C0HUMAN001": {}},
+                    events={"C0HUMAN001": [{"ts": f"{NOWX - 3600:.6f}", "subtype": "channel_archive",
+                                            "user": PERSON}]})
+    r = hc.check_channel_archive(client_factory=lambda: fake, now=NOWX)
+    assert r.status == "warn" and "LATEST SCAN BLIND" in r.detail and "policy_unreadable" in r.detail
+
+
 def test_no_client_is_blind_never_ok():
     r = hc.check_channel_archive()          # default factory refuses under pytest
     assert r.status == "warn" and r.detail.startswith("BLIND: no Slack client")

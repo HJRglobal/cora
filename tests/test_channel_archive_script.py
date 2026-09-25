@@ -230,6 +230,69 @@ class TestManualAndClear:
         assert st.read_ledger()[-1]["by"] == HARRISON and markers() == []
 
 
+class TestRegistryRebaseline:
+    """D-051 r1 registry-ops#1 + c1-false-inactive#2: one legitimate registry trim of
+    more than 10% blinded the lane for good (a blind scan persists registry_count=0, so
+    the floor never moved) with no way back but hand-editing the append-only store. The
+    operator re-baseline (dry run prints; --apply appends a store event the fold honours)
+    is that way back, and the blind copy names it."""
+
+    def _stage_old_count(self, n=121):
+        st.append_event("staged", proposal_id="chanarch-000000000001", trigger="monthly",
+                        ts=az(2026, 9, 7), expires_ts=az(2026, 9, 21), rows=[], registry_count=n)
+
+    def _fixture_count(self):
+        from cora.channel_archive import registry as reg
+        return reg.load_registry().count
+
+    def test_a_trimmed_registry_is_blind_then_rebaselined_then_sighted(self, fake, capsys):
+        n = self._fixture_count()
+        self._stage_old_count(n + 13)                        # a > 10% shrink since the last good read
+        SCRIPT.main([], now=az(2026, 10, 5))
+        out = capsys.readouterr().out
+        assert "BLIND: registry_unreadable" in out and "--rebaseline-registry --apply" in out
+        before = len(st.read_events())
+        assert SCRIPT.main(["--rebaseline-registry"], now=az(2026, 10, 5)) == 0
+        out = capsys.readouterr().out
+        assert f"{n} ids" in out and f"{n + 13}" in out and "--apply" in out
+        assert len(st.read_events()) == before                # a dry run writes nothing
+        assert SCRIPT.main(["--rebaseline-registry", "--apply"], now=az(2026, 10, 5)) == 0
+        assert "RE-BASELINED" in capsys.readouterr().out
+        ev = st.read_events()[-1]
+        assert ev["event"] == "registry_rebaselined" and ev["registry_count"] == n
+        assert ev["previous"] == n + 13 and ev["by"] == HARRISON
+        assert st.fold(now=az(2026, 10, 5)).last_registry_count == n
+        SCRIPT.main([], now=az(2026, 10, 5))
+        out = capsys.readouterr().out
+        assert "BLIND" not in out and "SECTION A candidates (1): C0CANDID01" in out
+        assert markers() == []                                # an operator command writes no marker
+
+    def test_a_structurally_incomplete_registry_is_refused(self, fake, monkeypatch, tmp_path, capsys):
+        from _chanarch_fakes import REGISTRY_FIXTURE
+        text = REGISTRY_FIXTURE.read_text(encoding="utf-8")
+        cut = tmp_path / "registry.md"
+        cut.write_text(text[: len(text) // 2], encoding="utf-8")
+        monkeypatch.setenv("CORA_CHANNEL_REGISTRY_PATH", str(cut))
+        self._stage_old_count()
+        before = len(st.read_events())
+        assert SCRIPT.main(["--rebaseline-registry", "--apply"], now=az(2026, 10, 5)) == 1
+        assert "REFUSED" in capsys.readouterr().out and len(st.read_events()) == before
+
+    def test_the_blind_card_names_the_shrink_and_the_command(self, fake):
+        from cora.channel_archive import deliver
+        self._stage_old_count(self._fixture_count() + 13)
+        out = deliver.deliver_proposal(trigger="ask", now=az(2026, 10, 5), sleep=no_sleep)
+        assert out["delivered"] and out["blind"] == "registry_unreadable"
+        body = json.dumps(fake.posts[-1]["blocks"], ensure_ascii=False)
+        assert "fewer than 90%" in body and "--rebaseline-registry --apply" in body
+        assert "could not be read completely" not in body
+
+    def test_a_later_good_scan_still_moves_the_baseline(self):
+        st.append_event("registry_rebaselined", registry_count=108, by=HARRISON, previous=140, ts=1.0)
+        st.append_event("staged", proposal_id="chanarch-000000000002", ts=2.0, rows=[], registry_count=112)
+        assert st.fold(now=3.0).last_registry_count == 112
+
+
 def test_clear_demotion_names_and_acks_every_listed_event(capsys):
     """D-051 r1 c1-monitor#2: the preview names every unattributed event and --apply
     acknowledges each one (and prints them all)."""

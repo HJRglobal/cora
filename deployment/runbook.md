@@ -231,7 +231,13 @@ any T0 card.**
   unreadable, Slack's list incomplete, bot identity unknown). The registry is read from
   `_shared\playbooks\slack-channel-registry.md` and counts only when all nine entity
   sections, the `_Coverage note` line and >= max(100, 90% of the last good parse) ids
-  are present.
+  are present. The 08:45 check WARNs `LATEST SCAN BLIND` while the latest staged card
+  was blind. **After a legitimate registry trim of more than 10%** every scan reads
+  BLIND "N ids < floor M" (a blind scan never moves the floor) and the card says so:
+  `.\.venv\Scripts\python.exe scripts\run_channel_archive_proposal.py --rebaseline-registry`
+  shows the counts, and the same with `--apply` records the registry's current count as
+  the new last good count (a `registry_rebaselined` store event; only a structurally
+  complete registry of >= 100 ids is accepted; no marker, no Slack call).
 - **T1 (after promotion ONLY):** a `promoted` event on the registry row (a Code/Cowork
   commit) + `CORA_CHANNEL_ARCHIVE=act` + one restart. Then a tap posts a one-line
   notice in the channel, archives it on a no-retry client, reads it back, and ledgers

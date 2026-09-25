@@ -62,6 +62,9 @@ _ROW_EVENTS: frozenset = frozenset({CLAIMED, AGREED, KEPT, ARCHIVED, ALREADY_ARC
 #: A proposal-level event: a tap / re-render saw the lane demoted after this card (A12).
 DEMOTED_SEEN = "demoted_seen"
 
+#: Harrison's registry re-baseline (run_channel_archive_proposal.py --rebaseline-registry).
+REBASELINE_EVENT = "registry_rebaselined"
+
 _APPEND_LOCK = threading.Lock()
 #: THE claim lock: every Mark / Keep / Archive decision is check-then-write inside
 #: ONE acquisition of this lock (lesson 12). Lock order: the app's render lock is
@@ -316,6 +319,16 @@ def fold(events: list[dict] | None = None, ledger: list[dict] | None = None, *,
             continue
         if ev == DEMOTED_SEEN:
             demoted_seen.add(pid)
+            continue
+        if ev == REBASELINE_EVENT:
+            # Harrison's re-baseline after a legitimate registry trim (D-051 r1
+            # registry-ops#1): the registry floor follows it until the next good scan
+            try:
+                n = int(e.get("registry_count") or 0)
+            except (TypeError, ValueError):
+                n = 0
+            if n > 0:
+                f.last_registry_count = n
             continue
         if ev == "staged":
             if not pid or pid in f.proposals:

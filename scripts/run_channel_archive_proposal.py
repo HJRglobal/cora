@@ -30,6 +30,12 @@ Usage (from the repo root, main's tree checked out):
     .venv\\Scripts\\python.exe scripts\\run_channel_archive_proposal.py --clear-demotion
     .venv\\Scripts\\python.exe scripts\\run_channel_archive_proposal.py --clear-demotion --apply
 
+    # Harrison only, after a LEGITIMATE registry trim of more than 10% (every scan then
+    # reads BLIND "N ids < floor M"): show / record the registry's current id count as the
+    # new last good count (a `registry_rebaselined` store event; no marker, no Slack call)
+    .venv\\Scripts\\python.exe scripts\\run_channel_archive_proposal.py --rebaseline-registry
+    .venv\\Scripts\\python.exe scripts\\run_channel_archive_proposal.py --rebaseline-registry --apply
+
 Script-side: a change here needs no bot restart. Its card's BUTTONS are handled by the
 bot, so the task must be registered only AFTER the restart that loads the lane.
 """
@@ -49,6 +55,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from cora import run_marker  # noqa: E402
 from cora.channel_archive import cards, deliver  # noqa: E402
+from cora.channel_archive import registry as reg  # noqa: E402
 from cora.channel_archive import store as st  # noqa: E402
 
 TASK_NAME = "cowork-cora-channel-archive-proposal"
@@ -146,6 +153,9 @@ def _dry_run(now: float) -> int:
     if out.get("blind"):
         _print(f"  BLIND: {out['blind']} {out.get('blind_detail') or ''} -- a live run would propose "
                "nothing and say why")
+        shrink = reg.shrink_copy(out.get("blind_detail")) if out["blind"] == "registry_unreadable" else None
+        if shrink is not None:
+            _print(f"  {shrink[0]}. {shrink[1]}".rstrip())
         return 0
     _print(f"  scanned {out.get('scanned', 0)} member channels | active {c.get('active', 0)} | "
            f"could not be read {c.get('unreadable', 0)} {c.get('unreadable_codes') or ''}")
@@ -158,6 +168,37 @@ def _dry_run(now: float) -> int:
     return 0
 
 
+def _rebaseline(now: float, *, apply: bool) -> int:
+    """Harrison's escape hatch for a LEGITIMATE registry trim of more than 10% (D-051 r1
+    registry-ops#1): a blind scan persists no count, so the A9 floor would otherwise
+    never move. Accepts only a STRUCTURALLY complete registry (all nine sections, the
+    coverage sentinel, >= the 100-id minimum); --apply appends a ``registry_rebaselined``
+    store event the fold honours. No run marker; no Slack call."""
+    f = st.fold(now=now)
+    if not f.ok:
+        _print("REFUSED: the proposals store could not be read -- nothing re-baselined.")
+        return 1
+    r = reg.load_registry(last_good_count=0)
+    prev = f.last_registry_count
+    if not r.ok:
+        _print(f"REFUSED: the registry is not complete ({r.reason}) -- a re-baseline accepts only "
+               "a registry with every entity section, the coverage line and at least "
+               f"{reg.MIN_REGISTRY_IDS} ids.")
+        return 1
+    new_floor = reg.registry_floor(r.count)
+    if not apply:
+        _print(f"Registry re-baseline (dry run): the registry parses complete with {r.count} ids; the "
+               f"stored last good count is {prev or 'none'} (floor {reg.registry_floor(prev)}). "
+               f"Re-run with --apply to record {r.count} (the floor becomes {new_floor}).")
+        return 0
+    if not st.append_event(st.REBASELINE_EVENT, registry_count=r.count, previous=prev or None,
+                           by=deliver.HARRISON_ID, ts=now):
+        _print("NOT re-baselined: the proposals store write failed.")
+        return 1
+    _print(f"Registry RE-BASELINED: last good count {prev or 'none'} -> {r.count} (floor now {new_floor}).")
+    return 0
+
+
 def main(argv: list[str] | None = None, *, now: float | None = None) -> int:
     ap = argparse.ArgumentParser(description="Dead-channel proposal card (Code #16 C1).")
     ap.add_argument("--apply", action="store_true", help="stage + DM the card (default: dry run)")
@@ -165,8 +206,14 @@ def main(argv: list[str] | None = None, *, now: float | None = None) -> int:
                     help="the scheduled task: deliver only when this month's card is due")
     ap.add_argument("--clear-demotion", action="store_true",
                     help="Harrison only: show (or with --apply, clear) the automatic demotion")
+    ap.add_argument("--rebaseline-registry", action="store_true",
+                    help="Harrison only: show (or with --apply, record) the channel registry's "
+                         "current id count as the new last good count, after a legitimate trim")
     args = ap.parse_args(argv)
     now = time.time() if now is None else float(now)
+
+    if args.rebaseline_registry:
+        return _rebaseline(now, apply=args.apply)
 
     if args.clear_demotion:
         out = st.clear_demotion(actor=deliver.HARRISON_ID, dry_run=not args.apply)
