@@ -124,6 +124,7 @@ FOLLOWUP_FIRE_R1 = [
     "archive the dead ones", "ok, archive them", "sure, archive the 3 i marked", "go ahead and archive",
     "please archive them now", "archive it", "archive them after the meeting next week and tell tommy",
     "Cora, archive the ones I marked", "yes please archive them", "archive the card",
+    "archive them in slack",
 ]
 FOLLOWUP_NOT_R1 = [
     "yes, and also send the report", "ok thanks for that", "archive this thread", "archive old emails",
@@ -131,6 +132,7 @@ FOLLOWUP_NOT_R1 = [
     "archived them myself", "don't archive them", "did you archive them?",
     "archive of the old site is in drive", "archive folder is full", "archive: q3 decks",
     "archive is in drive", "archive the channel history",
+    "archive everything in the promo folder", "archive them in my gmail", "archive the old stuff from asana",
 ]
 
 

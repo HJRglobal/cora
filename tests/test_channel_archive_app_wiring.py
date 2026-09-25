@@ -544,7 +544,7 @@ class TestFounderDMGrammarR1:
         assert not dm.qa.called and not dm.capture.called and not dm.scans
 
     @pytest.mark.parametrize("text", ["archive the retail channel deals", "archive my emails from tommy",
-                                      "archive the hubspot deal"])
+                                      "archive the hubspot deal", "archive everything in the promo folder"])
     def test_an_archive_of_some_other_object_is_not_a_card_followup(self, dm, text):
         _live_card()
         client = MagicMock()

@@ -157,6 +157,12 @@ _FOLLOWUP_VERB_RE = re.compile(r"\A" + _PREFIX + _ARCHIVE_V + r"\b")
 _FOREIGN_OBJECT_RE = re.compile(
     " (?:" + _DET + " ){0,3}(?:" + _FILLER + " ){0,4}?(?:" + _OBJ_NOUNS
     + "|channels? " + _SALES_NOUNS + r")\b")
+#: ... or whose place is some other system ("archive everything in the promo folder",
+#: "archive them in my gmail").
+_FOREIGN_PLACE_RE = re.compile(
+    r"\b(?:in|from|inside|on|at) (?:(?:my|the|our|his|her|their) )?(?:[a-z0-9-]+ ){0,2}"
+    r"(?:folders?|drives?|inbox(?:es)?|gmail|e-?mail|asana|hubspot|notion|dropbox|quickbooks|"
+    r"qbo|shopify|deposco|airtable|trello|jira|github|calendar)\b")
 _BARE_YES_RE = re.compile(
     r"\A(?:yes|yep|yeah|y|ok|okay|go ahead|do it|go|sure|please do|yes please|confirm|"
     r"confirmed|approved|approve)[?.!]*\Z")
@@ -212,7 +218,7 @@ def followup_shape(text: str) -> str | None:
     if not _ok(t):
         return None
     m = _FOLLOWUP_VERB_RE.match(t)
-    if m and not _FOREIGN_OBJECT_RE.match(t, m.end()):
+    if m and not _FOREIGN_OBJECT_RE.match(t, m.end()) and not _FOREIGN_PLACE_RE.search(t, m.end()):
         return "imperative"
     if _BARE_YES_RE.match(t):
         return "affirmative"
