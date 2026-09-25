@@ -12,6 +12,9 @@ Locked decisions (Universal Session Capture spec, 2026-06-09):
   1. Distilled summaries (decisions / facts learned / action items / open
      questions), not raw verbatim.
   2. PHI sessions captured IN FULL — nothing redacted from the distillation.
+     (Code #15 S1, 2026-09-24: API-TOKEN shapes are the one exception -- a
+     credential is not knowledge. They are redacted before the distill prompt and
+     in the note; PHI capture and every PHI screen are unchanged.)
   3. Promotion to canonical CLAUDE.md / memory/ stays gated behind Harrison's
      existing 👍 knowledge-review DM. This module only lands captures in the
      capture log + KB (searchable) — it never writes canonical memory.
@@ -43,7 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from . import drive_io, phi_guard
+from . import drive_io, phi_guard, secret_tokens
 
 log = logging.getLogger(__name__)
 
@@ -167,6 +170,14 @@ class ParsedSession:
     ended_iso: str | None
     text: str
     n_turns: int
+    # Code #15 S1 (cq-d9d0c92cc797): the SAME flattening with API-token shapes
+    # redacted BEFORE each tool_result's 400-char cut (belt a). ``text`` stays the
+    # raw flattening -- the PHI screens (is_phi_risk / is_prose_phi_risk /
+    # route_capture) and the scheduled-task check keep reading exactly what they
+    # read before; only the distill input comes from here. None (a hand-built
+    # session) falls back to ``text`` -- belt (b) in _build_distill_prompt still
+    # redacts it before the cap.
+    distill_text: str | None = None
 
 
 @dataclass
@@ -202,10 +213,19 @@ def iter_transcript_files(projects_root: Path = PROJECTS_ROOT) -> Iterator[Path]
         yield path
 
 
-def _extract_text(content: Any) -> str:
-    """Flatten a message ``content`` (str or list of blocks) into plain text."""
+def _tok(text: str, redact: bool) -> str:
+    return secret_tokens.redact_secret_tokens(text)[0] if redact else text
+
+
+def _extract_text(content: Any, *, redact_tokens: bool = False) -> str:
+    """Flatten a message ``content`` (str or list of blocks) into plain text.
+
+    ``redact_tokens`` (Code #15 S1 belt a): API-token shapes are redacted in every
+    text block and in a tool_result BEFORE its 400-char cut -- a token straddling
+    the cut would otherwise leave a partial prefix no later belt can match (the
+    run_daily_briefing pre-slice lesson). Off = the exact prior flattening."""
     if isinstance(content, str):
-        return content
+        return _tok(content, redact_tokens)
     if not isinstance(content, list):
         return ""
     parts: list[str] = []
@@ -214,14 +234,14 @@ def _extract_text(content: Any) -> str:
             continue
         btype = block.get("type")
         if btype == "text":
-            parts.append(str(block.get("text", "")))
+            parts.append(_tok(str(block.get("text", "")), redact_tokens))
         elif btype == "thinking":
             continue  # internal reasoning — not durable signal
         elif btype == "tool_use":
             parts.append(f"[tool: {block.get('name', '?')}]")
         elif btype == "tool_result":
             inner = block.get("content")
-            txt = _extract_text(inner) if inner is not None else ""
+            txt = _extract_text(inner, redact_tokens=redact_tokens) if inner is not None else ""
             if txt:
                 parts.append(f"[result: {txt[:400]}]")
     return "\n".join(p for p in parts if p)
@@ -244,6 +264,7 @@ def parse_transcript(path: Path) -> ParsedSession | None:
     last_ts: str | None = None
     last_epoch = path.stat().st_mtime
     turns: list[str] = []
+    dturns: list[str] = []   # Code #15 S1: the token-redacted twin (distill input)
     n_turns = 0
 
     try:
@@ -271,6 +292,8 @@ def parse_transcript(path: Path) -> ParsedSession | None:
                     # Skip pure tool-result/system noise and empty turns.
                     if text and not _is_noise_turn(text):
                         turns.append(f"{msg['role'].upper()}: {text}")
+                        dturns.append(f"{msg['role'].upper()}: "
+                                      f"{_extract_text(msg.get('content'), redact_tokens=True)}")
                         n_turns += 1
     except OSError as exc:
         log.warning("session_capture: cannot read %s: %s", path, exc)
@@ -289,6 +312,7 @@ def parse_transcript(path: Path) -> ParsedSession | None:
         ended_iso=last_ts,
         text="\n\n".join(turns),
         n_turns=n_turns,
+        distill_text="\n\n".join(dturns),
     )
 
 
@@ -413,6 +437,7 @@ def parse_cowork_session(session_dir: Path,
     last_ts: str | None = None
     last_epoch = 0.0
     turns: list[str] = []
+    dturns: list[str] = []   # Code #15 S1: the token-redacted twin (distill input)
     n_turns = 0
     seen_uuids: set[str] = set()
     total_chars = 0
@@ -453,6 +478,8 @@ def parse_cowork_session(session_dir: Path,
                         text = _extract_text(msg.get("content"))
                         if text and not _is_noise_turn(text):
                             turns.append(f"{msg['role'].upper()}: {text}")
+                            dturns.append(f"{msg['role'].upper()}: "
+                                          f"{_extract_text(msg.get('content'), redact_tokens=True)}")
                             n_turns += 1
                             total_chars += len(text)
                             if total_chars >= _COWORK_MAX_TEXT_CHARS:
@@ -474,6 +501,7 @@ def parse_cowork_session(session_dir: Path,
         ended_iso=last_ts,
         text="\n\n".join(turns),
         n_turns=n_turns,
+        distill_text="\n\n".join(dturns),
     )
 
 
@@ -530,13 +558,38 @@ def entity_folder(entity: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _distill_input(session: ParsedSession) -> str:
+    """The distill input: the token-redacted flattening (belt a) when the parser
+    built one, else the raw text (belt b below still redacts it). ``getattr``: a
+    duck-typed session without the field (a caller/test stub) must not break the
+    batch or the sync path -- it falls back to ``text``."""
+    twin = getattr(session, "distill_text", None)
+    return twin if twin is not None else session.text
+
+
+def _redacted_transcript(text: str) -> str | None:
+    """Belt (b), Code #15 S1: API-token shapes out of the WHOLE transcript before
+    the cap is sliced. None = the redactor failed (fail-closed: no distill, the
+    session is not ledger-marked and retries next run). A legitimate redaction can
+    never equal WITHHELD (its output carries the MARKER)."""
+    safe, n = secret_tokens.redact_secret_tokens(text or "")
+    if n and safe == secret_tokens.WITHHELD:
+        return None
+    return safe
+
+
 def _build_distill_prompt(text: str, default_entity: str, *, phi: bool) -> str:
     """The exact distill prompt for one transcript -- shared verbatim by the
     sync path (distill) and the batch path (_batch_distill), so batching
-    changes transport, never content."""
+    changes transport, never content. Code #15 S1 belt (b): token shapes are
+    redacted BEFORE ``text[:cap]`` -- covers both transports (the Message Batch
+    is a 29-day at-rest copy) and any future text source."""
     cap = _MAX_INPUT_CHARS_PHI if phi else _MAX_INPUT_CHARS
+    safe = _redacted_transcript(text)
+    if safe is None:
+        safe = secret_tokens.WITHHELD   # never the raw text
     return _DISTILL_PROMPT.format(default_entity=default_entity,
-                                  transcript=text[:cap])
+                                  transcript=safe[:cap])
 
 
 def distill(text: str, default_entity: str, *, phi: bool,
@@ -558,6 +611,9 @@ def distill(text: str, default_entity: str, *, phi: bool,
             log.warning("session_capture: anthropic client init failed: %s", exc)
             return None
 
+    if _redacted_transcript(text) is None:
+        log.warning("session_capture: api-token redaction failed -- skipping distill (fail-closed)")
+        return None
     prompt = _build_distill_prompt(text, default_entity, phi=phi)
     try:
         resp = client.messages.create(
@@ -792,7 +848,9 @@ def _finalize_capture(
     default_entity = entity_from_cwd(session.cwd)
 
     if pre_distilled is _NO_PREDISTILL:
-        distilled = distill(session.text, default_entity, phi=phi_strict,
+        # Code #15 S1: the distill input is the token-redacted flattening; the PHI
+        # screen above and route_capture below keep reading the raw session.text.
+        distilled = distill(_distill_input(session), default_entity, phi=phi_strict,
                             client=anthropic_client)
     else:
         distilled = pre_distilled
@@ -809,6 +867,12 @@ def _finalize_capture(
     # QUARANTINED (held + alerted), not filed.
     entity, phi, quarantined = route_capture(distilled["entity"], session.text)
     distilled["entity"] = entity
+    # Code #15 S1 belt (c) -- the Haiku-echo belt: a model can repeat a token it
+    # saw (or hallucinate one). The topic rides in the note header, the KB title,
+    # the ledger, the CaptureResult meta and the runner's log line, so it is
+    # redacted BEFORE any of them is built; the rendered note is redacted as a
+    # whole below, before the G: write / KB ingest.
+    distilled["topic"] = secret_tokens.redact_title(distilled["topic"])
 
     when = datetime.now(timezone.utc)
     if quarantined:
@@ -819,6 +883,18 @@ def _finalize_capture(
                               root=founder_os_root, surface=surface)
     note = render_note(distilled, session, when.strftime("%Y-%m-%d"), phi,
                        surface=surface, quarantined=quarantined)
+    note, n_note_tok = secret_tokens.redact_secret_tokens(note)
+    if n_note_tok and note == secret_tokens.WITHHELD:
+        # Fail-closed: never write a withheld shell over a capture; retry next run.
+        log.warning("session_capture: api-token redaction failed on the note for %s -- skipped",
+                    ledger_key)
+        return CaptureResult(
+            session_id=session.session_id, entity=entity, note_path=None,
+            phi=phi, distilled=False, skipped_reason="token_redaction_failed",
+        )
+    if n_note_tok:
+        log.warning("session_capture: api-token redaction: %d token(s) redacted from the "
+                    "distilled note for %s", n_note_tok, ledger_key)
 
     result = CaptureResult(
         session_id=session.session_id, entity=entity, note_path=npath,
@@ -1028,7 +1104,11 @@ def _batch_distill(pending: list[tuple[ParsedSession, str, str]]) -> dict[str, A
                 skipped_phi += 1
                 continue
             default_entity = entity_from_cwd(session.cwd)
-            prompt = _build_distill_prompt(session.text, default_entity, phi=False)
+            # Code #15 S1: the token-redacted flattening; a redactor failure keeps
+            # the item OFF the batch (the sync fallback fails closed the same way).
+            if _redacted_transcript(_distill_input(session)) is None:
+                continue
+            prompt = _build_distill_prompt(_distill_input(session), default_entity, phi=False)
             requests.append({
                 "custom_id": f"item-{len(keys)}",
                 "params": {"model": _HAIKU_MODEL, "max_tokens": 1500,
