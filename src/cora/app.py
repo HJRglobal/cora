@@ -5200,6 +5200,58 @@ def _ca_start_scan(client, channel: str, thread_ts, *, ack_text: str,
         _ca_run_scan(client, channel, thread_ts, "ask", running)
 
 
+def _ca_thread_claimed(user_id: str, dm: str, thread_ts) -> bool:
+    """integration#1: a founder reply typed in a gap-ask, knowledge-check or stalled-
+    decision thread is THAT capture's answer ("threaded replies always win"), however
+    archive-shaped it reads. Each check is the exact predicate the capture below
+    uses. A card's own thread is never claimed, and neither is an ordinary Q&A
+    thread -- a near-miss typed there still gets the code reply (the model has no
+    archive tool, and its "Archived ..." would trip no rail)."""
+    ts = str(thread_ts or "")
+    if not ts or ts in channel_archive_intents.live_card_message_ts(dm):
+        return False
+    checks = (
+        lambda: gap_autofill.match_pending_ask(user_id, ts, allow_toplevel=False),
+        lambda: (knowledge_check.enabled() and knowledge_check.has_live_cycle(user_id)
+                 and knowledge_check.match_live_cycle(user_id, ts, allow_toplevel=False)),
+        lambda: decision_alerts.match_alert_reply(user_id, ts),
+    )
+    for check in checks:
+        try:
+            if check():
+                return True
+        except Exception:  # noqa: BLE001 -- the capture itself treats a failed match as none
+            log.warning("channel_archive: thread-claim check failed", exc_info=True)
+    return False
+
+
+def _ca_bot_spoke_since_card(client, dm: str, card_ts: float) -> bool:
+    """c1-intents-copy#5: True when Cora posted a NEWER top-level DM message that is
+    neither a card page nor one of the lane's own lines -- a bare "yes" then answers
+    THAT message (e.g. the model's "Want the 13-week view too?"), not the card. A
+    read error keeps the rail (honesty over convenience: the rail exists so that no
+    model turn can narrate an archive)."""
+    cai = channel_archive_intents
+    try:
+        resp = client.conversations_history(channel=dm, oldest=f"{float(card_ts):.6f}", limit=10)
+        msgs = resp.get("messages") or []
+        card_stamps = cai.live_card_message_ts(dm)
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            ts = str(m.get("ts") or "")
+            if not ts or ts in card_stamps or float(ts) <= float(card_ts):
+                continue
+            if not (m.get("bot_id") or (_CORA_BOT_USER_ID and m.get("user") == _CORA_BOT_USER_ID)):
+                continue
+            if not cai.is_lane_reply(str(m.get("text") or "")):
+                return True
+    except Exception:  # noqa: BLE001
+        log.warning("channel_archive: DM history read failed -- keeping the follow-up rail",
+                    exc_info=True)
+    return False
+
+
 def _channel_archive_dm_intercept(event: dict, client, user_id: str, text: str) -> bool:
     """True when a FOUNDER DM was a dead-channel-lane intent and has been answered."""
     cai = channel_archive_intents
@@ -5233,6 +5285,14 @@ def _channel_archive_dm_intercept(event: dict, client, user_id: str, text: str) 
             if gap_autofill.has_live_ask(user_id) or (
                     knowledge_check.enabled() and knowledge_check.has_live_cycle(user_id)):
                 return False
+            # ... nor the answer to a NEWER top-level message of Cora's (a top-level
+            # "yes" answers the last thing said; typed in the card's thread it is
+            # the card's).
+            if not thread_ts and _ca_bot_spoke_since_card(client, dm, card_ts):
+                return False
+    if thread_ts and _ca_thread_claimed(user_id, dm, thread_ts):
+        log.info("channel_archive DM intercept kind=%s yields: a capture owns the thread", kind)
+        return False
     if os.environ.get("CORA_EVAL_MODE") == "1":
         log.info("channel_archive DM intercept kind=%s under EVAL_MODE: no-op", kind)
         return True

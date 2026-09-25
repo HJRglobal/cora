@@ -252,6 +252,18 @@ ATTEMPT_REPLY = ("I only run the full dead-channel scan — nothing was archived
                  "the dead channels' here; exceptions are the Keep buttons.")
 CATCHUP_DRAFT = "This was a dead-channel request — ask again live; nothing was archived."
 EVAL_NOOP = ""
+#: how every line this lane posts in the DM begins (the card's text= included):
+#: a newer bot message that is one of THESE does not take a bare "yes" from the card
+_LANE_REPLY_PREFIXES = ("That reply archived nothing", "Typed replies don't act",
+                        "Dead-channel lane:", "Dead-channel proposal", "I only run the full dead-channel",
+                        "Scanning the channels I belong to", "Scanning now — the proposal card",
+                        "A scan is already running", "The dead-channel scan stopped",
+                        "The dead-channel lane is switched off", "This was a dead-channel request")
+
+
+def is_lane_reply(text: str) -> bool:
+    t = str(text or "").strip()
+    return bool(t) and t.startswith(_LANE_REPLY_PREFIXES)
 
 
 #: Scoped to the TYPED turn (c1-authority-tier#4): true whatever the lane has done.

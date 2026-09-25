@@ -366,6 +366,16 @@ class TestReplies:
             assert se.screen_phantom_write_claims(r, tool_use_count=0) == r, r
 
 
+class TestLaneReplies:
+    def test_every_lane_line_is_recognised_and_ordinary_answers_are_not(self):
+        for r in (it.ACK_REPLY, it.CHANNEL_ACK_REPLY, it.SCAN_RUNNING_REPLY, it.SCAN_RUNNING_CHANNEL_REPLY,
+                  it.SCAN_FAILED_REPLY, it.OFF_REPLY, it.ATTEMPT_REPLY, it.followup_reply(),
+                  it.status_reply(now=NOW), "Dead-channel proposal (T0 — nothing archived): 12 listed."):
+            assert it.is_lane_reply(r), r
+        for r in ("Want the 13-week view too?", "", "Done.", "Dead channels are a pain"):
+            assert not it.is_lane_reply(r), r
+
+
 class TestClockSkew:
     """harness-isolation#0: the card ts is Slack's clock, ``now`` is the host's."""
 

@@ -21,7 +21,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import cora.app as app_module
-from _chanarch_fakes import DAY, HARRISON, NOW, PERSON
+from _chanarch_fakes import DAY, HARRISON, NOW, PERSON, resp
 from cora.channel_archive import cards, deliver, intents
 from cora.channel_archive import registry as reg
 from cora.channel_archive import store as st
@@ -370,6 +370,131 @@ def _live_card():
     _stage()
     st.append_event("delivered", proposal_id=PID, page=1, dm_channel="DHARRISON1",
                     message_ts=f"{time.time() - 5:.6f}", rendered_cids=[A1], buttons=True)
+
+
+ASK_TS = "1790000050.000100"
+
+
+class TestThreadOwnershipR1:
+    """integration#1: a reply typed in a gap-ask / knowledge-check / decision-alert
+    thread is THAT capture's answer ('threaded replies always win'), even when it
+    reads like an archive request -- driven through the REAL handle_message_event."""
+
+    ANSWER = "archive channels after 90 days with no human posts, except leadership"
+
+    def test_a_gap_ask_thread_answer_is_recorded_not_refused(self, dm, monkeypatch):
+        dm.gap.side_effect = lambda uid, tts, allow_toplevel=True: (
+            {"ask_id": "ask-1", "ask_message_ts": ASK_TS} if tts == ASK_TS else None)
+        recorded = []
+        monkeypatch.setattr(app_module.gap_autofill, "record_ask_answer",
+                            lambda ask, text: recorded.append((ask["ask_id"], text)) or "Got it -- thanks.")
+        client = MagicMock()
+        app_module.handle_message_event(_event(self.ANSWER, thread_ts=ASK_TS), client)
+        assert recorded == [("ask-1", self.ANSWER)]
+        assert intents.ATTEMPT_REPLY not in _texts(client) and "Got it -- thanks." in _texts(client)
+
+    @pytest.mark.parametrize("text", ["archive the channels on the list", "did you archive the channels?",
+                                      "archive the dead channels"])
+    def test_a_knowledge_check_thread_answer_goes_to_the_check(self, dm, monkeypatch, text):
+        dm.kc.side_effect = lambda uid, tts, allow_toplevel=True: (
+            {"cycle_id": "kc-1"} if tts == ASK_TS else None)
+        handled = MagicMock(return_value=True)
+        monkeypatch.setattr(app_module, "_handle_knowledge_check_reply", handled)
+        client = MagicMock()
+        app_module.handle_message_event(_event(text, thread_ts=ASK_TS), client)
+        assert handled.called and _texts(client) == [] and not dm.scans, text
+
+    def test_a_decision_alert_thread_answer_goes_to_the_decision(self, dm, monkeypatch):
+        monkeypatch.setattr(app_module.decision_alerts, "match_alert_reply",
+                            lambda uid, tts, *a: {"alert_message_ts": ASK_TS} if tts == ASK_TS else None)
+        monkeypatch.setattr(app_module.decision_alerts, "is_decline", lambda t: True)
+        marked = MagicMock()
+        monkeypatch.setattr(app_module.decision_alerts, "mark_state", marked)
+        monkeypatch.setattr(app_module.gap_autofill, "has_live_ask", lambda uid: False)
+        monkeypatch.setattr(app_module.knowledge_check, "has_live_cycle", lambda uid: False)
+        client = MagicMock()
+        app_module.handle_message_event(_event("archive the channels on the list", thread_ts=ASK_TS), client)
+        assert marked.called and intents.ATTEMPT_REPLY not in _texts(client)
+
+    def test_an_unowned_thread_still_gets_the_attempt_reply(self, dm):
+        """Only a CAPTURE-owned thread yields: an ordinary Q&A thread keeps the rail (the
+        model has no archive tool, and its 'Archived ...' trips no rail)."""
+        client = MagicMock()
+        app_module.handle_message_event(_event(self.ANSWER, thread_ts="1790000070.000100"), client)
+        assert _texts(client) == [intents.ATTEMPT_REPLY] and not dm.qa.called
+
+    def test_a_card_thread_follow_up_is_still_the_cards(self, dm):
+        _live_card()
+        card_ts = next(iter(intents.live_card_message_ts("DHARRISON1")))
+        dm.gap.side_effect = lambda uid, tts, allow_toplevel=True: {"ask_id": "x"}   # would claim anything
+        client = MagicMock()
+        app_module.handle_message_event(_event("archive them", thread_ts=card_ts), client)
+        assert _texts(client) == [intents.followup_reply()]
+
+
+def _history(*msgs):
+    return resp({"ok": True, "messages": list(msgs), "has_more": False})
+
+
+class TestNewerBotMessageR1:
+    """c1-intents-copy#5: a bare 'yes' is the card's only while the card is the newest
+    thing Cora said in the DM; a newer answer of Cora's owns it."""
+
+    @pytest.fixture
+    def quiet(self, dm, monkeypatch):
+        monkeypatch.setattr(app_module.gap_autofill, "has_live_ask", lambda uid: False)
+        monkeypatch.setattr(app_module.knowledge_check, "has_live_cycle", lambda uid: False)
+        _live_card()
+        return dm
+
+    def test_a_newer_bot_question_owns_the_yes(self, quiet):
+        client = MagicMock()
+        client.conversations_history.return_value = _history(
+            {"ts": f"{time.time() - 1:.6f}", "user": HARRISON, "text": "yes"},
+            {"ts": f"{time.time() - 2:.6f}", "bot_id": "BCORA", "user": BOT,
+             "text": "Cash is $1.2M across the operating accounts. Want the 13-week view too?"})
+        before = quiet.qa.call_count
+        app_module.handle_message_event(_event("yes"), client)
+        assert quiet.qa.call_count == before + 1
+        assert intents.FOLLOWUP_REPLY_LEAD not in " ".join(t or "" for t in _texts(client))
+        kw = client.conversations_history.call_args.kwargs
+        assert kw["channel"] == "DHARRISON1" and "oldest" in kw
+
+    def test_the_lanes_own_newer_line_does_not(self, quiet):
+        client = MagicMock()
+        client.conversations_history.return_value = _history(
+            {"ts": f"{time.time() - 2:.6f}", "bot_id": "BCORA", "user": BOT, "text": intents.followup_reply()})
+        app_module.handle_message_event(_event("yes"), client)
+        assert _texts(client) == [intents.followup_reply()] and not quiet.qa.called
+
+    def test_a_newer_founder_message_does_not(self, quiet):
+        client = MagicMock()
+        client.conversations_history.return_value = _history(
+            {"ts": f"{time.time() - 2:.6f}", "user": HARRISON, "text": "hmm let me look"})
+        app_module.handle_message_event(_event("yes"), client)
+        assert _texts(client) == [intents.followup_reply()] and not quiet.qa.called
+
+    def test_a_history_read_error_keeps_the_rail(self, quiet):
+        client = MagicMock()
+        client.conversations_history.side_effect = RuntimeError("slack down")
+        app_module.handle_message_event(_event("yes"), client)
+        assert _texts(client) == [intents.followup_reply()] and not quiet.qa.called
+
+    def test_a_yes_in_the_cards_own_thread_is_the_cards(self, quiet):
+        client = MagicMock()
+        client.conversations_history.return_value = _history(
+            {"ts": f"{time.time() - 2:.6f}", "bot_id": "BCORA", "text": "Want the 13-week view too?"})
+        card_ts = next(iter(intents.live_card_message_ts("DHARRISON1")))
+        app_module.handle_message_event(_event("yes", thread_ts=card_ts), client)
+        assert _texts(client) == [intents.followup_reply()] and not quiet.qa.called
+
+    def test_an_imperative_follow_up_ignores_newer_messages(self, quiet):
+        """Only the bare affirmative is ambiguous; 'archive them' always means the card."""
+        client = MagicMock()
+        client.conversations_history.return_value = _history(
+            {"ts": f"{time.time() - 2:.6f}", "bot_id": "BCORA", "text": "Want the 13-week view too?"})
+        app_module.handle_message_event(_event("archive them"), client)
+        assert _texts(client) == [intents.followup_reply()] and not quiet.qa.called
 
 
 class TestFounderDMGrammarR1:
