@@ -88,14 +88,14 @@ BRANCH = "claude/code-15-integrity-queue-ux-2026-09-21"
 # The commits that closed each item (build + D-051 fixes), on the branch as merged.
 COMMITS: dict[str, str] = {
     "cq-d9d0c92cc797": "dc261783,eaf3707c,37b390e5,e3b83459,6016bfa1",
-    "cq-22b84598aee8": "0ee863cc,a2aac6ee,6016bfa1",
+    "cq-22b84598aee8": "0ee863cc,a2aac6ee,6016bfa1,6e0a33df,c61d3dc7,5b1dee25",
     "cq-90568f0b1222": "3da6cced,5410cd5f",
     "cq-74e6b20d5d3d": "3da6cced,5410cd5f",
-    "cq-5f44ce934aeb": "6c9b6c97,5410cd5f,1503cfb2",
+    "cq-5f44ce934aeb": "6c9b6c97,5410cd5f,1503cfb2,6e0a33df",
     "cq-2d26f131091e": "b3ed2621,23b6a0b3,ea366070",
     "cq-3a29e7dc3953": "b5ba666a,23b6a0b3,ea366070",
-    "cq-59c5048d0891": "a6bded4f,2849c6d0,4e28d5a9,9408e135,a1bc558d,ce6625d5,6613107d",
-    "cq-592baba613f1": "6fad929e,804a6034,ed133cd5,51787fb3",
+    "cq-59c5048d0891": "a6bded4f,2849c6d0,4e28d5a9,9408e135,a1bc558d,ce6625d5,6613107d,6e0a33df",
+    "cq-592baba613f1": "6fad929e,804a6034,ed133cd5,51787fb3,6e0a33df,5b1dee25",
 }
 # RIDER B ships with its per-item record in the bundle reference (kickoff section 7).
 BUNDLE_REFS: dict[str, str] = {
