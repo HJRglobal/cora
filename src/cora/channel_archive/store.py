@@ -324,7 +324,9 @@ def fold(events: list[dict] | None = None, ledger: list[dict] | None = None, *,
             continue
         cur = p.row_state.get(cid) or {"state": OPEN}
         if ev == "reconciled":
-            if cur.get("state") == UNKNOWN:
+            # the monitor settled an attempt Slack has now decided: a locked UNKNOWN,
+            # or a claim whose process died between the intent and the outcome
+            if cur.get("state") in (UNKNOWN, CLAIMED):
                 new = ARCHIVED if e.get("outcome") == ARCHIVED else FAILED
                 p.row_state[cid] = {**cur, "state": new, "reconciled": True, "ts": ts,
                                     "code": e.get("code") or cur.get("code")}
