@@ -305,7 +305,41 @@ class TestReplies:
         assert "can't give counts" in it.status_reply(now=NOW)
 
     def test_followup_reply_is_tier_truthful(self):
-        assert "Lane at T0: nothing has been archived" in it.followup_reply()
+        r = it.followup_reply()
+        assert r.startswith(it.FOLLOWUP_REPLY_LEAD)
+        assert "Lane at T0: nothing has been archived" in r          # clean ledger, not demoted
+
+    def test_followup_reply_is_scoped_to_the_typed_turn(self):
+        """c1-authority-tier#4: the reply speaks for THIS typed turn, never for the lane."""
+        assert it.FOLLOWUP_REPLY_LEAD == "That reply archived nothing — only the card's buttons act."
+
+    def test_followup_reply_never_denies_archives_the_ledger_shows(self):
+        """c1-authority-tier#4: a lane back at T0 after real archives (a demotion, a flag
+        roll-back) must not say 'nothing has been archived'."""
+        st.append_ledger("intent", proposal_id="chanarch-aaaaaaaaaaaa", channel_id="C0AAAAAAA1",
+                         tapped_by=HARRISON, ts=NOW)
+        st.append_ledger("outcome", proposal_id="chanarch-aaaaaaaaaaaa", channel_id="C0AAAAAAA1",
+                         outcome="archived", tapped_by=HARRISON, ts=NOW)
+        r = it.followup_reply()
+        assert r.startswith(it.FOLLOWUP_REPLY_LEAD) and "Lane at T0" in r
+        assert "nothing has been archived" not in r and "nothing was archived" not in r
+
+    def test_followup_reply_when_demoted_or_the_ledger_is_unreadable(self, monkeypatch, tmp_path):
+        from cora.channel_archive import policy
+        policy.demotion_path().write_text("{}", encoding="utf-8")
+        assert "nothing has been archived" not in it.followup_reply()
+        policy.demotion_path().unlink()
+        d = tmp_path / "d"
+        d.mkdir()
+        monkeypatch.setenv("CORA_CHANNEL_ARCHIVE_LEDGER_PATH", str(d))
+        assert "nothing has been archived" not in it.followup_reply()
+
+    def test_followup_reply_at_t1(self, monkeypatch):
+        from cora.channel_archive import gates, policy
+        monkeypatch.setattr(policy, "acting_tier", lambda: "T1")
+        monkeypatch.setattr(gates, "registry_allows_t1", lambda: True)
+        r = it.followup_reply()
+        assert r.startswith(it.FOLLOWUP_REPLY_LEAD) and "without a tap on the card" in r
 
     def test_live_card_ts_needs_a_live_card_in_this_dm(self):
         self._seed()
@@ -319,6 +353,9 @@ class TestReplies:
         replies = [it.ACK_REPLY, it.CHANNEL_ACK_REPLY, it.SCAN_RUNNING_REPLY, it.SCAN_FAILED_REPLY,
                    it.OFF_REPLY, it.ATTEMPT_REPLY, it.CATCHUP_DRAFT, it.followup_reply(),
                    it.status_reply(now=NOW + 60)]
+        st.append_ledger("outcome", proposal_id="chanarch-aaaaaaaaaaaa", channel_id="C0AAAAAAA1",
+                         outcome="archived", tapped_by=HARRISON, ts=NOW)
+        replies.append(it.followup_reply())                       # the ledger-shows-archives copy
         for r in replies:
             assert se.screen_phantom_write_claims(r, tool_use_count=0) == r, r
             assert se.sanitize_text(r) == r, r

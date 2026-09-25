@@ -251,14 +251,36 @@ CATCHUP_DRAFT = "This was a dead-channel request — ask again live; nothing was
 EVAL_NOOP = ""
 
 
+#: Scoped to the TYPED turn (c1-authority-tier#4): true whatever the lane has done.
+FOLLOWUP_REPLY_LEAD = "That reply archived nothing — only the card's buttons act."
+
+
+def _lane_never_archived() -> bool:
+    """True only when the ledger is readable, holds no archive intent or outcome at
+    all, and the lane is not demoted (a demotion means the monitor found an archive)."""
+    from . import policy  # noqa: PLC0415
+    from . import store as st  # noqa: PLC0415
+    try:
+        if policy.is_demoted():
+            return False
+        ledger = st.read_ledger()
+    except Exception:  # noqa: BLE001
+        return False
+    return ledger is not None and not any(
+        r.get("event") in ("intent", "outcome") for r in ledger)
+
+
 def followup_reply() -> str:
     from . import gates, policy  # noqa: PLC0415
     tier = "T1" if (policy.acting_tier() == "T1" and gates.registry_allows_t1() is True) else "T0"
-    if tier == "T0":
-        return ("Typed replies don't act — only the card's buttons do. Lane at T0: nothing has "
-                "been archived.")
-    return ("Typed replies don't act — only the card's buttons do. Nothing is archived without "
-            "a tap on the card.")
+    if tier == "T1":
+        return FOLLOWUP_REPLY_LEAD + " Nothing is archived without a tap on the card."
+    # "nothing has been archived" is a claim about the LANE's history: only when the
+    # ledger proves it. A lane back at T0 after real archives (a demotion, a flag
+    # roll-back) states the T0 rule instead -- never a denial the ledger contradicts.
+    if _lane_never_archived():
+        return FOLLOWUP_REPLY_LEAD + " Lane at T0: nothing has been archived."
+    return FOLLOWUP_REPLY_LEAD + " Lane at T0: a tap records your mark; nothing is archived at T0."
 
 
 def status_reply(*, now: float | None = None) -> str:
