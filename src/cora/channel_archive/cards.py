@@ -234,6 +234,10 @@ def _secondary_lines(row: dict, reason: str) -> str:
     return out
 
 
+CHANNEL_GONE_LINE = ("_Outcome unknown — the channel is gone from Slack's list (deleted, or I "
+                     "lost access to it), so it can't be checked or acted on from this card._")
+
+
 def _decided_line(row: dict, state: dict, tier: str) -> str:
     s = state.get("state")
     by = state.get("by") or ""
@@ -251,6 +255,9 @@ def _decided_line(row: dict, state: dict, tier: str) -> str:
     if s == st.ALREADY_ARCHIVED:
         return "_Already archived by someone else — nothing done here._"
     if s == st.UNKNOWN:
+        if state.get("code") == st.CHANNEL_GONE_CODE:
+            # r2:c1-state-machine#3: settled by the monitor -- nothing left to retry or check
+            return CHANNEL_GONE_LINE
         return "_Outcome unknown — the nightly monitor reconciles against Slack._"
     if s == st.STALE:
         why = state.get("code") or "it changed since the card"

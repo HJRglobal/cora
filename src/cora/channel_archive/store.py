@@ -62,6 +62,13 @@ _ROW_EVENTS: frozenset = frozenset({CLAIMED, AGREED, KEPT, ARCHIVED, ALREADY_ARC
 #: A proposal-level event: a tap / re-render saw the lane demoted after this card (A12).
 DEMOTED_SEEN = "demoted_seen"
 
+#: The monitor's settlement of an attempt whose channel left Slack's list (deleted, or
+#: Cora lost access) -- monitor.py writes this exact ledger outcome. Nothing more can be
+#: checked or archived there, so the row folds to a TERMINAL unknown carrying
+#: CHANNEL_GONE_CODE -- never a FAILED "tap to retry" row (r2:c1-state-machine#3).
+CHANNEL_GONE_OUTCOME = "failed (reconciled: channel gone)"
+CHANNEL_GONE_CODE = "channel_gone"
+
 #: Harrison's registry re-baseline (run_channel_archive_proposal.py --rebaseline-registry).
 REBASELINE_EVENT = "registry_rebaselined"
 
@@ -381,9 +388,15 @@ def fold(events: list[dict] | None = None, ledger: list[dict] | None = None, *,
             rec = e.get("outcome")
             if cur.get("state") in (UNKNOWN, CLAIMED) or (cur.get("state") == FAILED
                                                            and rec == ARCHIVED):
-                new = rec if rec in (ARCHIVED, ALREADY_ARCHIVED) else FAILED
+                code = e.get("code") or cur.get("code")
+                if rec in (ARCHIVED, ALREADY_ARCHIVED):
+                    new = rec
+                elif _channel_gone(outcomes.get((pid, cid), []), ts):
+                    new, code = UNKNOWN, CHANNEL_GONE_CODE     # terminal: nothing to retry
+                else:
+                    new = FAILED
                 p.row_state[cid] = {**cur, "state": new, "reconciled": True, "ts": ts,
-                                    "code": e.get("code") or cur.get("code")}
+                                    "code": code}
             continue
         if cur.get("state") in TERMINAL:
             continue          # terminal is sticky
@@ -417,9 +430,17 @@ def fold(events: list[dict] | None = None, ledger: list[dict] | None = None, *,
                     p.row_state[cid] = {**st, "state": UNKNOWN, "code": "no_outcome"}
                 # else: an archive in flight -- stays CLAIMED ("In progress…")
             else:
+                gone = outs[-1].startswith(CHANNEL_GONE_OUTCOME)
                 p.row_state[cid] = {**st, "state": _state_from_outcome(outs[-1]),
-                                    "code": outs[-1]}
+                                    "code": CHANNEL_GONE_CODE if gone else outs[-1]}
     return f
+
+
+def _channel_gone(outs: list[tuple[float, str]], ts: float) -> bool:
+    """True when the ledger twin of a ``reconciled`` store event -- the monitor writes
+    the ledger outcome and then the store event with the SAME ts -- is the channel-gone
+    settlement."""
+    return any(abs(t - ts) <= 1.0 and o.startswith(CHANNEL_GONE_OUTCOME) for t, o in outs)
 
 
 def _demotion_mark(row: dict) -> float:
@@ -463,7 +484,7 @@ def _state_from_outcome(outcome: str) -> str:
         return ALREADY_ARCHIVED
     if o.startswith("stale_refused"):
         return STALE
-    if o.startswith("unknown"):
+    if o.startswith("unknown") or o.startswith(CHANNEL_GONE_OUTCOME):
         return UNKNOWN
     return FAILED
 

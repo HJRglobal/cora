@@ -305,3 +305,99 @@ class TestTheA12RecheckIsImmediatelyBeforeTheWrite:
         r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1", now=NOW + 100)
         assert r.outcome == "refused_transient" and "ladder registry" in r.msg, r.msg
         assert "conversations_archive" not in fake.method_names() and _notices_to(fake, A1) == []
+
+
+# ── r2:c1-state-machine#3 ──────────────────────────────────────────────────────────
+def _texts(blocks):
+    out = []
+    for b in blocks:
+        if b.get("type") == "section":
+            out.append(b["text"]["text"])
+        elif b.get("type") == "context":
+            out.extend(e["text"] for e in b["elements"])
+        elif b.get("type") == "actions":
+            out.extend(e["text"]["text"] for e in b["elements"])
+    return out
+
+
+class TestAChannelGoneSettlementIsTerminal:
+    """The monitor settles an unknown / unfinished attempt whose channel left Slack's
+    list as 'failed (reconciled: channel gone)'. The row must fold TERMINAL with honest
+    copy -- never 'the channel stays open; tap to retry' with an Archive button."""
+
+    MPID = "chanarch-aaaaaaaaaaaa"
+
+    def _stage(self, mon_now, *, unknown_event: bool):
+        from test_channel_archive_monitor import ARCH
+        st.append_event("staged", proposal_id=self.MPID, ts=mon_now - 3 * DAY,
+                        expires_ts=mon_now + 11 * DAY,
+                        rows=[{"cid": ARCH, "section": "A", "tier": "T1", "name": "fx-arch",
+                               "name_fp": reg.name_fp("fx-arch")}])
+        st.append_event("delivered", proposal_id=self.MPID, page=1, dm_channel="DH",
+                        message_ts=f"{mon_now - 3 * DAY + 1:.6f}", rendered_cids=[ARCH],
+                        buttons=True, ts=mon_now - 3 * DAY)
+        st.append_event(st.CLAIMED, proposal_id=self.MPID, cid=ARCH, kind="archive",
+                        ts=mon_now - 2 * DAY - 10)
+        st.append_ledger("intent", proposal_id=self.MPID, channel_id=ARCH, tapped_by=HARRISON,
+                         ts=mon_now - 2 * DAY)
+        if unknown_event:
+            st.append_event(st.UNKNOWN, proposal_id=self.MPID, cid=ARCH, ts=mon_now - 2 * DAY + 5)
+            st.append_ledger("outcome", proposal_id=self.MPID, channel_id=ARCH, outcome="unknown",
+                             ts=mon_now - 2 * DAY + 5)
+        return ARCH
+
+    @pytest.mark.parametrize("unknown_event", [True, False], ids=["after_unknown", "claim_died"])
+    def test_the_real_monitor_settlement_folds_terminal_with_honest_copy(self, unknown_event,
+                                                                         monkeypatch, armed):
+        from test_channel_archive_monitor import NOW as MNOW, MonSlack, run
+        arch = self._stage(MNOW, unknown_event=unknown_event)
+        run(MonSlack())                                   # the REAL monitor: ARCH is not listed
+        assert [r["outcome"] for r in st.read_ledger() if r["event"] == "outcome"][-1] \
+            == st.CHANNEL_GONE_OUTCOME
+        f = st.fold(now=MNOW)
+        p = f.proposals[self.MPID]
+        assert p.state_of(arch) in st.TERMINAL and p.state_of(arch) == st.UNKNOWN
+        assert cards.undecided_a_on_page(p, 1) == []
+        blocks, text = cards.render_page(f, self.MPID, 1, now=MNOW)
+        body = "\n".join(_texts(blocks))
+        assert cards.CHANNEL_GONE_LINE in body, body
+        assert "tap to retry" not in body and "stays open" not in body
+        assert not [b for b in blocks if b.get("type") == "actions"
+                    and any(e.get("action_id") in (cards.ACTION_ROW, cards.ACTION_ALL)
+                            for e in b["elements"])]
+        assert "outcome unknown 1" in text
+        # a stale Archive button from an older render: refused as decided, no Slack write
+        f2 = FakeSlack(channels=[], scopes=["channels:manage", "groups:write"])
+        monkeypatch.setattr(clients, "read_client_factory", lambda: f2)
+        monkeypatch.setattr(clients, "write_client_factory", lambda: f2)
+        r = handler.process_tap(cards.ACTION_ROW, f"{self.MPID}:{arch}:T1", HARRISON, now=MNOW,
+                                sleep=no_sleep)
+        assert r.outcome == "already_handled" and r.ephemeral, r.msg
+        assert not f2.posts and "conversations_archive" not in f2.method_names()
+
+    def test_a_ledger_only_settlement_still_folds_terminal(self, armed):
+        """The store event of the settlement failed to land (fail-soft): the claim-expiry
+        branch reads the ledger outcome alone and must reach the same terminal row."""
+        from test_channel_archive_monitor import NOW as MNOW
+        arch = self._stage(MNOW, unknown_event=False)
+        st.append_ledger("outcome", proposal_id=self.MPID, channel_id=arch,
+                         outcome=st.CHANNEL_GONE_OUTCOME, ts=MNOW)
+        p = st.fold(now=MNOW).proposals[self.MPID]
+        assert p.state_of(arch) == st.UNKNOWN
+        assert p.row_state[arch]["code"] == st.CHANNEL_GONE_CODE
+
+    def test_the_monitor_writes_the_outcome_the_fold_keys_on(self):
+        import ast
+        from pathlib import Path
+        src = (Path(handler.__file__).parent / "monitor.py").read_text(encoding="utf-8")
+        lits = {n.value for n in ast.walk(ast.parse(src))
+                if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+        assert st.CHANNEL_GONE_OUTCOME in lits
+
+    def test_the_channel_gone_line_passes_both_rails(self, monkeypatch):
+        from cora import slack_egress as se
+        s = cards.CHANNEL_GONE_LINE
+        assert se.screen_phantom_write_claims(s, tool_use_count=0) == s
+        assert se.sanitize_text(s) == s
+        monkeypatch.setenv("CORA_SENTINEL_ENFORCE", "enforce")
+        assert se.screen_phantom_write_claims(s, tool_use_count=0) == s
