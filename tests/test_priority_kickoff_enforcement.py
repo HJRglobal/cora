@@ -164,6 +164,68 @@ class TestEnsureKickoffStaged:
         assert events and events[-1].get("mis_homed") is True
 
 
+# ── Code #15 S6: every door threads its `via` into the generator ─────────────
+
+class TestViaThreadedToGenerator:
+    """The STATUS line names the door, so the generator must be TOLD it: before S6,
+    ensure_kickoff_staged recorded via on the ledger but never passed it on, and
+    seed_item(stage_now) passed none at all."""
+
+    def _capture(self, monkeypatch):
+        seen: list[str] = []
+
+        def _gen(items, slug=None, meta_out=None, **kw):
+            seen.append(kw.get("via"))
+            return f"/notes/prompt-{len(seen)}.md"
+        monkeypatch.setattr(cq, "generate_kickoff_prompt", _gen)
+        return seen
+
+    def _via_on_ledger(self, cid):
+        return [e.get("via") for e in cq._read_jsonl(cq._EVENT_LEDGER)
+                if e.get("event") == "staged" and e.get("id") == cid]
+
+    def test_approve_auto(self, qenv, monkeypatch):  # noqa: F811
+        seen = self._capture(monkeypatch)
+        cid = _seed(severity="P1")
+        cq.process_queue_action(cq.ACTION_APPROVE, cid, HARRISON)
+        assert seen == ["approve_auto"] and self._via_on_ledger(cid) == ["approve_auto"]
+
+    def test_stage_button(self, qenv, monkeypatch):  # noqa: F811
+        seen = self._capture(monkeypatch)
+        cid = _seed(severity="P3")
+        cq.process_queue_action(cq.ACTION_STAGE, cid, HARRISON)
+        assert seen == ["button"] and self._via_on_ledger(cid) == ["button"]
+
+    def test_typed_verb(self, qenv, monkeypatch):  # noqa: F811
+        seen = self._capture(monkeypatch)
+        cid = _seed(severity="P3", status="APPROVED")
+        cq.stage_by_id(cid, HARRISON)
+        assert seen == ["typed_verb"] and self._via_on_ledger(cid) == ["typed_verb"]
+
+    def test_seed_stage_now(self, qenv, monkeypatch):  # noqa: F811
+        seen = self._capture(monkeypatch)
+        cid = _seed(severity="HIGH", status="APPROVED", title="seed door", stage_now=True)
+        assert seen == ["seed"] and self._via_on_ledger(cid) == ["seed"]
+
+    def test_generator_reason_rides_the_error_detail(self, qenv, monkeypatch):  # noqa: F811
+        def _gen(items, slug=None, meta_out=None, **kw):
+            meta_out["error"] = "read-back line 1 is not the STATUS line that was written"
+            return None
+        monkeypatch.setattr(cq, "generate_kickoff_prompt", _gen)
+        cid = _seed(severity="P1")
+        outcome, msg = cq.process_queue_action(cq.ACTION_APPROVE, cid, HARRISON)
+        assert outcome == "approved" and "did NOT generate" in msg
+        assert "no file" in msg and "read-back line 1" in msg
+
+    def test_truncated_meta_lands_on_the_staged_event(self, qenv, monkeypatch):  # noqa: F811
+        _fake_generator(monkeypatch, meta={"truncated": True})
+        cid = _seed()
+        cq.ensure_kickoff_staged(cid, via="button")
+        ev = [e for e in cq._read_jsonl(cq._EVENT_LEDGER)
+              if e.get("event") == "staged" and e.get("id") == cid][-1]
+        assert ev["truncated"] is True
+
+
 # ── defect 2: the HIGH vocabulary was invisible to the rule ──────────────────
 
 class TestSeverityVocabulary:

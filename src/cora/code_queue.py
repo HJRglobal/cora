@@ -1645,6 +1645,266 @@ def _id_suffix(items: list[dict[str, Any]]) -> str:
     return hashlib.sha1(basis.encode("utf-8", "replace")).hexdigest()[:6]  # noqa: S324 -- filename disambig, not security
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Code #15 S6 (cq-3a29e7dc3953): ONE fixed kickoff-file shape
+# ─────────────────────────────────────────────────────────────────────────────
+# Measured on the 12 kickoffs staged 2026-09-21 (and 96 since 8/05): 92 of 96
+# auto-drafts were wrapped in a ```markdown fence the model added unasked, 15 of
+# them UNCLOSED -- and every unclosed one was a TRUNCATED reply (output == the
+# 2000-token max_tokens on the llm_usage line at its staged time; 14 of 96 calls
+# hit the cap, all 4 since 9/22). No file carried a STATUS line, so the Cowork
+# Friday unfired-work sweep ("STATUS: STAGED <date>", "fire-owner if the STATUS
+# line names one") could not read one. 4 of 12 had no H1; the rest were model
+# paraphrases, never the item title; the skeleton's H1 was the SLUG.
+#
+# Fix: CODE owns the header (STATUS line, H1 = the LEX-safe item title, banner,
+# branch, queue line), bound SERVER-SIDE from the caller's via, _now() and the
+# get_item view -- never from model text. The model writes only the body; its
+# wrapper is stripped (outer only), its preamble dropped, any STATUS-looking line
+# it emits neutralized, a truncated reply is marked in the file AND on the
+# ledger, and a pre-write shape gate + a post-write read-back of line 1 make an
+# off-shape file impossible to stage silently.
+
+# The ledger's own `via` vocabulary (live ledger 9/21: button / approve_auto /
+# typed_verb). bundle_button = the Monday-menu "Stage bundle" door (stage_bundle),
+# seed = seed_item(stage_now=True) (the MCP cora_code_queue_seed tool), script =
+# record_staged / apply_prompt_rehome (a one-shot script names its own prompt).
+_KICKOFF_VIAS = ("button", "approve_auto", "typed_verb", "bundle_button", "seed", "script")
+_KICKOFF_VIA_UNSPECIFIED = "unspecified"
+_KICKOFF_MAX_TOKENS = 4096   # was 2000: 14 of 96 logged kickoff calls hit it (all 4 since 9/22)
+_KICKOFF_FIRE_WEEKDAY = 4    # Friday (the Cowork unfired-work sweep's day)
+_KICKOFF_FIRE_HOUR = 16      # 16:00 AZ
+_KICKOFF_TRUNCATED_TRAILER = (
+    "> TRUNCATED: the model reply was cut off (it hit max_tokens, or never closed its "
+    "wrapper fence); anything after this point is missing -- regenerate or complete "
+    "by hand before firing.")
+# A fence LINE at ANY indent (looser than CommonMark's 0-3 spaces on purpose: a
+# fence nested in a list item is commonly indented, and the balance check must see
+# it). Group 1 = the fence run, group 2 = the rest of the line (the info string).
+_FENCE_LINE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
+# The model's outer wrapper opener: a bare fence or a markdown/md one, alone on its line.
+_WRAPPER_OPEN_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})[ \t]*(?:markdown|md)?[ \t]*$", re.IGNORECASE)
+# An ATX H1 (0-3 spaces of indent, then '#' and whitespace or end of line).
+_H1_RE = re.compile(r"^ {0,3}#(?:[ \t]|$)")
+# A model line the Friday sweep could read as a STATUS line ("STATUS: FIRED",
+# "**Status**: ..."): optional quote/emphasis/list/heading marks, the word, a colon.
+_STATUS_LIKE_RE = re.compile(r"^[\s>*_`#~-]*status\b[\s*_`]*:[*_`]*", re.IGNORECASE)
+_STATUS_NEUTRALIZED_PREFIX = "> (model text, not a queue status) Status --"
+
+
+def _kickoff_via(via: str) -> str:
+    """The via token rendered on the STATUS line AND the ledger `staged` event: a
+    known ledger word as-is; anything else tokenized (no newline/markup can reach
+    line 1) with a WARNING; empty -> 'unspecified' (a stage never fails on it)."""
+    raw = str(via or "").strip()
+    if raw in _KICKOFF_VIAS:
+        return raw
+    if not raw:
+        log.warning("code_queue: kickoff staged with no via -- recorded as '%s'",
+                    _KICKOFF_VIA_UNSPECIFIED)
+        return _KICKOFF_VIA_UNSPECIFIED
+    tok = re.sub(r"[^a-z0-9_]", "", raw.lower())[:32] or _KICKOFF_VIA_UNSPECIFIED
+    log.warning("code_queue: kickoff staged via an unknown door %r -- recorded as '%s'", tok, tok)
+    return tok
+
+
+def _fence_scan(lines: list[str]) -> tuple[tuple[str, int] | None, list[str]]:
+    """Walk fenced code blocks the CommonMark way (a block closes only on a bare
+    fence of the SAME char at least as long as its opener; a backtick run whose
+    info string holds a backtick is an inline code span, not a fence). Returns
+    ``(open_fence, h1_lines)``: the still-open fence as ``(char, length)`` (None
+    = balanced) and the ATX H1 lines OUTSIDE any fence (a ``# comment`` inside a
+    bash block is not a heading)."""
+    open_: tuple[str, int] | None = None
+    h1: list[str] = []
+    for ln in lines:
+        m = _FENCE_LINE_RE.match(ln)
+        if m:
+            run, rest = m.group(1), m.group(2)
+            if open_ is None:
+                if not (run[0] == "`" and "`" in rest):
+                    open_ = (run[0], len(run))
+            elif run[0] == open_[0] and len(run) >= open_[1] and not rest.strip():
+                open_ = None
+            continue
+        if open_ is None and _H1_RE.match(ln):
+            h1.append(ln)
+    return open_, h1
+
+
+def _strip_model_fences(text: str) -> tuple[str, bool]:
+    """Strip the model's OUTER wrapper only. Returns ``(body, unclosed_wrapper)``.
+
+    The first non-blank line is an opener only if it is a bare / markdown / md
+    fence alone on its line. With an opener, it is dropped, and the last non-blank
+    line is dropped too when it is a bare fence of the same char that CLOSES the
+    wrapper (the body without it is balanced -- a final fence that instead closes
+    an INNER block leaves the wrapper open). An opener with no closer sets
+    ``unclosed_wrapper`` -- the truncation belt (every unclosed 9/21 file was a
+    max_tokens cut). With NO leading opener nothing is touched: a trailing fence
+    then closes a real inner code block."""
+    lines = str(text or "").splitlines()
+    i = 0
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    if i >= len(lines):
+        return "", False
+    m = _WRAPPER_OPEN_RE.match(lines[i])
+    if not m:
+        return str(text or ""), False
+    char, n = m.group(1)[0], len(m.group(1))
+    rest = lines[i + 1:]
+    j = len(rest) - 1
+    while j >= 0 and not rest[j].strip():
+        j -= 1
+    if j >= 0:
+        cm = _FENCE_LINE_RE.match(rest[j])
+        if (cm and cm.group(1)[0] == char and len(cm.group(1)) >= n
+                and not cm.group(2).strip()):
+            if _fence_scan(rest[:j])[0] is None or _fence_scan(rest[:j + 1])[0] is not None:
+                return "\n".join(rest[:j]), False
+            # the final fence closes an inner block -> the wrapper itself never closed
+    return "\n".join(rest), True
+
+
+def _next_fire_or_park(now_utc: datetime) -> datetime:
+    """The next Friday 16:00 AZ STRICTLY after ``now`` (the weekday is computed in
+    AZ: a Friday-evening AZ stage is already Saturday in UTC). A Friday stage
+    before 16:00 gets the same day (the literal rule; see the S6 report)."""
+    az = now_utc.astimezone(_AZ)
+    days = (_KICKOFF_FIRE_WEEKDAY - az.weekday()) % 7
+    cand = (az + timedelta(days=days)).replace(hour=_KICKOFF_FIRE_HOUR, minute=0,
+                                               second=0, microsecond=0)
+    if cand <= az:
+        cand += timedelta(days=7)
+    return cand
+
+
+def _kickoff_status_line(via: str, now_utc: datetime) -> str:
+    """Line 1 of every generated kickoff -- the claim-lock / Friday-sweep line."""
+    staged = now_utc.astimezone(_AZ).isoformat(timespec="seconds")
+    fire = _next_fire_or_park(now_utc).isoformat(timespec="seconds")
+    return (f"STATUS: STAGED {staged} · via {_kickoff_via(via)} · fire-owner: Harrison · "
+            f"fire-or-park: {fire}")
+
+
+def _one_line(value: Any) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _kickoff_h1(items: list[dict[str, Any]]) -> str:
+    """The H1 text: the item title from the LEX-safe view (re-applied here as a
+    belt -- a LEX row renders the redaction placeholder, never raw text), or for a
+    bundle the shared theme and the count (never a member title). Whitespace is
+    collapsed so a multi-line title can never add a line to the header."""
+    safe = [_lex_safe_view(it) for it in items]
+    if len(safe) > 1:
+        return f"Bundle: {_one_line(_bundle_theme(safe)) or 'bundle'} ({len(safe)} items)"
+    return _one_line(safe[0].get("title") if safe else "") or "(untitled)"
+
+
+def _kickoff_queue_line(items: list[dict[str, Any]]) -> str:
+    parts = []
+    for it in items:
+        parts.append(f"`{_one_line(it.get('id')) or '?'}` ({_one_line(it.get('severity')) or '?'}, "
+                     f"{_one_line(it.get('entity')) or '?'}, {_one_line(it.get('kind')) or '?'})")
+    return "Queue: " + ", ".join(parts)
+
+
+def _kickoff_header(items: list[dict[str, Any]], slug: str, via: str,
+                    now_utc: datetime) -> list[str]:
+    """The ONE fixed header block, shared by the model path and the skeleton."""
+    return [
+        _kickoff_status_line(via, now_utc),
+        "",
+        f"# {_kickoff_h1(items)}",
+        "",
+        "_AUTO-GENERATED DRAFT -- VERIFY-FIRST everything. Opus-tier, xhigh; follow the "
+        "STANDING OPERATING LOOP in repo CLAUDE.md. Branch: "
+        f"`claude/{slug}` off `main`._",
+        "",
+        _kickoff_queue_line(items),
+        "",
+    ]
+
+
+def _normalize_model_body(text: str) -> tuple[str, dict[str, Any]]:
+    """The model reply -> the body that follows the code-rendered header: outer
+    wrapper stripped; the model's own preamble (its title/byline/banner/branch
+    lines) dropped -- the lines before the first ``## `` heading, ONLY when such a
+    heading exists; and any line the Friday sweep could read as a STATUS line
+    neutralized. An empty result means: use the skeleton."""
+    body, unclosed = _strip_model_fences(text)
+    lines = body.splitlines()
+    info: dict[str, Any] = {"unclosed_wrapper": unclosed, "preamble_dropped": 0,
+                            "status_neutralized": 0}
+    first = next((k for k, ln in enumerate(lines) if ln.startswith("## ")), None)
+    if first:
+        info["preamble_dropped"] = first
+        lines = lines[first:]
+    out: list[str] = []
+    for ln in lines:
+        m = _STATUS_LIKE_RE.match(ln)
+        if m:
+            info["status_neutralized"] += 1
+            ln = f"{_STATUS_NEUTRALIZED_PREFIX} {ln[m.end():].strip()}".rstrip()
+        out.append(ln)
+    while out and not out[0].strip():
+        out.pop(0)
+    while out and not out[-1].strip():
+        out.pop()
+    return "\n".join(out), info
+
+
+def _kickoff_shape_errors(text: str, expected_h1: str) -> list[str]:
+    """The shape invariant every written kickoff must pass (empty = valid): line 1
+    is the STATUS: STAGED line; exactly one H1 outside code fences and it is the
+    expected title; no wrapper fence right after the header; fences BALANCED.
+    Inner code blocks are allowed -- the kickoff's spec said "no line == ```",
+    which would reject legitimate code blocks (hand-written kickoffs carry them)."""
+    errs: list[str] = []
+    lines = str(text or "").splitlines()
+    if not lines or not lines[0].startswith("STATUS: STAGED "):
+        errs.append("line 1 is not a 'STATUS: STAGED' line")
+    open_, h1 = _fence_scan(lines)
+    if len(h1) != 1:
+        errs.append(f"{len(h1)} H1 headings outside code (want exactly 1)")
+    elif h1[0] != f"# {expected_h1}":
+        errs.append("the H1 is not the expected item title")
+    q = next((k for k, ln in enumerate(lines) if ln.startswith("Queue: ")), None)
+    if q is None:
+        errs.append("header has no Queue line")
+    else:
+        nxt = next((ln for ln in lines[q + 1:] if ln.strip()), "")
+        if _FENCE_LINE_RE.match(nxt):
+            errs.append("a code fence wraps the body")
+    if open_ is not None:
+        errs.append("unbalanced code fence")
+    return errs
+
+
+def _skeleton_safe(lines: list[str]) -> list[str]:
+    """Skeleton lines are built from item fields that can hold newlines (a typed
+    ask's title, a summary, an evidence note). A continuation line that starts
+    with '# ' or a fence would break the skeleton's OWN shape gate and turn a
+    stage into an error for an item-content reason, so each continuation is
+    indented under its bullet, a leading fence run is escaped, and a STATUS-looking
+    continuation is neutralized exactly like a model line."""
+    out: list[str] = []
+    for line in lines:
+        phys = str(line).splitlines() or [""]
+        out.append(phys[0])
+        for cont in phys[1:]:
+            c = cont.strip()
+            if _FENCE_LINE_RE.match(c):
+                c = "\\" + c
+            m = _STATUS_LIKE_RE.match(c)
+            if m:
+                c = f"{_STATUS_NEUTRALIZED_PREFIX} {c[m.end():].strip()}".rstrip()
+            out.append(f"      {c}" if c else "")
+    return out
+
+
 def _write_prompt_file(body: str, fname: str) -> tuple[str | None, bool]:
     """Write a generated prompt. Primary target: the Founder-OS ``_notes`` folder via
     drive_io (mount-resilient). If G: is unavailable (DriveUnavailable) or the write
@@ -1833,46 +2093,47 @@ def _evidence_block(items: list[dict[str, Any]], *, override: bool = False) -> l
 
 
 _PROMPT_SYS = """\
-You write a paste-ready Code-session kickoff prompt for "Cora" (an internal
-Slack AI-assistant codebase). Match this house skeleton EXACTLY:
+You write the BODY of a paste-ready Code-session kickoff prompt for "Cora" (an
+internal Slack AI-assistant codebase). Code prepends the header itself -- the
+STATUS line, the title, the byline/banner and the branch. Do NOT write a title
+(no `# ` heading), a byline, a banner, a branch line or a STATUS line. Do NOT
+wrap your reply in a code fence. Start directly with the `## 0. Evidence`
+heading and use exactly these `## ` sections, in order:
 
-- A one-line byline pinning Opus-tier + the STANDING OPERATING LOOP, and the
-  literal banner "AUTO-GENERATED DRAFT -- VERIFY-FIRST everything", plus a
-  suggested branch name `claude/<slug>`.
-- Section 0: evidence -- copy the EVIDENCE block you are given VERBATIM (every
+- ## 0. Evidence -- copy the EVIDENCE block you are given VERBATIM (every
   permalink, the seed text, the classifier fields); if it says none exists,
   say so. Never invent a pointer.
-- Section 1: deliverable slices (ONE per queued item when bundled).
-- Section 2: guardrails to respect (reference Cora doctrine IDs where relevant:
+- ## 1. Deliverables -- slices (ONE per queued item when bundled).
+- ## 2. Guardrails -- to respect (reference Cora doctrine IDs where relevant:
   D-011 no-canon-write, staged-write gate, D-051 adversarial review, PHI D-082).
-- Section 3: tests.
-- Section 4: live acceptance (Harrison, after merge + restart).
-- Section 5: notes incl. restart implications.
+- ## 3. Tests.
+- ## 4. Live acceptance (Harrison, after merge + restart).
+- ## 5. Notes -- incl. restart implications.
 
-Be concise. Do NOT invent facts beyond the evidence. Output MARKDOWN only.
+Be concise. Do NOT invent facts beyond the evidence. Output MARKDOWN only; a
+fenced code block inside a section is fine, but close every fence you open.
 """
 
 
-def _deterministic_prompt(items: list[dict[str, Any]], slug: str, *, override: bool = False) -> str:
-    today = _now().strftime("%Y-%m-%d")
-    lines = [
-        f"# Cora Code prompt -- {slug} ({today})",
-        "",
-        "_AUTO-GENERATED DRAFT -- VERIFY-FIRST everything. Opus-tier, xhigh; follow the "
-        "STANDING OPERATING LOOP in repo CLAUDE.md. Branch: "
-        f"`claude/{slug}` off `main`._",
-        "",
+def _deterministic_prompt(items: list[dict[str, Any]], slug: str, *, override: bool = False,
+                          via: str = "", now: datetime | None = None) -> str:
+    """The fail-soft skeleton. Its header is the SAME fixed block the model path
+    uses (S6), so its H1 is the item title -- no longer the slug."""
+    items = [_lex_safe_view(it) for it in items]  # belt: callers already pass get_item views
+    lines = _kickoff_header(items, slug, via, now or _now())
+    lines += [
         "## 0. Evidence",
         "",
     ]
-    lines += _evidence_block(items, override=override)
+    lines += _skeleton_safe(_evidence_block(items, override=override))
     lines += [
         "",
         "## 1. Deliverables",
         "",
     ]
-    for i, it in enumerate(items, 1):
-        lines.append(f"- Slice {i}: {it.get('title', '')} -- {it.get('fix_sketch', '') or it.get('summary', '')}")
+    lines += _skeleton_safe([
+        f"- Slice {i}: {it.get('title', '')} -- {it.get('fix_sketch', '') or it.get('summary', '')}"
+        for i, it in enumerate(items, 1)])
     lines += [
         "",
         "## 2. Guardrails",
@@ -1892,22 +2153,66 @@ def _deterministic_prompt(items: list[dict[str, Any]], slug: str, *, override: b
     return "\n".join(lines)
 
 
+def _loggable_prompt_path(path: str, items: list[dict[str, Any]]) -> str:
+    """A prompt path for a LOG line (D-082: logs carry ids, never titles or LEX
+    names): the folder plus a glob on the id suffix -- the filename's slug is
+    title-derived, so it never reaches the log; the suffix finds the file."""
+    return f"{Path(str(path)).parent}{os.sep}*-{_id_suffix(items)}.md"
+
+
+def _read_back_prompt(path: str, body: str, mis_homed: bool) -> str:
+    """Post-write read-back (S6). "" when the file on disk IS the body we wrote;
+    otherwise a short reason. Line endings are normalized on both sides (the repo
+    fallback writes in text mode). Never raises."""
+    try:
+        if mis_homed:
+            got = Path(path).read_text(encoding="utf-8")
+        else:
+            got = drive_io.read_text(path)
+    except Exception as exc:  # noqa: BLE001 -- a failed read-back is a reason, never a raise
+        return f"read-back failed ({type(exc).__name__})"
+    want_lines, got_lines = body.splitlines(), str(got).splitlines()
+    if not got_lines or not want_lines or got_lines[0] != want_lines[0]:
+        return "read-back line 1 is not the STATUS line that was written"
+    if got_lines != want_lines:
+        return "read-back content differs from what was written"
+    return ""
+
+
 def generate_kickoff_prompt(items: list[dict[str, Any]], *, slug: str | None = None,
                             meta_out: dict[str, Any] | None = None,
-                            override: bool = False) -> str | None:
+                            override: bool = False, via: str = "") -> str | None:
     """Render a kickoff prompt for one item or a bundle and write it to the Founder-OS
     ``_notes`` folder (mount-resilient; fail-soft to the repo ``_notes``). Returns the
-    written path (str) or None on total write failure. Model call is fail-soft: on any
-    Sonnet error a deterministic skeleton is written instead of nothing.
+    written path (str) or None when nothing trustworthy was written. Model call is
+    fail-soft: on any Sonnet error -- or an off-shape model body -- a deterministic
+    skeleton is written instead of nothing.
 
-    ``meta_out`` (optional): populated with ``{"mis_homed": bool}`` so the caller can
-    stamp the ledger ``staged`` event when the prompt fell back to the repo ``_notes``
-    (G: was unavailable)."""
+    S6 shape (cq-3a29e7dc3953): code renders the header (_kickoff_header: STATUS line
+    naming ``via`` -- the door this stage came through, 'button' | 'approve_auto' |
+    'typed_verb' | 'bundle_button' | 'seed' | 'script' -- the H1 = the LEX-safe item
+    title, the banner, the queue line); the model writes only the body. A truncated
+    reply (stop_reason == 'max_tokens', or a wrapper that never closed) is written
+    WITH a TRUNCATED trailer, never silently. Every file passes _kickoff_shape_errors
+    before it is written and a line-1 read-back after; a failure of either returns
+    None (log.error; ``meta_out["error"]`` says why) -- never a raise, so every
+    caller's existing "nothing staged" ack surfaces it.
+
+    ``meta_out`` (optional): ``mis_homed`` (bool; G: was unavailable -> repo
+    ``_notes``), ``truncated`` (True when the written file carries the TRUNCATED
+    trailer), ``shape_fallback`` (the reasons, when an off-shape model body was
+    replaced by the skeleton), ``error`` (why None was returned)."""
     if not items:
         return None
+    items = [_lex_safe_view(it) for it in items]  # belt: the H1 + evidence read the safe view only
     slug = slug or _slug(str(items[0].get("title", "")))
-    today = _now().strftime("%Y-%m-%d")
+    now = _now()
+    # The filename date stays the UTC date (unchanged; S6 residual: an AZ-evening stage
+    # is named for tomorrow while its STATUS line carries the AZ time).
+    today = now.strftime("%Y-%m-%d")
+    expected_h1 = _kickoff_h1(items)
     body: str | None = None
+    truncated = False
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if api_key:
         # C1: the model is handed the SAME evidence block the deterministic
@@ -1925,20 +2230,59 @@ def generate_kickoff_prompt(items: list[dict[str, Any]], *, slug: str | None = N
         try:
             import anthropic
             client = anthropic.Anthropic(api_key=api_key)
+            # No "Slug:" line any more (S6): the header renders the branch itself, and
+            # the slug was the model's cue to title the file with it (8b5b6c's H1).
             resp = client.messages.create(
-                model=_SONNET_MODEL, max_tokens=2000, system=_PROMPT_SYS,
+                model=_SONNET_MODEL, max_tokens=_KICKOFF_MAX_TOKENS, system=_PROMPT_SYS,
                 thinking={"type": "disabled"},  # D-051: Sonnet 5 thinks by default + shares max_tokens
-                messages=[{"role": "user", "content":
-                           f"Slug: {slug}\nItems to cover:\n{evidence}"}],
+                messages=[{"role": "user", "content": f"Items to cover:\n{evidence}"}],
             )
             from .llm_usage import log_usage
             log_usage(resp, caller="code_queue.kickoff")
-            body = resp.content[0].text.strip()
+            raw = resp.content[0].text
+            model_body, info = _normalize_model_body(raw)
+            cut = (getattr(resp, "stop_reason", None) == "max_tokens"
+                   or bool(info.get("unclosed_wrapper")))
+            if model_body.strip():
+                blines = model_body.splitlines()
+                lines = _kickoff_header(items, slug, via, now) + blines
+                if cut:
+                    # Close a code block the cut left open, or the trailer would render
+                    # INSIDE it -- the one warning that must be visible.
+                    open_ = _fence_scan(blines)[0]
+                    if open_ is not None:
+                        lines.append(open_[0] * open_[1])
+                    lines += ["", _KICKOFF_TRUNCATED_TRAILER]
+                candidate = "\n".join(lines) + "\n"
+                errs = _kickoff_shape_errors(candidate, expected_h1)
+                if errs:
+                    log.warning("code_queue: kickoff model body is off-shape (%s) -- "
+                                "writing the deterministic skeleton instead", "; ".join(errs))
+                    if meta_out is not None:
+                        meta_out["shape_fallback"] = errs
+                else:
+                    body = candidate
+                    truncated = cut
+            if cut:
+                log.warning("code_queue: kickoff model reply was cut off (stop_reason=%s, "
+                            "unclosed_wrapper=%s)%s", getattr(resp, "stop_reason", None),
+                            bool(info.get("unclosed_wrapper")),
+                            " -- file carries the TRUNCATED trailer" if truncated else "")
         except Exception as exc:  # noqa: BLE001 -- fail-soft to the skeleton
             log.warning("code_queue: prompt generation failed, using skeleton: %s", exc)
             body = None
+            truncated = False
     if not body:
-        body = _deterministic_prompt(items, slug, override=override)
+        body = _deterministic_prompt(items, slug, override=override, via=via, now=now) + "\n"
+        errs = _kickoff_shape_errors(body, expected_h1)
+        if errs:
+            # The skeleton is code-built from a fixed header: failing its own gate is
+            # a CODE bug. Loud, and nothing is written or staged.
+            log.error("code_queue: kickoff SKELETON failed its shape gate (%s) -- nothing "
+                      "written for %s", "; ".join(errs), [it.get("id") for it in items])
+            if meta_out is not None:
+                meta_out["error"] = "kickoff shape gate failed (" + "; ".join(errs) + ")"
+            return None
 
     # Id-suffix the filename so two items with the same slug can never clobber each
     # other's prompt (day-one defect #4).
@@ -1946,6 +2290,22 @@ def generate_kickoff_prompt(items: list[dict[str, Any]], *, slug: str | None = N
     path, mis_homed = _write_prompt_file(body, fname)
     if meta_out is not None:
         meta_out["mis_homed"] = mis_homed
+    if not path:
+        if meta_out is not None:
+            meta_out["error"] = "the prompt file write failed on both targets"
+        return None
+    why = _read_back_prompt(path, body, mis_homed)
+    if why:
+        # The ledger `staged` event is written by the CALLERS only after a truthy
+        # return, so None here leaves the row unstaged and retryable (Stage /
+        # `stage cq-...`); a same-day retry overwrites this orphan (same fname).
+        log.error("code_queue: kickoff read-back FAILED (%s) -- NOT staging %s; orphan file "
+                  "%s", why, [it.get("id") for it in items], _loggable_prompt_path(path, items))
+        if meta_out is not None:
+            meta_out["error"] = why
+        return None
+    if meta_out is not None and truncated:
+        meta_out["truncated"] = True
     return path
 
 
@@ -2388,7 +2748,8 @@ def ensure_kickoff_staged(cq_id: str, *, override_evidence_floor: bool = False,
             return "noop", str(fresh["prompt_path"])
         meta: dict[str, Any] = {}
         try:
-            path = generate_kickoff_prompt([fresh], meta_out=meta, override=override_evidence_floor)
+            path = generate_kickoff_prompt([fresh], meta_out=meta, override=override_evidence_floor,
+                                           via=via)
         except Exception as exc:  # noqa: BLE001 -- an approve must never crash on this
             log.exception("code_queue: kickoff generation crashed for %s", cq_id)
             return "error", f"generator crashed ({type(exc).__name__})"
@@ -2396,17 +2757,22 @@ def ensure_kickoff_staged(cq_id: str, *, override_evidence_floor: bool = False,
             log.error("code_queue: kickoff generation returned no path for %s "
                       "(severity=%s) -- APPROVED but UNSTAGED",
                       cq_id, rec.get("severity"))
-            return "error", "prompt generation produced no file"
+            # S6: the generator's own reason (shape gate / read-back / write) rides the
+            # detail into every caller's ack; "no file" stays the stable phrase.
+            why = str(meta.get("error") or "").strip()
+            return "error", "prompt generation produced no file" + (f" -- {why}" if why else "")
         # C7: the single-item path names its bundle too ("solo-<id>"), so a later
         # Mark-shipped tap on this row has a reference and the gate can pass it.
+        # S6/C13-09: `via` is ALWAYS on the event (the STATUS line's same token;
+        # 'unspecified' when a caller named no door) -- D-314: the ledger must say.
         ev = {"event": "staged", "ts": _now_iso(), "id": cq_id, "prompt_path": path,
-              "bundle_id": solo_bundle_id(cq_id)}
-        if via:
-            ev["via"] = str(via)
+              "bundle_id": solo_bundle_id(cq_id), "via": _kickoff_via(via)}
         if override_evidence_floor:
             ev["override"] = True   # the founder's typed verb bypassed the C1 floor
         if meta.get("mis_homed"):
             ev["mis_homed"] = True
+        if meta.get("truncated"):
+            ev["truncated"] = True  # the file carries the TRUNCATED trailer (S6)
         _append_event(ev)
         _render_backlog_safe()
         _dm_prompt_path(path)
@@ -2602,9 +2968,11 @@ def record_staged(cq_id: str, prompt_path: str, actor_id: str) -> tuple[str, str
         return "noop", f"Item is {rec['status']} -- not staging a terminal row."
     if rec.get("prompt_path"):
         return "noop", f"Already staged: `{rec['prompt_path']}`"
+    # C7: single-item path names its bundle. C13-09 (Code #15 S6): and its door --
+    # every `staged` event carries `via` (test_kickoff_shape source-scans for it).
     _append_event({"event": "staged", "ts": _now_iso(), "id": cq_id,
                    "prompt_path": path, "authored": "external",
-                   "bundle_id": solo_bundle_id(cq_id)})  # C7: single-item path names its bundle
+                   "bundle_id": solo_bundle_id(cq_id), "via": "script"})
     _render_backlog_safe()
     return "staged", f"📝 Prompt staged: `{path}`"
 
@@ -3627,15 +3995,29 @@ def stage_bundle(value: str, actor_id: str) -> tuple[str, str]:
         # Slug from the shared theme, NOT item #1 (defect #5).
         slug = _slug(_bundle_theme(still))
         meta: dict[str, Any] = {}
-        path = generate_kickoff_prompt(still, slug=f"{slug}-bundle", meta_out=meta)
+        # S6: wrapped exactly like ensure_kickoff_staged's call -- an exception here
+        # used to escape to app._handle_code_queue_button, which swallows it with a
+        # log.warning and posts NO ack (the bundle tap looked like it did nothing).
+        try:
+            path = generate_kickoff_prompt(still, slug=f"{slug}-bundle", meta_out=meta,
+                                           via="bundle_button")
+        except Exception as exc:  # noqa: BLE001 -- a bundle tap must never crash silently
+            log.exception("code_queue: bundle kickoff generation crashed for %s",
+                          [r.get("id") for r in still])
+            return "error", (f"Prompt generation failed -- nothing staged (generator crashed "
+                             f"({type(exc).__name__})).")
         if not path:
-            return "error", "Prompt generation failed -- nothing staged."
+            why = str(meta.get("error") or "").strip()
+            return "error", ("Prompt generation failed -- nothing staged."
+                             if not why else f"Prompt generation failed -- nothing staged ({why}).")
         bundle_id = "bnd-" + uuid.uuid4().hex[:8]
         for r in still:
             ev = {"event": "staged", "ts": _now_iso(), "id": r["id"],
-                  "prompt_path": path, "bundle_id": bundle_id}
+                  "prompt_path": path, "bundle_id": bundle_id, "via": "bundle_button"}
             if meta.get("mis_homed"):
                 ev["mis_homed"] = True
+            if meta.get("truncated"):
+                ev["truncated"] = True
             _append_event(ev)
         _render_backlog_safe()
         _dm_prompt_path(path)
@@ -3738,7 +4120,8 @@ def apply_prompt_rehome(plan: list[dict[str, str]]) -> list[dict[str, Any]]:
                 body = src.read_text(encoding="utf-8", errors="replace")
                 drive_io.write_text_atomic(dst, body)
             _append_event({"event": "staged", "ts": _now_iso(), "id": cq_id,
-                           "prompt_path": str(dst), "rehomed": True})
+                           "prompt_path": str(dst), "rehomed": True,
+                           "via": "script"})  # C13-09: every staged event names its door
             if str(src) not in moved and not a.get("backfill_only") and src.exists():
                 src.unlink()
                 moved.add(str(src))
@@ -3850,7 +4233,7 @@ def seed_item(*, kind: str, severity: str, title: str, summary: str, entity: str
     # loudly and let the nightly monitor catch it.
     if str(status).strip().upper() == "APPROVED" and is_priority_severity(severity):
         if stage_now:
-            outcome, detail = ensure_kickoff_staged(cq_id)
+            outcome, detail = ensure_kickoff_staged(cq_id, via="seed")
             if outcome == "error":
                 log.error("code_queue.seed_item: %s seeded APPROVED (%s) but the "
                           "kickoff did NOT generate: %s", cq_id, severity, detail)

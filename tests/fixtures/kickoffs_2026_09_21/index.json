@@ -1,0 +1,75 @@
+{
+  "68c8e8": {
+    "cq_id": "cq-be90cea867c3",
+    "via": "button",
+    "truncated": false,
+    "title": "Add ability to archive inactive channels in bulk or automatically"
+  },
+  "62c07b": {
+    "cq_id": "cq-5f44ce934aeb",
+    "via": "approve_auto",
+    "truncated": false,
+    "title": "Auditor: carve-out breach detector keys on skip reasons; log breach event ids"
+  },
+  "c30f51": {
+    "cq_id": "cq-3a29e7dc3953",
+    "via": "approve_auto",
+    "truncated": true,
+    "title": "Auto-generated kickoff files carry no STATUS line and start with a leaked ```markdown fence (all 11 kickoffs staged 2026-09-21; 2 with an unclosed fence)"
+  },
+  "b31f66": {
+    "cq_id": "cq-74e6b20d5d3d",
+    "via": "button",
+    "truncated": false,
+    "title": "cora_delegated_jobs: expose requester identity per job (uptake attribution is impossible)"
+  },
+  "3ca933": {
+    "cq_id": "cq-90568f0b1222",
+    "via": "approve_auto",
+    "truncated": false,
+    "title": "DW: Justin's two live-fired doc_draft jobs 9/10 -> one registered (dw-d1c6b3fba5e1) and FAILED, second absent"
+  },
+  "82feab": {
+    "cq_id": "cq-4f3fcc9b7096",
+    "via": "button",
+    "truncated": false,
+    "title": "Enable Cora to autonomously drive browser tabs/windows to execute bulk archive operations and expose extensible capabili"
+  },
+  "ac6e89": {
+    "cq_id": "cq-e9ef3f581d60",
+    "via": "button",
+    "truncated": false,
+    "title": "Enable Cora to search and filter hotel/vacation rental listings by date, location, budget, amenities, and loyalty progra"
+  },
+  "796adf": {
+    "cq_id": "cq-22b84598aee8",
+    "via": "approve_auto",
+    "truncated": true,
+    "title": "Gap-executor (pass5 drive-insight) Asana tasks land projectless + unassigned, and title-only dedup lets the same gap re-create daily: 30+ open duplicates since 8/31"
+  },
+  "1849b9": {
+    "cq_id": "cq-b93e2abf2922",
+    "via": "button",
+    "truncated": false,
+    "title": "[LEX build ask -- details withheld]",
+    "synthetic": true
+  },
+  "23ce76": {
+    "cq_id": "cq-d9d0c92cc797",
+    "via": "approve_auto",
+    "truncated": true,
+    "title": "Redact API-token shapes (Asana PAT 2/<digits>/<digits>:<hex>, xox*, sk-, AIza) at every KB chunk renderer + the session-capture harvest"
+  },
+  "8b5b6c": {
+    "cq_id": "cq-17fe76f5ab91",
+    "via": "approve_auto",
+    "truncated": false,
+    "title": "Slack `[Asana task]` cards render a literal `?` badge instead of a resolved priority indicator (~15 instances, weekly clarity check 9/19)"
+  },
+  "456286": {
+    "cq_id": "cq-2d26f131091e",
+    "via": "button",
+    "truncated": false,
+    "title": "Staged code-session prompt cards (the Keep/Park/Dismiss/Stage decision cards DM'd to Harrison) are not visually updating"
+  }
+}

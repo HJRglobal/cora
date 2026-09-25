@@ -713,6 +713,11 @@ def test_prompt_skeleton_has_banner(qenv):
     from pathlib import Path
     body = Path(path).read_text(encoding="utf-8")
     assert "AUTO-GENERATED DRAFT" in body and "VERIFY-FIRST" in body
+    # Code #15 S6: the skeleton shares the fixed header -- line 1 is the STATUS line
+    # and the H1 is the item TITLE (it used to be "# Cora Code prompt -- <slug> (...)").
+    lines = body.splitlines()
+    assert lines[0].startswith("STATUS: STAGED ") and "fire-owner: Harrison" in lines[0]
+    assert [ln for ln in lines if ln.startswith("# ")] == ["# Widget"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

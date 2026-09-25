@@ -85,6 +85,53 @@ class TestGate:
         assert outcome2 == "shipped" and bid in msg2
         assert cq.get_item(ids[0])["bundle_id"] == bid
 
+    def test_bundle_staged_events_carry_via_bundle_button(self, qenv):
+        """Code #15 S6 / D-314 parity: the Monday-menu bundle door names itself on the
+        ledger like every other door, and its file's STATUS line says the same."""
+        ids = [_seed(title=f"via bundle {i}") for i in range(2)]
+        outcome, msg = cq.stage_bundle("bundle:" + ",".join(ids), HARRISON)
+        assert outcome == "staged"
+        evs = [e for e in cq._read_jsonl(cq._EVENT_LEDGER) if e.get("event") == "staged"]
+        assert len(evs) == 2 and all(e["via"] == "bundle_button" for e in evs)
+        path = evs[0]["prompt_path"]
+        from pathlib import Path
+        first = Path(path).read_text(encoding="utf-8").splitlines()
+        assert first[0].startswith("STATUS: STAGED ") and " · via bundle_button · " in first[0]
+        assert first[2] == "# Bundle: f3e (2 items)"  # theme + count, never a member title
+
+    def test_bundle_generator_crash_is_an_error_not_a_raise(self, qenv, monkeypatch):
+        """app._handle_code_queue_button swallows an exception with NO ack, so a raise
+        here was a silent bundle tap. It must come back as an error outcome."""
+        def _boom(items, slug=None, meta_out=None, **_kw):
+            raise RuntimeError("sonnet down")
+        monkeypatch.setattr(cq, "generate_kickoff_prompt", _boom)
+        ids = [_seed(title=f"crash bundle {i}") for i in range(2)]
+        outcome, msg = cq.stage_bundle("bundle:" + ",".join(ids), HARRISON)
+        assert outcome == "error"
+        assert "nothing staged" in msg and "generator crashed (RuntimeError)" in msg
+        assert not [e for e in cq._read_jsonl(cq._EVENT_LEDGER) if e.get("event") == "staged"]
+        assert not (set(ids) & cq._STAGING_INFLIGHT)  # reservation released
+
+    def test_bundle_generator_reason_rides_the_error(self, qenv, monkeypatch):
+        def _none(items, slug=None, meta_out=None, **kw):
+            assert kw.get("via") == "bundle_button"
+            meta_out["error"] = "read-back failed (DriveUnavailable)"
+            return None
+        monkeypatch.setattr(cq, "generate_kickoff_prompt", _none)
+        ids = [_seed(title=f"none bundle {i}") for i in range(2)]
+        outcome, msg = cq.stage_bundle("bundle:" + ",".join(ids), HARRISON)
+        assert outcome == "error" and "nothing staged" in msg and "read-back failed" in msg
+
+    def test_bundle_truncated_meta_lands_on_every_event(self, qenv, monkeypatch):
+        def _cut(items, slug=None, meta_out=None, **kw):
+            meta_out.update({"mis_homed": False, "truncated": True})
+            return "/notes/bundle.md"
+        monkeypatch.setattr(cq, "generate_kickoff_prompt", _cut)
+        ids = [_seed(title=f"cut bundle {i}") for i in range(2)]
+        assert cq.stage_bundle("bundle:" + ",".join(ids), HARRISON)[0] == "staged"
+        evs = [e for e in cq._read_jsonl(cq._EVENT_LEDGER) if e.get("event") == "staged"]
+        assert len(evs) == 2 and all(e.get("truncated") is True for e in evs)
+
     def test_solo_stage_names_its_bundle_so_a_tap_can_ship(self, qenv):
         cid = _seed(title="solo staged")
         outcome, _ = cq.stage_by_id(cid, HARRISON)
