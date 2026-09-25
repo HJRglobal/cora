@@ -199,7 +199,7 @@ def message_kind(client: Any, m: dict, ctx: reg.Context) -> str:
     """"person" | "system" | "bot" for one projected message."""
     st = str(m.get("subtype") or "")
     uid = str(m.get("user") or "")
-    if m.get("lane_line") and uid and uid == ctx.bot_uid and not st:
+    if m.get("lane_line") and uid and uid == ctx.bot_uid and st in ("", "bot_message"):
         return "system"          # the lane's own notice / correction line (only Cora posts as her)
     if st in UNARCHIVE_SUBTYPES:
         return "person" if is_person(client, uid, ctx) else "system"

@@ -320,7 +320,8 @@ class TestMetadataOnly:
         assert cl.LANE_LINE_PREFIXES == (cards.NOTICE_PREFIX, cards.CORRECTION_TEXT)
         notice = cards.notice_text(200, HARRISON)
         v, _ = run([msg(1, user=BOT_UID, text=cards.CORRECTION_TEXT),
-                    msg(1.1, user=BOT_UID, text=notice), msg(200)])
+                    msg(1.1, user=BOT_UID, text=notice, bot_id="BCORABOT1"),
+                    msg(1.2, user=BOT_UID, text=notice, subtype="bot_message"), msg(200)])
         assert v.kind == cl.SECTION_A and v.bot_posts == 0, v
         v2, _ = run([msg(1, user=BOT_UID, text="Daily health: all green"), msg(200)])
         assert v2.kind == cl.SECTION_B and v2.reason == cl.B_BOT_TRAFFIC

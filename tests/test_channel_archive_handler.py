@@ -959,3 +959,21 @@ class TestRoundOneRepliesPassTheRails:
         out = [tap(cards.ACTION_ROW, f"{PID}:{A1}:T1").msg, handler.MSG_STORE]
         assert "decided while I was re-checking it" in out[0]
         _assert_rails(out, monkeypatch, caplog)
+
+
+
+@pytest.mark.parametrize("shape", [" " * 40000, "a" * 40000, "internal_error" + " " * 40000],
+                         ids=["spaces", "run", "code-then-spaces"])
+def test_the_write_code_screen_is_linear_on_degenerate_input(shape):
+    """D-051: every new regex timed on the 40k whitespace-only input (_SAFE_CODE_RE)."""
+    import time as _t
+    from slack_sdk.errors import SlackApiError
+    from _chanarch_fakes import resp as _resp
+    exc = SlackApiError(message="x", response=_resp({"ok": False, "error": shape}))
+    best = float("inf")
+    code = ""
+    for _ in range(3):
+        t0 = _t.perf_counter()
+        code = handler._write_code(exc)
+        best = min(best, _t.perf_counter() - t0)
+    assert best < 0.05 and code == "unexpected_response"
