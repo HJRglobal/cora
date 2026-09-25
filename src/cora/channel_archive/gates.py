@@ -82,14 +82,23 @@ def t0_reason() -> str:
     return "the lane is at T0"
 
 
+DEMOTED_AFTER_CARD = ("the lane was demoted after this card went out (the nightly monitor "
+                      "found an archive it could not attribute to a tap)")
+#: A T1 row tapped through a button that was DRAWN as "Mark to archive" (A12): the
+#: label on screen promised a record, so a record is all it does.
+MARK_BUTTON = ("the button you tapped was a Mark button — it only records (the card was drawn "
+               "while the lane acted at T0)")
+
+
 def tap_gate(row: dict, client: Any, *, scopes: frozenset | None = None,
-             probe_scopes: bool = True) -> tuple[str, str]:
-    """(ARCHIVE | RECORD | TRANSIENT, reason) for a tap on *row*."""
+             probe_scopes: bool = True, demoted_after_card: bool = False) -> tuple[str, str]:
+    """(ARCHIVE | RECORD | TRANSIENT, reason) for a tap on *row*. ``demoted_after_card``
+    is the card's A12 demotion HISTORY (``Proposal.demoted``): a demotion newer than
+    the card keeps its T1 rows T0-equivalent even after Harrison cleared it."""
     if row.get("tier") != "T1":
         return RECORD, t0_reason()
-    if policy.is_demoted():
-        return RECORD, ("the lane was demoted after this card went out (the nightly monitor "
-                        "found an archive it could not attribute to a tap)")
+    if policy.is_demoted() or demoted_after_card:
+        return RECORD, DEMOTED_AFTER_CARD
     reg_ok = registry_allows_t1()
     if reg_ok is None:
         return TRANSIENT, "the ladder registry could not be read"

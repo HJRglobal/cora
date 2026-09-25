@@ -76,7 +76,7 @@ class TestT0Card:
         assert ids.count(cards.ACTION_ROW) == 2 and ids.count(cards.ACTION_KEEP) == 3
         assert ids.count(cards.ACTION_OVERRIDE) == 1 and cards.ACTION_AGREED in ids
         allb = next(a for a in acts if a["action_id"] == cards.ACTION_ALL)
-        assert allb["value"] == f"{PID}:p1" and allb["text"]["text"] == "Mark all 2 shown to archive"
+        assert allb["value"] == f"{PID}:p1:T0" and allb["text"]["text"] == "Mark all 2 shown to archive"
         assert all(a["value"].startswith(PID) for a in acts)
         assert text == "Dead-channel proposal (T0 — nothing archived): 3 listed, you marked 0, kept 0."
         assert len(blocks) <= cards.BLOCK_BUDGET
@@ -148,7 +148,7 @@ class TestPages:
                     assert cid in page_cids
                     seen_row_buttons.add(cid)
                 if a["action_id"] == cards.ACTION_ALL:
-                    assert a["value"] == f"{PID}:p{n}"
+                    assert a["value"] == f"{PID}:p{n}:T0"
             covered = set(cards.undecided_a_on_page(f.proposals[PID], n))
             assert covered <= page_cids and all(c.startswith("C0A") for c in covered)
         assert seen_row_buttons == {r["cid"] for r in rows}     # every actionable row has buttons

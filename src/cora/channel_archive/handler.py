@@ -85,25 +85,48 @@ class TapResult:
         return self.outcome in RACE_OUTCOMES
 
 
+def _split_tier(target: str) -> tuple[str, str]:
+    """(target, the tier the button's LABEL showed). An unmarked value is T0: it can
+    only ever record (A12 -- fail safe for any value not drawn as Archive)."""
+    for tier in ("T1", "T0"):
+        if target.endswith(":" + tier):
+            return target[:-3], tier
+    return target, "T0"
+
+
 def parse_value(action: str, value: str) -> tuple[str, str]:
     """(proposal_id, target) -- target is a channel id, "p<N>" for Archive-all, or ""
-    for the card-level button. ("", "") when the value is malformed."""
+    for the card-level button. ("", "") when the value is malformed. A trailing
+    ``:T1`` / ``:T0`` label marker is accepted and stripped (see ``button_tier``)."""
     v = str(value or "").strip()
     if action == cards.ACTION_AGREED:
         return (v, "") if _PID_RE.match(v) else ("", "")
     pid, _, target = v.partition(":")
     if not _PID_RE.match(pid):
         return "", ""
+    target, _tier = _split_tier(target)
     if action == cards.ACTION_ALL:
         return (pid, target) if _PAGE_RE.match(target) else ("", "")
     return (pid, target) if _CID_RE.match(target) else ("", "")
 
 
-def needs_act_pool(action: str, value: str, *, now: float | None = None) -> bool:
-    """True when the tap would run the network archive path (a T1 row, or an
-    Archive-all over a page with T1 rows) -- the app wrapper then runs it on the
-    lane's own 1-worker pool, never on Bolt's shared listener workers (A18)."""
+def button_tier(action: str, value: str) -> str:
+    """"T1" only for an Archive-labelled button (its value ends ``:T1``); every other
+    value -- "Mark to archive", Keep, the card-level button, an unmarked or legacy
+    value -- is "T0" and records at most. The handler archives ONLY from "T1"."""
     if action not in (cards.ACTION_ROW, cards.ACTION_OVERRIDE, cards.ACTION_ALL):
+        return "T0"
+    return _split_tier(str(value or "").strip())[1]
+
+
+def needs_act_pool(action: str, value: str, *, now: float | None = None) -> bool:
+    """True when the tap would run the network archive path (an Archive-labelled
+    button on a T1 row, or an Archive-all over a page with T1 rows) -- the app wrapper
+    then runs it on the lane's own 1-worker pool, never on Bolt's shared listener
+    workers (A18). A Mark-labelled button only records: inline."""
+    if action not in (cards.ACTION_ROW, cards.ACTION_OVERRIDE, cards.ACTION_ALL):
+        return False
+    if button_tier(action, value) != "T1":
         return False
     pid, target = parse_value(action, value)
     if not pid:
@@ -149,12 +172,15 @@ def _process(action: str, value: str, actor_id: str, *, now: float,
     pid, target = parse_value(action, value)
     if not pid:
         return TapResult("orphaned", MSG_ORPHANED, rerender=False)
+    btier = button_tier(action, value)
     f = st.fold(now=now)
     if not f.ok:
         return TapResult("store_error", MSG_STORE, pid, rerender=False)
     p = f.proposals.get(pid)
     if p is None:
         return TapResult("orphaned", MSG_ORPHANED, pid, rerender=False)
+    if policy.is_demoted():
+        st.note_demoted(p, now=now)      # A12: this card outlived a demotion -- for good
     page = _page_of(p, target) if action != cards.ACTION_ALL else int(target[1:])
     sup = f.superseded_by(pid)
     if sup is not None:
@@ -168,7 +194,8 @@ def _process(action: str, value: str, actor_id: str, *, now: float,
     if action == cards.ACTION_AGREED:
         return _card_agreed(p, actor_id, now)
     if action == cards.ACTION_ALL:
-        return _archive_all(f, p, page, actor_id, now=now, sleep=sleep, progress=progress)
+        return _archive_all(f, p, page, actor_id, now=now, sleep=sleep, progress=progress,
+                            btier=btier)
     row = p.rows_by_cid.get(target)
     if row is None:
         return TapResult("orphaned", MSG_ORPHANED, pid, rerender=False)
@@ -180,7 +207,7 @@ def _process(action: str, value: str, actor_id: str, *, now: float,
     if action == cards.ACTION_KEEP:
         return _keep(p, row, actor_id, now, page)
     res = _decide_or_archive(p, row, actor_id, now=now, sleep=sleep,
-                             override=section == cl.SECTION_B)
+                             override=section == cl.SECTION_B, btier=btier)
     res.page = page
     return res
 
@@ -262,16 +289,20 @@ def _record(p: st.Proposal, row: dict, actor: str, now: float, *, override: bool
 
 def _decide_or_archive(p: st.Proposal, row: dict, actor: str, *, now: float,
                        sleep: Callable[[float], None] | None, override: bool,
-                       read: Any = None, write: Any = None) -> TapResult:
+                       read: Any = None, write: Any = None, btier: str = "T0") -> TapResult:
     if row.get("tier") != "T1":
         return _record(p, row, actor, now, override=override, why=gates.t0_reason())
+    if btier != "T1":
+        # A12: the label on screen was "Mark to archive" -- it only ever records
+        return _record(p, row, actor, now, override=override,
+                       why=gates.DEMOTED_AFTER_CARD if p.demoted else gates.MARK_BUTTON)
     try:
         read = read if read is not None else clients.read_client()
     except Exception as exc:  # noqa: BLE001
         return TapResult("refused_transient", (f"Nothing was archived — I couldn't open a Slack "
                                                f"client ({type(exc).__name__}). The buttons stay."),
                          p.proposal_id)
-    gate, why = gates.tap_gate(row, read)
+    gate, why = gates.tap_gate(row, read, demoted_after_card=p.demoted)
     if gate == gates.RECORD:
         return _record(p, row, actor, now, override=override, why=why)
     if gate == gates.TRANSIENT:
@@ -381,7 +412,7 @@ def _archive_one(p: st.Proposal, row: dict, actor: str, *, now: float,
         st.append_event("released", proposal_id=pid, cid=cid, code=reason, ts=time.time())
         return TapResult("failed", (f"Not archived: I couldn't re-check {_label(row)} just now "
                                     f"({reason}). The buttons stay; tap again."), pid), None
-    gate, gwhy = gates.tap_gate(row, read)
+    gate, gwhy = gates.tap_gate(row, read, demoted_after_card=p.demoted)
     if gate != gates.ARCHIVE:
         st.append_event("released", proposal_id=pid, cid=cid, code="gate", ts=time.time())
         return TapResult("refused_transient", f"Nothing was archived — {gwhy}.", pid), None
@@ -479,14 +510,20 @@ def _identity(read: Any) -> tuple[str, str]:
 
 def _archive_all(f: st.Fold, p: st.Proposal, page: int, actor: str, *, now: float,
                  sleep: Callable[[float], None] | None,
-                 progress: Callable[[str, int], None] | None) -> TapResult:
+                 progress: Callable[[str, int], None] | None, btier: str = "T0") -> TapResult:
     targets = cards.undecided_a_on_page(p, page)
     if not targets:
         return TapResult("noop", "Nothing left to act on in this part of the card.",
                          p.proposal_id, page)
     rows = p.rows_by_cid
     counts: dict[str, int] = {}
-    t1 = any((rows.get(c) or {}).get("tier") == "T1" for c in targets)
+    any_t1 = any((rows.get(c) or {}).get("tier") == "T1" for c in targets)
+    # A12: only an Archive-labelled "Archive all" may archive; "Mark all ... to archive"
+    # records every row, whatever the rows' staged tier says -- and so does any button
+    # on a card that outlived a demotion
+    t1 = any_t1 and btier == "T1" and not p.demoted
+    t0_why = ((gates.DEMOTED_AFTER_CARD if p.demoted else gates.MARK_BUTTON) if any_t1
+              else gates.t0_reason())
     read = None
     if t1:
         try:
@@ -501,8 +538,10 @@ def _archive_all(f: st.Fold, p: st.Proposal, page: int, actor: str, *, now: floa
     for i, cid in enumerate(targets):
         row = rows[cid]
         try:
-            if row.get("tier") == "T1":
-                gate, why = gates.tap_gate(row, read)
+            if not t1:
+                res, systemic = _record(p, row, actor, now, override=False, why=t0_why), None
+            elif row.get("tier") == "T1":
+                gate, why = gates.tap_gate(row, read, demoted_after_card=p.demoted)
                 if gate == gates.ARCHIVE:
                     res, systemic = _archive_one(p, row, actor, now=time.time(), sleep=sleep,
                                                  override=False, read=read)
@@ -534,7 +573,7 @@ def _archive_all(f: st.Fold, p: st.Proposal, page: int, actor: str, *, now: floa
         return TapResult("archive_all", msg, p.proposal_id, page, counts=counts)
     if not t1:
         msg = (f"Marked {counts.get('agreed', 0)} of {len(targets)} shown to archive — recorded as "
-               f"T1 promotion evidence. Nothing was archived: {gates.t0_reason()}.")
+               f"T1 promotion evidence. Nothing was archived: {t0_why}.")
     elif aborted:
         msg = (f"Stopped at the first systemic Slack error ({aborted}): {len(targets) - done} of "
                f"{len(targets)} not attempted (no notice posted to them). Outcomes: "

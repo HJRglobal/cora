@@ -99,16 +99,26 @@ def _plural(n: int, word: str) -> str:
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
-def effective_tier(row: dict) -> str:
-    """A T1 row acts T0 while the lane is demoted (A12: a demotion newer than the
-    card re-renders every T1 row T0-equivalent)."""
+def effective_tier(row: dict, p: st.Proposal | None = None) -> str:
+    """A T1 row acts T0 while the lane is demoted, AND for good once the card has
+    outlived a demotion (A12: a demotion newer than the card re-renders every T1 row
+    T0-equivalent) -- ``p.demoted`` carries that history past Harrison's clear."""
     if row.get("tier") != "T1":
+        return "T0"
+    if p is not None and p.demoted:
         return "T0"
     return "T0" if policy.is_demoted() else "T1"
 
 
 def card_tier(p: st.Proposal) -> str:
-    return "T1" if any(effective_tier(r) == "T1" for r in p.rows) else "T0"
+    return "T1" if any(effective_tier(r, p) == "T1" for r in p.rows) else "T0"
+
+
+def button_value(pid: str, target: str, tier: str) -> str:
+    """A button's value carries the tier its LABEL showed (A12): ``:T1`` only on an
+    Archive-labelled button. The handler archives only from a ``:T1`` value, so a
+    "Mark to archive" button can never archive, whatever changed after it was drawn."""
+    return f"{pid}:{target}:{'T1' if tier == 'T1' else 'T0'}"
 
 
 def paginate(rows: list[dict]) -> list[list[str]]:
@@ -226,7 +236,7 @@ def _btn(text: str, action: str, value: str, style: str | None = None) -> dict:
 def _row_blocks(p: st.Proposal, row: dict, *, buttons: bool, actionable: bool) -> list[dict]:
     cid = row["cid"]
     state = p.row_state.get(cid) or {"state": st.OPEN}
-    tier = effective_tier(row)
+    tier = effective_tier(row, p)
     lines = [_name_part(row), _fields_line(row)]
     if row.get("section") == cl.SECTION_B:
         lines.append(_b_line(row))
@@ -247,6 +257,7 @@ def _row_blocks(p: st.Proposal, row: dict, *, buttons: bool, actionable: bool) -
     if decided or not buttons or not actionable:
         return blocks
     value = f"{p.proposal_id}:{cid}"
+    act_value = button_value(p.proposal_id, cid, tier)
     elements: list[dict] = []
     if row.get("section") == cl.SECTION_B:
         exempt = row.get("reason") in cl.OVERRIDABLE_EXEMPTIONS
@@ -254,9 +265,9 @@ def _row_blocks(p: st.Proposal, row: dict, *, buttons: bool, actionable: bool) -
             label = "Archive (override)" if exempt else "Archive this one"
         else:
             label = "Mark to archive (override)" if exempt else "Mark to archive (this one)"
-        elements.append(_btn(label, ACTION_OVERRIDE, value, "danger"))
+        elements.append(_btn(label, ACTION_OVERRIDE, act_value, "danger"))
     else:
-        elements.append(_btn("Archive" if tier == "T1" else "Mark to archive", ACTION_ROW, value,
+        elements.append(_btn("Archive" if tier == "T1" else "Mark to archive", ACTION_ROW, act_value,
                              "danger" if tier == "T1" else "primary"))
     if not capped:
         elements.append(_btn("Keep", ACTION_KEEP, value))
@@ -332,6 +343,8 @@ def render_page(fold: st.Fold, proposal_id: str, page: int, *, now: float | None
     sup = fold.superseded_by(proposal_id)
     expired = now >= p.expires
     actionable = buttons and sup is None and not expired
+    if policy.is_demoted():
+        st.note_demoted(p, now=now)      # A12: this card outlived a demotion -- for good
     tier = card_tier(p)
     blocks: list[dict] = []
     if sup is not None:
@@ -390,7 +403,8 @@ def render_page(fold: st.Fold, proposal_id: str, page: int, *, now: float | None
             n = len(undecided)
             label = f"Archive all {n} shown" if tier == "T1" else f"Mark all {n} shown to archive"
             blocks.append({"type": "actions", "block_id": f"chanarch_all_{proposal_id}_{page}"[:255],
-                           "elements": [_btn(label, ACTION_ALL, f"{proposal_id}:p{page}",
+                           "elements": [_btn(label, ACTION_ALL,
+                                             button_value(proposal_id, f"p{page}", tier),
                                              "danger" if tier == "T1" else None)]})
     if n_pages > 1:
         blocks.append(_context(f"Part {page} of {n_pages} — each part has its own buttons."))

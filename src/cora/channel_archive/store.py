@@ -55,6 +55,8 @@ OPEN, CLAIMED, AGREED, KEPT, ARCHIVED, ALREADY_ARCHIVED, FAILED, UNKNOWN, STALE 
 TERMINAL: frozenset = frozenset({AGREED, KEPT, ARCHIVED, ALREADY_ARCHIVED, STALE, UNKNOWN})
 _ROW_EVENTS: frozenset = frozenset({CLAIMED, AGREED, KEPT, ARCHIVED, ALREADY_ARCHIVED,
                                     FAILED, UNKNOWN, STALE, "released", "reconciled"})
+#: A proposal-level event: a tap / re-render saw the lane demoted after this card (A12).
+DEMOTED_SEEN = "demoted_seen"
 
 _APPEND_LOCK = threading.Lock()
 #: THE claim lock: every Mark / Keep / Archive decision is check-then-write inside
@@ -180,6 +182,15 @@ class Proposal:
     row_state: dict = field(default_factory=dict)  # cid -> {"state", "by", "ts", "override", "code", ...}
     card_agreed_by: str = ""
     card_agreed_ts: float | None = None
+    #: A12: a demotion NEWER THAN THE CARD was seen -- a ``demoted_seen`` store event
+    #: (a tap or re-render observed the demotion file) or an ``acknowledged`` ledger
+    #: row whose ``demoted_since`` is at/after the card's creation. From then on every
+    #: T1 row of this card acts T0-equivalent FOR GOOD, even after Harrison clears.
+    demoted: bool = False
+
+    @property
+    def has_t1_rows(self) -> bool:
+        return any(isinstance(r, dict) and r.get("tier") == "T1" for r in self.rows)
 
     @property
     def rows_by_cid(self) -> dict:
@@ -267,18 +278,25 @@ def fold(events: list[dict] | None = None, ledger: list[dict] | None = None, *,
         return f
     intents: dict[tuple, list[float]] = {}
     outcomes: dict[tuple, list[tuple[float, str]]] = {}
+    demotion_marks: list[float] = []     # A12: every card created at/before one is T0 for good
     for r in ledger or []:
         key = (str(r.get("proposal_id") or ""), str(r.get("channel_id") or ""))
         if r.get("event") == "intent":
             intents.setdefault(key, []).append(float(r.get("ts") or 0))
         elif r.get("event") == "outcome":
             outcomes.setdefault(key, []).append((float(r.get("ts") or 0), str(r.get("outcome") or "")))
+        elif r.get("event") == "acknowledged":
+            demotion_marks.append(_demotion_mark(r))
+    demoted_seen: set[str] = set()
     for e in events:
         ev = e.get("event")
         pid = str(e.get("proposal_id") or "")
         ts = float(e.get("ts") or 0)
         if ev == "scan_started":
             f.scans_started.append(e)
+            continue
+        if ev == DEMOTED_SEEN:
+            demoted_seen.add(pid)
             continue
         if ev == "staged":
             if not pid or pid in f.proposals:
@@ -339,6 +357,10 @@ def fold(events: list[dict] | None = None, ledger: list[dict] | None = None, *,
         p.row_state[cid] = {"state": ev, "by": e.get("by") or cur.get("by"), "ts": ts,
                             "override": bool(e.get("override")), "code": e.get("code"),
                             "kind": e.get("kind"), "age_days": e.get("age_days")}
+    # A12 demotion history: a card that outlived a demotion stays T0-equivalent for good
+    for p in f.proposals.values():
+        if p.proposal_id in demoted_seen or any(m >= p.created for m in demotion_marks):
+            p.demoted = True
     # reader-side claim expiry (A13)
     for p in f.proposals.values():
         for cid, st in list(p.row_state.items()):
@@ -358,6 +380,39 @@ def fold(events: list[dict] | None = None, ledger: list[dict] | None = None, *,
                 p.row_state[cid] = {**st, "state": _state_from_outcome(outs[-1]),
                                     "code": outs[-1]}
     return f
+
+
+def _demotion_mark(row: dict) -> float:
+    """The epoch a cleared demotion began, from its ``acknowledged`` ledger row: the
+    demotion record's ``demoted_since`` (ISO) when it parses, else the clear's own ts --
+    always at/after the real start, so the fallback only ever makes MORE cards T0."""
+    raw = row.get("demoted_since")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            dt = datetime.fromisoformat(raw.strip())
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_AZ)
+            return dt.timestamp()
+        except ValueError:
+            pass
+    try:
+        return float(row.get("ts") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def note_demoted(p: Proposal, *, now: float | None = None) -> bool:
+    """A12: a tap or a re-render just observed the demotion file while *p* has T1
+    rows -- persist that ONCE as a ``demoted_seen`` event, so the card stays
+    T0-equivalent after Harrison clears the demotion. Returns True when *p* is (now)
+    marked. The in-memory proposal is marked even if the append fails (this render /
+    tap still sees it; the demotion file itself keeps it T0 until the next try)."""
+    if p.demoted or not p.has_t1_rows:
+        return p.demoted
+    p.demoted = True
+    if not append_event(DEMOTED_SEEN, proposal_id=p.proposal_id, ts=now):
+        log.error("channel_archive: demoted_seen append failed proposal=%s", p.proposal_id)
+    return True
 
 
 def _state_from_outcome(outcome: str) -> str:
@@ -510,6 +565,11 @@ def clear_demotion(*, actor: str, dry_run: bool) -> dict:
                              demoted_since=state.get("since")):
             out["reason"] = "ledger write failed -- the demotion stays"
             return out
+    elif not append_ledger("acknowledged", by=actor, demoted_since=state.get("since")):
+        # A12: even a demotion with no event to ack (an unreadable file) leaves its
+        # history in the ledger, so every card older than this clear stays T0.
+        out["reason"] = "ledger write failed -- the demotion stays"
+        return out
     try:
         policy.demotion_path().unlink()
     except FileNotFoundError:

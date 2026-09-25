@@ -145,7 +145,7 @@ class TestTapWrapper:
         upd = client.chat_update.call_args.kwargs
         acted = [e["value"] for b in upd["blocks"] if b.get("type") == "actions" for e in b["elements"]
                  if e["action_id"] == cards.ACTION_ROW]
-        assert acted == [f"{PID}:C0DEADAAA2"]                 # A1 decided: no button left
+        assert acted == [f"{PID}:C0DEADAAA2:T0"]                 # A1 decided: no button left
         assert upd["text"].startswith("Dead-channel proposal (T0 — nothing archived)")
         assert st.fold().proposals[PID].state_of(A1) == st.AGREED
 
@@ -159,7 +159,7 @@ class TestTapWrapper:
             done.set()
         monkeypatch.setattr(app_module, "_ca_run_tap", _run)
         client = MagicMock()
-        app_module._handle_channel_archive_tap(_body(cards.ACTION_ROW, f"{PID}:{A1}"), client,
+        app_module._handle_channel_archive_tap(_body(cards.ACTION_ROW, f"{PID}:{A1}:T1"), client,
                                                cards.ACTION_ROW)
         assert done.wait(5) and seen[0].startswith("chanarch-act")
         assert client.chat_postEphemeral.call_args.kwargs["text"] == app_module._CHANNEL_ARCHIVE_WORKING

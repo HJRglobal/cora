@@ -156,29 +156,33 @@ class TestT0:
         assert not handler.needs_act_pool(cards.ACTION_ROW, f"{PID}:{A1}")
         assert not handler.needs_act_pool(cards.ACTION_ALL, f"{PID}:p1")
         stage(tier="T1", pid="chanarch-000000000007", ts=NOW + 5)
-        assert handler.needs_act_pool(cards.ACTION_ROW, f"chanarch-000000000007:{A1}")
-        assert handler.needs_act_pool(cards.ACTION_ALL, "chanarch-000000000007:p1")
+        assert handler.needs_act_pool(cards.ACTION_ROW, f"chanarch-000000000007:{A1}:T1")
+        assert handler.needs_act_pool(cards.ACTION_ALL, "chanarch-000000000007:p1:T1")
+        # a Mark-labelled (or unmarked) button on a T1 row only records: inline
+        assert not handler.needs_act_pool(cards.ACTION_ROW, f"chanarch-000000000007:{A1}:T0")
+        assert not handler.needs_act_pool(cards.ACTION_ROW, f"chanarch-000000000007:{A1}")
+        assert not handler.needs_act_pool(cards.ACTION_ALL, "chanarch-000000000007:p1:T0")
 
 
 class TestT1Gates:
     def test_registry_still_t0_records_instead_of_archiving(self, fake, monkeypatch):
         monkeypatch.setenv("CORA_CHANNEL_ARCHIVE", "act")        # but the real registry is T0
         stage(tier="T1")
-        r = tap(cards.ACTION_ROW, f"{PID}:{A1}")
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
         assert r.outcome == "agreed" and "registry says the lane is at T0" in r.msg
         assert "conversations_archive" not in fake.method_names() and not fake.posts
 
     def test_flag_not_act_in_this_process_is_transient(self, fake, monkeypatch, armed):
         monkeypatch.setenv("CORA_CHANNEL_ARCHIVE", "propose")
         stage(tier="T1")
-        r = tap(cards.ACTION_ROW, f"{PID}:{A1}")
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
         assert r.outcome == "refused_transient" and state(A1) == st.OPEN
         assert "archive switch is not on" in r.msg
 
     def test_a_demotion_after_the_card_records_t0_equivalent(self, fake, armed):
         stage(tier="T1")
         policy.demotion_path().write_text('{"since": "x"}', encoding="utf-8")
-        r = tap(cards.ACTION_ROW, f"{PID}:{A1}")
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
         assert r.outcome == "agreed" and "demoted" in r.msg
         assert "conversations_archive" not in fake.method_names()
 
@@ -187,10 +191,10 @@ class TestT1Gates:
         stage(tier="T1", rows=[_row(A1, "fx-dead-one", tier="T1"),
                                _row(A2, "fx-dead-two", tier="T1", is_private=True)])
         fake.scopes = None
-        r = tap(cards.ACTION_ROW, f"{PID}:{A1}")
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
         assert r.outcome == "refused_transient" and state(A1) == st.OPEN
         fake.scopes = ["channels:manage"]                   # groups:write missing
-        r2 = tap(cards.ACTION_ROW, f"{PID}:{A2}")
+        r2 = tap(cards.ACTION_ROW, f"{PID}:{A2}:T1")
         assert r2.outcome == "agreed"
         assert "the Slack scope groups:write is missing — Harrison adds it" in r2.msg
         assert "conversations_archive" not in fake.method_names()
@@ -199,7 +203,7 @@ class TestT1Gates:
 class TestArchivePath:
     def test_the_happy_path_orders_notice_before_archive_and_ledgers_both_rows(self, fake, armed):
         stage(tier="T1")
-        r = tap(cards.ACTION_ROW, f"{PID}:{A1}")
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
         assert r.outcome == "archived", r.msg
         assert r.msg.startswith(f"Archived <#{A1}>") and "ledger row written" in r.msg
         names = fake.method_names()
@@ -219,7 +223,7 @@ class TestArchivePath:
         stage(tier="T1")
         seen: list = []
         fake.post_behaviour = lambda kw: seen.append([x["event"] for x in (st.read_ledger() or [])])
-        tap(cards.ACTION_ROW, f"{PID}:{A1}")
+        tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
         assert seen and seen[0] == ["intent"]
 
     def test_a_failed_intent_write_refuses_and_keeps_the_buttons(self, fake, armed, monkeypatch):
@@ -227,7 +231,7 @@ class TestArchivePath:
         real = st.append_ledger
         monkeypatch.setattr(st, "append_ledger",
                             lambda ev, **kw: False if ev == "intent" else real(ev, **kw))
-        r = tap(cards.ACTION_ROW, f"{PID}:{A1}")
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
         assert r.outcome == "failed" and "ledger write failed" in r.msg
         assert not fake.posts and "conversations_archive" not in fake.method_names()
         assert state(A1) == st.OPEN
@@ -237,7 +241,7 @@ class TestArchivePath:
         d = tmp_path / "isadir"
         d.mkdir()
         monkeypatch.setenv("CORA_CHANNEL_ARCHIVE_LEDGER_PATH", str(d))
-        r = tap(cards.ACTION_ROW, f"{PID}:{A1}")
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
         assert r.outcome == "failed" and "reverify_store_unreadable" in r.msg
         assert not fake.posts and "conversations_archive" not in fake.method_names()
 
@@ -248,7 +252,7 @@ class TestArchivePath:
         fake.channels.append(chan("C0LEXLEX01", "lex-old"))
         fake.history["C0LEXLEX01"] = [msg(300)]
         stage(tier="T1", rows=[row])
-        r = tap(cards.ACTION_OVERRIDE, f"{PID}:C0LEXLEX01")
+        r = tap(cards.ACTION_OVERRIDE, f"{PID}:C0LEXLEX01:T1")
         assert r.outcome == "archived", r.msg
         intent = st.read_ledger()[0]
         assert intent["lex"] is True and "channel_name" not in intent and intent["override"] is True
@@ -263,7 +267,7 @@ class TestArchivePath:
     def test_the_live_reverify_refuses_a_changed_channel(self, fake, armed, mutate, why):
         stage(tier="T1")
         mutate(fake)
-        r = tap(cards.ACTION_ROW, f"{PID}:{A1}")
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
         assert r.outcome == "stale_refused" and why in r.msg, r.msg
         assert not fake.posts and "conversations_archive" not in fake.method_names()
         assert state(A1) == st.STALE and st.read_ledger() == []
@@ -271,33 +275,33 @@ class TestArchivePath:
     def test_a_registry_row_added_after_the_card_is_refused(self, fake, armed):
         """A channel staged as a clean A row that is in the registry at tap time."""
         stage(tier="T1", rows=[_row(B1, "fx-registry-quiet", tier="T1")])
-        r = tap(cards.ACTION_ROW, f"{PID}:{B1}")
+        r = tap(cards.ACTION_ROW, f"{PID}:{B1}:T1")
         assert r.outcome == "stale_refused" and "no longer a clean candidate (registry)" in r.msg
 
     def test_a_keep_since_the_card_is_refused(self, fake, armed):
         stage(tier="T1")
         st.append_event(st.KEPT, proposal_id="chanarch-000000000003", cid=A1, ts=NOW + 1)
-        r = tap(cards.ACTION_ROW, f"{PID}:{A1}")
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
         assert r.outcome == "stale_refused" and "kept since the card" in r.msg
 
     def test_a_reverify_read_error_is_retryable(self, fake, armed):
         stage(tier="T1")
         fake.info_override[A1] = api_error("ratelimited")
-        r = tap(cards.ACTION_ROW, f"{PID}:{A1}")
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
         assert r.outcome == "failed" and "reverify_ratelimited" in r.msg
         assert state(A1) == st.OPEN and not fake.posts
 
     def test_an_unreadable_registry_at_tap_time_is_retryable(self, fake, armed, monkeypatch, tmp_path):
         stage(tier="T1")
         monkeypatch.setenv("CORA_CHANNEL_REGISTRY_PATH", str(tmp_path / "gone.md"))
-        r = tap(cards.ACTION_ROW, f"{PID}:{A1}")
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
         assert r.outcome == "failed" and "reverify_registry_unreadable" in r.msg
         assert state(A1) == st.OPEN
 
     def test_a_failed_notice_stops_before_the_archive(self, fake, armed):
         stage(tier="T1")
         fake.post_behaviour = lambda kw: api_error("not_in_channel") if kw["channel"] == A1 else None
-        r = tap(cards.ACTION_ROW, f"{PID}:{A1}")
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
         assert r.outcome == "failed" and "did not post (not_in_channel)" in r.msg
         assert "conversations_archive" not in fake.method_names()
         assert st.read_ledger()[-1]["outcome"] == "notice_failed:not_in_channel"
@@ -306,7 +310,7 @@ class TestArchivePath:
     def test_an_api_refusal_posts_the_correction_and_keeps_the_button(self, fake, armed):
         stage(tier="T1")
         fake.archive_behaviour = api_error("restricted_action")
-        r = tap(cards.ACTION_ROW, f"{PID}:{A1}")
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
         assert r.outcome == "failed" and "restricted_action" in r.msg
         texts = [p["text"] for p in fake.posts if p["channel"] == A1]
         assert texts[-1] == cards.CORRECTION_TEXT and len(texts) == 2
@@ -327,7 +331,7 @@ class TestArchivePath:
             return orig(channel, oldest=oldest, latest=latest, limit=limit, cursor=cursor,
                         inclusive=inclusive)
         fake.conversations_history = _hist
-        r = tap(cards.ACTION_ROW, f"{PID}:{A1}")
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
         assert r.outcome == want
 
     @pytest.mark.parametrize("readback,want", [(True, "archived"), (False, "failed"), ("error", "unknown")])
@@ -349,7 +353,7 @@ class TestArchivePath:
                     raise api_error("internal_error")
                 return orig_info(channel, **kw)
             fake.conversations_info = _info
-        r = tap(cards.ACTION_ROW, f"{PID}:{A1}")
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
         assert r.outcome == want, r.msg
         assert fake.method_names().count("conversations_archive") == 1
         if want == "failed":
@@ -362,17 +366,131 @@ class TestArchivePath:
     def test_ok_but_the_read_back_disagrees_is_unknown_not_archived(self, fake, armed):
         stage(tier="T1")
         fake.archive_behaviour = lambda ch: "ok_no_effect"
-        r = tap(cards.ACTION_ROW, f"{PID}:{A1}")
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
         assert r.outcome == "unknown" and "Archived" not in r.msg
         assert st.read_ledger()[-1]["outcome"] == "unknown"
 
     def test_the_pre_notice_recheck_stops_after_the_intent(self, fake, armed, monkeypatch):
         stage(tier="T1")
         monkeypatch.setattr(gates, "pre_notice_check", lambda: (False, "the lane was demoted a moment ago"))
-        r = tap(cards.ACTION_ROW, f"{PID}:{A1}")
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
         assert r.outcome == "refused_transient" and not fake.posts
         assert st.read_ledger()[-1]["outcome"].startswith("not_attempted:")
         assert state(A1) == st.OPEN
+
+
+def _rendered_values(page=1, now=NOW + 10):
+    """label -> value of every button on the page, drawn by the REAL renderer."""
+    blocks, _ = cards.render_page(st.fold(now=now), PID, page, now=now)
+    return {e["text"]["text"]: e["value"] for b in blocks if b.get("type") == "actions"
+            for e in b["elements"]}
+
+
+def _demote(since_ts=NOW + 5):
+    from datetime import datetime, timedelta, timezone
+    since = datetime.fromtimestamp(since_ts, timezone(timedelta(hours=-7))).isoformat(timespec="seconds")
+    assert st.write_demotion({"since": since, "channel_id": "C0ROGUE0001", "archive_ts": "1790.1",
+                              "reason": "an archive by Cora with no tap-attributed ledger intent"},
+                             dry_run=False)
+
+
+class TestDemotionHistoryA12:
+    """c1-authority-tier#0: a T1 card that outlived a demotion stays T0-equivalent after
+    Harrison clears it, and a button archives only when its LABEL said Archive."""
+
+    def test_a_card_redrawn_during_a_demotion_never_archives_after_the_clear(self, fake, armed):
+        stage(tier="T1")
+        assert set(_rendered_values()) >= {"Archive", "Archive all 2 shown"}
+        _demote()
+        r0 = tap(cards.ACTION_KEEP, f"{PID}:{A2}")          # any tap re-renders the page
+        assert r0.outcome == "kept"
+        drawn = _rendered_values()                           # what _ca_rerender now shows
+        assert "Mark to archive" in drawn and "Archive" not in drawn
+        assert st.clear_demotion(actor=HARRISON, dry_run=False)["cleared"]
+        assert not policy.is_demoted()
+        r = tap(cards.ACTION_ROW, drawn["Mark to archive"])
+        assert r.outcome == "agreed" and "demoted after this card went out" in r.msg, r.msg
+        assert "conversations_archive" not in fake.method_names() and not fake.posts
+        assert state(A1) == st.AGREED and st.read_ledger()[-1]["event"] == "acknowledged"
+
+    def test_mark_all_drawn_during_a_demotion_never_archives_after_the_clear(self, fake, armed):
+        rows = [_row(A1, "fx-dead-one", tier="T1"), _row(A2, "fx-dead-two", tier="T1"),
+                _row(A3, "fx-dead-three", tier="T1")]
+        stage(tier="T1", rows=rows)
+        _demote()
+        tap(cards.ACTION_KEEP, f"{PID}:{A3}")
+        drawn = _rendered_values()
+        st.clear_demotion(actor=HARRISON, dry_run=False)
+        r = tap(cards.ACTION_ALL, drawn["Mark all 2 shown to archive"])
+        assert r.outcome == "archive_all" and "Nothing was archived" in r.msg, r.msg
+        assert fake.method_names().count("conversations_archive") == 0 and not fake.posts
+        assert (state(A1), state(A2)) == (st.AGREED, st.AGREED)
+
+    def test_a_card_never_redrawn_still_records_after_a_cleared_demotion(self, fake, armed):
+        """No tap during the demotion: the page still shows Archive (:T1) -- the ledger's
+        acknowledged row (demoted_since after the card) keeps it T0-equivalent."""
+        stage(tier="T1")
+        drawn = _rendered_values()
+        assert drawn["Archive"].endswith(":T1")
+        _demote()
+        st.clear_demotion(actor=HARRISON, dry_run=False)
+        r = tap(cards.ACTION_ROW, drawn["Archive"])
+        assert r.outcome == "agreed" and "demoted after this card went out" in r.msg
+        assert "conversations_archive" not in fake.method_names() and not fake.posts
+        r2 = tap(cards.ACTION_ALL, drawn["Archive all 2 shown"])
+        assert "Nothing was archived" in r2.msg and not fake.posts
+        assert "Archive" not in _rendered_values()          # the page itself now says Mark
+
+    def test_a_demotion_seen_by_a_tap_is_persisted_even_without_an_ack_row(self, fake, armed):
+        stage(tier="T1")
+        policy.demotion_path().write_text("{corrupt", encoding="utf-8")   # unreadable = demoted
+        tap(cards.ACTION_KEEP, f"{PID}:{A2}")
+        assert any(e.get("event") == st.DEMOTED_SEEN and e.get("proposal_id") == PID
+                   for e in st.read_events())
+        policy.demotion_path().unlink()                       # gone without any ledger row
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
+        assert r.outcome == "agreed" and "demoted after this card went out" in r.msg
+        assert "conversations_archive" not in fake.method_names()
+
+    def test_clearing_an_unreadable_demotion_still_leaves_its_history(self, fake, armed):
+        stage(tier="T1")
+        policy.demotion_path().write_text("{corrupt", encoding="utf-8")
+        assert st.clear_demotion(actor=HARRISON, dry_run=False)["cleared"]
+        ack = st.read_ledger()[-1]
+        assert ack["event"] == "acknowledged" and ack["by"] == HARRISON
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1", now=NOW + 30)
+        assert r.outcome == "agreed" and not fake.posts
+
+    def test_a_card_staged_after_the_clear_archives_normally(self, fake, armed):
+        _demote(since_ts=NOW - 3 * DAY)
+        st.clear_demotion(actor=HARRISON, dry_run=False)
+        stage(tier="T1")                                      # created NOW, after the clear
+        r = tap(cards.ACTION_ROW, _rendered_values()["Archive"])
+        assert r.outcome == "archived", r.msg
+
+    @pytest.mark.parametrize("value", [f"{PID}:{A1}", f"{PID}:{A1}:T0"],
+                             ids=["unmarked", "mark-labelled"])
+    def test_only_an_archive_labelled_value_archives(self, fake, armed, value):
+        stage(tier="T1")
+        r = tap(cards.ACTION_ROW, value)
+        assert r.outcome == "agreed" and "Mark button" in r.msg, r.msg
+        assert "conversations_archive" not in fake.method_names() and not fake.posts
+        assert tap(cards.ACTION_ROW, f"{PID}:{A2}:T1").outcome == "archived"
+
+    def test_every_rendered_button_carries_the_tier_its_label_shows(self):
+        rows = [_row(A1, "fx-dead-one", tier="T1"),
+                _row(B1, "fx-registry-quiet", section="B", reason="registry", tier="T1")]
+        stage(tier="T1", rows=rows)
+        v = _rendered_values()
+        assert v["Archive"] == f"{PID}:{A1}:T1" and v["Archive (override)"] == f"{PID}:{B1}:T1"
+        assert v["Archive all 1 shown"] == f"{PID}:p1:T1" and v["Keep"] == f"{PID}:{B1}"
+        policy.demotion_path().write_text('{"since": "x"}', encoding="utf-8")
+        v2 = _rendered_values()
+        assert v2["Mark to archive"] == f"{PID}:{A1}:T0"
+        assert v2["Mark to archive (override)"] == f"{PID}:{B1}:T0"
+        assert v2["Mark all 1 shown to archive"] == f"{PID}:p1:T0"
+        for value in v2.values():
+            assert handler.button_tier(cards.ACTION_ROW, value) == "T0"
 
 
 class TestFreshAge:
@@ -380,7 +498,7 @@ class TestFreshAge:
         row = _row(A1, "fx-dead-one", tier="T1")
         row["last_person_days"] = 150               # what the card said
         stage(tier="T1", rows=[row])
-        r = tap(cards.ACTION_ROW, f"{PID}:{A1}")
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
         assert r.outcome == "archived" and "200 days" in r.msg
         notice = next(p for p in fake.posts if p["channel"] == A1)
         assert "200 days since the last message" in notice["text"]
@@ -401,7 +519,7 @@ class TestArchiveAll:
                 raise RuntimeError("boom")
             return real(*a, **k)
         monkeypatch.setattr(handler, "_archive_one", _flaky)
-        r = tap(cards.ACTION_ALL, f"{PID}:p1")
+        r = tap(cards.ACTION_ALL, f"{PID}:p1:T1")
         assert r.msg.startswith("Stopped after 1 of 3 (RuntimeError)") and "archived 1" in r.msg
         assert fake.method_names().count("conversations_archive") == 1
 
@@ -410,7 +528,7 @@ class TestArchiveAll:
                 _row(A3, "fx-dead-three", tier="T1")]
         stage(tier="T1", rows=rows)
         fake.archive_behaviour = api_error("restricted_action")
-        r = tap(cards.ACTION_ALL, f"{PID}:p1")
+        r = tap(cards.ACTION_ALL, f"{PID}:p1:T1")
         assert "2 of 3 not attempted" in r.msg and "restricted_action" in r.msg
         notices = [p for p in fake.posts if p["channel"] in (A2, A3)]
         assert notices == [] and fake.method_names().count("conversations_archive") == 1
@@ -425,7 +543,7 @@ class TestArchiveAll:
         monkeypatch.setattr(clients, "write_client_factory", lambda: f)
         stage(tier="T1", rows=[_row(c, f"fx-d{i}", tier="T1") for i, c in enumerate(cids)])
         ticks: list = []
-        r = tap(cards.ACTION_ALL, f"{PID}:p1", progress=lambda pid, page: ticks.append(page))
+        r = tap(cards.ACTION_ALL, f"{PID}:p1:T1", progress=lambda pid, page: ticks.append(page))
         assert r.counts == {"archived": 12} and ticks == [1, 1]
         assert f.method_names().count("conversations_archive") == 12
 
@@ -471,3 +589,33 @@ def test_the_scan_and_the_monitor_never_write_to_a_channel():
         assert "conversations_archive" not in attrs, mod
         if mod != "deliver":            # deliver posts ONLY the card, to Harrison's DM
             assert "chat_postMessage" not in attrs, mod
+
+
+# ── A27: the D-051 round-1 fix replies pass both honesty rails (rendered, realistic) ──
+def _assert_rails(strings, monkeypatch, caplog):
+    import logging
+    from cora import slack_egress as se
+    caplog.set_level(logging.WARNING, logger=se.__name__)
+    assert strings
+    for s in strings:
+        assert se.screen_phantom_write_claims(s, tool_use_count=0) == s, s
+        assert se.sanitize_text(s) == s, s
+    assert not [r for r in caplog.records if se.PHANTOM_LOG_KEY in r.getMessage()]
+    monkeypatch.setenv("CORA_SENTINEL_ENFORCE", "enforce")
+    for s in strings:
+        assert se.screen_phantom_write_claims(s, tool_use_count=0) == s, s
+
+
+class TestRoundOneRepliesPassTheRails:
+    def test_demotion_and_mark_button_replies(self, fake, armed, monkeypatch, caplog):
+        rows = [_row(A1, "fx-dead-one", tier="T1"), _row(A2, "fx-dead-two", tier="T1"),
+                _row(A3, "fx-dead-three", tier="T1")]
+        stage(tier="T1", rows=rows)
+        out = [tap(cards.ACTION_ROW, f"{PID}:{A1}:T0").msg,                # a Mark button
+               tap(cards.ACTION_ALL, f"{PID}:p1:T0").msg]                  # Mark all
+        stage(tier="T1", pid="chanarch-000000000011", ts=NOW + 1)
+        _demote(since_ts=NOW + 2)
+        out += [tap(cards.ACTION_ROW, f"chanarch-000000000011:{A1}:T1", now=NOW + 3).msg,
+                tap(cards.ACTION_ALL, "chanarch-000000000011:p1:T1", now=NOW + 3).msg]
+        assert not fake.posts
+        _assert_rails(out, monkeypatch, caplog)
