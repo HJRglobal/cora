@@ -94,6 +94,10 @@ _MONTHS = {m: i for i, m in enumerate(
 _PAREN_RE = re.compile(r"\([^()]{0,120}\)")
 _CLAUSE_RE = re.compile(r"\b(?:as of|currently|pending since|overdue since)\b.*$",
                         re.IGNORECASE)
+# The clause keywords themselves (every occurrence), stripped before the dropped
+# clause's content words are collected (drift_identity, D-051 r2 s2#r2-2).
+_CLAUSE_KW_RE = re.compile(r"\b(?:as of|currently|pending since|overdue since)\b",
+                           re.IGNORECASE)
 # Split ONCE on a SPACED hyphen / en dash / em dash ("day-over-day" is not split).
 _DASH_SPLIT_RE = re.compile(r"\s[-–—]\s")
 _NUMRUN_RE = re.compile(r"\d[\d,]{0,24}")
@@ -189,7 +193,9 @@ def _drop_figure_tail(s: str) -> str:
 
 def normalize(text: str) -> str:
     """The tier-A dedup key: prefix-stripped, figure/date drift removed, lowercased.
-    The words it drops are NOT all drift -- `drift_identity` guards them (s2#2)."""
+    The words it drops are NOT all drift -- `drift_identity` guards all three
+    word-drop sites: parentheticals, a figure dash tail (s2#2) and the
+    "as of / currently / pending since / overdue since" clause (r2 s2#r2-2)."""
     s = strip_task_prefix(text)
     s = _drop_figure_tail(s)
     s = _PAREN_RE.sub(" ", s)
@@ -240,10 +246,10 @@ def body_dates(text: str) -> frozenset[str]:
     return frozenset(out)
 
 
-def drift_identity(text: str) -> tuple[frozenset, frozenset]:
-    """(parenthetical words, dropped-tail words): the content words the tier-A key
-    throws away that can still NAME the task. Stemmed; never used for matching,
-    only as a guard.
+def drift_identity(text: str) -> tuple[frozenset, frozenset, frozenset]:
+    """(parenthetical words, dropped-tail words, dropped-clause words): the content
+    words the tier-A key throws away that can still NAME the task. Stemmed; never
+    used for matching, only as a guard.
 
     D-051 r1 s2#2. `normalize` deletes every parenthetical and every short
     figure-bearing dash tail -- right for the drift it was measured on ("($33,487
@@ -254,7 +260,17 @@ def drift_identity(text: str) -> tuple[frozenset, frozenset]:
     a DIGIT-FREE parenthetical counts (a figure-bearing one is the measured drift;
     its ids are already guarded by `extract_ids`), and only a tail `normalize`
     really DROPS. Two non-empty, unequal sets = no tier A -- the pair falls to
-    tier B and is listed, never suppressed (the id / body-date rule)."""
+    tier B and is listed, never suppressed (the id / body-date rule).
+
+    D-051 r2 s2#r2-2: the THIRD drop site. `_CLAUSE_RE` deletes everything from
+    the first "as of|currently|pending since|overdue since" to the end, so "...
+    bug currently affecting Apple Pay" vs "... discount codes" -- and, with a
+    mid-string keyword, "Update the currently active price list for Target" vs
+    "... wholesale agreement with Costco" (key: "update") -- were tier A. The
+    clause is read exactly where `normalize` drops it (after the tail, the
+    parentheticals and the figures), minus the keywords and digit runs, so a
+    figure-only clause ("as of 2026-08-27", "currently $35,337") stays empty and
+    the measured drift still collapses."""
     s = strip_task_prefix(text)
     kept, tail = _split_figure_tail(s)
     paren: set[str] = set()
@@ -267,7 +283,12 @@ def drift_identity(text: str) -> tuple[frozenset, frozenset]:
     if tail:
         rest = _NUMRUN_RE.sub(" ", _remove_figures(tail))
         tail_words.update(stem(t) for t in _content(_raw_tokens(rest)))
-    return frozenset(paren), frozenset(tail_words)
+    clause_words: set[str] = set()
+    cm = _CLAUSE_RE.search(_remove_figures(_PAREN_RE.sub(" ", kept)))
+    if cm:
+        rest = _NUMRUN_RE.sub(" ", _CLAUSE_KW_RE.sub(" ", cm.group(0)))
+        clause_words.update(stem(t) for t in _content(_raw_tokens(rest)))
+    return frozenset(paren), frozenset(tail_words), frozenset(clause_words)
 
 
 def stem(tok: str) -> str:
@@ -304,6 +325,7 @@ class Sig:
     bigrams: frozenset       # stemmed non-generic adjacent pairs (tier-B bigram rule)
     paren: frozenset = frozenset()   # digit-free parenthetical words (tier-A guard only)
     tail: frozenset = frozenset()    # dropped dash-tail words (tier-A guard only)
+    clause: frozenset = frozenset()  # dropped "as of / currently ..." clause words (ditto)
 
 
 @lru_cache(maxsize=8192)
@@ -317,10 +339,10 @@ def signature(text: str) -> Sig:
         (a, b) for a, b in zip(words, words[1:])
         if not _is_generic(a) and not _is_generic(b)
     )
-    paren, tail = drift_identity(text)
+    paren, tail, clause = drift_identity(text)
     return Sig(norm=norm, ids=extract_ids(text), dates=body_dates(text), tokens=toks,
                content_n=len(content), stems=frozenset(stems), words=frozenset(words),
-               bigrams=bigrams, paren=paren, tail=tail)
+               bigrams=bigrams, paren=paren, tail=tail, clause=clause)
 
 
 def _id_conflict(a: Sig, b: Sig) -> bool:
@@ -333,6 +355,8 @@ def _drift_conflict(a: Sig, b: Sig) -> bool:
     """The words the tier-A key dropped disagree (see drift_identity). Gates tier
     A ONLY: such a pair is still listed as tier B, never suppressed."""
     if a.paren and b.paren and a.paren != b.paren:
+        return True
+    if a.clause and b.clause and a.clause != b.clause:
         return True
     return bool(a.tail) and bool(b.tail) and a.tail != b.tail
 

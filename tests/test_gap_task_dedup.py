@@ -409,6 +409,63 @@ def test_the_drift_the_key_was_measured_on_still_collapses():
                  "Pay Deposco invoice - $4,900 setup fee") == "A"
 
 
+# D-051 r2 s2#r2-2: the THIRD word-drop site -- `_CLAUSE_RE` deletes everything from
+# "as of|currently|pending since|overdue since" to the end, and drift_identity
+# guarded only the parenthetical and dash-tail sites. Each pair differs ONLY after
+# the clause keyword (the last one: a MID-string keyword, whose key was "update").
+_DISTINCT_BY_DROPPED_CLAUSE = [
+    ("Resolve Shopify checkout bug currently affecting Apple Pay",
+     "Resolve Shopify checkout bug currently affecting discount codes"),
+    ("Follow up with Brightwell on sleeves currently blocked by artwork",
+     "Follow up with Brightwell on sleeves currently blocked by freight"),
+    ("Chase the Acme Gym invoice overdue since the March promo",
+     "Chase the Acme Gym invoice overdue since the April rebrand"),
+    ("Reconcile the vendor ledger pending since the audit",
+     "Reconcile the vendor ledger pending since the migration"),
+    ("Update the currently active price list for Target",
+     "Update the currently active wholesale agreement with Costco"),
+    ("[F3E] Drive doc suggests missing task: Resolve Shopify checkout bug currently "
+     "affecting Apple Pay", "Resolve Shopify checkout bug currently affecting discount codes"),
+]
+
+
+@pytest.mark.parametrize("a,b", _DISTINCT_BY_DROPPED_CLAUSE)
+def test_words_the_clause_drop_removes_still_tell_two_tasks_apart(a, b):
+    assert gtd.normalize(a) == gtd.normalize(b)       # the key alone cannot tell them apart
+    assert _tier(a, b) == "B"
+    assert _tier(b, a) == "B"
+    ca, cb = gtd.drift_identity(a)[2], gtd.drift_identity(b)[2]
+    assert ca and cb and ca != cb                     # the guard's third set sees it
+
+
+def test_the_clause_drift_still_collapses():
+    """Only the clause's CONTENT words count: a figure-only clause, one side with no
+    clause at all, or the same words re-inflected stay tier A (the measured drift)."""
+    assert _tier("Reconcile the vendor ledger as of 2026-08-27",
+                 "Reconcile the vendor ledger as of 2026-09-03") == "A"
+    assert _tier("Monitor the ad spend currently $4,100",
+                 "Monitor the ad spend currently $5,250") == "A"
+    assert _tier("Resolve Shopify checkout bug currently affecting Apple Pay",
+                 "Resolve Shopify checkout bug") == "A"
+    assert _tier("Resolve Shopify checkout bug currently affecting Apple Pay",
+                 "Resolve Shopify checkout bug currently affecting Apple Pay payments") == "A"
+    assert _tier(CASH[2], CASH[1]) == "A"      # "(currently $35,337)": inside a paren
+    assert _tier(DLC[2], DLC[0]) == "A"        # "(..., overdue since 2026-08-15)"
+
+
+def test_a_dropped_clause_conflict_is_listed_by_the_ledger_never_suppressed(tmp_path,
+                                                                            monkeypatch):
+    _ledger(tmp_path, monkeypatch)
+    _seed_proposed_updates(monkeypatch, tmp_path, [])
+    assert gtd.record_proposal(gap_id="pass5:drive:cls00001", entity="F3E",
+                               subject="Resolve Shopify checkout bug currently affecting Apple Pay")
+    rows = gtd.ledger_rows(persist=True)
+    other = "Resolve Shopify checkout bug currently affecting discount codes"
+    assert gtd.find_tier_a("F3E", other, rows) is None                       # not suppressed
+    assert [n["ref"] for n in gtd.near_duplicates("F3E", other, rows)] == \
+        ["pass5:drive:cls00001"]                                              # ... listed
+
+
 def test_a_dropped_word_conflict_is_listed_by_the_ledger_never_suppressed(tmp_path, monkeypatch):
     _ledger(tmp_path, monkeypatch)
     _seed_proposed_updates(monkeypatch, tmp_path, [])

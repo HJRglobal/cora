@@ -217,6 +217,13 @@ def _result_dict(r: Any) -> dict[str, Any]:
     )
     n_redacted = n_body + n_title
     n_tok = n_body_tok + n_title_tok
+    # D-051 r2 s1#r2-0: a LEX row's tokens are redacted UPSTREAM, before the PHI
+    # scrub (context_loader._apply_lex_phi_scrub), so this belt counts 0 for them;
+    # the field adds that pre-scrub count back. The INFO below stays on this
+    # belt's own count (the upstream WARN is that event's one line).
+    n_pre = getattr(r, "_pre_scrub_token_redactions", 0)
+    if not isinstance(n_pre, int) or isinstance(n_pre, bool) or n_pre < 0:
+        n_pre = 0
     if n_redacted:
         # INFO, not WARN: the `text` rendering of the same rows goes through
         # context_loader._format_kb_chunks, which already WARNs once per chunk
@@ -240,7 +247,7 @@ def _result_dict(r: Any) -> dict[str, Any]:
         "deep_link": getattr(r, "deep_link", "") or "",
         "content": content,
         "banking_redactions": n_redacted,
-        "token_redactions": n_tok,
+        "token_redactions": n_tok + n_pre,
     }
 
 

@@ -23,6 +23,7 @@ Exit codes:
 import argparse
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -281,6 +282,22 @@ def _new_gap_run_state() -> dict:
     return {"created": [], "project_scan": {}, "attempted": [], "outcomes": {}}
 
 
+# D-051 r2 s2#r2-0: the statuses Asana ANSWERED with and committed nothing on --
+# a 4xx, as asana_client.create_task words it ("Asana 403 — ...", "Asana 400 —
+# bad request: ...", "Asana 404: ..."). A network error (a ReadTimeout is wrapped
+# as "Asana network error: ...") or a 5xx can follow a create Asana COMMITTED, so
+# those stay ambiguous; so does any message this does not recognise (the
+# fail-safe direction is a hold, never a second create).
+_ASANA_DEFINITIVE_REJECT_RE = re.compile(r"^Asana 4\d\d(?!\d)")
+
+
+def _asana_rejected_definitively(exc: BaseException) -> bool:
+    try:
+        return bool(_ASANA_DEFINITIVE_REJECT_RE.match(str(exc)))
+    except Exception:  # noqa: BLE001 -- unreadable = ambiguous
+        return False
+
+
 def _gap_outcome(run_state: dict, uid: str, kind: str, detail: str = "") -> None:
     """Record how _execute_asana_task ended for `uid`: created | recovered |
     refused | duplicate | pending. main() turns it into the card ack."""
@@ -295,11 +312,27 @@ def _asana_ack_overrides(run_state: dict | None, update: dict) -> dict:
     with the card stamped Resolved. A refusal / duplicate is a DELIBERATE terminal
     DISMISSED, so it says what happened; a transient failure leaves the row
     PENDING and the same reaction is retried next run, so the card is NOT retired
-    (its reaction still applies) and the ack says it will retry. {} = default."""
+    (its reaction still applies) and the ack says it will retry. {} = default.
+
+    D-051 r2 s2#r2-1: the EXCEPTION end. Every resolve happens inside the
+    executor and each end records its outcome right after its resolve, so NO
+    outcome means an exception escaped before the row was resolved: it is still
+    PENDING (a create may already exist -- the next run's ledger recovery
+    resolves it), and the card must not be retired or told "flagged in
+    #hjrg-leadership" (nothing was posted). A created / recovered row is a
+    success even when a later step raised: `success` overrides the executor's
+    False so a task that exists is never acked as a failure."""
     if update.get("update_type") != "asana_task" or not run_state:
         return {}
     o = (run_state.get("outcomes") or {}).get(str(update.get("update_id") or ""))
     kind = (o or {}).get("kind")
+    if o is None:
+        return {"text": (":warning: Approved -- but this run stopped on an error before "
+                         "it finished. It is still pending, and I pick it up again on the "
+                         "next review run."),
+                "retire": False, "success": False}
+    if kind in ("created", "recovered"):
+        return {"success": True}
     if kind == "refused":
         return {"text": (f":no_entry_sign: Approved -- but no Asana task was created: "
                          f"{o.get('detail') or 'this lane cannot create it'}. Dismissed; "
@@ -395,7 +428,9 @@ def _execute_asana_task(update: dict, slack_token: str, log: logging.Logger,
          (D-030), of a task created earlier in this run, or of an open task in
          the target project                 -> DISMISSED duplicate_of:<ref>
       3b. tier-A sibling of a create ATTEMPTED this run that did not confirm
-         (Asana may have committed it)      -> stays PENDING (next run's fresh
+         (Asana may have committed it -- a network error / 5xx / anything
+         unrecognised; a definitive 4xx un-records the attempt, r2 s2#r2-0)
+                                            -> stays PENDING (next run's fresh
                                                 project scan decides)
       4. create_task(name, project, assignee) -> APPROVED executed:<gid>
          a transient AsanaClientError        -> stays PENDING (retried next run;
@@ -411,15 +446,17 @@ def _execute_asana_task(update: dict, slack_token: str, log: logging.Logger,
     uid_short = uid[-8:]
     notify_ch = "hjrg-leadership"
 
+    # D-051 r2 s2#r2-1: each end records its outcome IMMEDIATELY after its resolve
+    # (before any post), so "no outcome" always means the row is still PENDING.
     plan = gtd.plan_create(update)
     if plan.refusal:
+        why = gtd.refusal_text(plan.refusal)
         resolve_update(uid, "DISMISSED", reason=f"refused:{plan.refusal}")
+        _gap_outcome(run_state, uid, "refused", why)
         _post_to_slack(slack_token, notify_ch, (
             f":no_entry_sign: *Gap executor* `[{uid_short}]` did not create an Asana "
-            f"task: {gtd.refusal_text(plan.refusal)}. Dismissed -- nothing was "
-            f"created."))
+            f"task: {why}. Dismissed -- nothing was created."))
         log.warning("gap-executor: refused uid=%s reason=%s", uid_short, plan.refusal)
-        _gap_outcome(run_state, uid, "refused", gtd.refusal_text(plan.refusal))
         return False
 
     rows = gtd.ledger_rows(persist=True)
@@ -427,13 +464,13 @@ def _execute_asana_task(update: dict, slack_token: str, log: logging.Logger,
     if own is not None:
         gid = str(own.get("gid") or "")
         resolve_update(uid, "APPROVED", reason=f"executed:{gid}")
+        _gap_outcome(run_state, uid, "recovered")
         _post_to_slack(slack_token, notify_ch, (
             f":white_check_mark: *Gap executor* `[{uid_short}]` this task was already "
             f"created on an earlier run"
             + (f": <{own.get('url')}|open it in Asana>" if own.get("url") else "")
             + " -- recorded, not re-created."))
         log.info("gap-executor: recovered earlier create uid=%s gid=%s", uid_short, gid)
-        _gap_outcome(run_state, uid, "recovered")
         return True
 
     hit = gtd.find_tier_a(plan.entity, plan.subject, rows, exclude_ref=uid,
@@ -465,6 +502,7 @@ def _execute_asana_task(update: dict, slack_token: str, log: logging.Logger,
     if hit is not None:
         ref = gtd.ref_of(hit) or str(hit.get("ref") or "")
         resolve_update(uid, "DISMISSED", reason=f"duplicate_of:{ref}")
+        _gap_outcome(run_state, uid, "duplicate", ref)
         if hit.get("gid"):
             what = (f"a task created {_md(hit.get('ts'))}"
                     if hit.get("kind") == "created" else "an open Asana task")
@@ -477,7 +515,6 @@ def _execute_asana_task(update: dict, slack_token: str, log: logging.Logger,
             f"task: it repeats {what}{link}. Dismissed as a duplicate."))
         log.warning("gap-executor: duplicate uid=%s of=%s kind=%s", uid_short,
                     ref[-24:], hit.get("kind") or "?")
-        _gap_outcome(run_state, uid, "duplicate", ref)
         return False
 
     # Tier-B near-duplicates the approver never saw: a legacy card (carded
@@ -497,9 +534,9 @@ def _execute_asana_task(update: dict, slack_token: str, log: logging.Logger,
     )
     # Recorded BEFORE the call (s2#3): whatever the create raises, a tier-A
     # sibling later in this run is held rather than created.
-    run_state.setdefault("attempted", []).append({
-        "kind": "attempted", "ref": uid, "entity": plan.entity, "subject": plan.subject,
-        "ts": datetime.now(timezone.utc).isoformat()})
+    attempt = {"kind": "attempted", "ref": uid, "entity": plan.entity,
+               "subject": plan.subject, "ts": datetime.now(timezone.utc).isoformat()}
+    run_state.setdefault("attempted", []).append(attempt)
     try:
         task = create_task(name=plan.task_name, assignee_gid=plan.assignee_gid,
                            project_gid=plan.project_gid, notes=notes)
@@ -509,6 +546,15 @@ def _execute_asana_task(update: dict, slack_token: str, log: logging.Logger,
         # The cached scan predates this create -- which Asana may have committed
         # before the error -- so drop it: the next row into this project re-scans.
         (run_state.get("project_scan") or {}).pop(plan.project_gid, None)
+        if _asana_rejected_definitively(exc):
+            # D-051 r2 s2#r2-0: Asana ANSWERED with a 4xx and committed nothing,
+            # so this is no "may have made it" -- un-record the attempt. Holding
+            # behind it starved a tier-A sibling (routed to a project the PAT CAN
+            # write) on every run, with a false "Asana may have made it" post.
+            try:
+                run_state["attempted"].remove(attempt)
+            except (KeyError, ValueError):
+                pass
         _post_to_slack(slack_token, notify_ch, (
             f":warning: *Gap executor* `[{uid_short}]` could not create the Asana task "
             f"({type(exc).__name__}: {str(exc)[:160]}). Left pending -- I retry on the "
@@ -2371,10 +2417,14 @@ def main() -> int:
                 # Code #15 D-051 r1 s2#5: an asana_task's ack says what really
                 # happened (refused / duplicate / still pending), not "didn't go
                 # through" for all three; a PENDING row's card is not retired.
+                # D-051 r2 s2#r2-1: the override may also set `success` (a created
+                # row whose later step raised is still a success; an escaped
+                # exception is a pending, unretired card).
+                ack_kw = {"success": ok}
+                ack_kw.update(_asana_ack_overrides(gap_run_state, u))
                 _ack_correlated_reaction(
                     reaction_by_uid.get(u["update_id"]) or {}, "APPROVED", u,
-                    slack_token, log, success=ok,
-                    **_asana_ack_overrides(gap_run_state, u))
+                    slack_token, log, **ack_kw)
 
     if dismissed_updates:
         log.info("DISMISSED %d updates (no action taken)", len(dismissed_updates))

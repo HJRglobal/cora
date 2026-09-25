@@ -714,7 +714,13 @@ def test_executor_posts_and_logs_name_the_row_by_its_hash_tail(env, caplog):
 def test_asana_ack_overrides_name_each_end(env):
     st = rkr._new_gap_run_state()
     u = {"update_id": "u1", "update_type": "asana_task"}
-    assert rkr._asana_ack_overrides(st, u) == {}                   # no outcome: default
+    # no outcome = an exception escaped before any resolve (D-051 r2 s2#r2-1):
+    # still PENDING, so a pending ack on an UNretired card -- never the default
+    # "didn't go through; flagged in #hjrg-leadership" (nothing was flagged)
+    kw = rkr._asana_ack_overrides(st, u)
+    assert kw["retire"] is False and kw["success"] is False
+    assert "still pending" in kw["text"] and "didn't go through" not in kw["text"]
+    assert "flagged" not in kw["text"] and "hjrg-leadership" not in kw["text"]
     rkr._gap_outcome(st, "u1", "refused", "no BDM Asana project is configured")
     kw = rkr._asana_ack_overrides(st, u)
     assert "no Asana task was created" in kw["text"] and "no BDM Asana project" in kw["text"]
@@ -724,8 +730,12 @@ def test_asana_ack_overrides_name_each_end(env):
     rkr._gap_outcome(st, "u1", "pending")
     kw = rkr._asana_ack_overrides(st, u)
     assert kw["retire"] is False and "retry it on the next review run" in kw["text"]
+    # created / recovered: the default success text, and success even if a LATER
+    # step raised (D-051 r2 s2#r2-1) -- a task that exists is never acked a failure
     rkr._gap_outcome(st, "u1", "created", "9")
-    assert rkr._asana_ack_overrides(st, u) == {}
+    assert rkr._asana_ack_overrides(st, u) == {"success": True}
+    rkr._gap_outcome(st, "u1", "recovered")
+    assert rkr._asana_ack_overrides(st, u) == {"success": True}
     assert rkr._asana_ack_overrides(st, {"update_id": "u1", "update_type": "task_close"}) == {}
 
 
@@ -795,3 +805,155 @@ def test_send_persists_what_was_shown_even_when_empty(env, monkeypatch):
     assert rows["pass5:drive:u0000001"]["near_dups_shown"] == ["1218000000000009"]
     assert rows["pass5:drive:u0000002"]["near_dups_shown"] == []   # new card, none shown
     assert "_create_plan" not in rows["pass5:drive:u0000001"]      # in-memory only
+
+
+# ── Code #15 D-051 r2 (s2#r2-0 / s2#r2-1) ────────────────────────────────────
+
+_RESTRICTED = "1214878916621796"   # a keyword-routed project the PAT cannot write
+
+
+@pytest.mark.parametrize("err,definitive", [
+    ("Asana 403 — PAT lacks permission to create tasks (or to assign to the "
+     "requested user)", True),
+    ('Asana 400 — bad request: {"errors":[{"message":"projects: Not a recognized ID"}]}',
+     True),
+    ('Asana 404: {"errors":[{"message":"Not Found"}]}', True),
+    ("Asana 503 — upstream error: Service Unavailable", False),
+    ("Asana network error: ReadTimeout", False),
+    ("an unrecognised failure", False),
+])
+def test_only_an_ambiguous_create_failure_holds_its_tier_a_sibling(env, monkeypatch, err,
+                                                                   definitive):
+    """D-051 r2 s2#r2-0: every create was recorded as ATTEMPTED and never
+    un-recorded, so a tier-A sibling was held behind ANY AsanaClientError --
+    including a 403/400/404, where Asana answered and committed nothing. A's
+    keyword-routed project rejects the PAT on every run, B (catch-all) would
+    create -- and B was held PENDING every weekday with a false 'Asana may have
+    made it' post. Only an ambiguous failure (network / 5xx / unrecognised) holds."""
+    from cora.tools import asana_client, project_resolver as pr
+    from cora.tools.asana_client import AsanaClientError
+    monkeypatch.setattr(pr, "resolve_project",
+                        lambda entity, task_text="", **k: _RESTRICTED
+                        if "launch" in task_text.lower() else PROJECT.get(entity))
+    made: list[dict] = []
+
+    def _create(**kw):
+        if kw["project_gid"] == _RESTRICTED:
+            raise AsanaClientError(err)
+        made.append(kw)
+        return {"gid": f"1219{len(made):012d}", "permalink_url": "https://app.asana.com/x",
+                "projects": [{"gid": kw["project_gid"], "name": "P"}],
+                "assignee": {"gid": kw["assignee_gid"], "name": "A"}}
+    monkeypatch.setattr(asana_client, "create_task", _create)
+    a = _p1("dfn00001", "Reorder the F3 Pure shrink sleeves - $4,100 Pure launch", days_ago=3)
+    b = _p1("dfn00002", "Reorder the F3 Pure shrink sleeves", days_ago=1)
+    assert gtd.match_tier(gtd.subject_of(a), gtd.subject_of(b)) == "A"
+    _write_rows(env, a, b)
+    st = rkr._new_gap_run_state()
+    assert _exec(a, st) is False
+    assert _p1_state(env, "dfn00001") == ("PENDING", "")         # A: retried as before
+    if definitive:
+        assert _exec(b, st) is True                               # B is NOT starved
+        assert [m["project_gid"] for m in made] == [PROJECT["F3E"]]
+        assert _p1_state(env, "dfn00002")[1].startswith("executed:")
+        assert [x["ref"] for x in st["attempted"]] == [b["update_id"]]   # A un-recorded
+        assert not any("may have made it" in p for p in env["posts"])
+        # next run: A repeats the task B made -> DISMISSED, not a 403 every weekday
+        assert _exec(a, rkr._new_gap_run_state()) is False
+        assert _p1_state(env, "dfn00001")[1].startswith("duplicate_of:")
+        assert len(made) == 1
+    else:
+        assert _exec(b, st) is False                              # HELD (s2#3 intact)
+        assert made == []
+        assert _p1_state(env, "dfn00002") == ("PENDING", "")
+        assert "may have made it" in env["posts"][-1]
+
+
+def test_only_a_4xx_reads_as_a_definitive_asana_rejection():
+    from cora.tools.asana_client import AsanaClientError
+    for msg in ("Asana 401 — PAT invalid or revoked", "Asana 403 — no",
+                "Asana 400 — bad request: x", "Asana 404: x", "Asana 429: rate limited"):
+        assert rkr._asana_rejected_definitively(AsanaClientError(msg)) is True, msg
+    for msg in ("Asana 500 — upstream error: x", "Asana 503 — upstream error: x",
+                "Asana network error: ReadTimeout", "Asana 4000: x", "HTTP 403",
+                "create_task requires a non-empty `name`", ""):
+        assert rkr._asana_rejected_definitively(AsanaClientError(msg)) is False, msg
+
+
+def test_a_post_create_resolve_failure_acks_pending_and_keeps_the_card(env, monkeypatch):
+    """D-051 r2 s2#r2-1: resolve_update(uid, APPROVED, executed:<gid>) raising on its
+    tmp.replace (a sharing violation, the s2#0 fault class) AFTER the task was
+    created recorded no outcome, so main() acked ':warning: ... didn't go through;
+    I've flagged it in #hjrg-leadership' (nothing was flagged) and RETIRED the card
+    of a row still PENDING. Now: a pending ack on an unretired card; the next run
+    recovers it -- one task, one success ack."""
+    real_resolve = rkr.resolve_update
+    left = {"n": 1}
+
+    def _flaky(uid, state, reason=""):
+        if left["n"] and str(reason).startswith("executed:"):
+            left["n"] -= 1
+            raise PermissionError(32, "sharing violation on the proposed-updates rename")
+        return real_resolve(uid, state, reason=reason)
+    monkeypatch.setattr(rkr, "resolve_update", _flaky)
+    a = _row("xr000001", "HJRP", CASH)
+    _write_rows(env, a)
+    ack = _main_env(env, monkeypatch, [(a, _reaction("xr000001"))], [])
+    rkr.main()
+    rkr._release_run_lock()
+    assert len(env["created"]) == 1 and _state(env, "xr000001") == ("PENDING", "")
+    kw1 = ack.call_args_list[-1].kwargs
+    assert kw1["success"] is False and kw1["retire"] is False
+    assert "still pending" in kw1["text"] and "didn't go through" not in kw1["text"]
+    assert "flagged" not in kw1["text"]
+    assert not any("created Asana task" in p for p in env["posts"])   # nothing was posted
+    rkr.main()                                                        # the next run
+    rkr._release_run_lock()
+    assert len(env["created"]) == 1                                   # no second task
+    assert _state(env, "xr000001")[1].startswith("executed:")
+    kw2 = ack.call_args_list[-1].kwargs
+    assert kw2["success"] is True and "text" not in kw2 and kw2.get("retire", True) is True
+
+
+def test_a_created_task_whose_post_raises_is_acked_as_a_success(env, monkeypatch):
+    """D-051 r2 s2#r2-1: an exception AFTER _gap_outcome('created') (while the
+    #hjrg-leadership post is built) made the executor return False, and kind
+    'created' mapped to {} -- so a created, APPROVED row was acked as a failure."""
+    def _boom(*a, **k):
+        raise RuntimeError("label render failed")
+    monkeypatch.setattr(rkr, "_slack_label", _boom)
+    a = _row("xr000002", "HJRP", CASH)
+    _write_rows(env, a)
+    ack = _main_env(env, monkeypatch, [(a, _reaction("xr000002"))], [])
+    rkr.main()
+    rkr._release_run_lock()
+    assert len(env["created"]) == 1
+    assert _state(env, "xr000002")[1].startswith("executed:")
+    kw = ack.call_args_list[-1].kwargs
+    assert kw["success"] is True and "text" not in kw
+
+
+def test_every_resolving_end_records_its_outcome_before_it_posts(env, monkeypatch):
+    """The invariant the no-outcome ack rests on (D-051 r2 s2#r2-1): each end
+    records its outcome IMMEDIATELY after its resolve, so an exception after a
+    resolve can never leave a DISMISSED / APPROVED row acked as 'still pending'."""
+    def _post_fails(*a, **k):
+        raise RuntimeError("post failed")
+    monkeypatch.setattr(rkr, "_post_to_slack", _post_fails)
+    refused = _row("ord00001", "BDM", "Finalize the shot list for events")
+    recovered = _row("ord00002", "HJRP", CASH)
+    duplicate = _row("ord00003", "OSN", "Clarify meter coverage")
+    _write_rows(env, refused, recovered, duplicate)
+    gtd.record_created(update_id=recovered["update_id"], entity="HJRP", subject=CASH,
+                       gid="1218000000000101", url="https://app.asana.com/x/101")
+    gtd.record_created(update_id="pass5:drive:ordother", entity="OSN",
+                       subject="Clarify meter coverage", gid="1218000000000102")
+    st = rkr._new_gap_run_state()
+    for u in (refused, recovered, duplicate):
+        _exec(u, st)
+    kinds = {k[-8:]: v["kind"] for k, v in st["outcomes"].items()}
+    assert kinds == {"ord00001": "refused", "ord00002": "recovered", "ord00003": "duplicate"}
+    assert _state(env, "ord00001") == ("DISMISSED", "refused:no_project:BDM")
+    assert _state(env, "ord00002") == ("APPROVED", "executed:1218000000000101")
+    assert _state(env, "ord00003")[0] == "DISMISSED"
+    assert env["created"] == []

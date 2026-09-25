@@ -820,6 +820,18 @@ def _apply_lex_phi_scrub(results: list) -> list:
                     "api-token redaction: %d token(s) redacted from LEX chunk %s before the PHI scrub",
                     n_tok, getattr(r, "chunk_id", "") or "?",
                 )
+                # D-051 r2 s1#r2-0: carry the count to the MCP surface, whose own
+                # belt now finds nothing and reported token_redactions=0 for a
+                # LEX row that had tokens. Accumulated (a re-scrub adds 0); its
+                # own try -- a result that refuses attributes must never turn a
+                # bookkeeping miss into the fail-closed WITHHOLD below.
+                try:
+                    prior = getattr(r, "_pre_scrub_token_redactions", 0)
+                    if not isinstance(prior, int) or isinstance(prior, bool):
+                        prior = 0
+                    r._pre_scrub_token_redactions = prior + n_tok
+                except Exception:  # noqa: BLE001
+                    pass
             r.content = phi_guard.scrub_lex_phi(r.content, allowed_names=staff)
             # B5 (2026-06-17): also redact a bare non-staff name sitting near a PHI
             # cue (the residual scrub_lex_phi misses -- "the client, Madison, ..." /

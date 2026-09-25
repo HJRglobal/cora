@@ -455,6 +455,33 @@ class TestLexScrubOrder:
         assert out["results"] and _lex_secret_free(out["results"][0]["content"])
         assert _lex_secret_free(out["text"]) and st.MARKER in out["text"]
 
+    def test_mcp_lex_row_counts_the_tokens_redacted_upstream(self, monkeypatch):
+        """D-051 r2 s1#r2-0: the LEX scrub now redacts tokens BEFORE the PHI pass, so
+        _result_dict's own belt found nothing and the structured token_redactions read
+        0 (row AND aggregate) for a LEX row whose content carries two markers, while
+        the same body under F3E read 2."""
+        rows = [mcp_server._result_dict(r)
+                for r in mcp_server._scrub_for_founder_surface([_lex_res()], "LEX")]
+        assert rows[0]["content"].count(st.MARKER) == 2
+        assert rows[0]["token_redactions"] == 2
+        _wire(monkeypatch, [_lex_res()])
+        out = mcp_server.kb_search("member sessions billing", entity="LEX", limit=5)
+        assert out["results"][0]["token_redactions"] == 2 and out["token_redactions"] == 2
+        # parity with a non-LEX row carrying the same body (its belt does the count)
+        f3e = _res(LEX_BODY, chunk_id="chunk-f3e-tok-1", source="slack", entity="F3E",
+                   title="setup notes", deep_link="", source_id="C0F3EFIXTURE")
+        _wire(monkeypatch, [f3e])
+        assert mcp_server.kb_search("billing", entity="F3E", limit=5)["token_redactions"] == 2
+        # a second scrub of the SAME object adds 0 -- never double counts
+        r = _lex_res()
+        cl._apply_lex_phi_scrub([r])
+        cl._apply_lex_phi_scrub([r])
+        assert mcp_server._result_dict(r)["token_redactions"] == 2
+        # a clean LEX chunk still reads 0
+        clean = _res("Billing units for the member sessions are tracked in the LLC sheet.",
+                     source="slack", entity="LEX")
+        assert mcp_server._result_dict(cl._apply_lex_phi_scrub([clean])[0])["token_redactions"] == 0
+
     def test_delegated_worker_order_is_the_same_hook(self):
         # delegated_worker calls cl._apply_lex_phi_scrub then cl._format_kb_chunks
         block = cl._format_kb_chunks(cl._apply_lex_phi_scrub([_lex_res()]))
