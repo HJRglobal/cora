@@ -68,6 +68,8 @@ from . import slack_update_throttle
 from . import team_learning
 from . import user_feedback_tracker as uft
 from . import web_guard
+# Code #16 C2: the travel shortlist lane (intercept in _dispatch_qa + B1 withhold).
+from . import travel_shortlist
 from .tools import user_identity
 from .tools import osn_shift_handler
 from .tools import tool_dispatch as _tool_dispatch
@@ -1115,6 +1117,58 @@ def _staged_write_force_tool(text: str) -> str | None:
     return None
 
 
+# ── Code #16 C2: travel shortlist lane helpers ───────────────────────────────
+def _travel_forced_tool_turn(text: str) -> bool:
+    """A turn some forced-tool intent owns (code-queue capture, delegate, a
+    staged-write command, an Asana task op, remember/forget) is never the travel
+    lane's (B5 bail) -- a travel noun inside "create a task to book the Scottsdale
+    hotel" must not steal the write. Evaluated lazily, only after the lane's
+    surface check and strict predicate have already passed."""
+    return bool(
+        _code_queue_capture_intent(text)
+        or _delegate_work_intent(text)
+        or _staged_write_force_tool(text)
+        or _asana_destructive_intent(text)
+        or _remember_or_forget_intent(text)
+    )
+
+
+def _travel_lane_thread_state(channel_id: str, thread_root_ts: str | None) -> tuple[bool, bool]:
+    """(is_lane_thread, store_error). The two consumers read an unreadable store
+    in OPPOSITE directions: the web withhold (B1) treats it as a lane thread
+    (fail closed -- no web), the lane intercept does not (it must never hijack
+    every turn because a file could not be read)."""
+    try:
+        return bool(travel_shortlist.is_lane_thread(channel_id, thread_root_ts)), False
+    except Exception:  # noqa: BLE001
+        log.warning("travel_shortlist: thread store unreadable -- web withheld this turn",
+                    exc_info=True)
+        return False, True
+
+
+def _travel_dm_ask_intent(user_id: str, text: str, event: dict, pending_write: bool) -> bool:
+    """The strict travel predicate for the DM branch's capture exclusion. Fails to
+    False (a crash here must never break DMs)."""
+    try:
+        return travel_shortlist.looks_like_travel_ask(
+            text, user_id=user_id or "", channel_id=str(event.get("channel", "") or ""),
+            channel_type="im", pending_write=bool(pending_write))
+    except Exception:  # noqa: BLE001
+        log.warning("travel_shortlist: DM predicate failed (non-fatal)", exc_info=True)
+        return False
+
+
+def _travel_ask_escapes_shift_keywords(user_id: str, travel_dm_ask: bool) -> bool:
+    """True only for a strict travel ask from a user who is NOT mid-flow in the OSN
+    shift scheduler (mid-flow users always stay with the scheduler)."""
+    if not travel_dm_ask:
+        return False
+    try:
+        return osn_shift_handler.get_dm_state(user_id).get("step", "idle") == "idle"
+    except Exception:  # noqa: BLE001 -- unknown state: leave the scheduler its turn
+        return False
+
+
 def _dispatch_qa(
     *,
     channel_id: str,
@@ -1517,6 +1571,53 @@ def _dispatch_qa(
             active_thread_store.register(channel_id, register_ts)
             return
 
+    # ── Code #16 C2: travel shortlist lane (cq-e9ef3f581d60) ─────────────────
+    # AFTER the F-23 confirm interceptor (a "yes" to a pending write is never a
+    # lodging ask) and BEFORE the pending-state note, the semantic cache and the
+    # model: a dated lodging ask on the lane's surface (the travel channel, or a DM
+    # from Harrison / Tessa) is answered by the lane's OWN web-only call built from
+    # parsed fields -- never by this pipeline, whose context names the asker, loads
+    # the KB and history and carries the raw message (the PII the lane must keep off
+    # the web). Once the strict predicate holds the lane never falls through (B2):
+    # off / web off / caps / model / EVAL_MODE / belt refusal each get a fixed code
+    # reply. A turn in a lane thread is deterministic too (B3). Everything else --
+    # including any lodging-SHAPED turn the strict predicate declines -- continues
+    # below with web tools withheld (B1, web_gate_skip "travel_lane").
+    _travel_lane_thread, _travel_store_error = _travel_lane_thread_state(channel_id, register_ts)
+    _travel_route = None
+    try:
+        _travel_route = travel_shortlist.route_turn(
+            user_message, user_id=user_id or "", channel_id=channel_id,
+            channel_name=channel_name, thread_root_ts=register_ts,
+            lane_thread=_travel_lane_thread,
+            retrieval_grant=retrieval_grant is not None,
+            pending_write=bool(user_id) and any(_confirm_before_snapshot.values()),
+            forced_tool_probe=lambda: bool(user_id) and _travel_forced_tool_turn(user_message),
+        )
+    except Exception:  # noqa: BLE001 -- the ordinary path (web withheld, B1) still answers
+        log.warning("travel_shortlist: routing failed -- ordinary path, web withheld",
+                    exc_info=True)
+        _travel_route = None
+    if _travel_route is not None:
+        try:
+            travel_shortlist.execute_route(
+                _travel_route, channel_id=channel_id, thread_root_ts=register_ts,
+                entity=entity, user_id=user_id or "", client=client, say=say,
+                submit=_submit_travel_shortlist,
+            )
+        except Exception:  # noqa: BLE001 -- handled means handled: never the model
+            log.exception("travel_shortlist: execute_route failed channel=#%s", channel_name)
+        active_thread_store.register(channel_id, register_ts)
+        return
+    # B1: the normal-path structural withhold. Recall-biased (any lodging noun, any
+    # surface, any user) plus every lane-thread turn; an unreadable lane store
+    # withholds too. Read by the web_clean pre-flight and the web gate below.
+    try:
+        _travel_web_withhold = (_travel_lane_thread or _travel_store_error
+                                or travel_shortlist.is_lodging_shaped(user_message))
+    except Exception:  # noqa: BLE001 -- fail closed: no web
+        _travel_web_withhold = True
+
     # ── Pending-state visibility for the model (cq-24cc6ac4bbc8) ────────────
     # Probed HERE, after the interceptor, for two reasons found by the D-051
     # lens-1 pass:
@@ -1739,8 +1840,11 @@ def _dispatch_qa(
         # forces phi_custodian=False internally under web_clean so the LEX scrub
         # actually runs (the flag is a separate parameter from the three
         # asker-scoped locals web_clean already nulls).
+        # Code #16 C2 (B1): a travel-lane withhold means web will NOT attach, so the
+        # context must not be degraded to the stranger posture for nothing.
         web_clean = (
             web_intent
+            and not _travel_web_withhold
             and web_guard.evaluate(
                 user_message, entity, kb_meta=None,
                 skip_kb=hints.skip_kb, model=model_router.MODEL_SONNET,
@@ -1976,6 +2080,13 @@ def _dispatch_qa(
         web_gate_skip = "phi_custodian"
     elif kb_meta.get("unstripped_personal"):
         web_gate_skip = "unstripped_personal"
+    # Code #16 C2 (B1): a lodging-shaped turn or a lane-thread turn never carries web
+    # tools on this path -- its context (asker identity, raw message, thread history
+    # with a guest's name or a loyalty number) is exactly what the travel lane's own
+    # fields-only call exists to keep off the web. Soft KB-only degrade, ledgered as
+    # gate_skipped:travel_lane whenever web_guard would have acted.
+    elif _travel_web_withhold:
+        web_gate_skip = "travel_lane"
     # evaluate() runs even on excluded turns (it is read-only and fail-closed):
     # a withheld web ask must ALWAYS leave ledger/log evidence — the original
     # cq-49a7835f081c failure was three explicit web asks degrading silently.
@@ -3598,11 +3709,17 @@ def handle_message_event(event: dict, client) -> None:
             # days: all weekend, every weekend.
             _kc_today = _kc_live and knowledge_check.has_cycle_asked_today(user_id)
             _gap_ask_live = gap_autofill.has_live_ask(user_id)
+            # Code #16 C2: a travel-lane ask is a DIFFERENT thing the person plainly
+            # meant to do, so a live gap ask / knowledge-check cycle must not swallow
+            # it as an answer. The lane's surface check runs FIRST inside the
+            # predicate (equality only), so a member's DM pays no regex here.
+            _travel_dm_ask = _travel_dm_ask_intent(user_id, text, event, _has_staged_write)
             _generic_intent_ok = (
                 not _dm_is_shift_message(user_id, text)
                 and not gap_autofill.looks_like_question(text)
                 and not _remember_or_forget_intent(text)
                 and not _has_staged_write
+                and not _travel_dm_ask
             )
             if _kc_live:
                 try:
@@ -3759,7 +3876,11 @@ def handle_message_event(event: dict, client) -> None:
             # (incl. the Phase 5 personal-notes write path) was unreachable.
             # The scheduler keeps (a) users mid availability flow and (b)
             # explicit scheduler phrases; everything else is a Q&A question.
-            if _dm_is_shift_message(user_id, text):
+            # Code #16 C2: the scheduler's KEYWORD leg ("availability" is one) must not
+            # take a travel-lane ask ("hotels with availability Oct 17-21"); a user
+            # mid-flow in the scheduler stays there regardless.
+            _shift_may_claim = not _travel_ask_escapes_shift_keywords(user_id, _travel_dm_ask)
+            if _shift_may_claim and _dm_is_shift_message(user_id, text):
                 log.info("osn_shift_handler: DM from user=%s text=%r", user_id, text[:80])
                 osn_shift_handler.handle_dm(text=text, slack_user_id=user_id, client=client)
                 return
@@ -6098,6 +6219,29 @@ def _submit_code_queue_button(body: dict, client, action_id: str) -> None:
         log.warning("code-queue kickoff pool refused action=%s -- running inline",
                     action_id, exc_info=True)
         _handle_code_queue_button(body, client, action_id)
+
+
+# ── Code #16 C2: the travel shortlist lane's pool ────────────────────────────
+# The lane's web-only search takes ~20-90 s (measured 22 s on the basic tool). It
+# runs HERE, never on Bolt's five shared listener workers (the s6#0 lesson): the
+# DM / @mention handler posts the ":mag: searching lodging..." ack, submits, and
+# returns. ONE worker bounds concurrent lane searches (and spend) to one at a time.
+# The body (travel_shortlist._search_job) owns its own try/except/finally, so the
+# thread always gets a card or one honest failure line. conftest swaps + drains
+# this pool per test (_travel_shortlist_pool_per_test).
+_TRAVEL_SHORTLIST_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="travel-shortlist")
+
+
+def _submit_travel_shortlist(fn, *args, **kwargs) -> bool:
+    """Submit a lane search. False when the pool refuses (interpreter shutdown) --
+    the lane then posts its "couldn't start" line; the search is never run inline
+    on a listener worker."""
+    try:
+        _TRAVEL_SHORTLIST_POOL.submit(fn, *args, **kwargs)
+        return True
+    except Exception:  # noqa: BLE001 -- RuntimeError after shutdown
+        log.warning("travel-shortlist pool refused a search", exc_info=True)
+        return False
 
 
 # ── Delegated work HELD-card one-tap (Release / Dismiss) ────────────────────

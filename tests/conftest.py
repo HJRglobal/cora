@@ -853,6 +853,46 @@ def _channel_archive_pools_per_test(monkeypatch):
                 _pool.shutdown(wait=True)
 
 
+# Code #16 C2: the travel shortlist lane's module-level executor
+# (app._TRAVEL_SHORTLIST_POOL, 1 worker) gets the SAME swap-and-drain as the
+# cq-kickoff pool above: a fresh pool per test, drained in the post-yield BEFORE
+# monkeypatch undoes the test's redirects (the thread store, the web ledger, the
+# injected Anthropic client factory), so a pooled search body can never outlive
+# its test and write a real file (feedback: a process-global executor escapes
+# test isolation). A module first imported during the test is drained + replaced.
+@pytest.fixture(autouse=True)
+def _travel_shortlist_pool_per_test(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _fresh():
+        return ThreadPoolExecutor(max_workers=1, thread_name_prefix="travel-shortlist")
+
+    swapped: list = []
+    for _name in _CQ_APP_MODULES:
+        _mod = sys.modules.get(_name)
+        if _mod is not None and hasattr(_mod, "_TRAVEL_SHORTLIST_POOL"):
+            _pool = _fresh()
+            monkeypatch.setattr(_mod, "_TRAVEL_SHORTLIST_POOL", _pool)
+            swapped.append((_name, _pool))
+    yield
+    for _name, _pool in swapped:
+        _pool.shutdown(wait=True)
+        # a test that swapped in its OWN pool (to run a second search after a drain)
+        # is drained here too, still before the undo
+        _cur = getattr(sys.modules.get(_name), "_TRAVEL_SHORTLIST_POOL", None)
+        if isinstance(_cur, ThreadPoolExecutor) and _cur is not _pool:
+            _cur.shutdown(wait=True)
+    done = {_name for _name, _pool in swapped}
+    for _name in _CQ_APP_MODULES:
+        _mod = sys.modules.get(_name)
+        if _name in done or _mod is None:
+            continue
+        _pool = getattr(_mod, "_TRAVEL_SHORTLIST_POOL", None)
+        if isinstance(_pool, ThreadPoolExecutor):
+            _mod._TRAVEL_SHORTLIST_POOL = _fresh()
+            _pool.shutdown(wait=True)
+
+
 # Real ledger/state files under logs/ and data/ that the test suite must NEVER
 # mutate (Slice 5, 2026-07-29 audit: generalized from the single shopify audit
 # file). Repo-relative; the autouse fixture above redirects each writer's module
