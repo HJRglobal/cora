@@ -267,10 +267,209 @@ def _is_contributed_note(update: dict) -> bool:
     return isinstance(payload, dict) and payload.get("source") == "info-for-cora"
 
 
-def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger) -> bool:
+def _new_gap_run_state() -> dict:
+    """Per-RUN state for the asana_task branch: tasks created earlier in this run
+    (two sibling cards approved together must create ONE task) and a per-project
+    open-task scan cache (one Asana read per target project per run)."""
+    return {"created": [], "project_scan": {}}
+
+
+def _slack_label(text: str, cap: int = 150) -> str:
+    """A free-text string safe INSIDE a Slack `<url|label>` / mrkdwn body: an
+    LLM-derived task subject must never become a live link or break the one it
+    sits in (the `<https://x|Approve>` smuggle, D-051 lens-4)."""
+    s = str(text or "")[:cap]
+    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+             .replace("|", "/"))
+
+
+def _project_scan_dup(project_gid: str, entity: str, subject: str, run_state: dict,
+                      log: logging.Logger) -> dict | None:
+    """A tier-A repeat among the TARGET project's open tasks, or None.
+
+    Copies meeting_actions._open_task_names_in_project: one get_project_tasks per
+    project per run, cached. FAILS OPEN with a WARNING on a read error (Q7): the
+    gap-task ledger is the primary net -- every orphan this lane ever made came
+    from this executor and is in it -- and a dedup read must never block a create.
+    """
+    from cora import gap_task_dedup as gtd
+    cache = run_state.setdefault("project_scan", {})
+    if project_gid not in cache:
+        try:
+            from cora.tools.asana_client import get_project_tasks
+            tasks = get_project_tasks(project_gid, max_tasks=500)
+            if len(tasks) >= 500:
+                log.warning("gap-executor: project scan hit its 500-task cap for "
+                            "project %s -- a duplicate past the cap may be missed",
+                            project_gid)
+            cache[project_gid] = tasks
+        except Exception as exc:  # noqa: BLE001 -- fail OPEN, named
+            log.warning("gap-executor: project scan failed for %s (%s) -- creating "
+                        "WITHOUT the project dedup net (fail-open)",
+                        project_gid, type(exc).__name__)
+            cache[project_gid] = None
+    for t in cache.get(project_gid) or ():
+        name = str(t.get("name") or "")
+        if name and gtd.tier_a(subject, name):
+            return {"kind": "open_task", "gid": str(t.get("gid") or ""),
+                    "url": str(t.get("permalink_url") or ""), "entity": entity}
+    return None
+
+
+def _execute_asana_task(update: dict, slack_token: str, log: logging.Logger,
+                        run_state: dict) -> bool:
+    """Create ONE approved asana_task row into a real project with a real
+    assignee -- or refuse visibly. Resolves the row itself (Step 1 defers it).
+
+    Order, each with its terminal state:
+      1. plan_create refusal (no entity / LEX / no project e.g. BDM / no
+         assignee)                           -> DISMISSED refused:<code>
+      2. this row already created a task (Asana answered, the resolve didn't
+         land -- crash recovery)             -> APPROVED executed:<gid>
+      3. tier-A repeat of a created task, of an EARLIER proposal in any state
+         (D-030), of a task created earlier in this run, or of an open task in
+         the target project                 -> DISMISSED duplicate_of:<ref>
+      4. create_task(name, project, assignee) -> APPROVED executed:<gid>
+         a transient AsanaClientError        -> stays PENDING (retried next run;
+                                                step 2/3 stop a double create)
+    Never logs a title: ids, codes and counts only (D-082).
+    """
+    from cora import gap_task_dedup as gtd
+    from cora.tools import user_identity
+    uid = str(update.get("update_id") or "")
+    uid_short = uid[:8]
+    notify_ch = "hjrg-leadership"
+
+    plan = gtd.plan_create(update)
+    if plan.refusal:
+        resolve_update(uid, "DISMISSED", reason=f"refused:{plan.refusal}")
+        _post_to_slack(slack_token, notify_ch, (
+            f":no_entry_sign: *Gap executor* `[{uid_short}]` did not create an Asana "
+            f"task: {gtd.refusal_text(plan.refusal)}. Dismissed -- nothing was "
+            f"created."))
+        log.warning("gap-executor: refused uid=%s reason=%s", uid_short, plan.refusal)
+        return False
+
+    rows = gtd.ledger_rows(persist=True)
+    own = gtd.created_by(uid, rows)
+    if own is not None:
+        gid = str(own.get("gid") or "")
+        resolve_update(uid, "APPROVED", reason=f"executed:{gid}")
+        _post_to_slack(slack_token, notify_ch, (
+            f":white_check_mark: *Gap executor* `[{uid_short}]` this task was already "
+            f"created on an earlier run"
+            + (f": <{own.get('url')}|open it in Asana>" if own.get("url") else "")
+            + " -- recorded, not re-created."))
+        log.info("gap-executor: recovered earlier create uid=%s gid=%s", uid_short, gid)
+        return True
+
+    hit = gtd.find_tier_a(plan.entity, plan.subject, rows, exclude_ref=uid,
+                          before_ts=str(update.get("proposed_at") or ""))
+    if hit is None:
+        hit = gtd.find_tier_a(plan.entity, plan.subject, run_state.get("created") or [],
+                              exclude_ref=uid)
+    if hit is None:
+        hit = _project_scan_dup(plan.project_gid, plan.entity, plan.subject, run_state, log)
+    if hit is not None:
+        ref = gtd.ref_of(hit) or str(hit.get("ref") or "")
+        resolve_update(uid, "DISMISSED", reason=f"duplicate_of:{ref}")
+        if hit.get("gid"):
+            what = (f"a task created {_md(hit.get('ts'))}"
+                    if hit.get("kind") == "created" else "an open Asana task")
+        else:
+            what = (f"an earlier proposal `[{str(hit.get('ref') or '')[-8:]}]` "
+                    f"(proposed {_md(hit.get('ts'))})")
+        link = f" -- <{hit.get('url')}|open it>" if hit.get("url") else ""
+        _post_to_slack(slack_token, notify_ch, (
+            f":no_entry_sign: *Gap executor* `[{uid_short}]` did not create an Asana "
+            f"task: it repeats {what}{link}. Dismissed as a duplicate."))
+        log.warning("gap-executor: duplicate uid=%s of=%s kind=%s", uid_short,
+                    ref[:24], hit.get("kind") or "?")
+        return False
+
+    # Tier-B near-duplicates the approver never saw: a legacy card (carded
+    # before this change, no near_dups_shown) saw none of them. Q5: create
+    # anyway and LIST them in the post -- they are possible, not proven.
+    shown = update.get("near_dups_shown")
+    shown_set = {str(x) for x in shown} if isinstance(shown, list) else set()
+    near = [n for n in gtd.near_duplicates(plan.entity, plan.subject,
+                                           list(rows) + list(run_state.get("created") or []),
+                                           exclude_ref=uid, limit=6)
+            if (gtd.ref_of(n) or str(n.get("ref") or "")) not in shown_set][:3]
+
+    from cora.tools.asana_client import create_task, AsanaClientError
+    notes = (
+        f"Auto-created from a Cora reconciliation gap (ref {uid}).\n\n"
+        f"Evidence: {str(update.get('source_evidence') or '')[:400]}"
+    )
+    try:
+        task = create_task(name=plan.task_name, assignee_gid=plan.assignee_gid,
+                           project_gid=plan.project_gid, notes=notes)
+    except AsanaClientError as exc:
+        # Transient by default: the row stays PENDING and the next run's
+        # correlate retries it (the ledger + scan above stop a double create).
+        _post_to_slack(slack_token, notify_ch, (
+            f":warning: *Gap executor* `[{uid_short}]` could not create the Asana task "
+            f"({type(exc).__name__}: {str(exc)[:160]}). Left pending -- I retry on the "
+            f"next review run."))
+        log.warning("gap-executor: create_task failed uid=%s (%s) -- left PENDING",
+                    uid_short, str(exc)[:160])
+        return False
+
+    gid = str(task.get("gid") or "")
+    url = str(task.get("permalink_url") or "")
+    projects = [p for p in (task.get("projects") or []) if isinstance(p, dict)]
+    assignee = task.get("assignee") if isinstance(task.get("assignee"), dict) else {}
+    proj_ok = any(str(p.get("gid") or "") == plan.project_gid for p in projects) or (
+        bool(projects) and not any(p.get("gid") for p in projects))
+    asg_ok = bool(assignee) and str(assignee.get("gid") or plan.assignee_gid) == plan.assignee_gid
+    # Record BEFORE anything else can fail: this row is now the proof a task
+    # exists, for the retry path (step 2) and for every later repeat (step 3).
+    gtd.record_created(update_id=uid, entity=plan.entity, subject=plan.subject, gid=gid,
+                       url=url, project_gid=plan.project_gid,
+                       assignee_gid=plan.assignee_gid)
+    run_state.setdefault("created", []).append({
+        "kind": "created", "ref": uid, "gid": gid, "url": url, "entity": plan.entity,
+        "subject": plan.subject, "ts": datetime.now(timezone.utc).isoformat()})
+    resolve_update(uid, "APPROVED", reason=f"executed:{gid}")
+
+    proj_name = ", ".join(str(p.get("name") or "") for p in projects if p.get("name")) \
+        or "(no project returned)"
+    asg_name = str(assignee.get("name") or "") or user_identity.display_name(plan.assignee_slack)
+    src = "entity owner" if plan.assignee_source == "owner" else "default owner"
+    msg = (f":white_check_mark: *Gap executor* `[{uid_short}]` created Asana task "
+           f"<{url}|{_slack_label(plan.task_name)}> in *{_slack_label(proj_name, 80)}* "
+           f"-- assignee {_slack_label(asg_name, 60)} ({src})")
+    if not (proj_ok and asg_ok):
+        # The incident's own signature. Loud, never silent: the create happened
+        # (so no retry), but somebody has to look at it.
+        log.error("gap-executor: CREATED WITHOUT %s uid=%s gid=%s (asked project=%s "
+                  "assignee=%s)", "/".join(x for x, ok in (("PROJECT", proj_ok),
+                                                           ("ASSIGNEE", asg_ok)) if not ok),
+                  uid_short, gid, plan.project_gid, plan.assignee_gid)
+        msg += ("\n:warning: Asana did not confirm the "
+                + " and ".join(x for x, ok in (("project", proj_ok), ("assignee", asg_ok))
+                               if not ok)
+                + " on this task -- please check it.")
+    if near:
+        msg += "\nPossible duplicates (not auto-blocked -- check before working it):"
+        for n in near:
+            label = _slack_label(n.get("subject") or "", 90)
+            state = "created" if n.get("kind") == "created" else "proposed"
+            item = f"<{n.get('url')}|{label}>" if n.get("url") else label
+            msg += f"\n• {item} ({state} {_md(n.get('ts'))})"
+    _post_to_slack(slack_token, notify_ch, msg)
+    log.info("gap-executor: created Asana task uid=%s gid=%s project=%s assignee_source=%s "
+             "near_dups_unseen=%d", uid_short, gid, plan.project_gid,
+             plan.assignee_source, len(near))
+    return True
+
+
+def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger,
+                             run_state: dict | None = None) -> bool:
     """Execute one approved gap update. Dispatches by update_type.
 
-    asana_task     → create the task via Asana API
+    asana_task     → create the task via Asana API (_execute_asana_task)
     task_close     → mark the task complete via Asana API
     decision       → post formatted entry to #hjrg-leadership for manual add
     hubspot_note   → post formatted note to #hjrg-leadership with deal link
@@ -292,23 +491,12 @@ def _execute_approved_update(update: dict, slack_token: str, log: logging.Logger
 
     try:
         if update_type == "asana_task":
-            sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-            from cora.tools.asana_client import create_task, AsanaClientError
-            task_name = (payload.get("suggested_task_name") or desc)[:150].strip()
-            notes = (
-                f"Auto-created from Cora reconciliation gap.\n\n"
-                f"Evidence: {update.get('source_evidence', '')[:400]}"
-            )
-            try:
-                task = create_task(name=task_name, notes=notes)
-                url = task.get("permalink_url", "")
-                msg = f":white_check_mark: *Gap executor* created Asana task: <{url}|{task_name}> `[{uid_short}]`"
-                log.info("gap-executor: created Asana task gid=%s name=%s", task.get("gid"), task_name)
-            except AsanaClientError as exc:
-                success = False
-                msg = f":warning: *Gap executor* could not create Asana task `[{uid_short}]`: {exc}\n> {task_name}"
-                log.warning("gap-executor: create_task failed: %s", exc)
-            _post_to_slack(slack_token, notify_ch, msg)
+            # Code #15 S2 (cq-22b84598aee8): project + assignee, refuse-don't-
+            # orphan, tier-A dup refusal, apply-first-then-resolve. The Step-1
+            # loop DEFERS this row, so every resolve happens inside.
+            success = _execute_asana_task(
+                update, slack_token, log,
+                run_state if run_state is not None else _new_gap_run_state())
 
         elif update_type == "task_close":
             sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -1464,6 +1652,9 @@ def _send_mechanical_review_dms(
             send_dm_to_harrison(header, slack_token, _client_factory=_client_factory)
         else:
             _send_dm_to_user(target, header, slack_token, _client_factory)
+        # Code #15 S2: what an asana_task card would create (or why it can't)
+        # and its possible duplicates -- attached in memory, fail-soft.
+        _attach_mechanical_plans(batch, log)
         sent_map = send_individual_dms(
             batch, slack_token, _client_factory,
             block_builder=build_mechanical_blocks, recipient_id=target)
@@ -1471,6 +1662,12 @@ def _send_mechanical_review_dms(
             ts = sent_map.get(u["update_id"])
             if ts:
                 _patch_dm_ts(u["update_id"], ts)
+                if "_near_dups" in u:
+                    # Persist WHAT WAS SHOWN (refs only) so the executor can tell
+                    # a near-dup the approver saw from one they never did (Q5).
+                    # Written even when empty: absent == a legacy card.
+                    _patch_near_dups_shown(u["update_id"], [
+                        str(n.get("ref") or "") for n in (u.get("_near_dups") or [])])
         sent_total += len(sent_map)
         if len(sent_map) < len(batch):
             log.warning("mechanical-review: sent %d/%d to %s (failed sends stay "
@@ -1616,6 +1813,91 @@ def _autowrite_eligible(update: dict, level: str) -> tuple[bool, int, str]:
             return True, 1, "auto_tier1"
         return False, 1, "tier1_read_unavailable"
     return False, tier, "harrison"
+
+
+def _md(ts: str) -> str:
+    """'2026-09-15T14:00:08+00:00' -> '9/15', in Arizona time (fixed UTC-7, no
+    DST -- the _is_digest_day rule); '' when unparseable."""
+    try:
+        dt = datetime.fromisoformat(str(ts or "").replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone(timedelta(hours=-7)))
+    return f"{dt.month}/{dt.day}"
+
+
+def _attach_mechanical_plans(items: list[dict], log: logging.Logger) -> None:
+    """Code #15 S2: stash, on each asana_task card about to be sent, what 👍 would
+    create (project + assignee) or why it can't, and up to 3 possible duplicates.
+
+    Copies the _attach_coras_read idiom: in memory only (the `_`-prefixed keys
+    are never persisted by propose/patch), fail-soft per item -- a card is sent
+    without these lines rather than not at all. What was SHOWN is persisted after
+    the send by _patch_near_dups_shown. No Asana read here: the card-time dup
+    check uses the local ledger; the project scan runs at execution."""
+    targets = [u for u in items or [] if u.get("update_type") == "asana_task"]
+    if not targets:
+        return
+    try:
+        from cora import gap_task_dedup as gtd
+        from cora.tools import user_identity
+        rows = gtd.ledger_rows(persist=True)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("mechanical-plan: unavailable (%s) -- cards sent without it", exc)
+        return
+    pend_rows: list[dict] = []
+    try:
+        for p in get_pending_updates():
+            if p.get("update_type") != "asana_task":
+                continue
+            pend_rows.append({
+                "kind": "proposed", "ref": str(p.get("update_id") or ""),
+                "entity": review_lanes.resolve_entity(p), "state": "PENDING",
+                "subject": gtd.subject_of(p), "ts": str(p.get("proposed_at") or "")})
+    except Exception:  # noqa: BLE001 -- the ledger alone still lists most
+        pend_rows = []
+    for u in targets:
+        uid = str(u.get("update_id") or "")
+        try:
+            plan = gtd.plan_create(u)
+            info: dict = {}
+            if plan.refusal:
+                info["refusal_text"] = gtd.refusal_text(plan.refusal)
+            else:
+                hit = gtd.find_tier_a(plan.entity, plan.subject, rows, exclude_ref=uid,
+                                      before_ts=str(u.get("proposed_at") or ""))
+                if hit is not None:
+                    info["refusal_text"] = (
+                        f"it repeats a task created {_md(hit.get('ts'))}"
+                        if hit.get("kind") == "created" else
+                        f"it repeats an earlier proposal (proposed {_md(hit.get('ts'))})")
+                else:
+                    route = ("catch-all" if plan.project_route == "catch_all"
+                             else "keyword-routed")
+                    info["project_url"] = f"https://app.asana.com/0/{plan.project_gid}/list"
+                    info["project_label"] = f"the [{plan.entity}] {route} project"
+                    who = user_identity.display_name(plan.assignee_slack)
+                    info["assignee_label"] = who + (" (entity owner)"
+                                                    if plan.assignee_source == "owner"
+                                                    else " (default owner)")
+            near = gtd.near_duplicates(plan.entity, plan.subject, list(rows) + pend_rows,
+                                       exclude_ref=uid, limit=3)
+            u["_create_plan"] = info
+            u["_near_dups"] = [{
+                "ref": gtd.ref_of(n) or str(n.get("ref") or ""),
+                "title": str(n.get("subject") or ""),
+                "url": str(n.get("url") or ""),
+                "when_label": (f"created {_md(n.get('ts'))}" if n.get("kind") == "created"
+                               else f"proposed {_md(n.get('ts'))}"),
+            } for n in near]
+        except Exception as exc:  # noqa: BLE001
+            log.warning("mechanical-plan: attach failed for %s (%s)", uid[:8],
+                        type(exc).__name__)
+    log.info("mechanical-plan: attached to %d asana_task card(s); %d with possible "
+             "duplicates", len(targets),
+             sum(1 for u in targets if u.get("_near_dups")))
 
 
 def _attach_coras_read(items: list[dict], log: logging.Logger) -> None:
@@ -1881,8 +2163,14 @@ def main() -> int:
         # resolve_update only mutates a PENDING row, so resolving here FIRST made
         # that branch's DISMISSED a silent no-op: a refused note stayed APPROVED
         # with no resolved_reason while the Slack post read "Dismissed."
+        # Code #15 S2 (cq-22b84598aee8): an APPROVED asana_task is deferred for
+        # the same reason -- _execute_asana_task resolves it itself, with a named
+        # reason (executed:<gid> / refused:<code> / duplicate_of:<ref>), and a
+        # transient Asana failure must leave it PENDING for the next run. Before
+        # this, a failed create was resolved APPROVED here and never retried.
         defer = (action == "APPROVED"
                  and (update.get("update_type") == _kr_UPDATE_TYPE_DECISION
+                      or update.get("update_type") == "asana_task"
                       or _is_contributed_note(update)))
         if not args.dry_run and not defer:
             resolve_update(uid, action)
@@ -1906,6 +2194,7 @@ def main() -> int:
     if approved_updates:
         log.info("APPROVED %d updates — executing now:", len(approved_updates))
         slack_token = os.environ.get("SLACK_BOT_TOKEN", "")
+        gap_run_state = _new_gap_run_state()  # Code #15 S2: one per run
         for u in approved_updates:
             log.info("  [%s] %s — %s", u["update_type"], u["update_id"][:8], u["description"][:120])
             if args.dry_run:
@@ -1917,7 +2206,8 @@ def main() -> int:
                 log.info("  [DRY RUN] would execute [%s] %s", u["update_type"], u["update_id"][:8])
                 ok = True
             else:
-                ok = _execute_approved_update(u, slack_token, log)
+                ok = _execute_approved_update(u, slack_token, log,
+                                              run_state=gap_run_state)
             # D2: ack AFTER the apply, gated on its result so "Saved" reflects the
             # durable write and a failed apply is never shown as success (D-051).
             if not args.dry_run:
@@ -2209,6 +2499,41 @@ def _patch_dm_ts(update_id: str, dm_ts: str) -> None:
                     continue
                 if entry.get("update_id") == update_id and not entry.get("dm_message_ts"):
                     entry["dm_message_ts"] = dm_ts
+                entries.append(entry)
+
+        tmp = _PROPOSED_UPDATES_PATH.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            for entry in entries:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        tmp.replace(_PROPOSED_UPDATES_PATH)
+
+
+def _patch_near_dups_shown(update_id: str, refs: list[str]) -> None:
+    """Code #15 S2: record on the row which possible duplicates its card SHOWED
+    (refs only -- gids / update_ids, never titles). _patch_dm_ts's sibling, same
+    atomic rewrite under the same lock. Overwritten on each send: a card is only
+    re-sent after --reset-dm-ts, and the reaction that counts is on the LATEST
+    card. Only ever called after a real send, so a dry run -- which returns
+    before Step 2 sends anything -- can never write it."""
+    import json
+    from cora.knowledge_review import _PROPOSED_UPDATES_PATH, _UPDATES_LOCK
+
+    if not _PROPOSED_UPDATES_PATH.exists():
+        return
+
+    with _UPDATES_LOCK:
+        entries = []
+        with _PROPOSED_UPDATES_PATH.open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("update_id") == update_id:
+                    entry["near_dups_shown"] = [str(r) for r in refs if r][:10]
                 entries.append(entry)
 
         tmp = _PROPOSED_UPDATES_PATH.with_suffix(".tmp")

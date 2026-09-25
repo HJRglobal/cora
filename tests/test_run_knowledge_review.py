@@ -883,5 +883,14 @@ def test_dry_run_never_executes_an_approved_update(tmp_path, monkeypatch, caplog
     executor.assert_not_called()
     resolve.assert_not_called()
     ack.assert_not_called()
-    assert any("[DRY RUN] would execute [asana_task] pass5:dr" in r.getMessage() for r in caplog.records)
+    # Code #15 S2: an approved asana_task is now DEFERRED (apply-first-then-
+    # resolve inside the executor), so the dry run reports it on that path.
+    assert any("[DRY RUN] would apply-then-resolve asana_task pass5:dr" in r.getMessage()
+               for r in caplog.records)
     assert not (tmp_path / "batch.json").exists()
+    # ... and the two write paths S2 added stay untouched: the gap-task ledger
+    # (no bootstrap, no row) and the proposed-updates file (no near_dups_shown).
+    import os as _os
+    from pathlib import Path as _P
+    assert not _P(_os.environ["GAP_TASK_FP_PATH"]).exists()
+    assert (tmp_path / "proposed.jsonl").read_text(encoding="utf-8") == ""

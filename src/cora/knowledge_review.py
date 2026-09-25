@@ -1030,15 +1030,80 @@ def format_mechanical_dm(update: dict[str, Any]) -> str:
         entity = ""
     label = _TYPE_LABEL.get(utype, utype)
     header = f"*[{label}]*" + (f" `{entity}`" if entity else "")
-    lines = [f"{header}\n{desc}"]
     link = _bare_url(payload.get("task_url") or payload.get("deal_url") or "")
     name = payload.get("task_name") or payload.get("deal_name") or ""
+    tail: list[str] = []
     if link:
-        lines.append(f"<{link}|{name or 'open in the tool'}>")
+        tail.append(f"<{link}|{name or 'open in the tool'}>")
     elif name:
-        lines.append(name)
-    lines.append(mechanical_affordance_line(update.get("update_type", "")))
+        tail.append(name)
+    extra = _mechanical_plan_lines(update)
+    footer = mechanical_affordance_line(update.get("update_type", ""))
+    # Code #15 S2: the footer is BYTE-IDENTICAL and must never be cut --
+    # strip_card_affordance only recognises the registered literal, and the block
+    # builder truncates at 2900. Over budget: drop duplicate lines from the end
+    # first, then shorten the description; never the footer.
+    def _size(d: str) -> int:
+        return len(header) + 1 + len(d) + sum(len(x) + 1 for x in tail + extra) + 1 + len(footer)
+    while extra and _size(desc) > _MECH_CARD_BUDGET:
+        extra.pop()
+        if extra and extra[-1] == _NEAR_DUPS_HEADER:
+            extra.pop()
+    if _size(desc) > _MECH_CARD_BUDGET:
+        keep = max(0, len(desc) - (_size(desc) - _MECH_CARD_BUDGET) - 1)
+        desc = desc[:keep].rstrip() + "…"
+    lines = [f"{header}\n{desc}", *tail, *extra, footer]
     return "\n".join(lines)
+
+
+# Code #15 S2: room left under the block builder's hard 2900 cut for the egress
+# sanitizer's rewrites, so the footer is never the part that gets truncated.
+_MECH_CARD_BUDGET = 2800
+_NEAR_DUPS_HEADER = "Possible duplicates:"
+
+
+def _card_esc(text: Any, cap: int = 200) -> str:
+    """Free text safe inside card mrkdwn and inside a `<url|label>`: a task
+    subject is LLM-derived from a Drive doc, so `<https://x|Approve>` in it must
+    render as text, never as a live link on a card that asks for approval."""
+    s = str(text or "")[:cap]
+    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+             .replace("|", "/"))
+
+
+def _mechanical_plan_lines(update: dict[str, Any]) -> list[str]:
+    """Body lines for an asana_task card (Code #15 S2), from the in-memory keys
+    run_knowledge_review._attach_mechanical_plans sets: what 👍 creates (or why it
+    can't) and up to 3 possible duplicates. [] when neither key is present, so
+    every other card -- and a card whose attach failed -- renders exactly as
+    before."""
+    out: list[str] = []
+    plan = update.get("_create_plan")
+    if isinstance(plan, dict) and plan:
+        if plan.get("refusal_text"):
+            out.append(f"Can't create: {_card_esc(plan['refusal_text'])} -- "
+                       f":+1: will not create a task")
+        elif plan.get("project_label"):
+            proj = _card_esc(plan.get("project_label"), 120)
+            url = _bare_url(plan.get("project_url") or "")
+            if url.startswith("https://"):
+                proj = f"<{url}|{proj}>"
+            out.append(f"Would create in {proj} · assignee "
+                       f"{_card_esc(plan.get('assignee_label') or 'unknown', 80)}")
+    near = update.get("_near_dups")
+    if isinstance(near, list) and near:
+        out.append(_NEAR_DUPS_HEADER)
+        for n in near[:3]:
+            if not isinstance(n, dict):
+                continue
+            title = _card_esc(n.get("title"), 90) or "(untitled)"
+            url = _bare_url(n.get("url") or "")
+            item = f"<{url}|{title}>" if url.startswith("https://") else title
+            when = _card_esc(n.get("when_label"), 40)
+            out.append(f"• {item}" + (f" ({when})" if when else ""))
+        if out and out[-1] == _NEAR_DUPS_HEADER:
+            out.pop()
+    return out
 
 
 def build_mechanical_blocks(update: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:

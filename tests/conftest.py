@@ -286,6 +286,14 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "DECISION_FACT_FP_PATH", str(tmp_path / "decision-fact-fingerprints.jsonl")
     )
+    # Code #15 S2 (cq-22b84598aee8): the gap-task propose-once / created ledger
+    # (writers: reconciliation_engine.record_task_proposals via the runner, the
+    # knowledge-review asana_task executor, and the one-time bootstrap). Resolved
+    # per call by gap_task_dedup.ledger_path. Redirected in the SAME commit that
+    # introduced the writer.
+    monkeypatch.setenv(
+        "GAP_TASK_FP_PATH", str(tmp_path / "gap-task-fingerprints.jsonl")
+    )
     # Same class, same commit: the decision-ALERT state file. decision_alerts
     # resolves its path per call (deliberately -- a module-level constant reading
     # os.environ is the cq-06f4797db4f1 trap), but only if a test actually points

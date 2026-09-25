@@ -69,6 +69,7 @@ try:
     from cora.reconciliation_engine import (  # noqa: E402
         reconcile,
         record_decision_proposals,
+        record_task_proposals,
         ReconciliationGap,
         DEFAULT_LOOKBACK_SECONDS,
     )
@@ -395,6 +396,19 @@ def main() -> int:
     # Now each pass's HIGH/MED gaps are proposed the moment that pass returns,
     # and a wall-clock budget bounds the whole sweep (pass 4 also honors the
     # deadline mid-pass via deadline_monotonic).
+    # Code #15 S2 (cq-22b84598aee8): seed the gap-task propose-once ledger from
+    # both proposed-updates files the first time it is absent -- on a LIVE run
+    # only. Pass 5 reads it read-only (a --dry-run builds the seed in memory and
+    # writes nothing). Fail-soft: a seed failure only means pass 5 fails open.
+    if not args.dry_run:
+        try:
+            from cora import gap_task_dedup as _gtd
+            _n_seed = _gtd.ensure_bootstrapped()
+            if _n_seed:
+                log.info("gap-task ledger bootstrapped with %d row(s)", _n_seed)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("gap-task ledger bootstrap failed (non-fatal): %s", exc)
+
     deadline_monotonic = time.monotonic() + args.time_budget_min * 60.0
     log.info(
         "Running reconciliation passes %s over last %.0fh of KB (budget %.0f min, per-pass proposing)...",
@@ -430,6 +444,8 @@ def main() -> int:
                 # succeeded -- never at gap-build time, or a --dry-run would
                 # permanently suppress a decision it never proposed (D-051).
                 record_decision_proposals([gap])
+                # Code #15 S2: the same rule for pass-5 missing-task gaps.
+                record_task_proposals([gap])
                 log.info(
                     "Proposed update gap_id=%s type=%s confidence=%s",
                     gap.gap_id[:20], gap.gap_type, gap.confidence,

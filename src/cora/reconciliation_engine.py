@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import Any
 
 from cora import fact_fingerprint
+from cora import gap_task_dedup
 from cora.phi_guard import _PHI_PATTERNS as _PHI_RE
 
 log = logging.getLogger(__name__)
@@ -329,6 +330,34 @@ def record_decision_proposals(gaps: list) -> int:
             n += 1
         except Exception:  # noqa: BLE001
             log.warning("could not record a decision fingerprint", exc_info=True)
+    return n
+
+
+def record_task_proposals(gaps: list) -> int:
+    """Record the propose-once row for every pass-5 missing-task gap in *gaps*
+    (Code #15 S2, cq-22b84598aee8) in the gap-task ledger (gap_task_dedup).
+
+    Same contract as record_decision_proposals: the RUNNER calls it after the
+    propose succeeded, never at gap-build time (a --dry-run builds every gap and
+    proposes nothing). Fail-soft. Returns the count recorded.
+    """
+    n = 0
+    for gap in gaps or []:
+        if getattr(gap, "gap_type", "") != "missing_asana_task":
+            continue
+        gid = getattr(gap, "gap_id", "") or ""
+        if not gid.startswith(gap_task_dedup.PASS5_PREFIX):
+            continue
+        payload = getattr(gap, "payload", None) or {}
+        subject = (payload.get("subject") if isinstance(payload, dict) else "") \
+            or getattr(gap, "title", "") or ""
+        try:
+            if gap_task_dedup.record_proposal(
+                    gap_id=gid, entity=getattr(gap, "entity", "") or "",
+                    subject=subject):
+                n += 1
+        except Exception:  # noqa: BLE001
+            log.warning("could not record a gap-task fingerprint", exc_info=True)
     return n
 
 
@@ -1383,6 +1412,9 @@ def pass5_drive_insights(
 
     # Build entity → task/deal lookup strings for context injection
     task_by_entity: dict[str, str] = {}
+    # Code #15 S2: the same open tasks as NAMES per entity, for the deterministic
+    # tier-A gate below (the Haiku prompt above is only a soft, LLM-side dedup).
+    open_names_by_entity: dict[str, list[str]] = {}
     for task in open_tasks:
         name = (task.get("name") or "").strip()
         if not name:
@@ -1393,6 +1425,16 @@ def pass5_drive_insights(
             ent = m.group(1)
             task_by_entity.setdefault(ent, "")
             task_by_entity[ent] += f"- {name}\n"
+            open_names_by_entity.setdefault(ent, []).append(name)
+
+    # Code #15 S2 (cq-22b84598aee8): the propose-once gate for missing-task gaps.
+    # READ-ONLY here (persist=False): pass 5 also runs under run_reconciliation
+    # --dry-run, which must write nothing -- the runner seeds/records the ledger
+    # on a live run. Fail-OPEN: an unreadable ledger returns [] (nothing is
+    # suppressed; a duplicate proposal is recoverable, a lost gap is not).
+    task_ledger = gap_task_dedup.ledger_rows(persist=False)
+    emitted_by_entity: dict[str, list[str]] = {}
+    n_suppressed = {"ledger": 0, "open_task": 0, "in_pass": 0}
 
     deal_by_entity: dict[str, str] = {}
     for deal in active_deals:
@@ -1481,6 +1523,31 @@ def pass5_drive_insights(
             if not subj or conf not in ("HIGH", "MED"):
                 continue
             gap_id = f"pass5:drive:{_stable_id(subj, entity)}"
+            # Code #15 S2: a tier-A repeat is suppressed at PROPOSAL time -- of
+            # any earlier proposal in the ledger, in ANY state (D-030 propose-
+            # once), of an open [ENT] task, or of a gap already emitted in this
+            # pass. Tier B (paraphrase) is NEVER suppressed here -- it is only
+            # listed on the card. Logs carry ids + counts, never the subject.
+            prior = gap_task_dedup.find_tier_a(entity, subj, task_ledger)
+            if prior is not None:
+                n_suppressed["ledger"] += 1
+                log.info("pass5: missing-task gap suppressed (tier-A repeat of %s) "
+                         "gap_id=%s entity=%s", str(prior.get("ref") or "")[:24],
+                         gap_id, entity)
+                continue
+            if any(gap_task_dedup.tier_a(subj, n)
+                   for n in open_names_by_entity.get(entity, ())):
+                n_suppressed["open_task"] += 1
+                log.info("pass5: missing-task gap suppressed (tier-A repeat of an "
+                         "open task) gap_id=%s entity=%s", gap_id, entity)
+                continue
+            if any(gap_task_dedup.tier_a(subj, e)
+                   for e in emitted_by_entity.get(entity, ())):
+                n_suppressed["in_pass"] += 1
+                log.info("pass5: missing-task gap suppressed (tier-A repeat within "
+                         "this pass) gap_id=%s entity=%s", gap_id, entity)
+                continue
+            emitted_by_entity.setdefault(entity, []).append(subj)
             gaps.append(ReconciliationGap(
                 gap_id=gap_id,
                 gap_type="missing_asana_task",
@@ -1491,6 +1558,18 @@ def pass5_drive_insights(
                 entity=entity,
                 confidence=conf,
                 proposed_action=f"Create Asana task: [{entity}] {subj}",
+                # Code #15 S2: what the executor needs, carried structurally
+                # instead of re-parsed out of the description. NO `entity` key
+                # on purpose: payload.entity is what makes a mechanical row
+                # delegable (review_lanes.can_approve), and widening who can
+                # approve these is not this slice's call -- resolve_entity
+                # already reads the [ENT] code from the description.
+                payload={
+                    "subject": subj,
+                    "source_filename": src_file,
+                    "dedup_key": gap_task_dedup.normalize(subj),
+                    "suggested_task_name": f"[{entity}] {subj}"[:150],
+                },
                 title=subj,
             ))
 
@@ -1550,6 +1629,10 @@ def pass5_drive_insights(
         if len(gaps) >= MAX_GAPS_PER_PASS:
             break
 
+    if any(n_suppressed.values()):
+        log.info("pass5: missing-task gaps suppressed as tier-A repeats: ledger=%d "
+                 "open_task=%d in_pass=%d", n_suppressed["ledger"],
+                 n_suppressed["open_task"], n_suppressed["in_pass"])
     log.info("pass5 (drive insights): %d gaps found", len(gaps))
     return gaps
 
