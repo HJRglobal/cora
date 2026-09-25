@@ -915,3 +915,44 @@ class TestAskGrammarR2:
         client = MagicMock()
         app_module.handle_message_event(_event(text), client)
         assert dm.qa.called and _texts(client) == [], text
+
+
+#: absolute frames only (a relative "in june" is pre-lane in 2026 and lane time in
+#: 2027 -- the pure tests pin both with a fixed clock; these never date-rot)
+STATUS_NOT_R2 = [
+    "were the <#C0B2T18R3FG|a> and <#C0B2T18R3FH|b> channels archived by alex?",
+    "how many channels were archived in the sprawl cleanup?", "which channels did we archive in june 2026?",
+    "did you archive any channels in 2025?", "which channels were archived by the sprawl script?",
+]
+
+
+class TestStatusScopeR2:
+    """r2:integration#3: questions about someone else's archives or a pre-lane time
+    frame are not the lane's status -- DM, @mention and /cora-ask all reach the model."""
+
+    @pytest.mark.parametrize("text", STATUS_NOT_R2)
+    def test_the_dm_question_reaches_the_model(self, dm, text):
+        client = MagicMock()
+        app_module.handle_message_event(_event(text), client)
+        assert dm.qa.called and _texts(client) == [], text
+
+    @pytest.mark.parametrize("text", STATUS_NOT_R2)
+    def test_the_mention_and_slash_questions_reach_the_model(self, text):
+        client, dispatch, _, start = TestFounderMention()._run(text)
+        assert dispatch.called and not start.called and not client.chat_postMessage.called, text
+        client, dispatch, _, start = TestFounderSlashAskR1()._run(text)
+        assert dispatch.called and not start.called and not client.chat_postMessage.called, text
+
+    def test_the_lanes_own_question_still_gets_the_ledger_line(self, dm):
+        client = MagicMock()
+        app_module.handle_message_event(_event("were the dead channels archived by you?"), client)
+        assert _texts(client)[0].startswith("Dead-channel lane:") and not dm.qa.called
+
+    @pytest.mark.parametrize("text", STATUS_NOT_R2)
+    def test_the_catch_up_drafts_it_normally(self, monkeypatch, text):
+        from cora import missed_message_catchup as mmc
+        monkeypatch.setattr(mmc, "HARRISON_ID", HARRISON)
+        monkeypatch.setattr(mmc, "_run_dispatch_capture", lambda *a, **k: "a model draft")
+        monkeypatch.setattr(mmc.user_access, "check_access", lambda *a, **k: None)
+        out = mmc.generate_draft(MagicMock(), _cand(mmc, text, HARRISON))
+        assert out.draft_text == "a model draft", text

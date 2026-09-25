@@ -661,3 +661,72 @@ class TestCoordinatedObjectR2:
             it.looks_like_archive_attempt("archive the a and" + " " * 40000 + "channels")
             best = min(best, time.perf_counter() - t0)
         assert best < 0.05
+
+
+#: r2:integration#3 -- the lane's status line answers what the LANE did since it was
+#: born (2026-09-25): a question about someone else's archives ("archived by alex")
+#: or a time frame that starts before the lane ("in june", "last summer", "since
+#: june", "in 2025", the sprawl) is not a lane-status question -> the model / KB.
+STATUS_NOT_R2 = [
+    "which channels did we archive in june?", "did we archive the old promo channels last summer?",
+    "were any f3e channels archived during the june cleanup?",
+    "were the <#C0B2T18R3FG|a> and <#C0B2T18R3FH|b> channels archived by alex?",
+    "which channels were archived by alex in june?", "which channels were archived by the sprawl script?",
+    "were any channels archived by slack?", "how many channels were archived in the sprawl cleanup?",
+    "were any channels archived in june?", "what channels did we archive last summer?",
+    "did you archive any channels in 2025?", "which channels did cora archive last year?",
+    "were the channels archived by hand?", "did we archive the sprawl channels?",
+    "which channels have been archived since june?", "were the dead channels archived by me?",
+    "which channels did you archive in october?", "were any channels archived in mid-june?",
+    "did cora archive the dead channels back in may?", "were the channels archived in june, 2026?",
+    "which channels were archived this summer?", "any channels archived by tommy yet?",
+]
+#: ... while the lane's own questions keep the ledger-backed line.
+STATUS_FIRE_R2 = [
+    "were the dead channels archived by you?", "were the dead channels archived by cora?",
+    "were the dead channels archived by now?", "which channels did we archive?",
+    "did cora archive any channels in 2027?", "were the channels archived by the lane?",
+    "what channels did cora archive last week?", "were any channels archived yet?",
+    "has cora archived any channels since the card?", "were the dead channels archived by friday?",
+    "which channels were archived by a tap?", "did you archive the channels today?",
+]
+
+
+class TestStatusScopeR2:
+    @pytest.mark.parametrize("text", STATUS_NOT_R2)
+    def test_other_actors_and_pre_lane_frames_are_not_lane_status(self, text):
+        assert not it.looks_like_archive_status(text, now=NOW), text
+
+    @pytest.mark.parametrize("text", STATUS_FIRE_R2)
+    def test_the_lanes_own_status_questions_still_fire(self, text):
+        assert it.looks_like_archive_status(text, now=NOW), text
+
+    @pytest.mark.parametrize("text", STATUS_FIRE + STATUS_FIRE_R1)
+    def test_every_earlier_must_fire_row_still_fires_at_the_lanes_birth(self, text):
+        assert it.looks_like_archive_status(text, now=NOW), text
+
+    def test_a_month_named_after_the_lane_was_born_is_lane_time(self):
+        """'in june' is pre-lane in 2026 and lane time in 2027 -- keyed on the clock,
+        never on a fixed month list (no date rot)."""
+        from datetime import datetime, timezone
+        later = datetime(2027, 7, 10, 19, 0, tzinfo=timezone.utc).timestamp()
+        q = "which channels did cora archive in june?"
+        assert not it.looks_like_archive_status(q, now=NOW)
+        assert it.looks_like_archive_status(q, now=later)
+        assert not it.looks_like_archive_status("which channels did cora archive last summer?", now=later)
+        assert it.looks_like_archive_status("which channels did cora archive this summer?", now=later)
+        assert not it.looks_like_archive_status("which channels did cora archive in june 2026?", now=later)
+
+    @pytest.mark.parametrize("shape", ["did you archive the channels " + "in june " * 36,
+                                       "were the channels archived by " + "by " * 90,
+                                       "did you archive the channels " + "last summer " * 24,
+                                       "were the channels archived" + " in 2025" * 36])
+    def test_the_scope_bails_are_fast_on_capped_worst_cases(self, shape):
+        best = float("inf")
+        for _ in range(3):
+            t0 = time.perf_counter()
+            it.looks_like_archive_status(shape, now=NOW)
+            it.looks_like_archive_status("were the channels archived by" + " " * 40000 + "x", now=NOW)
+            it.looks_like_archive_status("did you archive the channels in" + " " * 40000 + "june", now=NOW)
+            best = min(best, time.perf_counter() - t0)
+        assert best < 0.05

@@ -15,7 +15,9 @@ three-captures incident).
     the dead channels except #x"). -> a refusal naming the one thing that works.
   * ``looks_like_archive_status`` -- an interrogative about the LANE's state ("did
     you archive <channels>", "<channels> got archived", "the archive card"), never a
-    how-to / policy / decision question. -> a store/ledger-backed status line,
+    how-to / policy / decision question, someone else's archive ("archived by alex")
+    or a time frame older than the lane ("in june", the sprawl). -> a store/ledger-
+    backed status line,
     never a model turn, never a forced tool (lesson 83: a forced read is itself a
     tool_use).
   * ``looks_like_live_followup`` -- while a card is live in this DM, any text
@@ -34,6 +36,7 @@ from __future__ import annotations
 import html
 import re
 import time
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from .deliver import MISSING_PARTS_LEAD
@@ -168,6 +171,64 @@ _STATUS_LANE_RE = re.compile(
     r"|\b(?:archive|archiving|dead[ -]channels?|inactive[ -]channels?|"
     r"channel[ -]archiv(?:e|ing)) (?:cards?|proposals?|lane|scans?)\b"
     r"|\b(?:dead|inactive|stale)[ -]channels? archiv(?:e|al|ing)\b")
+#: ... but the lane's line answers what the LANE did (D-051 r2 integration#3): an
+#: archive BY someone else ("archived by alex / me / slack / the sprawl script") is
+#: not its question. "by you / cora / the lane / a tap" and a deadline ("by now",
+#: "by friday", "by 5pm") still are.
+_BY_OTHER_RE = re.compile(
+    r"\barchived by (?!(?:you|u|cora|yourself|the (?:lane|card|cards|bot|scan|proposal)|a tap|"
+    r"my tap|taps?|now|then|today|tonight|tomorrow|yesterday|this|next|last|the end|end|eod|"
+    r"eow|cob|noon|midnight|mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:rs|rsday)?|"
+    r"fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b|\d)[a-z#]")
+#: ... nor a named time frame that STARTS before the lane was born (monitor.LANE_EPOCH,
+#: 2026-09-25): "in june", "last summer", "since june", "in 2025", "last year", the
+#: June sprawl. A relative "last week" / "today" / "yet" is lane time. The month /
+#: season is resolved against the CLOCK (its most recent occurrence), so "in june"
+#: is pre-lane in 2026 and lane time in 2027.
+_MONTH_NUM = {"january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3, "april": 4,
+              "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7, "august": 8, "aug": 8,
+              "september": 9, "sept": 9, "sep": 9, "october": 10, "oct": 10, "november": 11,
+              "nov": 11, "december": 12, "dec": 12}
+_SEASON_START = {"spring": 3, "summer": 6, "fall": 9, "autumn": 9, "winter": 12}
+_PERIOD_RE = re.compile(
+    r"\b(?:(in|during|over|throughout|back in|since|from|after|last|this past)(?: the)?"
+    r"(?: (?:early|mid|late))?[ -](" + "|".join(sorted(_MONTH_NUM, key=len, reverse=True))
+    + r")(?:,? ((?:19|20)\d\d))?"
+    r"|(?:in|during|over|throughout|back in|since|from) ((?:19|20)\d\d)"
+    r"|(last|this past|this|over the|during the|in the|since) (spring|summer|fall|autumn|winter)"
+    r"|(last year)|(sprawl))\b")
+_AZ = timezone(timedelta(hours=-7))      # Arizona, no DST -- monitor.LANE_EPOCH's zone
+
+
+def _period_start(m: re.Match, today: date) -> date:
+    prep, mon, yr, yr2, sprep, season, last_year, sprawl = m.groups()
+    if sprawl:
+        return date.min
+    if last_year:
+        return date(today.year - 1, 1, 1)
+    if yr2:
+        return date(int(yr2), 1, 1)
+    if mon:
+        mi = _MONTH_NUM[mon]
+        if yr:
+            return date(int(yr), mi, 1)
+        y = today.year if mi <= today.month else today.year - 1
+        if prep in ("last", "this past") and mi == today.month:
+            y -= 1                                   # "last september" asked in September
+        return date(y, mi, 1)
+    sm = _SEASON_START[season]
+    y = today.year if date(today.year, sm, 1) <= today else today.year - 1
+    end_y, end_m = (y + 1, (sm + 3) - 12) if sm + 3 > 12 else (y, sm + 3)
+    if sprep in ("last", "this past") and today < date(end_y, end_m, 1):
+        y -= 1                                       # "last summer" asked in the summer
+    return date(y, sm, 1)
+
+
+def _names_pre_lane_period(t: str, now: float) -> bool:
+    from .monitor import LANE_EPOCH  # noqa: PLC0415
+    born = datetime.fromtimestamp(LANE_EPOCH, _AZ).date()
+    today = datetime.fromtimestamp(now, _AZ).date()
+    return any(_period_start(m, today) < born for m in _PERIOD_RE.finditer(t))
 
 #: A21(d), widened (c1-intents-copy#1): while a card is live, ANY text opening with
 #: the archive verb (after an optional yes / ok / sure / sounds good / just / now /
@@ -194,9 +255,9 @@ _AFF = (r"(?:yes|yep|yeah|yup|ya|yea|y|ok|okay|k|kk|sure|go ahead|go for it|go|d
         r"approve|approved|proceed|:?\+1:(?::skin-tone-[2-6]:)?|:?thumbsup:|:?thumbs_up:|"
         "\U0001f44d[\U0001f3fb-\U0001f3ff]?)")
 _AFF_SOFT = "(?:please|pls|plz|just|now)"
-_AFF_SEP = "(?: ?[,.!;:—–-]* (?:and )?)"
+_AFF_SEP = "(?: ?" + _PUNCT + "* (?:and )?)"
 _BARE_YES_RE = re.compile(
-    r"\A(?:@?cora ?[,:;!.—–-]* )?(?:" + _AFF_SOFT + " )?" + _AFF
+    r"\A(?:@?cora ?" + _PUNCT + "* )?(?:" + _AFF_SOFT + " )?" + _AFF
     + "(?:" + _AFF_SEP + "(?:" + _AFF + "|" + _AFF_SOFT + ")){0,3}"
     r"(?:,? @?cora)?[?.!]*\Z")
 
@@ -233,13 +294,18 @@ def looks_like_archive_attempt(text: str) -> bool:
     return bool(_ATTEMPT_RE.match(t))
 
 
-def looks_like_archive_status(text: str) -> bool:
+def looks_like_archive_status(text: str, *, now: float | None = None) -> bool:
     t = normalize(text)
     if not _ok(t) or not _STATUS_START_RE.match(t) or not _STATUS_ARCH_RE.search(t):
         return False
-    if _STATUS_BAIL_RE.search(t):
+    if _STATUS_BAIL_RE.search(t) or not _STATUS_LANE_RE.search(t):
         return False
-    return bool(_STATUS_LANE_RE.search(t))
+    if _BY_OTHER_RE.search(t):
+        return False
+    try:
+        return not _names_pre_lane_period(t, time.time() if now is None else float(now))
+    except Exception:  # noqa: BLE001 -- an unresolvable frame is not the lane's question
+        return False
 
 
 def followup_shape(text: str) -> str | None:
