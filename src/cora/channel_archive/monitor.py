@@ -19,12 +19,22 @@ FAIL CLASSES
       The finding says what happened to the demotion: WRITTEN / would demote (dry
       run) / DEMOTION WRITE FAILED with the tier the lane is really acting at.
   (2) MISMATCH -- a ledger ``archived`` channel that Slack lists as NOT archived.
-      The unarchive is searched from the archive time forward (bounded): a person's
-      unarchive -> an ``unarchived_seen`` row (the channel leaves the examined set);
-      a BOT unarchive -> WARN (Cora has no unarchive path); none found -> WARN.
+      The unarchive is searched FORWARD from the archive message's ts in bounded time
+      windows (``_first_after``; newest-first paging missed an unarchive buried under
+      1,000+ later messages): a person's unarchive -> an ``unarchived_seen`` row (the
+      channel leaves the examined set); a BOT unarchive -> WARN (Cora has no unarchive
+      path); none found -> WARN.
+      A ledger ``failed`` outcome on an attempt whose archive Slack shows Cora made
+      (an indeterminate error that landed) is reconciled ``archived`` once + WARN.
   (3) UNRESOLVED -- an intent older than 1 h with no outcome, or an ``unknown``
-      outcome -> WARN with ids; once Slack decides, a reconciled outcome is appended
-      to the ledger AND the store (the next card render shows it).
+      outcome. Settled from Slack's OWN history, the first archive message after the
+      intent: Cora's (within 15 min) -> ``archived (reconciled)`` carrying that
+      message's ts, and when the channel is open again its unarchive is followed as in
+      (2); a person's archive, or archived before the attempt -> ``already_archived
+      (reconciled)``; none and open -> ``failed (reconciled)``; gone from the list ->
+      ``failed (reconciled: channel gone)``; an unreadable history records NOTHING
+      (WARN). Each outcome goes to the ledger AND the store (the next card render
+      shows it), and a dry run says "would be recorded".
   (4) BLIND -- the channel list paginated incompletely, zero archived channels in
       it, no bot identity, or an unreadable ledger/store -> WARN, never OK.
   (5) DEMOTED -- the demotion file exists -> WARN daily until Harrison clears it.
@@ -60,7 +70,9 @@ SCAN_STALL_S = 3600
 #: A stall no crash path recorded (a killed process) stops WARNing after this long.
 SCAN_STALL_MAX_S = 7 * 86400
 HISTORY_LIMIT = 20
-UNARCHIVE_SEARCH_PAGES = 5
+#: The forward history search (unarchive / archive after a ts): first window, read cap.
+FORWARD_FIRST_WINDOW_S = 3600.0
+FORWARD_SEARCH_CALLS = 32
 LIST_MAX_PAGES = 20
 PACE_S = 1.0
 ARCHIVE_SUBTYPES = ("channel_archive", "group_archive")
@@ -110,24 +122,41 @@ def _latest_archive_event(client: Any, cid: str) -> tuple[dict | None, str]:
     return None, ""
 
 
-def _unarchive_after(client: Any, cid: str, since: float) -> tuple[dict | None, str]:
-    cursor = ""
-    for _ in range(UNARCHIVE_SEARCH_PAGES):
-        kwargs: dict[str, Any] = {"channel": cid, "oldest": f"{since:.6f}", "limit": 200}
-        if cursor:
-            kwargs["cursor"] = cursor
+def _first_after(client: Any, cid: str, since: float, now: float,
+                 subtypes: tuple[str, ...]) -> tuple[dict | None, str]:
+    """The EARLIEST message of one of *subtypes* at/after *since*, walking FORWARD in
+    time (D-051 r1 c1-false-inactive#1). Each read is one window [lo, hi] with BOTH
+    oldest and latest (inclusive), so Slack's newest-first order inside a window does not
+    matter: an empty or target-free window moves on and doubles; a window holding more
+    than one page halves (the earliest target is what matters). The old newest-first
+    paging from *since* with a 5-page cap never reached an early unarchive behind 1,000+
+    later messages. -> (projected message, ""), (None, "") = none up to *now*, or
+    (None, code) on a read error / (None, "page_cap") past FORWARD_SEARCH_CALLS reads."""
+    lo = float(since)
+    width = FORWARD_FIRST_WINDOW_S
+    for _ in range(FORWARD_SEARCH_CALLS):
+        if lo > now:
+            return None, ""
+        hi = min(lo + width, now)
         try:
-            resp = client.conversations_history(**kwargs)
+            resp = client.conversations_history(channel=cid, oldest=f"{lo:.6f}", latest=f"{hi:.6f}",
+                                                inclusive=True, limit=200)
         except Exception as exc:  # noqa: BLE001
             return None, cl._err_code(exc)
-        for m in resp.get("messages") or []:
-            if isinstance(m, dict) and m.get("subtype") in UNARCHIVE_SUBTYPES:
-                return {k: m.get(k) for k in ("ts", "user", "bot_id")}, ""
-        md = resp.get("response_metadata")
-        nxt = md.get("next_cursor") if isinstance(md, dict) else ""
-        if not (resp.get("has_more") is True and nxt):
+        more = resp.get("has_more") is True
+        if more and hi - lo > 1.0:
+            width = (hi - lo) / 2.0           # narrow toward lo: the earliest target is what counts
+            continue
+        hits = [m for m in (resp.get("messages") or [])
+                if isinstance(m, dict) and m.get("subtype") in subtypes]
+        if hits:
+            m = min(hits, key=lambda x: float(x.get("ts") or 0))
+            return {k: m.get(k) for k in ("ts", "user", "bot_id", "subtype")}, ""
+        if more:
+            return None, "page_cap"           # > one page inside one second: cannot narrow
+        if hi >= now:
             return None, ""
-        cursor = str(nxt)
+        lo, width = hi, width * 2.0
     return None, "page_cap"
 
 
@@ -233,9 +262,42 @@ def reconcile(client: Any, *, now: float | None = None, dry_run: bool = False,
     for (pid, cid), rows in outcomes.items():
         for r in rows:
             if str(r.get("outcome") or "").startswith("archived"):
-                ledger_archived[cid] = max(ledger_archived.get(cid, 0.0), float(r.get("ts") or 0))
+                # keyed on the archive MESSAGE's ts when the row carries it: a reconciled
+                # outcome is stamped at the (later) nightly run, after any unarchive
+                at = float(r.get("archive_ts") or r.get("ts") or 0)
+                ledger_archived[cid] = max(ledger_archived.get(cid, 0.0), at)
     floor_ts = max(now - WINDOW_DAYS * st.DAY_S, LANE_EPOCH)
     harrison = _harrison()
+
+    def settle(pid: str, cid: str, r: dict, outcome: str, store_outcome: str,
+               archive_ts: float | None = None) -> tuple[bool | None, str]:
+        """A reconciled outcome to the ledger AND the store (A25(3)). -> (True recorded /
+        None dry run / False ledger write failed, the honest copy tail -- c1-monitor#5)."""
+        if dry_run:
+            return None, f"would be recorded as {outcome} (dry run: nothing written)"
+        if not st.append_ledger("outcome", proposal_id=pid, channel_id=cid, outcome=outcome,
+                                tapped_by=r.get("tapped_by"), archive_ts=archive_ts, ts=now):
+            return False, f"NOT recorded as {outcome} (the ledger write FAILED; the next nightly retries)"
+        st.append_event("reconciled", proposal_id=pid, cid=cid, outcome=store_outcome, ts=now)
+        return True, f"recorded as {outcome}"
+
+    def follow_unarchive(cid: str, since: float, what: str) -> None:
+        """A channel archived at *since* (per the ledger) that Slack lists OPEN: search
+        FORWARD for who reopened it. A person -> ``unarchived_seen``; Cora -> WARN (she
+        has no unarchive path); none / unreadable -> WARN."""
+        sleep(PACE_S)
+        un, err = _first_after(client, cid, since, now, UNARCHIVE_SUBTYPES)
+        cov["histories"] += 1
+        if err:
+            findings.append(f"MISMATCH: {cid} {what}, Slack says open; history unreadable ({err})")
+        elif un is None:
+            findings.append(f"MISMATCH: {cid} {what}, Slack says open, and no unarchive message "
+                            "was found")
+        elif _is_cora(un, bot_uid, bot_id):
+            findings.append(f"MISMATCH: {cid} was UNARCHIVED BY CORA -- she has no unarchive path")
+        elif not dry_run:
+            st.append_ledger("unarchived_seen", channel_id=cid, unarchive_ts=float(un.get("ts") or now),
+                             by=str(un.get("user") or ""), ts=now)
 
     # -- (1) UNATTRIBUTED + cannot-attribute over the recent archived set --
     examine: set[str] = set()
@@ -295,6 +357,16 @@ def reconcile(client: Any, *, now: float | None = None, dry_run: bool = False,
             break
         if match is not None:
             used_intents.add(id(match))
+            # a tapped attempt the ledger closed as failed while Slack shows Cora archived
+            # it (internal_error / fatal_error / a 5xx can partly succeed): Slack's record
+            # wins, once (D-051 r1 c1-monitor#3)
+            mpid, mits = str(match.get("proposal_id") or ""), float(match.get("ts") or 0)
+            mouts = [o for o in outcomes.get((mpid, cid), []) if float(o.get("ts") or 0) >= mits - 1]
+            mlast = str(mouts[-1].get("outcome") or "") if mouts else ""
+            if mlast.startswith(("failed", "notice_failed", "not_attempted")):
+                _ok, tail = settle(mpid, cid, match, "archived (reconciled)", "archived", archive_ts=ats)
+                findings.append(f"RECONCILED: {cid} intent {mpid} -- the ledger said {mlast}, but Slack "
+                                f"shows Cora archived it at {ev.get('ts')}; {tail}")
             continue
         findings.append("")                   # filled once the demotion's fate is known
         unattributed.append((cid, str(ev.get("ts") or ""), len(findings) - 1))
@@ -333,22 +405,12 @@ def reconcile(client: Any, *, now: float | None = None, dry_run: bool = False,
             continue
         if c.get("is_archived"):
             continue
-        sleep(PACE_S)
-        un, err = _unarchive_after(client, cid, arch_ts)
-        cov["histories"] += 1
-        if err:
-            findings.append(f"MISMATCH: {cid} ledger says archived, Slack says open; history "
-                            f"unreadable ({err})")
-        elif un is None:
-            findings.append(f"MISMATCH: {cid} ledger says archived, Slack says open, and no "
-                            "unarchive message was found")
-        elif _is_cora(un, bot_uid, bot_id):
-            findings.append(f"MISMATCH: {cid} was UNARCHIVED BY CORA -- she has no unarchive path")
-        elif not dry_run:
-            st.append_ledger("unarchived_seen", channel_id=cid, unarchive_ts=float(un.get("ts") or now),
-                             by=str(un.get("user") or ""), ts=now)
+        follow_unarchive(cid, arch_ts, "ledger says archived")
 
-    # -- (3) UNRESOLVED --
+    # -- (3) UNRESOLVED: settled from Slack's OWN history (the first archive message
+    # after the intent), never from "open now = never archived"; every path ends in a
+    # settled outcome, so no WARN repeats forever with nothing that can clear it
+    # (D-051 r1 c1-monitor#1) --
     for cid, rows in sorted(intents.items()):
         for r in rows:
             pid = str(r.get("proposal_id") or "")
@@ -359,31 +421,48 @@ def reconcile(client: Any, *, now: float | None = None, dry_run: bool = False,
                 continue
             if not outs and now - its < UNRESOLVED_S:
                 continue
+            aged = now - its >= UNRESOLVED_S
             c = by_id.get(cid)
-            if c is not None and c.get("is_archived"):
-                sleep(PACE_S)
-                ev, _err = _latest_archive_event(client, cid)
-                cov["histories"] += 1
-                if ev and _is_cora(ev, bot_uid, bot_id) and float(ev.get("ts") or 0) >= its - 1:
-                    if not dry_run:
-                        st.append_ledger("outcome", proposal_id=pid, channel_id=cid,
-                                         outcome="archived (reconciled)", tapped_by=r.get("tapped_by"),
-                                         ts=now)
-                        st.append_event("reconciled", proposal_id=pid, cid=cid, outcome="archived",
-                                        ts=now)
+            if c is None:
+                if not aged:
+                    findings.append(f"UNRESOLVED: {cid} intent {pid} has no settled outcome")
                     continue
-            elif c is not None and now - its >= UNRESOLVED_S:
-                if not dry_run:
-                    st.append_ledger("outcome", proposal_id=pid, channel_id=cid,
-                                     outcome="failed (reconciled)", tapped_by=r.get("tapped_by"),
-                                     ts=now)
-                    st.append_event("reconciled", proposal_id=pid, cid=cid, outcome="failed",
-                                    ts=now)
-                findings.append(f"RECONCILED: {cid} intent {pid} never archived (Slack shows it "
-                                "open) -- recorded as failed; the channel may still carry the "
-                                "notice")
+                _ok, tail = settle(pid, cid, r, "failed (reconciled: channel gone)", "failed")
+                findings.append(f"RECONCILED: {cid} intent {pid} -- the channel is no longer in Slack's "
+                                f"list (deleted, or Cora lost access), so nothing more can be checked; {tail}")
                 continue
-            findings.append(f"UNRESOLVED: {cid} intent {pid} has no settled outcome")
+            sleep(PACE_S)
+            first, err = _first_after(client, cid, its - 1, now, ARCHIVE_SUBTYPES)
+            cov["histories"] += 1
+            if err:
+                findings.append(f"UNRESOLVED: {cid} intent {pid} has no settled outcome; its history "
+                                f"could not be searched ({err})")
+                continue
+            by_cora = first is not None and _is_cora(first, bot_uid, bot_id)
+            fts = float(first.get("ts") or 0) if first is not None else 0.0
+            if by_cora and fts <= its + INTENT_BEFORE_S:
+                ok, tail = settle(pid, cid, r, "archived (reconciled)", "archived", archive_ts=fts)
+                if ok is False:
+                    findings.append(f"UNRESOLVED: {cid} intent {pid} -- Slack shows Cora archived it at "
+                                    f"{first.get('ts')}, but it was {tail}")
+                if not c.get("is_archived"):   # archived by Cora, reopened since: by whom?
+                    follow_unarchive(cid, fts, f"Cora archived it at {first.get('ts')} (intent {pid})")
+                continue
+            if not aged:
+                findings.append(f"UNRESOLVED: {cid} intent {pid} has no settled outcome")
+                continue
+            if c.get("is_archived") and not by_cora:
+                how = (f"a person (not Cora) archived it at {first.get('ts')}" if first is not None
+                       else "it was already archived before the attempt")
+                _ok, tail = settle(pid, cid, r, "already_archived (reconciled)", "already_archived")
+                findings.append(f"RECONCILED: {cid} intent {pid} -- Slack shows {how}; {tail}")
+                continue
+            why = ("Slack shows it open and no archive message after the intent" if first is None
+                   else f"the first archive after it is a later one by Cora at {first.get('ts')}"
+                   if by_cora else f"the first archive after it is a person's at {first.get('ts')}")
+            _ok, tail = settle(pid, cid, r, "failed (reconciled)", "failed")
+            findings.append(f"RECONCILED: {cid} intent {pid} never archived by this attempt ({why}) -- "
+                            f"{tail}; the channel may still carry the notice")
 
     # -- scan stall: settled by a staged card OR a recorded crash (scan_failed, already
     # DM'd where the scan was asked); a kill that recorded nothing drops after 7 days --

@@ -43,14 +43,19 @@ class MonSlack(FakeSlack):
 
     def conversations_history(self, channel, oldest=None, latest=None, limit=100, cursor=None,
                               inclusive=False, **kw):
-        self.calls.append(("conversations_history", {"channel": channel, "oldest": oldest, "limit": limit}))
-        if oldest is not None:
-            return resp({"ok": True, "messages": self.unarchives.get(channel, []), "has_more": False,
-                         "response_metadata": {"next_cursor": ""}})
+        self.calls.append(("conversations_history", {"channel": channel, "oldest": oldest,
+                                                     "latest": latest, "limit": limit}))
         ev = self.events.get(channel, [])
         if isinstance(ev, Exception):
             raise ev
-        return resp({"ok": True, "messages": ev, "has_more": False})
+        if oldest is None:
+            return resp({"ok": True, "messages": ev, "has_more": False})
+        # a windowed read: every archive + unarchive event inside [oldest, latest], newest first
+        lo = float(oldest)
+        hi = float(latest) if latest is not None else float("inf")
+        msgs = [m for m in list(ev) + list(self.unarchives.get(channel, [])) if lo <= float(m["ts"]) <= hi]
+        return resp({"ok": True, "messages": sorted(msgs, key=lambda m: -float(m["ts"])),
+                     "has_more": False, "response_metadata": {"next_cursor": ""}})
 
 
 def arch_event(ts, **who):
@@ -345,6 +350,137 @@ class TestUnresolved:
         outcome(ARCH, NOW - 590, "unknown")
         out = run(MonSlack(archived={ARCH: {"is_archived": False}}), dry_run=True)
         assert any("UNRESOLVED" in f for f in out["findings"])
+
+
+PID = "chanarch-aaaaaaaaaaaa"
+
+
+def _stage_t1_row(state_event=st.UNKNOWN):
+    st.append_event("staged", proposal_id=PID, ts=NOW - 3 * DAY, expires_ts=NOW + 11 * DAY,
+                    rows=[{"cid": ARCH, "section": "A", "tier": "T1"}])
+    st.append_event(st.CLAIMED, proposal_id=PID, cid=ARCH, ts=NOW - 2 * DAY - 10)
+    if state_event:
+        st.append_event(state_event, proposal_id=PID, cid=ARCH, ts=NOW - 2 * DAY + 5)
+
+
+def _outcomes():
+    return [r["outcome"] for r in st.read_ledger() if r["event"] == "outcome"]
+
+
+class TestUnresolvedReadsSlackHistory:
+    """D-051 r1 c1-monitor#1: an unknown/missing outcome is settled from Slack's own
+    history, never from "open now = never archived", and every path ends in a settled
+    outcome (no WARN that repeats forever with no action that can clear it)."""
+
+    def test_cora_archived_then_a_person_unarchived_records_archived_and_the_unarchive(self):
+        _stage_t1_row()
+        its = NOW - 2 * DAY
+        intent(ARCH, its)
+        outcome(ARCH, its + 5, "unknown")
+        ats = its + 3
+        fake = MonSlack(archived={ARCH: {"is_archived": False}},
+                        events={ARCH: [arch_event(ats, user=BOT_UID)]},
+                        unarchives={ARCH: [{"ts": f"{NOW - DAY:.6f}", "subtype": "channel_unarchive",
+                                            "user": PERSON}]})
+        out = run(fake)
+        assert out["status"] == "ok", out["findings"]
+        assert _outcomes() == ["unknown", "archived (reconciled)"]
+        rec = [r for r in st.read_ledger() if r["event"] == "outcome"][-1]
+        assert rec["archive_ts"] == pytest.approx(ats)
+        seen = [r for r in st.read_ledger() if r["event"] == "unarchived_seen"]
+        assert len(seen) == 1 and seen[0]["by"] == PERSON
+        assert st.unarchive_state(st.read_ledger())[ARCH] == {"at": pytest.approx(NOW - DAY), "by": PERSON}
+        assert st.fold(now=NOW).proposals[PID].state_of(ARCH) == st.ARCHIVED
+        again = run(fake)
+        assert again["status"] == "ok" and _outcomes() == ["unknown", "archived (reconciled)"]
+
+    def test_a_person_archived_it_after_an_unknown_attempt_settles_once(self):
+        _stage_t1_row()
+        its = NOW - 2 * DAY
+        intent(ARCH, its)
+        outcome(ARCH, its + 5, "unknown")
+        fake = MonSlack(archived={ARCH: {}}, events={ARCH: [arch_event(NOW - DAY, user=PERSON)]})
+        out = run(fake)
+        assert any("RECONCILED" in f and "a person" in f for f in out["findings"]), out["findings"]
+        assert _outcomes()[-1] == "already_archived (reconciled)"
+        assert st.fold(now=NOW).proposals[PID].state_of(ARCH) == st.ALREADY_ARCHIVED
+        assert run(fake)["status"] == "ok"                     # settled: no repeating WARN
+
+    def test_a_channel_gone_from_the_list_settles_once(self):
+        _stage_t1_row(state_event=None)
+        intent(ARCH, NOW - 2 * DAY)
+        out = run(MonSlack())
+        assert any("RECONCILED" in f and "no longer in Slack's list" in f for f in out["findings"])
+        assert _outcomes() == ["failed (reconciled: channel gone)"]
+        assert run(MonSlack())["status"] == "ok"
+
+    def test_an_unreadable_history_records_nothing(self):
+        _stage_t1_row(state_event=None)
+        intent(ARCH, NOW - 2 * DAY)
+        fake = MonSlack(archived={ARCH: {"is_archived": False}}, events={ARCH: api_error("ratelimited")})
+        out = run(fake)
+        assert any("UNRESOLVED" in f and "could not be searched" in f for f in out["findings"])
+        assert _outcomes() == []
+
+    def test_dry_run_reconcile_copy_says_would_record(self):
+        _stage_t1_row(state_event=None)
+        intent(ARCH, NOW - 2 * DAY)
+        out = run(MonSlack(archived={ARCH: {"is_archived": False}}), dry_run=True)
+        line = next(f for f in out["findings"] if "RECONCILED" in f)
+        assert "would be recorded as failed (reconciled) (dry run" in line and "-- recorded as" not in line
+        assert _outcomes() == []
+
+
+class TestFailedOutcomeSlackArchived:
+    """D-051 r1 c1-monitor#3: a ledger `failed` for an archive Slack shows Cora performed
+    (internal_error / fatal_error can partly succeed) is reconciled, never read clean."""
+
+    def test_a_failed_outcome_after_coras_archive_is_reconciled_archived(self):
+        _stage_t1_row(state_event=st.FAILED)
+        ats = NOW - DAY
+        intent(ARCH, ats - 3)
+        outcome(ARCH, ats + 1.5, "failed:internal_error")
+        fake = MonSlack(archived={ARCH: {}}, events={ARCH: [arch_event(ats, user=BOT_UID)]})
+        out = run(fake)
+        line = next(f for f in out["findings"] if "RECONCILED" in f)
+        assert "failed:internal_error" in line and "Cora archived it" in line
+        assert not out["demotion_written"]
+        assert _outcomes() == ["failed:internal_error", "archived (reconciled)"]
+        assert st.fold(now=NOW).proposals[PID].state_of(ARCH) == st.ARCHIVED
+        assert run(fake)["status"] == "ok"
+
+    def test_dry_run_appends_nothing(self):
+        ats = NOW - DAY
+        intent(ARCH, ats - 3)
+        outcome(ARCH, ats + 1.5, "failed:internal_error")
+        out = run(MonSlack(archived={ARCH: {}}, events={ARCH: [arch_event(ats, user=BOT_UID)]}),
+                  dry_run=True)
+        assert any("would be recorded" in f for f in out["findings"])
+        assert _outcomes() == ["failed:internal_error"]
+
+
+class TestUnarchiveSearchWalksForward:
+    """D-051 r1 c1-false-inactive#1: the unarchive search walks FORWARD from the archive
+    time. Newest-first paging with a 5-page cap never reached an unarchive that 1,000+
+    later messages buried, so ``unarchived_seen`` was never written."""
+
+    def test_an_unarchive_buried_under_1200_later_messages_is_found(self):
+        from _chanarch_fakes import msg
+        arch_ts = NOW - 200 * DAY
+        outcome(ARCH, arch_ts, "archived")
+        un_ts = arch_ts + 2 * DAY
+        later = [msg(0, now=un_ts + 60 + i * 300) for i in range(1200)]
+        hist = {"C0PERSONA1": [arch_event(NOW - 3 * DAY, user=PERSON)],
+                ARCH: [{"ts": f"{un_ts:.6f}", "subtype": "channel_unarchive", "user": PERSON}] + later}
+        fake = FakeSlack(channels=[chan("C0PERSONA1", "fx-person-archived", is_archived=True,
+                                        updated=int((NOW - 3 * DAY) * 1000)),
+                                   chan(ARCH, "fx-reopened")], history=hist)
+        out = run(fake)
+        assert out["status"] == "ok", out["findings"]
+        seen = [r for r in st.read_ledger() if r["event"] == "unarchived_seen"]
+        assert len(seen) == 1 and seen[0]["unarchive_ts"] == pytest.approx(un_ts)
+        reads = [c for c in fake.calls if c[0] == "conversations_history" and c[1]["channel"] == ARCH]
+        assert len(reads) <= mon.FORWARD_SEARCH_CALLS
 
 
 def test_a_scan_that_started_and_never_staged_warns():

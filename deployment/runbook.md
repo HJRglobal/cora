@@ -241,6 +241,12 @@ any T0 card.**
   `.\.venv\Scripts\python.exe scripts\run_channel_archive_proposal.py --clear-demotion`
   (lists every event) and the same with `--apply` (appends an `acknowledged` ledger row
   for EACH listed archive event, then deletes the file -- none of them re-demotes).
+  An attempt with no settled outcome is settled from Slack's own history (the first
+  archive message after the intent), never from "open now": Cora's -> archived (and a
+  reopen is recorded as `unarchived_seen`), a person's -> already archived, none ->
+  failed, channel gone -> failed (channel gone); an unreadable history records nothing.
+  A channel the lane archived that is open again is section B `unarchived_before`
+  (date unknown until the monitor finds the unarchive), never section A.
   A scan that started and never staged a card WARNs after 1 h; a crash the bot's scan
   pool or the script recorded (`scan_failed` in the proposals store -- the crash was
   already said where the scan was asked) settles it, and a kill that recorded nothing

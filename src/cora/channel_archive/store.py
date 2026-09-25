@@ -362,10 +362,13 @@ def fold(events: list[dict] | None = None, ledger: list[dict] | None = None, *,
             continue
         cur = p.row_state.get(cid) or {"state": OPEN}
         if ev == "reconciled":
-            # the monitor settled an attempt Slack has now decided: a locked UNKNOWN,
-            # or a claim whose process died between the intent and the outcome
-            if cur.get("state") in (UNKNOWN, CLAIMED):
-                new = ARCHIVED if e.get("outcome") == ARCHIVED else FAILED
+            # the monitor settled an attempt Slack has now decided: a locked UNKNOWN, a
+            # claim whose process died between the intent and the outcome, or a FAILED
+            # row Slack shows Cora archived after all (D-051 r1 c1-monitor#1/#3)
+            rec = e.get("outcome")
+            if cur.get("state") in (UNKNOWN, CLAIMED) or (cur.get("state") == FAILED
+                                                           and rec == ARCHIVED):
+                new = rec if rec in (ARCHIVED, ALREADY_ARCHIVED) else FAILED
                 p.row_state[cid] = {**cur, "state": new, "reconciled": True, "ts": ts,
                                     "code": e.get("code") or cur.get("code")}
             continue
@@ -443,7 +446,7 @@ def _state_from_outcome(outcome: str) -> str:
     o = str(outcome or "")
     if o.startswith("archived"):
         return ARCHIVED
-    if o == "already_archived":
+    if o.startswith("already_archived"):     # incl. the monitor's "(reconciled)" form
         return ALREADY_ARCHIVED
     if o.startswith("stale_refused"):
         return STALE
@@ -454,19 +457,36 @@ def _state_from_outcome(outcome: str) -> str:
 
 def unarchive_state(ledger: list[dict] | None) -> dict:
     """cid -> {"at": epoch, "by": uid} for channels the ledger shows archived by this
-    lane and then unarchived (the monitor's ``unarchived_seen`` rows, A10)."""
-    out: dict = {}
+    lane and then unarchived (the monitor's ``unarchived_seen`` rows, A10).
+
+    FAIL-CLOSED WITHOUT THE MONITOR (D-051 r1 c1-false-inactive#1): a lane archive with
+    no ``unarchived_seen`` at/after it reads ``{"at": None, "by": "", "unconfirmed":
+    True}``. The scan lists only OPEN channels, so a channel it meets here was reopened
+    since the lane archived it; the classifier then routes it to section B
+    ``unarchived_before`` with the date and actor unknown -- never a clean section-A row
+    inside Archive-all (and an unknown date suppresses nothing). An archive is keyed on
+    its archive MESSAGE's ts when the row carries ``archive_ts`` (a reconciled outcome
+    is stamped at the later nightly run)."""
     archived: dict[str, float] = {}
+    seen: dict[str, dict] = {}
     for r in ledger or []:
         cid = str(r.get("channel_id") or "")
         if not cid:
             continue
         if r.get("event") == "outcome" and str(r.get("outcome") or "").startswith("archived"):
-            archived[cid] = float(r.get("ts") or 0)
+            at = float(r.get("archive_ts") or r.get("ts") or 0)
+            archived[cid] = max(archived.get(cid, 0.0), at)
         elif r.get("event") == "unarchived_seen":
             at = float(r.get("unarchive_ts") or r.get("ts") or 0)
-            if at >= archived.get(cid, 0):
-                out[cid] = {"at": at, "by": str(r.get("by") or "")}
+            if cid not in seen or at >= seen[cid]["at"]:
+                seen[cid] = {"at": at, "by": str(r.get("by") or "")}
+    out: dict = {}
+    for cid in set(archived) | set(seen):
+        s = seen.get(cid)
+        if s is not None and s["at"] >= archived.get(cid, 0.0):
+            out[cid] = s
+        elif cid in archived:
+            out[cid] = {"at": None, "by": "", "unconfirmed": True}
     return out
 
 

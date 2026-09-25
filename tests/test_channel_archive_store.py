@@ -115,6 +115,17 @@ class TestLedger:
         assert "C2" in ua    # a later unarchive of an earlier archive is still an unarchive
 
 
+def test_a_reconciled_already_archived_outcome_folds_terminal_even_without_its_store_event():
+    """D-051 r1 c1-monitor#1: the monitor's `already_archived (reconciled)` ledger outcome
+    must read ALREADY_ARCHIVED on the claim-expiry path too (a lost store append)."""
+    pid = stage()
+    st.append_event(st.CLAIMED, proposal_id=pid, cid="C0AAAAAAA1", ts=NOW)
+    st.append_ledger("intent", proposal_id=pid, channel_id="C0AAAAAAA1", tapped_by=HARRISON, ts=NOW + 1)
+    st.append_ledger("outcome", proposal_id=pid, channel_id="C0AAAAAAA1",
+                     outcome="already_archived (reconciled)", ts=NOW + 5000)
+    assert st.fold(now=NOW + 6000).proposals[pid].state_of("C0AAAAAAA1") == st.ALREADY_ARCHIVED
+
+
 class TestClaims:
     def test_claim_expiry_releases_without_an_intent(self):
         pid = stage()
