@@ -221,8 +221,11 @@ def _mkdb(tmp_path: Path) -> Path:
 
 def _root(tmp_path: Path) -> Path:
     """The Founder-OS tree on disk: the ARCHIVE row's OLD path is still live (HELD),
-    the MOVE rows' old paths are gone and their new paths are live."""
+    the MOVE rows' old paths are gone and their new paths are live. It carries the
+    real root's anchor folders (00-Founder, _shared): the gate refuses a root without."""
     root = tmp_path / "HJR-Founder-OS"
+    for anchor in ("00-Founder", "_shared"):
+        (root / anchor).mkdir(parents=True, exist_ok=True)
     for rel in (R_ARCHIVE_OLD, R_MOVE_NEW, R_META_NEW):
         p = root / Path(rel.replace("\\", "/"))
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -408,6 +411,54 @@ class TestStaticOldPaths:
         env.csv = _csv(tmp_path / "bad.csv", [("a.md", "b.md", "DELETE")])
         _, data = env.dry()
         assert data["lanes"]["rb3_static_old_paths"]["stops"][0]["reason"].startswith("CSV refused: row 1")
+
+    # D-051 r1 purge#2: a wrong root / a gone mount must STOP, never read as ABSENT.
+    @pytest.mark.parametrize("where", ["unrelated", "sub-folder"])
+    def test_a_root_without_its_anchor_folders_stops_the_lane(self, env, where):
+        if where == "unrelated":
+            env.root = env.tmp / "some-other-existing-dir"
+            env.root.mkdir()
+        else:
+            env.root = env.root / "_shared"                          # a typo'd --founder-root one level down
+        _, data = env.dry()
+        lane = data["lanes"]["rb3_static_old_paths"]
+        assert lane["chunk_ids"] == [] and lane["stops"], lane["counts"].get("rows")
+        assert "anchor folders" in lane["stops"][0]["reason"] and "Founder-OS root" in lane["stops"][0]["reason"]
+
+    def test_a_mount_gone_mid_gate_stops_instead_of_reading_absent(self, env, monkeypatch):
+        from cora import drive_io
+        real_exists, real_static_ids = drive_io.exists, pk._static_ids
+        gone = {"on": False}
+
+        def _exists(path, **kw):                    # Path.exists on a gone drive letter: False, no raise
+            return False if gone["on"] else real_exists(path, **kw)
+
+        def _static_ids(conn, relpath):              # the root check passed; the mount drops as the rows start
+            gone["on"] = True
+            return real_static_ids(conn, relpath)
+        monkeypatch.setattr(drive_io, "exists", _exists)
+        monkeypatch.setattr(pk, "_static_ids", _static_ids)
+        _, data = env.dry("--lanes", "rb3_static_old_paths")
+        lane = data["lanes"]["rb3_static_old_paths"]
+        assert lane["chunk_ids"] == [], "row 1 (ARCHIVE, old path LIVE) was planned on absence alone"
+        assert lane["stops"] and "mount unavailable" in lane["stops"][0]["reason"]
+
+    def test_an_apply_under_a_different_root_refuses(self, env):
+        import shutil
+        intent, data = env.dry("--lanes", "rb3_static_old_paths")
+        assert sorted(data["lanes"]["rb3_static_old_paths"]["chunk_ids"]) == ["c2", "c3", "c5"]
+        other = env.tmp / "copy-of-the-tree"
+        shutil.copytree(env.root, other)                        # same files, same anchors -- a different root
+        real = env.root
+        env.root = other
+        digest = env.digest()
+        assert env.apply(intent, "--lanes", "rb3_static_old_paths") == 1 and env.digest() == digest
+        assert {"c2", "c3", "c5"} <= env.ids()
+        counts = data["lanes"]["rb3_static_old_paths"]["counts"]
+        assert counts["founder_root_sha256"] == pk.founder_root_digest(real) != pk.founder_root_digest(other)
+        _no_text(json.dumps(data))
+        env.root = real
+        assert env.apply(intent, "--lanes", "rb3_static_old_paths") == 0 and {"c2", "c3", "c5"}.isdisjoint(env.ids())
 
 
 # ── rb3_archived_nonmd + rb2_personal_finances ───────────────────────────────
@@ -638,6 +689,40 @@ class TestApply:
         digest = env.digest()
         assert env.apply(intent, "--lanes", lane) == 1 and env.digest() == digest
         assert cid in env.ids()
+
+    # D-051 r1 purge#0: the LEX hold is re-decided at --apply from the CURRENT entity --
+    # the folder lanes' selector re-run admits LEX rows (the hold is applied after it).
+    def test_a_planned_row_retagged_to_lex_refuses_without_release(self, env):
+        intent, data = env.dry()
+        assert "a3" in data["lanes"]["rb3_archived_nonmd"]["chunk_ids"]
+        c = sqlite3.connect(env.db)
+        c.execute("UPDATE knowledge_chunks SET entity='LEX' WHERE chunk_id='a3'")
+        c.commit()
+        c.close()
+        digest = env.digest()
+        assert env.apply(intent, "--lanes", "rb3_archived_nonmd") == 1 and env.digest() == digest
+        assert "a3" in env.ids()
+
+    def test_an_edited_intent_cannot_smuggle_the_held_lex_row(self, env):
+        intent, data = env.dry()
+        assert [h["chunk_id"] for h in data["lanes"]["rb3_archived_nonmd"]["holds"]] == ["a5"]
+        c = sqlite3.connect(env.db)
+        content, title = c.execute("SELECT content, title FROM knowledge_chunks WHERE chunk_id='a5'").fetchone()
+        c.close()
+        data["lanes"]["rb3_archived_nonmd"]["chunk_ids"].append("a5")
+        data["lanes"]["rb3_archived_nonmd"]["pre_sha256"]["a5"] = pk.chunk_digest(content, title)
+        intent.write_text(json.dumps(data), encoding="utf-8")
+        digest = env.digest()
+        assert env.apply(intent, "--lanes", "rb3_archived_nonmd") == 1 and env.digest() == digest
+        assert "a5" in env.ids()
+
+    def test_a_released_lex_row_is_applied_and_counted(self, env):
+        intent, data = env.dry("--release-lex", "rb3_archived_nonmd")
+        assert "a5" in data["lanes"]["rb3_archived_nonmd"]["chunk_ids"]
+        assert env.apply(intent, "--lanes", "rb3_archived_nonmd", "--release-lex", "rb3_archived_nonmd") == 0
+        assert "a5" not in env.ids()
+        rec = json.loads(sorted(env.out.glob("kb-purge-code15-APPLIED-*.json"))[0].read_text(encoding="utf-8"))
+        assert rec["lex_partition_gate"]["lex_chunks_in_released_lanes"] == {"rb3_archived_nonmd": 1}
 
     def test_a_zero_planned_lane_is_not_reverified(self, env, monkeypatch):
         intent, _ = env.dry()

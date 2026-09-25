@@ -19,6 +19,7 @@ Every token is ASSEMBLED at runtime (the pre-commit hook greps staged files).
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -357,6 +358,88 @@ class TestApply:
         rec = json.loads(sorted(out.glob("kb-purge-code15-APPLIED-*.json"))[0].read_text(encoding="utf-8"))
         assert rec["outcome"]["s1_tokens"]["errors"] == [{"chunk_id": "c-tok", "error": "RuntimeError"}]
 
+    # D-051 r1 lens-integration#2: the at-rest belt must not rest on the lane binding alone.
+    def test_a_redactor_returning_withheld_is_an_error_never_persisted(self, tmp_path, monkeypatch):
+        db = _mkdb(tmp_path / "kb")
+        out = tmp_path / "out"
+        intent = _dry(db, out)
+        before = _snapshot(db)
+        lane = pk.LANES["s1_tokens"]
+        # the egress redactor's fail-closed shape: (WITHHELD, 1) instead of a raise
+        monkeypatch.setitem(pk.LANES, "s1_tokens", pk.Lane(name=lane.name, action=lane.action,
+                                                            select=lane.select,
+                                                            redact=lambda _text: (st.WITHHELD, 1),
+                                                            residual=lane.residual))
+        assert pk.main(["--apply", "--manifest", str(intent), "--db", str(db), "--out-dir", str(out)]) == 0
+        assert st.WITHHELD not in (_row(db, "c-tok")[0] or "") and st.WITHHELD not in (_row(db, "c-tok")[1] or "")
+        assert _snapshot(db)["c-tok"] == before["c-tok"]
+        rec = json.loads(sorted(out.glob("kb-purge-code15-APPLIED-*.json"))[0].read_text(encoding="utf-8"))
+        o = rec["outcome"]["s1_tokens"]
+        assert o["errors"] == [{"chunk_id": "c-tok", "error": "withheld-returned"}] and o["rows_updated"] == 0
+
+    def test_the_s1_lane_is_bound_to_the_strict_redactor(self):
+        # the egress redactor returns WITHHELD on an engine error; only the strict one raises
+        assert pk.LANES["s1_tokens"].redact is st.redact_secret_tokens_strict
+
+    # D-051 r1 purge#0: the LEX hold is re-decided at --apply from the CURRENT entity.
+    def test_a_planned_row_retagged_to_lex_after_the_dry_run_refuses(self, tmp_path):
+        db = _mkdb(tmp_path / "kb")
+        out = tmp_path / "out"
+        intent = _dry(db, out)
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE knowledge_chunks SET entity='LEX' WHERE chunk_id='c-tok'")   # content/title unchanged
+        conn.commit()
+        conn.close()
+        digest = _bytes(db)
+        before = _snapshot(db)
+        args = ["--apply", "--manifest", str(intent), "--db", str(db), "--out-dir", str(out)]
+        assert pk.main(args) == 1
+        assert pk.main(args + ["--accept-delta"]) == 1               # a re-tag is not drift to accept
+        assert _bytes(db) == digest and _snapshot(db) == before     # refused on the read-only handle
+        assert SLACK_BOT in _row(db, "c-tok")[0]
+        assert not list(out.glob("kb-purge-code15-APPLIED-*"))
+
+    def test_an_edited_intent_cannot_plan_a_held_lex_row(self, tmp_path):
+        db = _mkdb(tmp_path / "kb")
+        out = tmp_path / "out"
+        intent = _dry(db, out)
+        data = json.loads(intent.read_text(encoding="utf-8"))
+        content, title = _row(db, "c-lex")[:2]
+        data["lanes"]["s1_tokens"]["chunk_ids"].append("c-lex")
+        data["lanes"]["s1_tokens"]["pre_sha256"]["c-lex"] = pk.chunk_digest(content, title)   # a correct digest
+        intent.write_text(json.dumps(data), encoding="utf-8")
+        before = _snapshot(db)
+        assert pk.main(["--apply", "--manifest", str(intent), "--db", str(db), "--out-dir", str(out)]) == 1
+        assert _snapshot(db) == before and SLACK_BOT in _row(db, "c-lex")[0]
+
+    def test_a_retag_between_the_pre_check_and_the_write_lock_refuses(self, tmp_path, monkeypatch):
+        # the re-verification runs AFTER the read-only partition pre-check; a re-tag that
+        # lands meanwhile is caught by the in-lock re-read
+        def _retag(conn, ctx, plan):
+            c = sqlite3.connect(db)
+            c.execute("UPDATE knowledge_chunks SET entity='LEX-LLC' WHERE chunk_id='c-plain'")
+            c.commit()
+            c.close()
+            return []
+        monkeypatch.setitem(pk.LANES, "rb_stub", dataclasses.replace(_stub_delete_lane(["c-plain"]), verify=_retag))
+        db = _mkdb(tmp_path / "kb")
+        out = tmp_path / "out"
+        intent = _dry(db, out)
+        assert pk.main(["--apply", "--manifest", str(intent), "--db", str(db), "--out-dir", str(out),
+                        "--lanes", "rb_stub"]) == 1
+        assert "c-plain" in _snapshot(db) and "c-plain" in _vec_ids(db)
+        assert not list(out.glob("kb-purge-code15-APPLIED-*"))
+
+    def test_a_released_lane_records_its_lex_count(self, tmp_path):
+        db = _mkdb(tmp_path / "kb")
+        out = tmp_path / "out"
+        released = _dry(db, out, "--release-lex", "s1_tokens")
+        assert pk.main(["--apply", "--manifest", str(released), "--db", str(db), "--out-dir", str(out),
+                        "--release-lex", "s1_tokens"]) == 0
+        rec = json.loads(sorted(out.glob("kb-purge-code15-APPLIED-*.json"))[0].read_text(encoding="utf-8"))
+        assert rec["lex_partition_gate"] == {"released_lanes": ["s1_tokens"],
+                                             "lex_chunks_in_released_lanes": {"s1_tokens": 1}}
+
 
 # ── the lane registry (RIDER B plugs in here) ────────────────────────────────
 def _stub_delete_lane(ids, *, files=0, stops=None, holds=None):
@@ -476,6 +559,29 @@ class TestLargeGate:
         assert "c-plain" not in _snapshot(db)
         rec = json.loads(sorted(out.glob("kb-purge-code15-APPLIED-*.json"))[0].read_text(encoding="utf-8"))
         assert rec["heartbeat"]["stopped"] is True and rec["union"]["is_large"] is True
+
+    # D-051 r1 purge#1: the LARGE gate is re-read UNDER the write lock.
+    def test_cora_back_during_reverification_refuses_at_the_write_lock(self, tmp_path, monkeypatch):
+        hb = _hb(tmp_path / "heartbeat.txt", 900)                  # stale by both clocks at the first read
+
+        def _cora_comes_back(conn, ctx, plan):                     # stands in for the minutes-long Drive re-walk
+            _hb(hb, 0)
+            return []
+        monkeypatch.setitem(pk.LANES, "rb_stub", dataclasses.replace(
+            _stub_delete_lane(["c-plain"], files=101), verify=_cora_comes_back))
+        db = _mkdb(tmp_path / "kb")
+        out = tmp_path / "out"
+        intent = _dry(db, out)
+        assert json.loads(intent.read_text(encoding="utf-8"))["union"]["is_large"] is True
+        assert pk.main(self._args(db, out, intent, hb)) == 1
+        assert "c-plain" in _snapshot(db) and "c-plain" in _vec_ids(db)
+        assert not list(out.glob("kb-purge-code15-APPLIED-*"))
+        _hb(hb, 900)
+        monkeypatch.setitem(pk.LANES, "rb_stub", _stub_delete_lane(["c-plain"], files=101))
+        assert pk.main(self._args(db, out, intent, hb)) == 0       # stopped throughout: applies
+        rec = json.loads(sorted(out.glob("kb-purge-code15-APPLIED-*.json"))[0].read_text(encoding="utf-8"))
+        assert rec["heartbeat"]["stopped"] is True and rec["heartbeat_at_write_lock"]["stopped"] is True
+        assert rec["heartbeat_at_write_lock"].keys() == {"exists", "content_age_s", "mtime_age_s", "stopped"}
 
     def test_allow_live_overrides(self, large):
         db, out, intent, hb = large

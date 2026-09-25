@@ -46,6 +46,10 @@ is RE-VERIFIED at --apply before any write):
                            existence-gated against the Founder-OS root (--founder-root):
                            PURGE only when the old path is ABSENT (a MOVE also needs its
                            new path live with >= 1 static_md row), else HELD with the why.
+                           The root must carry its anchor folders (00-Founder, _shared) and
+                           an absence counts only while they still answer (a gone mount
+                           STOPS the lane); the root's digest is recorded and an apply
+                           under a different root refuses.
     rb3_archived_nonmd     item 3: the positive leaf _archive\dedup-2026-09 (folder mode,
                            --expect-leaf dedup-2026-09) -- source='drive_sweep' ONLY; the
                            drive_asset cards are KEPT and counted.
@@ -74,12 +78,17 @@ RUN SHAPE (the refile_misrouted_session_captures / D-086 shape):
   * ``--apply`` refuses without ``--manifest``; refuses a manifest for another DB;
     refuses any selected lane with stops, an action that disagrees with the code, a
     LEX release the INTENT does not record (or one the apply does not repeat);
-    refuses when any chunk's current sha256 differs from the INTENT (or the chunk
-    vanished) unless ``--accept-delta``; and when the DELETE-lane union is LARGE
+    refuses when a planned chunk's CURRENT ``entity`` is in the LEX partition and its
+    lane is not released at this apply (re-read on the read-only handle AND under the
+    write lock -- a re-tag is not content drift, and an edited INTENT can carry a
+    held id); refuses when any chunk's current sha256 differs from the INTENT (or the
+    chunk vanished) unless ``--accept-delta``; and when the DELETE-lane union is LARGE
     (>500 chunks or >100 files, D-087) it requires Cora STOPPED -- the heartbeat file
     must EXIST and be older than 300 s by both its content stamp and its mtime; a
     MISSING or unparseable heartbeat refuses (fail closed) unless ``--allow-live``.
-    Every refusal happens BEFORE the first write.
+    The heartbeat is read before the lanes' re-verification AND again under the
+    write lock (BEGIN IMMEDIATE); both readings go in the APPLIED record. Every
+    refusal happens BEFORE the first write (an in-lock refusal rolls back).
   * The apply connection is ``kb_archive.connect_rw`` (vec0 loaded, so the DELETE
     cascade really deletes) with ``PRAGMA secure_delete=ON``. REDACT is ``UPDATE
     knowledge_chunks SET content=?, title=?`` with the STRICT redactor (a redactor
@@ -636,15 +645,45 @@ def _static_ids(conn: sqlite3.Connection, relpath: str) -> list[str]:
         "SELECT chunk_id FROM knowledge_chunks WHERE source='static_md' AND source_id = ?", (relpath,))]
 
 
-def _fs_exists(path: Path) -> bool:
-    """drive_io.exists: a real bool while the mount answers; DriveUnavailable (an
-    OSError) when it is gone -- "gone" must never read as "absent" here."""
+#: Top-level folders every real Founder-OS root carries. The existence gate runs only
+#: under a root that has ALL of them (a typo'd / sub-folder / unrelated --founder-root
+#: would read every old path as ABSENT), and an absence counts only while they still
+#: answer (a mount that went away mid-gate).
+FOUNDER_ROOT_ANCHORS = ("00-Founder", "_shared")
+
+
+def _anchors_present(root: Path) -> bool:
     from cora import drive_io  # noqa: PLC0415
-    return drive_io.exists(path)
+    return all(drive_io.exists(Path(root) / a) and (Path(root) / a).is_dir() for a in FOUNDER_ROOT_ANCHORS)
+
+
+def _fs_exists(path: Path, root: Path | None = None) -> bool:
+    """drive_io.exists, made safe for an ABSENCE verdict. drive_io.exists wraps
+    pathlib.Path.exists, which SWALLOWS ENOENT / WinError 21 / 123: a gone drive
+    letter returns False WITHOUT raising (DriveUnavailable fires only in hang /
+    timeout mode). So a False is re-probed against ``root``'s anchor folders, and
+    raises DriveUnavailable (an OSError) when they no longer answer -- "gone" must
+    never read as "absent" here."""
+    from cora import drive_io  # noqa: PLC0415
+    if drive_io.exists(path):
+        return True
+    if root is not None and not _anchors_present(root):
+        raise drive_io.DriveUnavailable("the Founder-OS root's anchor folders stopped answering -- mount gone?")
+    return False
 
 
 def _founder_root_ok(root: Path | None) -> bool:
-    return root is not None and _fs_exists(root) and Path(root).is_dir()
+    """The root exists, is a directory and carries every FOUNDER_ROOT_ANCHORS folder."""
+    return root is not None and _fs_exists(root) and Path(root).is_dir() and _anchors_present(root)
+
+
+def founder_root_digest(root: Path | None) -> str | None:
+    """sha256 of the normalised absolute --founder-root (no filesystem access): the
+    INTENT records it; an apply under a different root refuses."""
+    if root is None:
+        return None
+    norm = os.path.normcase(os.path.abspath(str(root)))
+    return hashlib.sha256(norm.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def _hash_store_keys(path: Path | None) -> set[str] | None:
@@ -703,9 +742,11 @@ def select_rb3_static(conn: sqlite3.Connection, ctx: RunContext) -> LanePlan:
                                      f"gate cannot run"})
         return plan
     if not root_ok:
-        plan.stops.append({"reason": "the Founder-OS root is missing or not a directory -- the existence gate "
-                                     "cannot run (a missing root would read every old path as absent)"})
+        plan.stops.append({"reason": f"the Founder-OS root is missing, not a directory, or lacks its anchor "
+                                     f"folders ({', '.join(FOUNDER_ROOT_ANCHORS)}) -- the existence gate cannot "
+                                     f"run (a missing or wrong root would read every old path as absent)"})
         return plan
+    plan.counts["founder_root_sha256"] = founder_root_digest(ctx.founder_root)
     keys = _hash_store_keys(ctx.hash_store)
     records: list[dict[str, Any]] = []
     purge_ids: list[str] = []
@@ -713,8 +754,8 @@ def select_rb3_static(conn: sqlite3.Connection, ctx: RunContext) -> LanePlan:
         for row in rows:
             old_ids = _static_ids(conn, row.old)
             new_n = len(_static_ids(conn, row.new))
-            old_exists = _fs_exists(Path(ctx.founder_root) / row.old)
-            new_exists = _fs_exists(Path(ctx.founder_root) / row.new)
+            old_exists = _fs_exists(Path(ctx.founder_root) / row.old, ctx.founder_root)
+            new_exists = _fs_exists(Path(ctx.founder_root) / row.new, ctx.founder_root)
             disposition, reason = static_gate(row, len(old_ids), new_n, old_exists, new_exists)
             records.append({
                 "row": row.index, "action": row.action,
@@ -757,9 +798,13 @@ def verify_rb3_static(conn: sqlite3.Connection, ctx: RunContext, plan: LanePlan)
         return [f"CSV refused/unreadable at apply ({type(exc).__name__})"]
     if digest != plan.counts.get("csv_sha256"):
         return ["the CSV changed since the dry-run (sha256 differs) -- re-run the dry-run"]
+    if founder_root_digest(ctx.founder_root) != plan.counts.get("founder_root_sha256"):
+        return ["the --founder-root differs from the dry-run's (digest mismatch) -- apply with the SAME root, "
+                "or re-run the dry-run"]
     try:
         if not _founder_root_ok(ctx.founder_root):
-            return ["the Founder-OS root is missing or not a directory"]
+            return [f"the Founder-OS root is missing, not a directory, or lacks its anchor folders "
+                    f"({', '.join(FOUNDER_ROOT_ANCHORS)})"]
         by_index = {r.index: r for r in rows}
         out: list[str] = []
         selectable: set[str] = set()
@@ -771,10 +816,10 @@ def verify_rb3_static(conn: sqlite3.Connection, ctx: RunContext, plan: LanePlan)
                 out.append(f"row {rec.get('row')}: not in the CSV")
                 continue
             selectable.update(_static_ids(conn, row.old))
-            if _fs_exists(Path(ctx.founder_root) / row.old):
+            if _fs_exists(Path(ctx.founder_root) / row.old, ctx.founder_root):
                 out.append(f"row {row.index}: the old path is LIVE again")
             if row.action == "MOVE":
-                if not _fs_exists(Path(ctx.founder_root) / row.new):
+                if not _fs_exists(Path(ctx.founder_root) / row.new, ctx.founder_root):
                     out.append(f"row {row.index}: the MOVE target is gone")
                 elif not _static_ids(conn, row.new):
                     out.append(f"row {row.index}: the MOVE target has no static_md rows")
@@ -1135,6 +1180,9 @@ RESIDUALS = [
     "repeats it).",
     "WAL: a pre-redaction page image can persist in the -wal file until a checkpoint resets it; "
     "secure_delete zeroes freed pages of the main file only.",
+    "LARGE gate: a Cora started less than 60 s before the write lock has not written its first "
+    "heartbeat yet, so the in-lock re-check cannot see it -- the stop window's disabled tasks and "
+    "empty process listing are the gate for that window.",
     "Out of this script's reach: the G: session-capture notes, the Claude Desktop Cowork store "
     "and the ~/.claude Code transcripts keep any raw token they hold -- and redaction never "
     "un-leaks a secret: the credentials themselves must be rotated / revoked.",
@@ -1327,10 +1375,14 @@ def run_apply(db: Path, out_dir: Path, manifest: Path, *, lanes: list[str] | Non
     ctx = RunContext(release_lex=frozenset(release_lex), csv_path=csv_path, founder_root=founder_root,
                      hash_store=hash_store, accept_delta=accept_delta, drive_factory=drive_factory,
                      folder_dir=_folder_dir(Path(manifest).resolve().parent, str(data.get("stamp") or "")))
-    # Drift gate + every lane's re-verification on a READ-ONLY handle first: a
-    # refusal must precede every write (connect_rw alone issues writer pragmas).
+    # Drift gate + the LEX partition gate + every lane's re-verification on a
+    # READ-ONLY handle first: a refusal must precede every write (connect_rw alone
+    # issues writer pragmas).
     ro = kb_archive.connect_ro(db)
     try:
+        lex_refusals, _ = _partition_gate(ro, plans, frozenset(release_lex))
+        if lex_refusals:
+            raise Refused("; ".join(lex_refusals) + " -- nothing written; re-run the dry-run")
         verified = _verify_lanes(ro, ctx, plans)
         vanished, drifted = _drift(ro, plans, all_ids)
     finally:
@@ -1343,11 +1395,25 @@ def run_apply(db: Path, out_dir: Path, manifest: Path, *, lanes: list[str] | Non
     try:
         conn.execute("PRAGMA secure_delete=ON")
         conn.execute("BEGIN IMMEDIATE")   # ONE transaction: re-verify, redact, delete, commit
+        # The LARGE gate again, UNDER the write lock: the first reading precedes the
+        # lanes' re-verification (the folder lanes re-walk Drive for minutes), so a
+        # Cora that came back meanwhile is only seen here. (A bot started < 60 s ago
+        # has not written its first heartbeat yet -- the runbook's disabled tasks +
+        # empty process listing cover that window, not this file.)
+        hb_lock = heartbeat_evidence(heartbeat_path)
+        if union["is_large"] and not hb_lock["stopped"] and not allow_live:
+            conn.rollback()
+            raise Refused(f"LARGE apply: Cora no longer looks STOPPED at the write lock ({hb_lock.get('why')}) "
+                          f"-- nothing written; stop Cora and re-run the apply, or pass --allow-live")
         v2, d2 = _drift(conn, plans, all_ids)
         if (set(v2), set(d2)) != (set(vanished), set(drifted)):
             conn.rollback()
             raise Refused("the KB changed between the drift check and the write lock -- nothing written; "
                           "re-run the apply")
+        lex_refusals, lex_released = _partition_gate(conn, plans, frozenset(release_lex))
+        if lex_refusals:
+            conn.rollback()
+            raise Refused("; ".join(lex_refusals) + " (at the write lock) -- nothing written; re-run the dry-run")
         vanished_set = set(vanished)
         delete_set = {cid for p in plans.values() if p.action == "DELETE" for cid in p.chunk_ids} - vanished_set
         outcome: dict[str, Any] = {}
@@ -1386,6 +1452,8 @@ def run_apply(db: Path, out_dir: Path, manifest: Path, *, lanes: list[str] | Non
         "intent": str(manifest), "db": str(Path(db).resolve()), "lanes": selected,
         "release_lex": sorted(release_lex), "accept_delta": accept_delta, "allow_live": allow_live,
         "union": union, "heartbeat": {k: hb[k] for k in ("exists", "content_age_s", "mtime_age_s", "stopped")},
+        "heartbeat_at_write_lock": {k: hb_lock[k] for k in ("exists", "content_age_s", "mtime_age_s", "stopped")},
+        "lex_partition_gate": {"released_lanes": sorted(release_lex), "lex_chunks_in_released_lanes": lex_released},
         "drift": {"changed": sorted(set(drifted)), "vanished": vanished},
         "outcome": outcome, "wal_checkpoint": checkpoint,
         "verified": verified,
@@ -1406,6 +1474,38 @@ def _drift(conn: sqlite3.Connection, plans: dict[str, LanePlan],
     drifted = sorted({cid for p in plans.values() for cid in p.chunk_ids
                       if cid in now and now[cid] != p.pre_sha256.get(cid)})
     return vanished, drifted
+
+
+def _lex_partition_ids(conn: sqlite3.Connection, ids: list[str]) -> list[str]:
+    """The ids among ``ids`` whose CURRENT ``entity`` is in the LEX partition."""
+    out: list[str] = []
+    uniq = sorted(set(ids))
+    for i in range(0, len(uniq), _ID_BATCH):
+        batch = uniq[i:i + _ID_BATCH]
+        ph = ",".join("?" * len(batch))
+        out.extend(cid for cid, entity in conn.execute(
+            f"SELECT chunk_id, entity FROM knowledge_chunks WHERE chunk_id IN ({ph})", batch)
+            if is_lex_partition(entity))
+    return sorted(out)
+
+
+def _partition_gate(conn: sqlite3.Connection, plans: dict[str, LanePlan],
+                    release_lex: frozenset[str]) -> tuple[list[str], dict[str, int]]:
+    """The LEX hold, re-decided at --apply from the CURRENT ``entity`` of every planned
+    id (the dry-run's hold is a point-in-time read, and chunk_digest covers content +
+    title only -- a re-tag is not drift, and an edited INTENT can carry a held id).
+    Returns ``(refusals, lex_in_released)``: a lane NOT released at this apply that
+    plans a LEX-partition chunk refuses; a released lane's LEX count is recorded."""
+    refusals: list[str] = []
+    released: dict[str, int] = {}
+    for n, p in plans.items():
+        lex = _lex_partition_ids(conn, p.chunk_ids) if p.chunk_ids else []
+        if n in release_lex:
+            released[n] = len(lex)
+        elif lex:
+            refusals.append(f"lane {n}: {len(lex)} planned chunk(s) are in the LEX partition now and the lane "
+                            f"is not released (--release-lex {n} on the dry-run AND the apply)")
+    return refusals, released
 
 
 def _verify_lanes(conn: sqlite3.Connection, ctx: RunContext, plans: dict[str, LanePlan]) -> dict[str, str]:
@@ -1464,7 +1564,9 @@ def _redact_lane(conn: sqlite3.Connection, lane: Lane, plan: LanePlan,
     """UPDATE content/title in place with the lane's STRICT redactor, inside the
     caller's transaction (no commit here). A chunk also in a DELETE lane is skipped
     (it is deleted instead); a redactor error skips the chunk -- a withheld marker
-    is never persisted over a chunk."""
+    is never persisted over a chunk: a redactor that RETURNS the withheld marker
+    (the egress redactor's fail-closed shape, were a lane ever bound to it) is
+    treated as that same error, not written."""
     assert lane.redact is not None and lane.residual is not None
     targets = [cid for cid in plan.chunk_ids if cid not in delete_set and cid not in vanished]
     res: dict[str, Any] = {
@@ -1485,6 +1587,9 @@ def _redact_lane(conn: sqlite3.Connection, lane: Lane, plan: LanePlan,
             new_t, n_t = lane.redact(title or "")
         except Exception as exc:  # noqa: BLE001 -- skip the chunk; never persist a withheld shell
             res["errors"].append({"chunk_id": cid, "error": type(exc).__name__})
+            continue
+        if new_c == secret_tokens.WITHHELD or new_t == secret_tokens.WITHHELD:
+            res["errors"].append({"chunk_id": cid, "error": "withheld-returned"})
             continue
         if not (n_c or n_t):
             continue
