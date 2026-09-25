@@ -628,6 +628,52 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
         def _no_real_drive():
             raise RuntimeError("tests/conftest.py: the real Drive service is disabled in tests")
         monkeypatch.setattr(_kbp, "DRIVE_SERVICE_FACTORY", _no_real_drive, raising=False)
+    # Code #15 rider (c): D-243 fixture pollution -- three writers found by the
+    # 2026-09-24 worktree ROOT differential (touch a marker, run the suite, list
+    # logs/ data/ design/ newer than it), each with measured LIVE damage in the
+    # primary: hygiene-deferred.jsonl 22,000 of 22,117 rows fixture,
+    # cora-finance-queries.jsonl 2,448 of 2,505 rows fixture, and the
+    # info-for-cora run-state stamped fresh by a test (nightly_health_check then
+    # reads a dead sweep as alive for 48h). Self-contained; a test that patches
+    # one of these itself still wins (its monkeypatch runs after this one).
+    #   (1)+(3) SCRIPT modules: same sys.modules-only rule as _SCRIPT_CONSTS above
+    #   (importing a script here would run its import-time load_dotenv on every
+    #   test). Both spellings are listed because the suite imports
+    #   each script BOTH ways (`import run_info_for_cora_sweep` in
+    #   test_info_for_cora_liveness, `import scripts.run_info_for_cora_sweep` in
+    #   test_info_for_cora_sweep) and those are two distinct module objects. Every
+    #   current importer does so at module top, i.e. at COLLECTION, so the module
+    #   is in sys.modules before this fixture first runs (pinned by
+    #   tests/test_conftest_d243_rider_c.py). A future LAZY importer is caught by
+    #   the _GUARDED_LEDGERS rows added below, not silently missed. THROTTLE_FILE,
+    #   _WATERMARK_PATH and _LOCK_PATH ride as belts beside the measured writers:
+    #   same modules, same class, every existing writer test already patches them.
+    for _mod_name, _attr, _fname in (
+        ("run_asana_hygiene_nudges", "DEFERRED_FILE", "hygiene-deferred.jsonl"),
+        ("scripts.run_asana_hygiene_nudges", "DEFERRED_FILE", "hygiene-deferred.jsonl"),
+        ("run_asana_hygiene_nudges", "THROTTLE_FILE", "hygiene_nudge_throttle.json"),
+        ("scripts.run_asana_hygiene_nudges", "THROTTLE_FILE", "hygiene_nudge_throttle.json"),
+        ("run_info_for_cora_sweep", "_RUNSTATE_PATH", "info-for-cora-runstate.json"),
+        ("scripts.run_info_for_cora_sweep", "_RUNSTATE_PATH", "info-for-cora-runstate.json"),
+        ("run_info_for_cora_sweep", "_WATERMARK_PATH", "info-for-cora-watermark.json"),
+        ("scripts.run_info_for_cora_sweep", "_WATERMARK_PATH", "info-for-cora-watermark.json"),
+        ("run_info_for_cora_sweep", "_LOCK_PATH", "info_for_cora_sweep.lock"),
+        ("scripts.run_info_for_cora_sweep", "_LOCK_PATH", "info_for_cora_sweep.lock"),
+    ):
+        _mod = _sys.modules.get(_mod_name)
+        if _mod is not None and hasattr(_mod, _attr):
+            monkeypatch.setattr(_mod, _attr, tmp_path / _fname, raising=False)
+    #   (2) src module cora.tools.financial_client: _audit_log_path() and
+    #   _throttle_path() are FUNCTIONS of _repo_root(), so the redirect is at that
+    #   ROOT (D-243: mount root, not per path) -- both files, and any future path
+    #   built on it, land under tmp. tests/test_financial_client.py's own autouse
+    #   _repo_root patch (and every per-test _throttle_path patch) still wins.
+    try:
+        import cora.tools.financial_client as _fcl
+        monkeypatch.setattr(_fcl, "_repo_root", lambda: tmp_path / "financial-client-root",
+                            raising=False)
+    except Exception:
+        pass
     yield
     os.environ["CORA_DISABLE_HUBSPOT_PORTAL_GUARD"] = "1"
     try:
@@ -712,6 +758,14 @@ _GUARDED_LEDGERS = (
     # Code #13 Rider 1 S-A: the cora@ mailbox intake sweep's watermark (writer:
     # scripts/run_mailbox_intake_sweep.py --apply; redirected via MAILBOX_INTAKE_WATERMARK_PATH).
     "data/state/mailbox-intake-watermark.json",
+    # Code #15 rider (c): the D-243 root-differential writers redirected in the
+    # autouse fixture above (see the "Code #15 rider (c)" block there).
+    "data/state/hygiene-deferred.jsonl",
+    "data/state/hygiene_nudge_throttle.json",
+    "logs/cora-finance-queries.jsonl",
+    "data/cache/finance-notify-throttle.json",
+    "data/state/info-for-cora-runstate.json",
+    "data/state/info-for-cora-watermark.json",
 )
 
 
