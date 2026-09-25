@@ -170,6 +170,6 @@ run_markers:
     expects_output: false     # a day with no human note emailed to cora@ legitimately queues 0 proposals
     registered: 2026-09-19T00:00:00+00:00   # the marker WARNs 'never recorded' until Harrison registers the task -- that is the reminder
   - name: cowork-cora-channel-archive-proposal
-    cadence_hours: 168        # weekly Monday 07:07 AZ (Code #16 C1; deployment/setup-channel-archive-proposal-task.ps1); EVERY --apply --monthly fire writes a marker (delivered / skipped / FAILED month_undelivered)
+    cadence_hours: 168        # weekly Monday 07:07 AZ (Code #16 C1; deployment/setup-channel-archive-proposal-task.ps1); EVERY --apply --monthly fire writes a marker (delivered / skipped / FAILED month_undelivered|month_blind|month_partial)
     expects_output: false     # three Mondays a month legitimately skip (not due / already delivered)
     registered: 2026-09-25T00:00:00+00:00   # the marker WARNs 'never recorded' until Harrison registers the task (after the restart) -- that is the reminder

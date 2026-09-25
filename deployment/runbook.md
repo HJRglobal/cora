@@ -216,11 +216,17 @@ any T0 card.**
   previously unarchived, history longer than 2,000 messages). Non-overridable and never
   listed: the sweep deny-list (never read, never named), general, Slack Connect,
   #info-for-cora, `*-leadership` / `*-finance`, pinned, < 30 days old, a 90-day Keep.
-- **Monthly gate:** the task fires every Monday; the script delivers only when today
-  (AZ) is on/after the month's first Monday AND no monthly card went out this month,
-  so a Tuesday catch-up still delivers. Run marker every `--apply --monthly` fire:
-  ok delivered / ok skipped / **FAILED `month_undelivered` + exit 1** (WARNs until a
-  card goes out). Dry runs and `--clear-demotion` write no marker.
+- **Monthly gate:** the task fires every Monday; the script delivers only INSIDE the
+  month's first-Monday week (AZ: first Monday <= today < first Monday + 7 days) and
+  only until a non-blind, fully delivered monthly card went out this month -- so a
+  Tuesday catch-up still delivers, and a task registered late in a month (e.g. after
+  the 9/25 restart) sends nothing until the NEXT first Monday (10/5) instead of a
+  surprise card that would supersede an open ask card. Run marker every `--apply
+  --monthly` fire: ok delivered / ok skipped / **FAILED `month_undelivered` (incl. a
+  crash), `month_blind` (the card proposed nothing) or `month_partial` (a continuation
+  message did not post) + exit 1**. A blind or partial card is not the month's card:
+  re-run `--apply --monthly` inside the same week once the cause is fixed. Dry runs and
+  `--clear-demotion` write no marker.
 - **Blind scans propose nothing and say why** (registry / deny-list / store
   unreadable, Slack's list incomplete, bot identity unknown). The registry is read from
   `_shared\playbooks\slack-channel-registry.md` and counts only when all nine entity

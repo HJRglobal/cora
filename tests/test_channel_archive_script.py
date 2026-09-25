@@ -112,8 +112,65 @@ class TestMonthly:
         m = markers()[-1]
         assert m["ok"] is False and m["outcome"] == "month_undelivered"
         fake.post_behaviour = None
-        assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 12)) == 0   # retried next week
+        assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 6)) == 0   # retried inside the week
         assert markers()[-1]["outcome"] == "delivered"
+
+
+class TestMonthlyGateD051:
+    """D-051 r1 registry-ops#0 + #4 (orchestrator ruling): a monthly card is due ONLY in
+    the month's first-Monday week (AZ) and only until a NON-blind, FULLY delivered
+    monthly card went out this calendar month. A blind card is ok=False month_blind, a
+    partial one ok=False month_partial (both exit 1), and neither counts as the month's
+    card, so a same-week re-run retries."""
+
+    def test_a_late_month_registration_waits_for_the_next_first_monday(self, fake):
+        """The 9/28 case: registered after the restart, September's first Monday (9/7)
+        long gone -> no surprise catch-up card superseding an open ask card."""
+        assert SCRIPT.monthly_due(az(2026, 9, 28), st.fold(events=[], ledger=[])) == (
+            False, "not_due_after_first_monday_week")
+        assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 9, 28)) == 0
+        m = markers()[-1]
+        assert m["ok"] is True and m["outcome"] == "skipped:not_due_after_first_monday_week"
+        assert not fake.posts
+        assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 5)) == 0
+        assert markers()[-1]["outcome"] == "delivered" and len(fake.posts) == 1
+
+    def test_the_week_window_edges(self):
+        empty = st.fold(events=[], ledger=[])
+        assert SCRIPT.monthly_due(az(2026, 10, 11, 23, 59), empty) == (True, "due")        # Sunday
+        assert SCRIPT.monthly_due(az(2026, 10, 12, 0, 1), empty)[0] is False                # +7 days
+        assert SCRIPT.monthly_due(az(2026, 10, 4, 23, 59), empty) == (False, "not_due_before_first_monday")
+
+    def test_a_blind_monthly_card_is_month_blind_and_is_retried_inside_the_week(self, fake, monkeypatch, capsys):
+        from cora.channel_archive import registry as reg
+        real_policy = reg.load_deny_policy
+        monkeypatch.setattr(reg, "load_deny_policy", lambda *a, **k: None)
+        assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 5)) == 1
+        m = markers()[-1]
+        assert m["ok"] is False and m["outcome"] == "month_blind" and "policy_unreadable" in m["detail"]
+        assert len(fake.posts) == 1                                   # the honest blind card went out
+        assert "FAILED" in capsys.readouterr().out
+        assert SCRIPT.monthly_due(az(2026, 10, 6), st.fold(now=az(2026, 10, 6))) == (True, "due")
+        monkeypatch.setattr(reg, "load_deny_policy", real_policy)
+        assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 6)) == 0
+        assert markers()[-1]["outcome"] == "delivered"
+        assert SCRIPT.monthly_due(az(2026, 10, 7), st.fold(now=az(2026, 10, 7))) == (
+            False, "already_delivered_this_month")
+
+    def test_a_partial_delivery_is_month_partial_and_not_the_months_card(self, monkeypatch):
+        from _chanarch_fakes import api_error
+        t = az(2026, 10, 5)
+        chans = [chan(f"C0DEAD{i:04d}", f"fx-dead-{i:02d}", now=t) for i in range(21)]
+        f = FakeSlack(channels=chans, history={c["id"]: [msg(200, now=t)] for c in chans},
+                      scopes=["channels:manage", "chat:write"])
+        monkeypatch.setattr(clients, "read_client_factory", lambda: f)
+        monkeypatch.setattr(clients, "write_client_factory", lambda: f)
+        monkeypatch.setattr("cora.channel_archive.classify.PACE_S", 0.0)
+        f.post_behaviour = lambda kw: api_error("ratelimited") if len(f.posts) >= 1 else None
+        assert SCRIPT.main(["--apply", "--monthly"], now=t) == 1
+        m = markers()[-1]
+        assert m["ok"] is False and m["outcome"] == "month_partial" and "1 of 2" in m["detail"]
+        assert SCRIPT.monthly_due(az(2026, 10, 6), st.fold(now=az(2026, 10, 6))) == (True, "due")
 
     def test_an_ask_card_does_not_count_as_the_monthly_one(self, fake):
         from cora.channel_archive import deliver

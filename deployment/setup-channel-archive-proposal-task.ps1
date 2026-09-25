@@ -2,13 +2,15 @@
 # cq-be90cea867c3, ladder row slack-channel-archive, born T0).
 #
 # Runs scripts/run_channel_archive_proposal.py --apply --monthly once a week. The
-# script itself decides whether this month's card is due: it delivers when today (AZ)
-# is on/after the month's first Monday AND no monthly card went out this calendar
-# month, otherwise it skips. A weekly trigger + that self-gate (rather than a schtasks
-# /MO FIRST trigger, which this repo has never exercised and which registers with
-# StartWhenAvailable=false) means a Monday the host was off is caught up the next
-# time it is on. NOTHING is archived by this task: archiving happens only on
-# Harrison's tap in the bot, and only after the lane is promoted.
+# script itself decides whether this month's card is due: it delivers only inside the
+# month's first-Monday week (AZ) and only until a non-blind, fully delivered monthly
+# card went out this calendar month, otherwise it skips. A weekly trigger + that
+# self-gate (rather than a schtasks /MO FIRST trigger, which this repo has never
+# exercised and which registers with StartWhenAvailable=false) means a first Monday
+# the host was off is caught up the next time it is on that week; a registration late
+# in a month waits for the next first Monday. NOTHING is archived by this task:
+# archiving happens only on Harrison's tap in the bot, and only after the lane is
+# promoted.
 #
 # WHEN: Monday 07:07 AZ. 07:05 is cowork-cora-bank-snapshot's daily slot; 07:07 was
 # unclaimed in the live-registry manifest (deployment\manifest\task-estate.md,
