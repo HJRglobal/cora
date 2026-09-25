@@ -30,7 +30,8 @@ dm_user_handles:
 # `aliases` (matched as whole words, and only in locative context -- "in X",
 # "near X", "the X area", or a slash/comma list that is -- so a surname or a
 # possessive "X's" is never read as a place). `key` is the stable id stored in the
-# lane's thread store.
+# lane's thread store. A locative alias hit is also one of the CUES that lets a weak
+# lodging noun ("condos in Scottsdale") withhold web on the normal Q&A path (B1).
 areas:
   # --- Phoenix metro + Arizona ---
   - {key: phoenix, name: Phoenix, state: Arizona, aliases: [phoenix, downtown phoenix, phx]}

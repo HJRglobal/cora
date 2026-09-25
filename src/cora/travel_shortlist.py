@@ -1801,11 +1801,12 @@ def route_turn(text: Any, *, user_id: str, channel_id: str, channel_name: str = 
     """None = not this lane's turn: the caller continues the ordinary path, where
     B1 still withholds web tools from lodging-shaped and lane-thread turns.
 
-    A turn IN A LANE THREAD is deterministic (B3) unless it is plainly another
-    capability (a remember / calendar / task / email / code-session / expense ask,
-    a retrieval grant, a pending write or a forced-tool intent): new fields re-run
-    the lane on the merged STRUCTURED fields; anything else gets the fixed
-    "I can re-search ...; I can't book" line. A fresh turn needs the allowed
+    A turn IN A LANE THREAD (one the lane created, live 48 h) is deterministic (B3)
+    unless it is plainly another capability (a remember / calendar / task / email /
+    code-session / expense ask, a retrieval grant, a pending write or a forced-tool
+    intent): a REFINEMENT-shaped turn with new fields re-runs the lane on the merged
+    STRUCTURED fields; anything else gets the fixed "I can re-search ...; I can't
+    book" line and bills nothing. A fresh turn needs the allowed
     surface (checked first) and the strict predicate; from there the lane never
     falls through (B2)."""
     if lane_thread:

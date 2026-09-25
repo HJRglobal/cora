@@ -279,9 +279,11 @@ class TestStrictFrame:
         assert not ts.looks_like_travel_ask(text, user_id="U_ANYONE", channel_id=TRAVEL_CHANNEL)
 
     @pytest.mark.parametrize("shape", [
+        " " * 40000, "find" + " " * 40000 + "hotels",
         "can you " * 5000, "find " + "a " * 20000 + "hotel", "find " + "nice, and " * 4000 + "x",
         "help me " * 5000 + "find hotels", "find the top " + "9 " * 13000,
-    ], ids=["polite-x5000", "det-x20000", "adj-x4000", "help-x5000", "top-x13000"])
+    ], ids=["spaces", "find-spaces-hotels", "polite-x5000", "det-x20000", "adj-x4000",
+            "help-x5000", "top-x13000"])
     def test_the_frame_regexes_are_linear_even_uncapped(self, shape):
         def run():
             ts._FRAME_RE.match(shape)
@@ -616,8 +618,13 @@ class TestDateParserRound1:
         assert pr.constraints is None and pr.malformed is True
 
     @pytest.mark.parametrize("shape", [
+        " " * 40000, "check in" + " " * 40000 + "oct 17",
         "check in oct 1 " * 2500, "arriving " * 5000, "oct 17-21 " * 4000, "for " * 10000,
-    ], ids=["check-in", "arriving", "ranges", "for"])
+    ], ids=["spaces", "check-in-spaces", "check-in", "arriving", "ranges", "for"])
     def test_the_date_candidates_are_linear(self, shape):
-        assert _best_of_3(lambda: ts._parse_dates(ts._norm(shape), TODAY)) < 0.25
+        def run():
+            ts._DATE_P6.search(shape)
+            ts._RANGE_CUE_BEFORE_RE.search(shape)
+            ts._parse_dates(ts._norm(shape), TODAY)
+        assert _best_of_3(run) < 0.25
         assert _best_of_3(lambda: ts.parse_constraints(shape, today=TODAY)) < 0.05
