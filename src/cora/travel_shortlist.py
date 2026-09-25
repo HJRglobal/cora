@@ -48,6 +48,7 @@ import os
 import re
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -237,11 +238,29 @@ def _load_map() -> LaneMap:
 
 
 _warned_handles: set[str] = set()
+_HANDLE_TTL_S = 300.0
+_handle_cache: tuple[tuple, float, frozenset[str]] | None = None
+_handle_lock = threading.Lock()
 
 
 def _dm_user_ids(lm: LaneMap) -> frozenset[str]:
     """Harrison + the map's roster handles, resolved via org_roles (B10). An
-    unresolved handle logs ONE warning per process and has no DM surface."""
+    unresolved handle logs ONE warning per process and has no DM surface. The
+    resolution is cached for 5 minutes, keyed on (founder id, handles): this runs
+    for every DM ahead of the rate limiter (via the capture exclusion)."""
+    global _handle_cache
+    key = (founder_id(), lm.dm_handles)
+    now = time.monotonic()
+    with _handle_lock:
+        if _handle_cache is not None and _handle_cache[0] == key and now - _handle_cache[1] < _HANDLE_TTL_S:
+            return _handle_cache[2]
+    ids = _resolve_dm_user_ids(lm)
+    with _handle_lock:
+        _handle_cache = (key, now, ids)
+    return ids
+
+
+def _resolve_dm_user_ids(lm: LaneMap) -> frozenset[str]:
     ids = {founder_id()}
     if lm.dm_handles:
         try:
@@ -539,28 +558,38 @@ def _year(tok: str | None) -> int | None:
     return y + 2000 if y < 100 else y
 
 
+def _resolve_check_in(m: int, d: int, y: int | None, today: date) -> date | None:
+    """An explicit year wins; otherwise the next occurrence on or after today. None
+    for a day that does not exist, a past check-in, or one more than 2 years out."""
+    try:
+        if y is None:
+            ci = date(today.year, m, d)
+            if ci < today:
+                ci = date(today.year + 1, m, d)
+        else:
+            ci = date(y, m, d)
+    except ValueError:
+        return None
+    if ci < today or ci > today + timedelta(days=730):
+        return None
+    return ci
+
+
 def _resolve_stay(m1: int, d1: int, y1: int | None, m2: int, d2: int, y2: int | None,
                   today: date) -> tuple[date, date] | None:
-    """Year inference: an explicit year wins; otherwise the next occurrence on or
-    after today; a check-out on or before check-in rolls to the next year
-    (Dec 30 - Jan 2). None = malformed (bad day, past stay, 1..30 nights broken)."""
+    """Check-in per _resolve_check_in; a check-out on or before it (with no year of
+    its own) rolls to the next year (Dec 30 - Jan 2). None = malformed (bad day,
+    past stay, outside 1..30 nights)."""
+    ci = _resolve_check_in(m1, d1, y1, today)
+    if ci is None:
+        return None
     try:
-        if y1 is None:
-            ci = date(today.year, m1, d1)
-            if ci < today:
-                ci = date(today.year + 1, m1, d1)
-        else:
-            ci = date(y1, m1, d1)
         co = date(y2 if y2 is not None else ci.year, m2, d2)
         if co <= ci and y2 is None:
             co = date(ci.year + 1, m2, d2)
     except ValueError:
         return None
-    if ci < today or ci > today + timedelta(days=730):
-        return None
-    if not 1 <= (co - ci).days <= 30:
-        return None
-    return ci, co
+    return (ci, co) if 1 <= (co - ci).days <= 30 else None
 
 
 def _parse_dates(norm: str, today: date) -> tuple[tuple[date, date] | None, bool]:
@@ -573,20 +602,11 @@ def _parse_dates(norm: str, today: date) -> tuple[tuple[date, date] | None, bool
                              today), True
     m = _DATE_P5.search(text)
     if m:
-        try:
-            nights = _num(m.group(4))
-            mo, dy, yr = _month_num(m.group(1)), int(m.group(2)), _year(m.group(3))
-            base = _resolve_stay(mo, dy, yr, mo, dy + 1 if dy < 28 else 1,
-                                 None if dy < 28 else yr, today)
-            if base is None:
-                return None, True
-            ci = base[0]
-            co = ci + timedelta(days=nights)
-            if not 1 <= nights <= 30:
-                return None, True
-            return (ci, co), True
-        except (ValueError, KeyError):
+        ci = _resolve_check_in(_month_num(m.group(1)), int(m.group(2)), _year(m.group(3)), today)
+        nights = _num(m.group(4))
+        if ci is None or not 1 <= nights <= 30:
             return None, True
+        return (ci, ci + timedelta(days=nights)), True
     m = _DATE_P2.search(text)
     if m:
         mo = _month_num(m.group(1))

@@ -265,10 +265,22 @@ class TestPredicates:
     def test_an_unresolved_handle_logs_a_warning_and_has_no_surface(self, monkeypatch, caplog):
         monkeypatch.setattr(org_roles, "find_by_handle", lambda h: None)
         monkeypatch.setattr(ts, "_warned_handles", set())
+        monkeypatch.setattr(ts, "_handle_cache", None)
         caplog.set_level(logging.WARNING, logger="cora.travel_shortlist")
         assert not ts.on_surface(user_id="U_SOMEONE", channel_id="D0T", channel_type="im")
         assert any("did not resolve" in r.getMessage() for r in caplog.records)
         assert ts.on_surface(user_id=HARRISON, channel_id="D0H", channel_type="im")
+
+    def test_the_handle_resolution_is_cached_and_keyed(self, monkeypatch):
+        calls = []
+        rec = org_roles.find_by_handle("tessa")
+        monkeypatch.setattr(ts, "_handle_cache", None)
+        monkeypatch.setattr(org_roles, "find_by_handle", lambda h: calls.append(h) or rec)
+        lm = ts._load_map()
+        assert ts._dm_user_ids(lm) == ts._dm_user_ids(lm) == frozenset({HARRISON, rec.slack_id})
+        assert calls == ["tessa"]
+        monkeypatch.setenv("HARRISON_SLACK_USER_ID", "U0OTHERFOUNDER")   # a new key re-resolves
+        assert "U0OTHERFOUNDER" in ts._dm_user_ids(lm) and calls == ["tessa", "tessa"]
 
     @pytest.mark.parametrize("flag", ["retrieval_grant", "pending_write", "forced_tool"])
     def test_turn_level_bails(self, flag):
@@ -324,6 +336,9 @@ class TestDates:
         ("hotels in scottsdale 10/17/2026 - 10/21/2026", date(2026, 10, 17), date(2026, 10, 21)),
         ("hotels in scottsdale oct 30 - nov 2", date(2026, 10, 30), date(2026, 11, 2)),
         ("hotels in scottsdale Oct 17 for 3 nights", date(2026, 10, 17), date(2026, 10, 20)),
+        # a check-in on day 28+ (a first cut read these as malformed)
+        ("hotels in scottsdale Oct 30 for 3 nights", date(2026, 10, 30), date(2026, 11, 2)),
+        ("hotels in sedona Dec 30 for five nights", date(2026, 12, 30), date(2027, 1, 4)),
         ("hotels in scottsdale oct 17 through the 21st", date(2026, 10, 17), date(2026, 10, 21)),
         # no year -> the next occurrence on/after today; December rolls into January
         ("hotels in sedona dec 30 - jan 2", date(2026, 12, 30), date(2027, 1, 2)),
