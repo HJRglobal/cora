@@ -678,6 +678,19 @@ def generate_draft(client, cand: Candidate, *, draft_answer: bool = True) -> Can
     cand.entity = entity
     cand.tier = tier
     is_dm = cand.is_dm
+
+    # Code #16 C1 (A23): a founder dead-channel request (the ask, a near-miss archive
+    # attempt, an archive-status question) is answered live ONLY by code -- the scan
+    # or a ledger-backed line. Replayed here it would reach the model, whose
+    # "Archived ..." no rail can see, so the draft is a fixed line (no model call).
+    if is_founder:
+        from .channel_archive import intents as _ca_intents  # noqa: PLC0415
+        if (_ca_intents.looks_like_archive_ask(cand.text)
+                or _ca_intents.looks_like_archive_attempt(cand.text)
+                or _ca_intents.looks_like_archive_status(cand.text)):
+            cand.status = "draft"
+            cand.draft_text = _ca_intents.CATCHUP_DRAFT
+            return cand
     phi_custodian = lex_phi_access.phi_allowed(cand.user_id, entity, is_dm=is_dm)
 
     # ── Pre-LLM handler guard sequence (order matches app.py handlers) ──────────

@@ -71,6 +71,13 @@ from . import web_guard
 from .tools import user_identity
 from .tools import osn_shift_handler
 from .tools import tool_dispatch as _tool_dispatch
+# Code #16 C1: the dead-channel archive lane (cq-be90cea867c3)
+from .channel_archive import cards as channel_archive_cards
+from .channel_archive import deliver as channel_archive_deliver
+from .channel_archive import handler as channel_archive_handler
+from .channel_archive import intents as channel_archive_intents
+from .channel_archive import policy as channel_archive_policy
+from .channel_archive import store as channel_archive_store
 
 log = logging.getLogger(__name__)
 
@@ -2541,6 +2548,15 @@ def handle_mention(event: dict, say: callable, client) -> None:
     entity = route(channel_name)
     user_message = _MENTION_RE.sub("", raw_text).strip()
 
+    # ── Code #16 C1: dead-channel archive lane (founder @mention, A21a) ───────
+    # The 9/20 origin conversation was a channel @mention: the founder's ask here
+    # runs the same scan (card to his DM, a one-line ack in this thread), and a
+    # status question / near-miss attempt gets its code-authored line -- all before
+    # the model and before code_queue's signal capture.
+    if user_id and user_id == code_queue.HARRISON_ID and _channel_archive_mention_intercept(
+            event, client, user_message):
+        return
+
     # ── #info-for-cora intake (route 1 of 3) ──────────────────────────────────
     # This is the ONLY intake route proven to fire in this channel today: channel
     # `message` events do not reach the app (see info_intake's module docstring),
@@ -3499,6 +3515,17 @@ def handle_message_event(event: dict, client) -> None:
                     )
                 except Exception as exc:  # noqa: BLE001
                     log.warning("founder-dm queue verb refusal post failed: %s", exc)
+                return
+            # ── Code #16 C1: dead-channel archive lane (founder DM, A21) ─────
+            # FOUNDER-ONLY, after the queue-verb rails and AHEAD of every greedy
+            # capture below (a non-question imperative like "archive the dead
+            # channels" passes _generic_intent_ok and a live KC / gap cycle would
+            # swallow it) and of the model: the ask starts the scan, a status
+            # question gets a ledger-backed line, a typed follow-up to a live card
+            # and a near-miss archive attempt get code-authored refusals. None of
+            # them reaches the model (whose "Archived ..." no rail can see) or
+            # code_queue's signal capture (the 9/20 three-captures incident).
+            if _q_founder and _channel_archive_dm_intercept(event, client, user_id, text):
                 return
             # Gap autofill Stage 2: if this user has a pending knowledge-gap
             # ask, treat the reply as the answer. Threaded replies to the ask
@@ -4962,6 +4989,270 @@ def handle_deposco_push_confirm(ack, body, client) -> None:
 def handle_deposco_push_dismiss(ack, body, client) -> None:
     ack()
     _handle_deposco_push_tap(body, client, action="dismiss")
+
+
+# ── Code #16 C1: dead-channel archive lane (cq-be90cea867c3) ────────────────
+#
+# Thin Slack-I/O wrappers. Authority, the per-channel claim, the tier gate (D-326
+# in code), the live re-verify, the ledger, the notice -> archive -> read-back order
+# and the circuit breaker all live in cora.channel_archive.handler; the scan and the
+# card in deliver / cards. Nothing is archived at T0 (the committed registry row).
+#
+# Two 1-worker pools keep the slow bodies OFF Bolt's shared 5-worker listener pool
+# (the 8/17 + 8/24 ack-timeout incidents): the SCAN pool runs an ask's multi-minute
+# scan; the ACT pool runs T1 archive taps (single and Archive-all). T0 marks, Keep
+# and "This list matches my read" are fast and run inline. The render lock is held
+# only across one fold + render + chat_update (bounded wait, then ONE retry on the
+# act pool); the claim lock (store.CLAIM_LOCK) is never taken while it is held.
+_CHANNEL_ARCHIVE_SCAN_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="chanarch-scan")
+_CHANNEL_ARCHIVE_ACT_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="chanarch-act")
+_CHANNEL_ARCHIVE_SCAN_GUARD = threading.Lock()
+_CHANNEL_ARCHIVE_RENDER_LOCK = threading.Lock()
+_CHANNEL_ARCHIVE_RENDER_WAIT_S = 5.0
+_CHANNEL_ARCHIVE_BUTTONS_OFF = ("My buttons are switched off right now — nothing was recorded "
+                                "or archived.")
+_CHANNEL_ARCHIVE_WORKING = "Working on it — the outcome will post in this card's thread."
+
+
+def _ca_post(client, channel: str, text: str, thread_ts=None) -> None:
+    try:
+        client.chat_postMessage(channel=channel, text=text, thread_ts=thread_ts,
+                                unfurl_links=False, unfurl_media=False)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("channel_archive: post failed: %s", exc)
+
+
+def _ca_run_scan(client, notify_channel: str, notify_thread, trigger: str) -> None:
+    """SCAN pool body. Never raises; a crash or an undelivered card says so where
+    the ask was made (A18: the 'card will follow' promise can never fail silently),
+    and the in-process guard is released in finally."""
+    try:
+        try:
+            out = channel_archive_deliver.deliver_proposal(trigger=trigger)
+        except Exception:  # noqa: BLE001
+            log.exception("channel_archive: scan crashed")
+            out = {"delivered": False, "reason": "crashed"}
+        reason = str(out.get("reason") or "")
+        if reason == "scan_running":
+            _ca_post(client, notify_channel, channel_archive_intents.SCAN_RUNNING_REPLY, notify_thread)
+        elif reason == "off":
+            _ca_post(client, notify_channel, channel_archive_intents.OFF_REPLY, notify_thread)
+        elif not out.get("delivered") and reason != "eval_mode":
+            _ca_post(client, notify_channel, channel_archive_intents.SCAN_FAILED_REPLY, notify_thread)
+        log.info("channel_archive scan trigger=%s outcome=%s proposal=%s", trigger, reason,
+                 out.get("proposal_id") or "-")
+    finally:
+        _CHANNEL_ARCHIVE_SCAN_GUARD.release()
+
+
+def _ca_start_scan(client, channel: str, thread_ts, *, ack_text: str) -> None:
+    if channel_archive_policy.mode() == "off":
+        _ca_post(client, channel, channel_archive_intents.OFF_REPLY, thread_ts)
+        return
+    if not _CHANNEL_ARCHIVE_SCAN_GUARD.acquire(blocking=False):
+        _ca_post(client, channel, channel_archive_intents.SCAN_RUNNING_REPLY, thread_ts)
+        return
+    _ca_post(client, channel, ack_text, thread_ts)
+    try:
+        _CHANNEL_ARCHIVE_SCAN_POOL.submit(_ca_run_scan, client, channel, thread_ts, "ask")
+    except Exception:  # noqa: BLE001 -- RuntimeError after shutdown: never drop the ask
+        log.warning("channel_archive scan pool refused -- running inline", exc_info=True)
+        _ca_run_scan(client, channel, thread_ts, "ask")
+
+
+def _channel_archive_dm_intercept(event: dict, client, user_id: str, text: str) -> bool:
+    """True when a FOUNDER DM was a dead-channel-lane intent and has been answered."""
+    cai = channel_archive_intents
+    dm = event.get("channel", user_id)
+    thread_ts = event.get("thread_ts")
+    kind = ("ask" if cai.looks_like_archive_ask(text)
+            else "status" if cai.looks_like_archive_status(text)
+            else "followup" if cai.followup_shape(text) is not None
+            else "attempt" if cai.looks_like_archive_attempt(text)
+            else "")
+    if not kind:
+        return False
+    if kind == "followup":
+        shape = cai.followup_shape(text)
+        card_ts = cai.live_card_ts(dm)
+        if card_ts is None or not cai.looks_like_live_followup(text, card_ts=card_ts):
+            return False
+        if shape == "affirmative":
+            # A bare "yes" never steals a pending staged write's confirm, nor a reply
+            # typed in some other thread (a knowledge-check / gap-ask answer).
+            if any(_tool_dispatch.snapshot_stash_ids(user_id, "dm").values()):
+                return False
+            if thread_ts and str(thread_ts) not in cai.live_card_message_ts(dm):
+                return False
+    if os.environ.get("CORA_EVAL_MODE") == "1":
+        log.info("channel_archive DM intercept kind=%s under EVAL_MODE: no-op", kind)
+        return True
+    log.info("channel_archive DM intercept kind=%s user=%s", kind, user_id)
+    try:
+        if kind == "ask":
+            _ca_start_scan(client, dm, thread_ts, ack_text=cai.ACK_REPLY)
+        elif kind == "status":
+            _ca_post(client, dm, cai.status_reply(), thread_ts)
+        elif kind == "followup":
+            _ca_post(client, dm, cai.followup_reply(), thread_ts)
+        else:
+            _ca_post(client, dm, cai.ATTEMPT_REPLY, thread_ts)
+    except Exception:  # noqa: BLE001 -- answered honestly, never handed to the model
+        log.exception("channel_archive DM intercept failed kind=%s", kind)
+        _ca_post(client, dm, cai.SCAN_FAILED_REPLY if kind == "ask" else cai.ATTEMPT_REPLY, thread_ts)
+    return True
+
+
+def _channel_archive_mention_intercept(event: dict, client, user_message: str) -> bool:
+    """True when a FOUNDER @mention was a dead-channel-lane intent (answered in-thread)."""
+    cai = channel_archive_intents
+    channel = event.get("channel", "")
+    thread_ts = event.get("ts")
+    kind = ("ask" if cai.looks_like_archive_ask(user_message)
+            else "status" if cai.looks_like_archive_status(user_message)
+            else "attempt" if cai.looks_like_archive_attempt(user_message)
+            else "")
+    if not kind:
+        return False
+    if os.environ.get("CORA_EVAL_MODE") == "1":
+        return True
+    log.info("channel_archive mention intercept kind=%s channel=%s", kind, channel)
+    try:
+        if kind == "ask":
+            _ca_start_scan(client, channel, thread_ts, ack_text=cai.CHANNEL_ACK_REPLY)
+        elif kind == "status":
+            _ca_post(client, channel, cai.status_reply(), thread_ts)
+        else:
+            _ca_post(client, channel, cai.ATTEMPT_REPLY, thread_ts)
+    except Exception:  # noqa: BLE001
+        log.exception("channel_archive mention intercept failed kind=%s", kind)
+    return True
+
+
+def _ca_rerender(client, channel_id: str, message_ts: str, *, retry: bool = True) -> bool:
+    """Re-render ONE card message from the store under the bounded render lock. A
+    busy lock re-submits once to the act pool (the last event on a card has no next
+    press to converge it); an unreadable store edits nothing."""
+    if not (channel_id and message_ts):
+        return False
+    if not _CHANNEL_ARCHIVE_RENDER_LOCK.acquire(timeout=_CHANNEL_ARCHIVE_RENDER_WAIT_S):
+        log.warning("channel_archive re-render skipped: render lock busy ts=%s", message_ts)
+        if retry:
+            try:
+                _CHANNEL_ARCHIVE_ACT_POOL.submit(_ca_rerender, client, channel_id, message_ts,
+                                                 retry=False)
+            except Exception:  # noqa: BLE001
+                pass
+        return False
+    try:
+        fold = channel_archive_store.fold()
+        if not fold.ok:
+            log.warning("channel_archive re-render skipped: store unreadable")
+            return False
+        loc = channel_archive_cards.find_page(fold, message_ts)
+        if loc is None:
+            return False
+        blocks, text = channel_archive_cards.render_page(fold, loc[0], loc[1])
+        client.chat_update(channel=channel_id, ts=message_ts, text=text, blocks=blocks)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.warning("channel_archive re-render failed: %s", exc)
+        return False
+    finally:
+        _CHANNEL_ARCHIVE_RENDER_LOCK.release()
+
+
+def _ca_run_tap(body: dict, client, action: str) -> None:
+    """Process one tap and surface it: the outcome in the card's thread FIRST, then
+    the page re-rendered from the store. Race losers get an ephemeral only."""
+    try:
+        actions = body.get("actions") or []
+        value = (actions[0].get("value") if actions else "") or ""
+        actor_id = (body.get("user") or {}).get("id", "")
+        channel_id = (body.get("channel") or {}).get("id", "")
+        message_ts = (body.get("message") or {}).get("ts", "")
+
+        def _progress(_pid, _page):
+            _ca_rerender(client, channel_id, message_ts, retry=False)
+
+        res = channel_archive_handler.process_tap(action, value, actor_id, progress=_progress)
+        log.info("channel_archive tap action=%s outcome=%s user=%s", action, res.outcome, actor_id)
+        if res.ephemeral:
+            try:
+                client.chat_postEphemeral(channel=channel_id, user=actor_id, text=res.msg)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        if channel_id and message_ts:
+            _ca_post(client, channel_id, res.msg, message_ts)
+            if res.rerender:
+                _ca_rerender(client, channel_id, message_ts)
+    except Exception:  # noqa: BLE001 -- a handler error must never crash the bot
+        log.warning("channel_archive tap handler error (non-fatal)", exc_info=True)
+
+
+def _handle_channel_archive_tap(body: dict, client, action: str) -> None:
+    try:
+        actions = body.get("actions") or []
+        value = (actions[0].get("value") if actions else "") or ""
+        actor_id = (body.get("user") or {}).get("id", "")
+        channel_id = (body.get("channel") or {}).get("id", "")
+        if os.environ.get("CORA_EVAL_MODE") == "1":
+            return
+        if not confirm_cards.confirm_buttons_enabled():
+            if channel_id and actor_id:
+                try:
+                    client.chat_postEphemeral(channel=channel_id, user=actor_id,
+                                              text=_CHANNEL_ARCHIVE_BUTTONS_OFF)
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+        if channel_archive_handler.needs_act_pool(action, value):
+            if channel_id and actor_id:
+                try:
+                    client.chat_postEphemeral(channel=channel_id, user=actor_id,
+                                              text=_CHANNEL_ARCHIVE_WORKING)
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                _CHANNEL_ARCHIVE_ACT_POOL.submit(_ca_run_tap, body, client, action)
+            except Exception:  # noqa: BLE001 -- never drop a tap
+                log.warning("channel_archive act pool refused -- running inline", exc_info=True)
+                _ca_run_tap(body, client, action)
+            return
+        _ca_run_tap(body, client, action)
+    except Exception:  # noqa: BLE001
+        log.warning("channel_archive tap wrapper error (non-fatal)", exc_info=True)
+
+
+@app.action(channel_archive_cards.ACTION_ROW)
+def handle_channel_archive_row(ack, body, client) -> None:
+    ack()
+    _handle_channel_archive_tap(body, client, channel_archive_cards.ACTION_ROW)
+
+
+@app.action(channel_archive_cards.ACTION_ALL)
+def handle_channel_archive_all(ack, body, client) -> None:
+    ack()
+    _handle_channel_archive_tap(body, client, channel_archive_cards.ACTION_ALL)
+
+
+@app.action(channel_archive_cards.ACTION_KEEP)
+def handle_channel_archive_keep(ack, body, client) -> None:
+    ack()
+    _handle_channel_archive_tap(body, client, channel_archive_cards.ACTION_KEEP)
+
+
+@app.action(channel_archive_cards.ACTION_OVERRIDE)
+def handle_channel_archive_override(ack, body, client) -> None:
+    ack()
+    _handle_channel_archive_tap(body, client, channel_archive_cards.ACTION_OVERRIDE)
+
+
+@app.action(channel_archive_cards.ACTION_AGREED)
+def handle_channel_archive_card_agreed(ack, body, client) -> None:
+    ack()
+    _handle_channel_archive_tap(body, client, channel_archive_cards.ACTION_AGREED)
 
 
 # ── S3 meeting-ask cards (cq-f52c6b691127) ──────────────────────────────────

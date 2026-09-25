@@ -799,6 +799,50 @@ def _cq_kickoff_pool_per_test(monkeypatch):
             _pool.shutdown(wait=True)
 
 
+# ── Code #16 C1: the dead-channel lane's two 1-worker pools never outlive a test ──
+# Same shape and reason as _cq_kickoff_pool_per_test above (copied): app's
+# _CHANNEL_ARCHIVE_SCAN_POOL (an ask's scan) and _CHANNEL_ARCHIVE_ACT_POOL (T1
+# archive taps) are process-global executors, so a submitted body would otherwise
+# resume after this test's monkeypatch redirects (store, ledger, clients) are undone.
+# Each test gets fresh pools and drains them BEFORE monkeypatch undo. The scan guard
+# lock is also reset so a body a test never let finish cannot wedge the next test.
+_CA_POOLS = (("_CHANNEL_ARCHIVE_SCAN_POOL", "chanarch-scan"), ("_CHANNEL_ARCHIVE_ACT_POOL", "chanarch-act"))
+
+
+@pytest.fixture(autouse=True)
+def _channel_archive_pools_per_test(monkeypatch):
+    import threading as _threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    swapped: list = []
+    for _name in _CQ_APP_MODULES:
+        _mod = sys.modules.get(_name)
+        if _mod is None:
+            continue
+        for _attr, _prefix in _CA_POOLS:
+            if hasattr(_mod, _attr):
+                _pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=_prefix)
+                monkeypatch.setattr(_mod, _attr, _pool)
+                swapped.append((_name, _attr, _pool))
+        if hasattr(_mod, "_CHANNEL_ARCHIVE_SCAN_GUARD"):
+            monkeypatch.setattr(_mod, "_CHANNEL_ARCHIVE_SCAN_GUARD", _threading.Lock())
+    yield
+    for _name, _attr, _pool in swapped:
+        _pool.shutdown(wait=True)
+    done = {(_n, _a) for _n, _a, _p in swapped}
+    for _name in _CQ_APP_MODULES:
+        _mod = sys.modules.get(_name)
+        if _mod is None:
+            continue
+        for _attr, _prefix in _CA_POOLS:
+            if (_name, _attr) in done:
+                continue
+            _pool = getattr(_mod, _attr, None)
+            if isinstance(_pool, ThreadPoolExecutor):
+                setattr(_mod, _attr, ThreadPoolExecutor(max_workers=1, thread_name_prefix=_prefix))
+                _pool.shutdown(wait=True)
+
+
 # Real ledger/state files under logs/ and data/ that the test suite must NEVER
 # mutate (Slice 5, 2026-07-29 audit: generalized from the single shopify audit
 # file). Repo-relative; the autouse fixture above redirects each writer's module

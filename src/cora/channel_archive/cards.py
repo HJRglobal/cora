@@ -275,6 +275,18 @@ def undecided_a_on_page(p: st.Proposal, page: int) -> list[str]:
     return undecided_a(p, list((p.pages.get(page) or {}).get("rendered_cids") or []))
 
 
+def find_page(fold: st.Fold, message_ts: str) -> tuple[str, int] | None:
+    """(proposal_id, page) of the card message posted at *message_ts*, else None."""
+    ts = str(message_ts or "")
+    if not ts:
+        return None
+    for pid in reversed(fold.order):
+        for page, info in fold.proposals[pid].pages.items():
+            if str(info.get("message_ts") or "") == ts:
+                return pid, page
+    return None
+
+
 def fallback_text(p: st.Proposal) -> str:
     """The code-built text= of the card and of every re-render (A22): counts only."""
     if p.blind:
