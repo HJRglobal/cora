@@ -94,14 +94,30 @@ def _split_pause(d: dict) -> tuple[dict, dict]:
 
 
 class _Stream:
+    """A completed stream: iterable (one event per content block, the way run_search
+    walks a stream against its wall-clock deadline), closable, snapshot-readable."""
+
     def __init__(self, resp):
         self._resp = resp
+        self.closed = False
 
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
+        self.close()
         return False
+
+    def __iter__(self):
+        for block in getattr(self._resp, "content", None) or []:
+            yield block
+
+    def close(self):
+        self.closed = True
+
+    @property
+    def current_message_snapshot(self):
+        return self._resp
 
     def get_final_message(self):
         return self._resp
@@ -676,7 +692,7 @@ class TestRunSearch:
             assert [t["type"] for t in kw["tools"]] == ["web_search_20250305"]
             assert kw["system"] == ts.TRAVEL_SYSTEM
             assert kw["messages"][0] == request["messages"][0]
-            assert kw["timeout"] == ts.API_TIMEOUT
+            assert 0 < kw["timeout"] <= ts.API_TIMEOUT      # the time left on ONE deadline
             assert kw["thinking"] == {"type": "disabled"}
         assert len(fake.calls[0]["messages"]) == 1
         assert fake.calls[1]["messages"][1] == {
@@ -748,6 +764,35 @@ class TestRunSearch:
                             client_factory=lambda: fake)
         assert out.status == "failed" and out.searches == 0
         assert ts.lane_searches_today() == 0
+
+    # D-051 r1 c2-webcall#2: timeout=90 on messages.stream is httpx's PER-READ timeout
+    # (the longest gap between chunks), not a bound on the whole create -- a stream
+    # that keeps delivering events was never cut and held the lane's only worker.
+    def test_a_trickling_stream_is_cut_at_the_wall_clock_deadline(self, monkeypatch):
+        monkeypatch.setattr(ts, "API_TIMEOUT", 0.2)
+        events = _sse_events(_fx())
+        raw = _RawSSE(events, pace=0.05)             # 27 events: >= 1.35 s if never cut
+        t0 = time.monotonic()
+        out = ts.run_search(ts.build_request(_constraints(), max_uses=4, model=MODEL), budget=4,
+                            client_factory=lambda: SdkStreamAnthropic([raw]))
+        elapsed = time.monotonic() - t0
+        assert out.status == "failed" and out.error == "api_error:WallClockTimeout"
+        assert raw.closed and raw.yielded < len(events)
+        assert elapsed < 1.0
+        # whatever the cut create had searched is charged, never lost
+        assert 0 <= out.searches <= 4 and ts.lane_searches_today() == out.searches
+
+    def test_one_deadline_spans_both_iterations(self, monkeypatch):
+        monkeypatch.setattr(ts, "API_TIMEOUT", 5.0)
+        d1, d2 = _split_pause(_fx())
+        fake = SdkStreamAnthropic([_RawSSE(_sse_events(d1), pace=0.02),    # >= 0.26 s
+                                   _RawSSE(_sse_events(d2))])
+        out = ts.run_search(ts.build_request(_constraints(), max_uses=4, model=MODEL), budget=4,
+                            client_factory=lambda: fake)
+        assert out.status == "ok" and len(fake.calls) == 2
+        assert fake.calls[0]["timeout"] <= 5.0
+        # the resume gets only what is LEFT of the one deadline (a stall there is cut too)
+        assert fake.calls[1]["timeout"] <= 5.0 - 0.25
 
     def test_the_real_sdk_stream_parses_the_live_shape_end_to_end(self):
         fake = SdkStreamAnthropic([_RawSSE(_sse_events(_fx()))])

@@ -1331,6 +1331,10 @@ def _record_searches(n: int, entity: str) -> None:
         log.warning("travel_shortlist: usage record failed", exc_info=True)
 
 
+class WallClockTimeout(TimeoutError):
+    """The lane's ONE wall-clock deadline (API_TIMEOUT across every create) passed."""
+
+
 @dataclass
 class SearchOutcome:
     status: str                    # ok | failed | unreadable | capped (no create: caps full)
@@ -1349,12 +1353,20 @@ def run_search(request: dict, *, budget: int, entity: str = "FNDR",
     and re-belted structurally (``_continuation_problem``). Each create's searches
     are ledgered as soon as known -- a create that raised is charged its partial
     snapshot (``_partial_searches``) -- with one llm usage line per create (a
-    ``via=partial`` line for a raised create that has a snapshot). Never raises."""
+    ``via=partial`` line for a raised create that has a snapshot).
+
+    ONE WALL-CLOCK DEADLINE (D-051 r1 c2-webcall#2): API_TIMEOUT across ALL creates.
+    The SDK's ``timeout`` is httpx's PER-READ timeout (the longest gap between
+    chunks), so a stream that keeps delivering events was never cut; the stream is
+    therefore iterated, closed and abandoned (WallClockTimeout) once the deadline
+    passes, and each create's per-read timeout is only the time LEFT (a stall is
+    cut too). Never raises."""
     from .llm_usage import log_usage  # noqa: PLC0415 -- stdlib-only module
     responses: list = []
     contents: list[list] = []
     searches = 0
     error = ""
+    deadline = time.monotonic() + API_TIMEOUT
     try:
         client = None
         for it in range(MAX_ITERATIONS):
@@ -1379,10 +1391,17 @@ def run_search(request: dict, *, budget: int, entity: str = "FNDR",
                     raise RuntimeError(f"continuation_{problem}")
             if client is None:
                 client = _client(client_factory)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise WallClockTimeout("deadline passed before a create")
             opened = None
             try:
-                with client.messages.stream(**kwargs, timeout=API_TIMEOUT) as stream:
+                with client.messages.stream(**kwargs, timeout=min(API_TIMEOUT, remaining)) as stream:
                     opened = stream
+                    for _event in stream:
+                        if time.monotonic() > deadline:
+                            stream.close()
+                            raise WallClockTimeout("deadline passed mid-stream")
                     resp = stream.get_final_message()
             except Exception:
                 n, partial = _partial_searches(opened, _max_uses(kwargs))
