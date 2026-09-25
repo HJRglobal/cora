@@ -50,8 +50,9 @@ step-1 Code session from the cascade reports since 8/30; the previous 1,690-line
 | 9/10 | Code #12 queue metabolism (`bb601c0`) | founder-DM queue verbs, phantom-write rail (observe), evidence floor, C7 bundle-linkage gate on SHIPPED, Monday menu; D-300/D-301 | `2026-09-09_fndr_cora-code-12-queue-metabolism-CASCADE-REPORT.md` |
 | 9/19 | Code #13 honesty rail (`41cee38`) | third egress rail, nightly catch-up task (08:30), One-Cora RSVP/recap, `data/ladder-registry.yaml`, Drive allowlist-by-folder (D-303), repeat-signal escalation (D-302/D-310) | `2026-09-19_fndr_cora-code-13-honesty-rail-CASCADE-REPORT.md` |
 | 9/19 | RIDER 1 identity (`907b2e2`) | cora@ system mailbox as knowledge-review intake, Asana identity resolver `CORA_ASANA_IDENTITY`, identity runbook sections; `f65b7fc` ruled roster rows on top | `2026-09-19_cora_CASCADE-REPORT-identity-least-privilege.md` |
-| PUSHED | DR/VM step 1 (`claude/dr-manifest-vm-step1-2026-09-22`) | task-estate manifest from the LIVE registry (96 tasks) + drift line in the Monday digest; `deployment/DR-MANIFEST.md` + probe baseline; secrets-scan CI gate; `uv.lock` mcp closure; VM step-1 scoping packet + T0 card; this TOM | `2026-09-23_fndr_cora-dr-manifest-vm-step1-CASCADE-REPORT.md` |
-| PUSHED | Code #14 bug bundle (`claude/code-14-bug-bundle`, on `afcca60`) | health-check `--dry-run` at every write site; founder-only start-anchored verb refusal; queue-status questions FORCE `cora_queue_status`; phantom rail = completion grammar + denial recall + an on-disk hit ledger; tool-bearing replies never cached (D-043 leak); cashflow `as_of`; card badge/id fixes; rail-2 legacy union wired; LEX RSVP include; sticky-ack window; run-marker grace; Meet join audit DARK; COPA no-record carve-out + audit breach-on-any-copy; uv `exclude-newer` pinned; needs ONE restart | `2026-09-23_fndr_cora-code-14-bug-bundle-CASCADE-REPORT.md` |
+| 9/24 | Deposco order-push write path (`6f65b37`) | human spec -> preflight -> Slack card -> Harrison tap -> push -> D-110 read-back; UA rehearsals end to end; prod verified read-only, nothing pushed to prod; new `@app.action` wiring (bot-loaded) | `2026-09-23_fndr_cora-deposco-push-write-path-CASCADE-REPORT.md` |
+| 9/24 | DR/VM step 1 (`afcca60`) | task-estate manifest from the LIVE registry (96 tasks) + drift line in the Monday digest; `deployment/DR-MANIFEST.md` + probe baseline; secrets-scan CI gate; `uv.lock` mcp closure; VM step-1 scoping packet + T0 card; this TOM | `2026-09-23_fndr_cora-dr-manifest-vm-step1-CASCADE-REPORT.md` |
+| 9/24 | Code #14 bug bundle (`ab00c69`) | health-check `--dry-run` at every write site; founder-only start-anchored verb refusal; queue-status questions FORCE `cora_queue_status`; phantom rail = completion grammar + denial recall + an on-disk hit ledger; tool-bearing replies never cached (D-043 leak); cashflow `as_of`; card badge/id fixes; rail-2 legacy union wired; LEX RSVP include; sticky-ack window; run-marker grace; Meet join audit DARK; COPA no-record carve-out + audit breach-on-any-copy; uv `exclude-newer` pinned; its ONE restart done 9/24 (proof: `logs/cora-instances.jsonl`) | `2026-09-23_fndr_cora-code-14-bug-bundle-CASCADE-REPORT.md` |
 
 **Live state pointers (read these, never this file, for current numbers):** the bot's pid and
 restarts = `logs/cora-instances.jsonl` (doctrine 5); the scheduled estate = `deployment/manifest/task-estate.md`
@@ -60,8 +61,8 @@ it is NOT the registry); rebuild = `deployment/DR-MANIFEST.md` + `deployment/boo
 queue = `cora_code_queue` (MCP) / `code-session-backlog.md`; ladder = `data/ladder-registry.yaml`;
 health = the 08:45 nightly check + the Monday `cora_health_report.py --slack` digest.
 
-**Open across those bundles (owner Harrison unless noted):** rail-2 loosening ESCALATION (Code #13
-slice 6, SHIP NO); `CORA_SENTINEL_ENFORCE` flip waits on the 9/25 clean-week read; register the
+**Open across those bundles (owner Harrison unless noted):** `CORA_SENTINEL_ENFORCE` flip waits on
+the clean-week read (Cowork recomputes the D-309 clock from the LAST WARN); register the
 06:11 mailbox-intake task + the Asana identity flip/restart + day-14 PAT removal (RIDER 1); 17
 mirror quarantines to decide; the interactive-logon posture of the whole estate (DR-MANIFEST D14).
 
@@ -70,7 +71,7 @@ mirror quarantines to decide; the interactive-logon posture of the whole estate 
 ```
 HJR Slack workspace
   Harrison (founder):       U02P3D6AT2C
-  NOTE 2026-09-19 (Code #13 RIDER 1 S-C): the id above is UNDER VERIFICATION -- code uniformly uses U0B2RM2JYJ1 (tool_dispatch.py _FOUNDER_SLACK_ID l.1106 / HARRISON_SLACK_USER_ID default l.7040 / _HARRISON_SLACK_ID l.8205; user_access.py:39; review_lanes.py:63; send-trust.yaml:25) and the live queue ledger records Harrison's taps under U0B2RM2JYJ1. The staged read-only probe scripts/probe_slack_user_ids.py (users.info on BOTH ids) decides; strike the loser with a dated note. Do not edit the id until then.
+  NOTE 2026-09-19 (Code #13 RIDER 1 S-C): the id above is UNDER VERIFICATION -- code uniformly uses U0B2RM2JYJ1 (tool_dispatch.py `_FOUNDER_SLACK_ID` / the `HARRISON_SLACK_USER_ID` env default / `_HARRISON_SLACK_ID`; user_access.py `_HARRISON_ID`; review_lanes.py `_FOUNDER_ID`; send-trust.yaml `silence_nudge.approvers`) and the live queue ledger records Harrison's taps under U0B2RM2JYJ1. The staged read-only probe scripts/probe_slack_user_ids.py (users.info on BOTH ids) decides; strike the loser with a dated note. Do not edit the id until then.
   Alex Cordova (F3E ops):   U0B3VGWJTMJ
   #f3-athletes channel:     C0B6GT3117Y
   #f3e-sales channel:       (name: f3e-sales)
