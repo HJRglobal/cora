@@ -1706,6 +1706,34 @@ def _clarify(pr: ParseResult) -> Route:
     return Route("reply", CLARIFY_AREA_REPLY, "clarify_area")
 
 
+# D-051 r1 (c2-trigger#2): in a lane thread only a REFINEMENT-shaped turn may re-run
+# the (billed) search -- a lodging-shaped turn, or the short refinement grammar (try /
+# what about / instead / cheaper / under $N / for N people / different dates / another
+# area / a bed or bedroom change, or a turn that OPENS with a date or "in <place>").
+# "what's the weather in phoenix?" or "draft a note about the offsite in tempe oct
+# 20-22" carry a field but are not refinements: they get the help line, never a card.
+_REFINE_RE = re.compile(
+    _WB + r"(?:try|what about|how about|instead|make it|cheaper|less expensive|more expensive"
+    r"|pricier|more affordable|same dates|other dates|different (?:dates?|days|nights|area|city"
+    r"|neighbou?rhood|part of town|hotels?|options)|another (?:area|city|neighbou?rhood"
+    r"|part of town)|(?:party|group) of \d{1,2}|(?:king|queen|two queens?|double queens?) beds?"
+    r"|two queens|\d{1,2}[- ]?(?:bedrooms?|br|bdrm))" + _WE
+    + r"|" + _WB + r"(?:under|below|less than|up to|max|no more than|at most|over|above|at least"
+    r"|around|about) \$ ?\d"
+    + r"|" + _WB + r"for (?:\d{1,2}|two|three|four|five|six|seven|eight|nine|ten|twelve)"
+    r" (?:people|persons|guests|adults|travell?ers|of us)" + _WE
+)
+_REFINE_START_RE = re.compile(
+    r"^(?:(?:ok|okay|actually|or|and|maybe|hmm|now|so)[ ,]+)?(?:" + _MONTH_WORD
+    + r"\.? \d{1,2}|\d{1,2}/\d{1,2}|(?:in|near|around|closer to) )"
+)
+
+
+def _is_refinement(text: Any) -> bool:
+    t = _norm(_clean(text))
+    return bool(_REFINE_RE.search(t) or _REFINE_START_RE.match(t)) or is_lodging_shaped(text)
+
+
 def route_turn(text: Any, *, user_id: str, channel_id: str, channel_name: str = "",
                thread_root_ts: str | None = None, lane_thread: bool = False,
                retrieval_grant: bool = False, pending_write: bool = False,
@@ -1732,6 +1760,8 @@ def route_turn(text: Any, *, user_id: str, channel_id: str, channel_name: str = 
             return Route("reply", EVAL_REPLY, "eval")
         if not lane_enabled():
             return Route("reply", OFF_REPLY, "lane_off")
+        if not _is_refinement(text):
+            return Route("reply", FOLLOWUP_HELP_REPLY, "followup_help")
         stored = latest_constraints(channel_id, str(thread_root_ts or ""))
         if stored is None:
             pr = parse_constraints(text, today=today)

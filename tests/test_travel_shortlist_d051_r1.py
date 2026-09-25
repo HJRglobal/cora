@@ -416,3 +416,83 @@ class TestLaneThreadScopeThroughRealHandlers:
         _dm(client, ASK, user=HARRISON)
         _drain()
         assert ts.is_lane_thread("D0TRAVELDM", ASK_TS)
+
+
+# ── c2-trigger#2 (+ #4's lane-thread half): only a REFINEMENT re-runs the search ──
+
+LANE_ROOT = "1790000000.000910"
+
+# Turns in a lane thread that carry a date or an area but are NOT about lodging:
+# the fixed help line, never a billed re-search.
+NOT_A_REFINEMENT = [
+    "what's the weather going to be in phoenix?",
+    "draft a note to the team about the offsite in tempe oct 20-22",
+    "what's our cash position this week?",
+    "can you move my 1:1 with alex to oct 20?",
+    "thanks!",
+    "anything less expensive?",          # a price refinement with no parsable field
+]
+# Refinement-shaped turns that change a field re-run on the merged structured fields.
+REFINEMENTS = [
+    ("try Tempe instead", {"areas": ("tempe",)}),
+    ("what about oct 20-22", {"nights": 2}),
+    ("same dates but 6 people", {"party_size": 6}),
+    ("something less expensive, under $200 a night", {"budget_max": 200}),
+    ("oct 20-22?", {"nights": 2}),
+    ("in tempe?", {"areas": ("tempe",)}),
+    ("make it for 6 people", {"party_size": 6}),
+    ("two queens instead", {"beds": "two_queens"}),
+    ("hotels in mesa oct 18-22 please", {"areas": ("mesa",)}),
+]
+
+
+class TestLaneThreadRefinementGate:
+    def _route(self, text):
+        return ts.route_turn(text, user_id=HARRISON, channel_id="D0HARRISON", channel_name="dm",
+                             thread_root_ts=LANE_ROOT, lane_thread=True,
+                             today=_now().date())
+
+    def _seed(self):
+        ts.append_event("asked", channel="D0HARRISON", root_ts=LANE_ROOT,
+                        constraints=_constraints().to_record(), registered=True)
+
+    @pytest.mark.parametrize("text", NOT_A_REFINEMENT)
+    def test_a_non_refinement_gets_the_help_line_and_bills_nothing(self, text):
+        self._seed()
+        r = self._route(text)
+        assert r is not None and r.kind == "reply" and r.reply == ts.FOLLOWUP_HELP_REPLY, (text, r)
+
+    @pytest.mark.parametrize("text,expect", REFINEMENTS)
+    def test_a_refinement_re_runs_on_the_merged_fields(self, text, expect):
+        self._seed()
+        r = self._route(text)
+        assert r is not None and r.kind == "search" and r.followup, (text, r)
+        for k, v in expect.items():
+            assert getattr(r.constraints, k) == v, (text, k)
+
+    @pytest.mark.parametrize("shape", [
+        " " * 40000, "under $" * 6000, "for 9 " * 7000, "try " * 10000, "oct 1" * 8000,
+        "two queens " * 4000,
+    ], ids=["spaces", "money", "party", "try", "date-start", "beds"])
+    def test_the_refinement_grammar_is_linear(self, shape):
+        def run():
+            ts._REFINE_RE.search(shape)
+            ts._REFINE_START_RE.match(shape)
+            ts._is_refinement(shape)
+        assert _best_of_3(run) < 0.25
+
+    def test_through_the_real_handler_a_dated_weather_question_bills_nothing(self, lane,
+                                                                              monkeypatch):
+        client = _slack_client()
+        _mention(client, MagicMock(), ASK, user=_tessa())
+        _drain()
+        assert len(lane.calls) == 1
+        monkeypatch.setattr(app_module, "_TRAVEL_SHORTLIST_POOL",
+                            __import__("concurrent.futures").futures.ThreadPoolExecutor(1))
+        client2 = _slack_client()
+        _mention(client2, MagicMock(), "what's the weather going to be in phoenix oct 18?",
+                 user=_tessa(), ts_="1790000000.000300", thread_ts=ASK_TS)
+        _drain()
+        (call,) = client2.chat_postMessage.call_args_list
+        assert call.kwargs["text"] == ts.FOLLOWUP_HELP_REPLY
+        assert len(lane.calls) == 1                     # no second (billed) web call
