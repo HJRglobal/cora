@@ -164,9 +164,21 @@ def _b_line(row: dict) -> str:
     if r == cl.B_UNARCHIVED_BEFORE:
         by = row.get("unarchived_by") or ""
         who = f"<@{by}>" if by else "someone"
-        return (f"Unarchived by {who} on {_date(row.get('unarchived_at'))} after an earlier "
+        line = (f"Unarchived by {who} on {_date(row.get('unarchived_at'))} after an earlier "
                 "archive. Per-row only.")
-    return B_LINES.get(r, "Per-row only.")
+    else:
+        line = B_LINES.get(r, "Per-row only.")
+    # Live-data finding (the 2026-09-25 preview): #cora-health / #cora-security /
+    # #cora-filing are Cora's own destinations -- registry-exempt, so their row said only
+    # "in the channel registry" and hid that Cora posts there daily. An override tap on
+    # such a row would stop those posts landing; say so on EVERY row that has bot traffic.
+    posts = int(row.get("bot_posts") or 0)
+    if posts > 0:
+        latest = row.get("bot_latest_days")
+        tail = f", latest {latest} days ago" if latest is not None else ""
+        line += (f"\nCora/app still posts here: {posts} in the last 90 days{tail} — archiving "
+                 "would stop those posts landing.")
+    return line
 
 
 def _decided_line(row: dict, state: dict, tier: str) -> str:

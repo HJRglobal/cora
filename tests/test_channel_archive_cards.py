@@ -220,7 +220,7 @@ def _all_rendered_strings():
     """Every string the lane can show, RENDERED with realistic data (A27)."""
     out: list[str] = []
     rows = [row("C0AAAAAAA1", keep_count=1), row("C0AAAAAAA2", keep_count=2),
-            row("C0BBBBBBB1", section="B", reason=cl.B_REGISTRY),
+            row("C0BBBBBBB1", section="B", reason=cl.B_REGISTRY, bot_posts=40, bot_latest_days=0),
             row("C0BBBBBBB2", section="B", reason=cl.B_BOT_TRAFFIC, bot_posts=2, bot_latest_days=4),
             row("C0BBBBBBB3", section="B", reason=cl.B_UNARCHIVED_BEFORE,
                 unarchived_by="UPERSON01", unarchived_at=NOW - 100 * DAY),
@@ -277,3 +277,24 @@ def test_the_notice_and_correction_copy():
     assert f"<@{HARRISON}>" in n and "Cora" in n
     assert "asking Cora" not in n            # no phantom unarchive capability (premise 14)
     assert cards.CORRECTION_TEXT == "Archive did not go through — the channel stays open."
+
+
+def test_a_registry_row_that_cora_still_posts_to_says_so():
+    """Live-data finding (2026-09-25 preview): #cora-health is registry-exempt AND Cora's
+    own daily destination; its row said only "in the channel registry". An override tap
+    must not hide that archiving would stop Cora's posts landing there."""
+    f = staged([row("C0BBBBBBB1", section="B", reason=cl.B_REGISTRY, bot_posts=40, bot_latest_days=0,
+                    last_person_days=None),
+                row("C0BBBBBBB2", section="B", reason=cl.B_REGISTRY)])
+    blocks, _text = cards.render_page(f, PID, 1, now=NOW)
+    body = "\n".join(texts(blocks))
+    first, second = body.split("C0BBBBBBB2", 1)
+    assert "Cora/app still posts here: 40 in the last 90 days, latest 0 days ago" in first
+    assert "would stop those posts landing" in first
+    assert "still posts here" not in second
+    # the bot-traffic-primary row keeps its own single line (no doubled sentence)
+    f2 = staged([row("C0BBBBBBB3", section="B", reason=cl.B_BOT_TRAFFIC, bot_posts=2,
+                     bot_latest_days=4)], pid="chanarch-dddddddddddd")
+    body2 = "\n".join(texts(cards.render_page(f2, "chanarch-dddddddddddd", 1, now=NOW)[0]))
+    assert body2.count("Cora/app posts in the last 90 days: 2") == 1
+    assert "still posts here" not in body2
