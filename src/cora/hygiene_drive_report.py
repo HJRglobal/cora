@@ -184,19 +184,40 @@ def _lex_entities():
     return _LEX_ENTITIES[0]
 
 
+# CamelCase and a glued all-caps code read as word breaks, for the belt and the
+# LEX-name rule (D-051 R3 rb2#r3-2): "LexOps" / "LexHR" -> "Lex Ops" / "Lex HR",
+# "LEXreport" / "LLAreport" / "COPAdiligence" -> "LEX report" / ..., "LEXReport"
+# -> "LEX Report", "TheLexington" / "HJRLexington" -> "The Lexington" / "HJR
+# Lexington". "Lexicon", "Lexus", "LEXUS", "Alex", "FlexSeal" and "NonLexington"
+# ("Non Lexington": the rule's own exception) split into nothing the rules match.
+_CAMEL_RE = re.compile(
+    r"(?<![A-Za-z])(LEX|LLA|DDD|COPA)(?=[a-z]|[A-Z][a-z])"   # a glued all-caps code
+    r"|(?<=[a-z])(?=[A-Z])"                                  # camelCase
+    r"|(?<=[A-Z])(?=[A-Z][a-z])")                            # ACRONYMWord
+
+
+def _split_camel(seg: str) -> str:
+    return _CAMEL_RE.sub(lambda m: (m.group(1) or "") + " ", seg)
+
+
 # The named LEX people, as ONE compiled regex: [pattern], or [None] when a source
 # failed to load. Sources (each read from its owner, never copied here): the LEX
 # detector's own lead identifiers (the per-sub-entity participant lists, the
 # Shaun list, the person names among its LEX title keywords) and every
 # org_roles registry person whose PRIMARY entity is a LEX entity (the one
 # roster). Each name matches first-last OR last-first, joined by any run of
-# spaces / '_' / '.' / ',' / '-' / '+' ("Justin_Gilmore", "Gilmore, Justin",
-# "jeff.montgomery") -- and on its own, so a segment naming two leads of
-# different sub-entities (which the detector deliberately leaves untagged) is
-# still LEX-named. Primary entity only: a founder or finance lead with LEX among
-# several entities is not a LEX person, and a file named after them is not LEX.
+# spaces / '_' / '.' / ',' / '-' / '+' or by NOTHING ("Justin_Gilmore", "Gilmore,
+# Justin", "jeff.montgomery", "JustinGilmore", "gilmorejustin"), and first
+# INITIAL + last ("JGilmore", "J.Gilmore", "J_Gilmore", "J. Gilmore") -- and on
+# its own, so a segment naming two leads of different sub-entities (which the
+# detector deliberately leaves untagged) is still LEX-named. Not covered: the
+# last name alone, and dotted / spaced initials of both names. Primary entity
+# only: a founder or finance lead with LEX among several entities is not a LEX
+# person, and a file named after them is not LEX.
 _LEX_LEADS: list = []
 _LEAD_SEP = r"[\s_.,+\-]+"
+_LEAD_JOIN = r"[\s_.,+\-]*"          # any run of separators, or none (glued)
+_LEAD_INITIAL_JOIN = r"[\s_.]{0,2}"   # "J.Gilmore", "J_Gilmore", "J. Gilmore", "JGilmore"
 
 
 def _lex_person_names() -> set[str]:
@@ -227,8 +248,9 @@ def _lex_lead_re():
                 if len(toks) < 2 or not all(t.replace("'", "").isalpha() for t in toks):
                     continue   # a person name is two or more words
                 first, last = re.escape(toks[0]), re.escape(toks[-1])
-                alts.add(f"{first}{_LEAD_SEP}{last}")
-                alts.add(f"{last}{_LEAD_SEP}{first}")
+                alts.add(f"{first}{_LEAD_JOIN}{last}")
+                alts.add(f"{last}{_LEAD_JOIN}{first}")
+                alts.add(f"{re.escape(toks[0][0])}{_LEAD_INITIAL_JOIN}{last}")
             if not alts:
                 raise ValueError("no LEX person names loaded")
             rx = re.compile(r"(?<![a-z])(?:" + "|".join(sorted(alts)) + r")(?![a-z])", re.IGNORECASE)
@@ -246,6 +268,9 @@ def _segment_names_lex(seg: str) -> bool:
     if _LEX_NAME_RE.search(seg) or _LEX_BELT_RE.search(seg):
         return True
     try:
+        camel = _split_camel(seg)
+        if camel != seg and (_LEX_NAME_RE.search(camel) or _LEX_BELT_RE.search(camel)):
+            return True
         if kb_exclusions.is_copa_meeting_title(seg):
             return True
         leads = _lex_lead_re()
@@ -318,19 +343,25 @@ def is_lex_relpath(relpath: str) -> bool:
 
       * the partition (``is_lex_partition``);
       * any segment carrying a LEX name outside the partition ("Lexington
-        Entities", "Lexington - Progress (16).gdoc"; not "Non-Lexington");
+        Entities", "Lexington - Progress (16).gdoc", "TheLexington"; not
+        "Non-Lexington" / "NonLexington");
       * any segment the ONE LEX title detector (``fireflies_connector.
         classify_lex_meeting``) calls LEX -- 'LBHS', 'Lex-LLC', 'Lex Services',
         the named LEX leads, DDD / care / clinical titles -- as named, and with
         '_' / '.' / '-' read as spaces;
       * any segment carrying a sub-entity / program code (``_LEX_BELT_RE``:
         lex, lbhs, lla, lts, lex-llc/lla, ddd, hcbs, bhrf, copa, left
-        non-letter bounded, plurals and glued forms included);
+        non-letter bounded, plurals and glued forms included), also read with
+        CamelCase and a glued all-caps code as word breaks (``_split_camel``:
+        LexOps, LexHR, LEXreport, LEXReport, LLAreport, COPAdiligence);
       * any segment cross_entity_guard's LEX keyword row matches ('tucson
         dta', 'revalidation', ...; the same table, never a copy);
       * any segment naming a LEX person (the detector's lead lists plus every
         org_roles person whose primary entity is LEX), first-last or
-        last-first, however joined, one lead or several;
+        last-first joined by any run of separators or by nothing (CamelCase,
+        glued), or first initial + last (JLast, J.Last, J_Last, J. Last), one
+        lead or several. NOT covered (listed): the last name alone, a middle
+        name or initial between the two, both names as initials;
       * any segment naming the NDA'd COPA diligence (the belt's non-letter
         bounded ``copa`` -- COPA_LOI, COPA2 -- plus ``kb_exclusions.
         is_copa_meeting_title``; never "Maricopa" or "copay") -- its meeting
@@ -643,7 +674,7 @@ def render_md(facts: RunFacts, now: CategorySet, diffs: dict[str, Diff],
     lines.append(f"# [Hygiene] Drive -- {facts.date} (Cora weekly inventory)")
     lines.append("")
     status = ("CLEAN (walk passed the sanity floor: at least 80% of the largest of the last four "
-              "comparable full runs)"
+              "comparable full runs, and of the newest re-baseline -- else the 2026-09-21 baseline)"
               if facts.status == "clean" else
               "UNVERIFIED (no prior full-root run to compare; the sanity floor was not applied)")
     lines.append(f"- Status: **{status}**")

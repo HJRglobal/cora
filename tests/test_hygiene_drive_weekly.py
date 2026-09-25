@@ -1034,6 +1034,107 @@ def test_r2_the_new_lex_screens_fail_closed(monkeypatch):
     assert not hdr.is_lex_relpath(plain)
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# 5. D-051 R3 rb2#r3-2: glued / initial lead names and CamelCase codes
+# ═════════════════════════════════════════════════════════════════════════════
+
+# The runbook and the gate's docstring said a LEX person is counts-only "however
+# joined"; _LEAD_SEP needed a separator and the belt a non-letter right bound.
+_R3_LEAD_SHAPES = [
+    "_shared\\meetings\\{F}{L}_2026-10-01 (1).mp4",                  # a Zoom export: glued
+    "_shared\\meetings\\{f}{l} notes (1).gdoc",                      # glued, lower
+    "_shared\\meetings\\{f}{L} sync (1).gdoc",                       # camelCase
+    "_shared\\meetings\\{L}{F} review (1).gdoc",                     # last-first glued
+    "_shared\\meetings\\{F0}{L} 1-1 (1).gdoc",                       # initial glued
+    "_shared\\meetings\\{F0}.{L} check-in (1).gdoc",
+    "_shared\\meetings\\{F0}_{L} budget (1).gdoc",
+    "_shared\\meetings\\{F0}. {L} review (1).gdoc",
+    "01-HJR-Global\\hr\\{F}{L}\\offer letter (1).pdf",
+]
+LEX_NAMED_R3 = [
+    "01-HJR-Global\\accounting\\LexOps budget (1).xlsx",
+    "01-HJR-Global\\accounting\\LexPayroll (1).xlsx",
+    "01-HJR-Global\\hr\\LexHR handbook (1).pdf",
+    "01-HJR-Global\\accounting\\LexBudget_FY27 (1).xlsx",
+    "01-HJR-Global\\accounting\\LexFinance (1).xlsx",
+    "01-HJR-Global\\accounting\\LEXreport (1).pdf",
+    "01-HJR-Global\\accounting\\LEXReport (1).pdf",
+    "01-HJR-Global\\accounting\\LLAreport (1).pdf",
+    "01-HJR-Global\\legal\\COPAdiligence (1).pdf",
+    "01-HJR-Global\\legal\\DDDcontract (1).pdf",
+    "_shared\\meetings\\TheLexington board (1).gdoc",
+    "01-HJR-Global\\accounting\\HJRLexington (1).xlsx",
+]
+NOT_LEX_R3 = [
+    "02-F3-Energy\\Lexicon flywheel (1).pdf",
+    "02-F3-Energy\\LexisNexis export (1).pdf",
+    "02-F3-Energy\\LEXUS brochure (1).pdf",
+    "02-F3-Energy\\AlexCordova notes (1).gdoc",
+    "02-F3-Energy\\FlexSeal order (1).pdf",
+    "01-HJR-Global\\02 NonLexington\\binder (1).pdf",
+    "02-F3-Energy\\DeliveryOps (1).xlsx",
+    "02-F3-Energy\\QBOExport (1).csv",
+    "02-F3-Energy\\LLAMA photos (1).jpg",
+]
+
+
+def _shape(sh: str, first: str, last: str) -> str:
+    return sh.format(F=first.capitalize(), L=last.capitalize(), f=first.lower(), l=last.lower(),
+                     F0=first[0].upper())
+
+
+def test_r3_a_lex_person_is_counts_only_glued_or_by_initial(monkeypatch):
+    """Fabricated registry records: a LEX-primary person in every glued / initial
+    shape is withheld; a non-LEX person in the same shapes stays listed."""
+    from cora import org_roles
+
+    lex_person = org_roles.RoleRecord(slack_id="U0FAKE1", name="Zorin Quell", role="Program lead", entity="LEX-LLA")
+    other = org_roles.RoleRecord(slack_id="U0FAKE2", name="Pim Vandor", role="Finance", entity="HJRG")
+    try:
+        monkeypatch.setattr(org_roles, "all_roles", lambda: [lex_person, other])
+        _fresh_lex_screens()
+        for i, sh in enumerate(_R3_LEAD_SHAPES):
+            assert hdr.is_lex_relpath(_shape(sh, "Zorin", "Quell")), i
+            assert not hdr.is_lex_relpath(_shape(sh, "Pim", "Vandor")), i
+        assert not hdr.is_lex_relpath("_shared\\meetings\\Quell review (1).gdoc"), \
+            "the last name alone is a documented residual, not claimed"
+    finally:
+        monkeypatch.undo()
+        _fresh_lex_screens()
+
+
+def test_r3_the_live_leads_are_counts_only_glued_or_by_initial():
+    """Every LEX-primary person in the repo's org-roles.yaml plus every detector
+    lead, in the glued / initial shapes. Failures report indexes only."""
+    from cora import org_roles
+    from cora.connectors import fireflies_connector as ff
+
+    names = {r.name for r in org_roles.all_roles() if str(r.entity).upper().startswith("LEX")}
+    names |= {ids[-1] for ids, _ in ff._FIREFLIES_PARTICIPANT_SUB_ENTITY} | {ff._SHAUN_IDENTIFIERS[-1]}
+    missed = []
+    for i, name in enumerate(sorted(names)):
+        parts = name.split()
+        for j, sh in enumerate(_R3_LEAD_SHAPES):
+            if not hdr.is_lex_relpath(_shape(sh, parts[0], parts[-1])):
+                missed.append((i, j))
+    assert len(names) >= 4 and missed == []
+
+
+def test_r3_camelcase_and_glued_codes_are_counts_only_and_ordinary_words_stay_listed():
+    md, now, diffs = _render([frow(p, suffix="paren-n") for p in LEX_NAMED_R3 + NOT_LEX_R3], [])
+    missed = [i for i, p in enumerate(LEX_NAMED_R3) if not hdr.is_lex_relpath(p)]
+    assert missed == [], "LEX_NAMED_R3 indexes still listable"
+    for p in LEX_NAMED_R3:
+        assert p.rsplit("\\", 1)[-1] not in md, p
+    for p in NOT_LEX_R3 + NOT_LEX_R2 + NOT_LEX:
+        assert not hdr.is_lex_relpath(p), p
+    for p in NOT_LEX_R3:
+        assert f"`{p}`" in md, p
+    assert f"{len(LEX_NAMED_R3)} LEX (counts only)" in md
+    assert hdr._split_camel("LexOps") == "Lex Ops" and hdr._split_camel("LEXreport") == "LEX report"
+    assert hdr._split_camel("Lexicon") == "Lexicon" and hdr._split_camel("LEXUS") == "LEXUS"
+
+
 def _weekly(n: int, start: int = 0) -> list[str]:
     from datetime import date, timedelta
     return [(date(2026, 9, 26) + timedelta(days=7 * (start + i))).strftime("%Y%m%d") + "-0240" for i in range(n)]
@@ -1102,21 +1203,94 @@ def test_r2_rebaseline_refuses_what_it_cannot_vouch_for(world, monkeypatch):
 
 
 def test_r2_the_high_water_is_bounded_to_the_newest_four_eligible_runs(world, monkeypatch):
-    """lens#r2-1: the baseline anchors the floor only while it is among the newest
-    KEEP_RUNNER_STAMPS eligible runs -- the window rotation keeps."""
+    """lens#r2-1: the baseline is part of the HIGH-WATER only while it is among the
+    newest KEEP_RUNNER_STAMPS eligible runs -- the window rotation keeps.
+
+    D-051 R3 rb2#r3-0: this test used to pin 100 -> 85x4 -> 70 as CLEAN (the window
+    alone slid the floor 20% every four eligible weeks: 30% below the baseline with
+    no operator action). The window is unchanged; the CUMULATIVE anchor (the
+    baseline, never re-baselined) now refuses that 70, and prints the re-baseline."""
     full = [frow(f"02-F3-Energy\\r\\f{i:03d}.pdf") for i in range(100)]
     write_stamp(world.outdir, rh.BASELINE_STAMP, full, BASE_DIRS, root=world.root, max_hash=200)
     s = _weekly(rh.KEEP_RUNNER_STAMPS + 1)
     for st in s[:-1]:
         fake_ps(monkeypatch, world, stamp=st, files=full[:85])
         assert rh.main(["--apply"]) == rh.EXIT_OK
-    runs = rh.eligible_runs(world.outdir, s[-1], world.root, rh.ledger_state(rh.read_ledger(world.ledger)))
+    ledger = rh.ledger_state(rh.read_ledger(world.ledger))
+    runs = rh.eligible_runs(world.outdir, s[-1], world.root, ledger)
     assert runs[-1].stamp == rh.BASELINE_STAMP and len(runs) == rh.KEEP_RUNNER_STAMPS + 1
     assert rh.high_water(runs)["files_total"][0] == 85
     assert rh.high_water(runs[-3:])["files_total"] == (100, rh.BASELINE_STAMP), "inside the window it still anchors"
     fake_ps(monkeypatch, world, stamp=s[-1], files=full[:70])     # >= 80% of 85, < 80% of the baseline's 100
-    assert rh.main(["--apply"]) == rh.EXIT_OK
-    assert "CLEAN" in world.report(_day(s[-1])).read_text(encoding="utf-8")
+    assert rh.main(["--apply"]) == rh.EXIT_INCOMPLETE
+    md = world.report(_day(s[-1])).read_text(encoding="utf-8")
+    assert "INCOMPLETE WALK" in md and "CLEAN" not in md
+    assert (f"files walked 70 < 80% of the 2026-09-21 baseline's 100 (stamp {rh.BASELINE_STAMP}): "
+            "a cumulative shrink over 20% is accepted only by a re-baseline") in md
+    assert "high-water" not in md, "the window (85) passed it: one reason, the anchor's"
+    assert f"--rebaseline {s[-1]} --apply" in md
+    assert rh.floor_anchor(runs, ledger, s[-1])["files_total"] == (100, rh.BASELINE_STAMP)
+
+
+def test_r3_a_slow_ratchet_is_caught_until_the_operator_rebaselines(world, monkeypatch):
+    """rb2#r3-0: 100 -> 81x4 (each CLEAN) -> 65 read CLEAN once the baseline left the
+    four-run window, and so on down to 43 in 13 CLEAN weeks. The anchor refuses the
+    65; a re-baseline accepts it, and from then on the RE-BASELINED counts anchor --
+    from the stamp ledger, after rotation has deleted that stamp's own files."""
+    full = [frow(f"02-F3-Energy\\r\\f{i:03d}.pdf") for i in range(100)]
+    write_stamp(world.outdir, rh.BASELINE_STAMP, full, BASE_DIRS, root=world.root, max_hash=200)
+    s = _weekly(12)
+    for st in s[:4]:
+        fake_ps(monkeypatch, world, stamp=st, files=full[:81])
+        assert rh.main(["--apply"]) == rh.EXIT_OK
+    for st in s[4:6]:                                             # every week, not just once
+        fake_ps(monkeypatch, world, stamp=st, files=full[:65])
+        assert rh.main(["--apply"]) == rh.EXIT_INCOMPLETE
+        md = world.report(_day(st)).read_text(encoding="utf-8")
+        assert "files walked 65 < 80% of the 2026-09-21 baseline's 100" in md
+        assert "resolved since last run" not in md
+    assert rh.main(["--rebaseline", s[5], "--apply"]) == rh.EXIT_OK
+    for st in s[6:11]:                                            # 55 >= 80% of the re-baselined 65
+        fake_ps(monkeypatch, world, stamp=st, files=full[:55])
+        assert rh.main(["--apply"]) == rh.EXIT_OK
+    led = rh.ledger_state(rh.read_ledger(world.ledger))
+    assert led[s[5]].get("rotated") and not (world.outdir / rh.stamp_files(s[5])[2]).exists()
+    fake_ps(monkeypatch, world, stamp=s[11], files=full[:50])     # >= 80% of the window's 55, < 52
+    assert rh.main(["--apply"]) == rh.EXIT_INCOMPLETE
+    md = world.report(_day(s[11])).read_text(encoding="utf-8")
+    assert f"files walked 50 < 80% of the newest re-baselined run's 65 (stamp {s[5]})" in md
+
+
+def test_r3_a_from_stamp_rebuild_before_a_rebaseline_keeps_its_own_floor(world, monkeypatch):
+    """rb2#r3-1: eligible_runs dropped every stamp older than the NEWEST re-baseline
+    whatever week it served, so rebuilding a week older than it (the INCOMPLETE
+    report's own --from-stamp line) found no prior, ran with no floor, and
+    overwrote that week's INCOMPLETE report with an UNVERIFIED one carrying the
+    partial walk's full lists -- 'no prior full-root run to compare'."""
+    full = [frow(f"02-F3-Energy\\r\\f{i:03d} (1).pdf", suffix="paren-n") for i in range(100)]
+    write_stamp(world.outdir, rh.BASELINE_STAMP, full, BASE_DIRS, root=world.root, max_hash=200)
+    w1, w2, w3 = _weekly(3)
+    fake_ps(monkeypatch, world, stamp=w1, files=full[:60])       # a degraded-mount partial walk
+    assert rh.main(["--apply"]) == rh.EXIT_INCOMPLETE
+    for st in (w2, w3):                                            # then a real partition move
+        fake_ps(monkeypatch, world, stamp=st, files=full[:78])
+        assert rh.main(["--apply"]) == rh.EXIT_INCOMPLETE
+    assert rh.main(["--rebaseline", w3, "--apply"]) == rh.EXIT_OK
+    assert rh.main(["--rebaseline", w1, "--apply"]) == rh.EXIT_REFUSED   # older than W3's
+    for st, n in ((w1, 60), (w2, 78)):
+        assert rh.main(["--from-stamp", st, "--apply"]) == rh.EXIT_INCOMPLETE, st
+        md = world.report(_day(st)).read_text(encoding="utf-8")
+        assert "INCOMPLETE WALK" in md and "UNVERIFIED" not in md and "f000 (1).pdf" not in md
+        assert f"files walked {n} < 80% of the prior full run's 100" in md
+        assert f"Prior full run: stamp `{rh.BASELINE_STAMP}`" in md
+    assert not list(world.outdir.glob("hygiene-findings-full-*")), "no sidecar for a pre-re-baseline week"
+    led = rh.ledger_state(rh.read_ledger(world.ledger))
+    assert [r.stamp for r in rh.eligible_runs(world.outdir, w1, world.root, led)] == [rh.BASELINE_STAMP]
+    assert [r.stamp for r in rh.eligible_runs(world.outdir, w3, world.root, led)] == []
+    assert rh.rebaseline_cutoff(led) == w3 and rh.rebaseline_cutoff(led, w1) is None
+    # the re-baselined week itself still reads UNVERIFIED, as designed
+    assert rh.main(["--from-stamp", w3, "--apply"]) == rh.EXIT_OK
+    assert "UNVERIFIED" in world.report(_day(w3)).read_text(encoding="utf-8")
 
 
 def test_r2_the_rebaseline_hint_appears_only_when_the_walk_itself_is_sound(world, monkeypatch):

@@ -3737,6 +3737,84 @@ class TestCarvedRecordingsCollapsePerMeeting:
         assert r.carved_recordings == [("a meeting at 09:00", "roster-user-declined")]
         assert r.carved_recording_event_ids == ["k9"]
 
+    # ── D-051 r3 s4#r3-0: the recording's time is ranked by the meeting's WINDOW
+    # first -- a late admit or a rejoin is still the meeting in progress ──
+
+    @staticmethod
+    def _back_to_back_day():
+        """Two DECLINED 30-minute meetings on one static room: 09:00-09:30 (`k900`)
+        and 09:30-10:00 (`k930`)."""
+        who = "harrison@hjrglobal.com"
+        a = _s4_decline(_ev("k900", summary="Tawny early", hh=9, link=_S4_ROOM), who)
+        b = _s4_decline(_ev("k930", summary="Tawny later", hh=9, mm=30, link=_S4_ROOM), who)
+        a["end"] = {"dateTime": _ts(9, 30)}
+        b["end"] = {"dateTime": _ts(10, 0)}
+        return {who: [a, b]}
+
+    @staticmethod
+    def _t_at(tid, hh, mm, **kw):
+        t = _t(tid, title="Untitled recording", hh=hh, link=_S4_ROOM, **kw)
+        t["date"] = int(datetime(2026, 8, 26, hh, mm, tzinfo=AZ).timestamp() * 1000)
+        return t
+
+    def test_a_rejoin_of_the_first_back_to_back_meeting_collapses_onto_it(self):
+        """P1: the 09:00 is recorded by cal_id at 09:00, the bot drops and rejoins at
+        09:20 (link-only). Nearest start filed the rejoin under the 09:30 (600 s away
+        vs 1,200 s): two single rows, carved_duplicated 0, and the green clean-day
+        verdict over a meeting recorded twice."""
+        trs = [self._t_at("tA", 9, 0, cal_id="k900"), self._t_at("tB", 9, 20)]
+        r = _audit(self._back_to_back_day(), trs)
+        out = mc.render_report(r)
+        assert "white_check_mark" not in out and "No qualifying roster meetings" not in out
+        assert r.carve_out_breaches == [] and r.unmatched_transcripts == []
+        assert r.carved_recordings == [("a meeting at 09:00", "roster-user-declined")]
+        assert r.carved_recording_event_ids == ["k900"]
+        assert r.carved_recording_transcript_ids == [["tA", "tB"]]
+        assert r.carved_recording_counts == [2] and r.carved_duplicated == 1
+        assert "Tawny" not in out and "Untitled recording" not in out
+
+    def test_a_late_admit_to_the_first_back_to_back_meeting_stays_on_it(self):
+        """P1b: the 09:00 is recorded ONCE, link-only, after a 17-minute waiting-room
+        admit (09:17); the 09:30 is recorded by cal_id. Nearest start put the 09:17
+        recording on the 09:30 row -- a phantom duplicate there, and no 09:00 line."""
+        trs = [self._t_at("tA", 9, 17), self._t_at("tB", 9, 30, cal_id="k930")]
+        r = _audit(self._back_to_back_day(), trs)
+        out = mc.render_report(r)
+        assert r.carve_out_breaches == [] and r.unmatched_transcripts == []
+        assert dict(zip(r.carved_recording_event_ids, r.carved_recording_transcript_ids)) == {
+            "k900": ["tA"], "k930": ["tB"]}
+        assert dict(zip(r.carved_recording_event_ids, r.carved_recordings)) == {
+            "k900": ("a meeting at 09:00", "roster-user-declined"),
+            "k930": ("a meeting at 09:30", "roster-user-declined"),
+        }
+        assert r.carved_duplicated == 0 and "transcripts)" not in out
+        assert "\n:white_check_mark: No qualifying roster meetings scheduled." in out
+
+    def test_an_early_join_of_the_second_back_to_back_meeting_stays_on_it(self):
+        """The mirror case the window must not break: the 09:30 recorded by cal_id and
+        again link-only by a bot that joined at 09:27 while the 09:00 still ran. Both
+        windows hold 09:27; the nearer start (the 09:30) wins, so the double capture
+        collapses there. Ranking 'in progress' first filed it under the 09:00."""
+        trs = [self._t_at("tA", 9, 27), self._t_at("tB", 9, 30, cal_id="k930")]
+        r = _audit(self._back_to_back_day(), trs)
+        assert r.carved_recording_event_ids == ["k930"]
+        assert r.carved_recording_transcript_ids == [["tB", "tA"]]
+        assert r.carved_duplicated == 1 and "white_check_mark" not in mc.render_report(r)
+
+    def test_the_pick_rank_is_window_then_nearest_start_then_in_progress(self):
+        ev = _ev("k", hh=9)                                   # 09:00-10:00
+        at = lambda hh, mm: int(datetime(2026, 8, 26, hh, mm, tzinfo=AZ).timestamp())  # noqa: E731
+        assert mc._carved_pick_rank(ev, at(9, 0)) == (0, 0, 0)       # start is inside
+        assert mc._carved_pick_rank(ev, at(9, 59)) == (0, 3540, 0)
+        assert mc._carved_pick_rank(ev, at(10, 0)) == (1, 3600, 1)   # end is not
+        assert mc._carved_pick_rank(ev, at(8, 55)) == (0, 300, 1)    # 300 s early join
+        assert mc._carved_pick_rank(ev, at(8, 54)) == (1, 360, 1)
+        allday = {"id": "d", "start": {"date": DAY}, "end": {"date": "2026-08-27"}}
+        assert mc._carved_pick_rank(allday, at(9, 0))[0] == 1        # never holds anything
+        # equally near, both windows hold it: the one in progress wins
+        a, b = _ev("a", hh=9, mm=55), _ev("b", hh=10, mm=5)
+        assert mc._carved_pick_rank(a, at(10, 0)) < mc._carved_pick_rank(b, at(10, 0))
+
     def test_breach_precedence_on_a_shared_room_is_unchanged(self):
         """r2probe case B: a declined 10:00 and a `[no-bot]` 15:00 share the room. The
         cal_id recording of the 10:00 is information; EVERY link-only recording on

@@ -1711,6 +1711,36 @@ def classify_carved_recording(
     return False, ev, why
 
 
+#: how early a bot may join a meeting and still be recording THAT meeting (the
+#: window a recording is ranked by in _carved_pick_rank).
+_CARVED_PICK_EARLY_JOIN_S = 300
+
+
+def _carved_pick_rank(event: dict[str, Any], t_ts: int) -> tuple[int, int, int]:
+    """Sort key over the carved claimants of ONE informational recording (lower
+    wins; min() over the claimants keeps first-seen on a full tie).
+
+    1. Does the meeting's window [start - early-join grace, end) hold the
+       recording's time? A late admit from a waiting room, or a drop-and-rejoin, is
+       still the meeting in progress. Nearest start alone (D-051 r2 s3s4#r2-0)
+       ignored the end, so a 09:20 rejoin of a 09:00-09:30 meeting went to the 09:30
+       on the same room -- the double capture split over two rows and read clean --
+       and a 09:17 late admit put a phantom duplicate on the 09:30 (D-051 r3 s4#r3-0).
+    2. The distance from the meeting's START. Among windows that BOTH hold the time
+       (a bot joining the 10:00 at 09:57 while the 09:00-10:00 still runs) the nearer
+       start wins: ranking "in progress" above it filed every early join of a
+       back-to-back meeting under the one before -- the same split, mirrored (pure
+       audit_day fuzz, 2x6000 days: that order was truth-worse than nearest-start
+       alone on 86 days, this one on none).
+    3. Among equally near windows, the one already in progress (start <= t).
+    A recording inside no window (a 10:00 one between a 09:00-10:00 and an 11:00
+    meeting) keeps the pre-r3 rule exactly: nearest start, then first-seen."""
+    start = event_start_ts(event)
+    inside = start - _CARVED_PICK_EARLY_JOIN_S <= t_ts < _event_end_ts(event)
+    return (0 if inside else 1, abs(start - t_ts),
+            0 if inside and start <= t_ts else 1)
+
+
 def _record_carved_hit(
     report: AuditReport,
     *,
@@ -1937,15 +1967,19 @@ def audit_day(
         could not produce.
 
         An INFORMATIONAL hit (no claimant breaches) names ONE carved meeting -- the
-        claimant whose start is NEAREST the recording's time (first-seen on a tie) --
-        and that one meeting is both its shape label and its collapse group: a second
+        claimant whose window holds the recording's time (the nearest start among
+        those, the one in progress on a tie), else the one whose start is NEAREST it,
+        first-seen on a tie (_carved_pick_rank) -- and that one meeting is both its
+        shape label and its collapse group: a second
         recording of the meeting joins its row as another transcript id -- a
         duplicate -- instead of printing a second identical line beside a clean-day
         verdict (D-051 s4#1). Binding the room's FIRST-SEEN claimant instead filed
         every link-only recording under that one meeting, whatever its time: a 10:00
         meeting recorded by cal_id and by link split over two rows and read clean,
         while a 09:00 and a 10:00 recorded once each collapsed into a phantom 09:00
-        duplicate (D-051 r2 s3s4#r2-0). Breach precedence is unchanged: any
+        duplicate (D-051 r2 s3s4#r2-0). Nearest START alone then filed a late admit
+        or a rejoin of a 09:00-09:30 meeting under the 09:30 on the same room (D-051
+        r3 s4#r3-0), so the window ranks first. Breach precedence is unchanged: any
         breaching claimant wins, and a breach is never grouped. The pick only chooses
         AMONG carved claimants; which transcripts 3b claims at all is still the
         time-blind link join (cq-4df9da0cb483)."""
@@ -1960,7 +1994,7 @@ def audit_day(
         else:
             t_ts = _transcript_ts(t)
             i = min(range(len(c_keys)),
-                    key=lambda j: abs(event_start_ts(carved[c_keys[j]][0]) - t_ts))
+                    key=lambda j: _carved_pick_rank(carved[c_keys[j]][0], t_ts))
             is_breach, h_ev, h_reason = results[i]
             group = c_keys[i]
         row = _record_carved_hit(

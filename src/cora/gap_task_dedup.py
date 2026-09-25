@@ -365,10 +365,33 @@ def _is_prefix(short: tuple, long_: tuple) -> bool:
     return len(short) < len(long_) and long_[: len(short)] == short
 
 
+def _is_truncated_copy(a_text: str, b_text: str) -> bool:
+    """One side's prefix-stripped, casefolded text is a STRICT prefix of the other's:
+    a truncated copy of the same text, not a second task.
+
+    D-051 r3 s1s2#r3-0. The nets compare a full subject (up to _MAX_INPUT) against
+    truncated copies of it -- the executor's own Asana task name is
+    f"[{ent}] {subj}"[:150] (plan_create), a ledger row stores
+    subject[:_MAX_SUBJECT_STORED]. `_CLAUSE_RE` runs to end-of-string, so the copy
+    carries a CUT clause (and a cut paren / dash tail): a strict subset of the full
+    text's dropped words. The drift guard read that as two tasks and refused the
+    task its own copy -- after a create that timed out post-commit, the fresh
+    project scan (the only net left) no longer recognised the task this executor
+    made. Whitespace runs are collapsed so a copy that only re-spaced still counts."""
+    sa = " ".join(strip_task_prefix(a_text).split()).casefold()
+    sb = " ".join(strip_task_prefix(b_text).split()).casefold()
+    return bool(sa) and bool(sb) and sa != sb and (sa.startswith(sb) or sb.startswith(sa))
+
+
 def tier_a(a_text: str, b_text: str) -> bool:
     """Same task, auto-suppressible. Caller guarantees the same entity."""
-    a, b = signature(str(a_text or "")), signature(str(b_text or ""))
-    if not a.norm or not b.norm or _id_conflict(a, b) or _drift_conflict(a, b):
+    a_text, b_text = str(a_text or ""), str(b_text or "")
+    a, b = signature(a_text), signature(b_text)
+    if not a.norm or not b.norm or _id_conflict(a, b):
+        return False
+    # The dropped-word guard compares what the key threw away; a truncated copy's
+    # dropped words are a cut of the full text's, never a different task's.
+    if _drift_conflict(a, b) and not _is_truncated_copy(a_text, b_text):
         return False
     if a.norm == b.norm:
         return True

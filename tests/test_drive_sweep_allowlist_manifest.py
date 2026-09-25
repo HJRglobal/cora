@@ -343,6 +343,43 @@ class TestFolderCache:
         folder_gets = [g for g in drive2.got if g in ("MY", FOS, "HJRG", "ACC", "DL", "DLSUB", "DLSUB2")]
         assert folder_gets == []                                             # only the files themselves were fetched
 
+    # D-051 r3 docs#r3-0: 4e and the REFUSED line said "rename it in Drive and re-run
+    # step 1", but _ancestor_chain never re-reads a cached folder, so the re-run
+    # rendered the OLD name and printed the same REFUSED line (0 folder lookups).
+    def test_a_refused_folder_renamed_in_drive_gets_its_line_on_the_rerun(self, tmp_path):
+        mod = _load()
+        meta = {k: dict(v) for k, v in META.items()}
+        meta["DLSUB"]["name"] = "Harrison’s Photos"            # a typographic apostrophe
+        cache_path = tmp_path / "cache.json"
+        rep = mod.build_report(_conn(), _Drive(meta, missing={"f_gone"}, fail={"BAD"}), account=ACCOUNT,
+                               allowlist=frozenset({FOS}), folder_cache={}, cache_path=cache_path)
+        section = mod.render_manifest(rep).split("PURGE LINES", 1)[1].split("UNRESOLVED / STALE", 1)[0]
+        assert "# REFUSED: folder DLSUB -- the folder name contains a non-ASCII character" in section
+        meta["DLSUB"]["name"] = "Harrison's Photos"            # Harrison renames it in Drive
+        drive2 = _Drive(meta, missing={"f_gone"}, fail={"BAD"})
+        rep2 = mod.build_report(_conn(), drive2, account=ACCOUNT, allowlist=frozenset({FOS}),
+                                folder_cache=mod.load_cache(cache_path), cache_path=cache_path)
+        section2 = mod.render_manifest(rep2).split("PURGE LINES", 1)[1].split("UNRESOLVED / STALE", 1)[0]
+        assert "REFUSED: folder DLSUB" not in section2
+        assert "--folder-id DLSUB --expect-leaf 'Harrison''s Photos' --impersonate" in section2
+        assert [g for g in drive2.got if g in ("MY", "DL", "DLSUB", "DLSUB2")] == ["DLSUB"]  # one re-read
+        saved = mod.load_cache(cache_path)
+        assert saved["DLSUB"]["name"] == "Harrison's Photos" and saved["DLSUB2"]["name"] == "scans"
+        # the REFUSED line itself names the move case's remedy
+        assert mod.CACHE_BASENAME in section and "--cache <new path>" in section
+
+    def test_the_runbook_says_to_drop_the_cache_after_a_drive_rename_or_move(self):
+        mod = _load()
+        text = (_REPO_ROOT / "deployment" / "runbook.md").read_text(encoding="utf-8")
+        start = text.index("# 4e. The purges:")
+        block = text[start:text.index("$env:PYTHONIOENCODING", start)]
+        assert block.isascii()
+        prose = " ".join(ln.lstrip("# ").strip() for ln in block.splitlines())
+        assert f"delete logs\\drive-sweep-allowlist\\{mod.CACHE_BASENAME} (or pass --cache <new path>)" in prose
+        step1 = text[text.index("1. Build the manifest"):text.index("3. Run every PURGE LINE")]
+        assert "After RENAMING or MOVING a folder in Drive, delete that JSON" in step1
+        assert "delete the folder-cache JSON" in step1              # step 2's move-in-Drive-first note
+
     def test_corrupt_cache_starts_empty(self, tmp_path):
         mod = _load()
         p = tmp_path / "c.json"

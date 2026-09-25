@@ -141,10 +141,18 @@ is regenerated. **Weekly Sat 02:40 AZ** -> `scripts/run_hygiene_drive_weekly.py 
   apply.ps1 schema; trend only -- Drive for Desktop recreates desktop.ini).
 - **Disclosure:** the report folder is static_md-ingested, so `08-Lexington-Services`,
   any path elsewhere naming LEX (a sub-entity / program code, COPA, a
-  cross_entity_guard LEX keyword, or a LEX person from the detector's lead lists or
-  the org_roles roster, however joined) and every KB-pinned container (incl.
-  `_archive` + `00-Founder\personal-finances`) are COUNTS ONLY, and listed names
-  pass `phi_guard.is_any_phi`.
+  cross_entity_guard LEX keyword -- codes also read with CamelCase and a glued
+  all-caps code as word breaks: `LexOps`, `LEXreport`, `COPAdiligence`,
+  `TheLexington` -- or a LEX person from the detector's lead lists or the org_roles
+  roster, first-last or last-first joined by any separators or none, or first
+  initial + last: `JaneDoe`, `doe_jane`, `JDoe`, `J.Doe`, `J. Doe`) and every
+  KB-pinned container (incl. `_archive` + `00-Founder\personal-finances`) are
+  COUNTS ONLY, and listed names pass `phi_guard.is_any_phi`. Still LISTED (known
+  residuals, 0 of the 4,681 listable items on the 9/21 baseline): a lead's last
+  name alone, a middle name or initial between the two names, both names as
+  initials, dotted / dashed
+  code letters (`L.B.H.S.`, `L-B-H-S`), an all-caps code glued to another
+  all-caps word (`LEXHR`), and payer words (`EVV`, `AHCCCS`, `Medicaid`).
 - **Safety:** never mkdirs the report folder; never overwrites a same-named file
   without the generator marker; a walk that fails the floor / has walk errors /
   wrote no summary / cannot read its prior's CSVs writes an INCOMPLETE WALK report,
@@ -152,13 +160,20 @@ is regenerated. **Weekly Sat 02:40 AZ** -> `scripts/run_hygiene_drive_weekly.py 
   Keep-4 rotation deletes only stamps the runner itself recorded
   (`data/state/hygiene-drive-stamps.jsonl`), never `20260921-1948`, hand or subtree
   runs, `manifest-*`, `_applied-*` or `_dryrun-*`.
-- **The floor (high-water):** files AND folders must be >= 80% of the LARGEST of the
-  newest four eligible runs (runner runs that passed the floor; the `20260921-1948`
-  baseline counts only while it is one of those four), never of a run older than
-  the newest re-baseline. It is anchored on that high-water mark, not on last
-  week, so a partial walk cannot ratchet the floor down; a run that fails it is
-  never eligible, so a LEGITIMATE shrink bigger than 20% (a partition moved out of
-  the tree, a purge) fails every week until the operator re-baselines.
+- **The floor (high-water + cumulative anchor):** files AND folders must be >= 80%
+  of the LARGEST of the newest four eligible runs (runner runs that passed the
+  floor; the `20260921-1948` baseline counts only while it is one of those four),
+  never of a run older than the newest re-baseline, AND >= 80% of the cumulative
+  ANCHOR -- the newest re-baselined stamp's counts (kept in the stamp ledger), or
+  the `20260921-1948` baseline's while nothing was ever re-baselined. It is
+  anchored on those, not on last week, so a partial walk cannot ratchet the floor
+  down -- neither at once nor 20% per four weeks (D-051 R3 rb2#r3-0: the four-run
+  window alone let 50% of the tree vanish over ~13 CLEAN weeks); a run that fails
+  it is never eligible, so ANY cumulative shrink bigger than 20% (a partition
+  moved out of the tree, a purge, or several small ones) fails every week until
+  the operator re-baselines. A `--from-stamp` rebuild of a week OLDER than a
+  re-baseline keeps that week's own floor (the re-baseline governs only the weeks
+  from its stamp on).
 - **Re-baseline (operator, after checking the shrink is real):** the INCOMPLETE
   report prints the exact commands whenever the walk itself was sound (COMPLETE,
   full root, 0 walk errors, CSV counts match). Dry-run first, then record it, then
@@ -166,8 +181,9 @@ is regenerated. **Weekly Sat 02:40 AZ** -> `scripts/run_hygiene_drive_weekly.py 
   `.\.venv\Scripts\python.exe scripts\run_hygiene_drive_weekly.py --rebaseline <stamp>`
   then the same with `--apply`, then `--from-stamp <stamp> --apply` (reads
   UNVERIFIED -- nothing is compared that week). It appends a `rebaselined` row to the
-  stamp ledger; from then on `<stamp>` is the prior and no older run (the baseline
-  included) is a prior or part of the high-water. The baseline's files stay on disk
+  stamp ledger; from then on `<stamp>` is the prior and the cumulative anchor, and
+  no older run (the baseline included) is a prior or part of the high-water for any
+  later week. The baseline's files stay on disk
   (the RIDER B proposer reads them). Refused (exit 3, writes nothing) for a stamp the
   runner did not record, a rotated one, one with its own walk failures, or one older
   than an earlier re-baseline. If the mount was degraded instead, just re-run
@@ -348,6 +364,11 @@ this section supersedes it for stop windows.)
    ```
    Re-runs are cheap: the folder cache persists at
    `logs\drive-sweep-allowlist\drive-sweep-allowlist-folder-cache.json` (override with `--cache`).
+   **After RENAMING or MOVING a folder in Drive, delete that JSON (or pass
+   `--cache <new path>`) before re-running:** a cached folder is never re-read, so
+   the re-run would still render its OLD name and OLD parents (D-051 r3 docs#r3-0).
+   A purge folder the manifest REFUSED is dropped from the cache automatically, so
+   renaming just that folder is picked up either way; a move never is.
    `--limit N` previews the N largest files; `--account` defaults to harrison@hjrglobal.com.
 2. EYEBALL the manifest (`logs\drive-sweep-allowlist\drive-sweep-allowlist-manifest-<date>.txt`):
    - `CANDIDATES TO ADD TO THE ALLOWLIST`: every out-of-tree TOP-LEVEL folder that
@@ -366,7 +387,8 @@ this section supersedes it for stop windows.)
      (a folder directly under My Drive) and cannot reach loose files directly
      under My Drive -- the manifest flags both `unreachable by the gate -- move in
      Drive first` (the 9/9 precedent: pin the parent, purge per CHILD). Move those
-     files/folders under a sub-folder in Drive, re-run step 1, and the lines appear.
+     files/folders under a sub-folder in Drive, delete the folder-cache JSON (step 1;
+     or pass `--cache <new path>`), re-run step 1, and the lines appear.
 3. Run every PURGE LINE WITHOUT `--apply` in normal PS (Cora running is fine --
    dry-run). Each writes its own reviewed manifest at
    `logs\purge-cora-internal-folder-<id>.txt`; eyeball the file list and totals.
@@ -417,8 +439,10 @@ Start-Sleep 310
 #     hand-typed name='...' row). A "# REFUSED: folder <id>" line means the name cannot pass through PS 5.1 intact
 #     (a double quote, a trailing backslash, a control character, an empty name, or ANY non-ASCII character --
 #     including a typographic/curly apostrophe, which macOS/iOS autocorrect types in place of a straight one, or an
-#     accented letter; D-051 r1 rb-pins#0 -- a plain ASCII apostrophe is fine, it is doubled): rename it in Drive
-#     and re-run step 1. Such a folder gets NO PURGE line until it is renamed, and the rename is a Drive connector
+#     accented letter; D-051 r1 rb-pins#0 -- a plain ASCII apostrophe is fine, it is doubled): rename it in Drive,
+#     delete logs\drive-sweep-allowlist\drive-sweep-allowlist-folder-cache.json (or pass --cache <new path>), and
+#     re-run step 1 -- a cached folder is never re-read, so a re-run on a stale cache still renders the old name
+#     (D-051 r3 docs#r3-0). Such a folder gets NO PURGE line until it is renamed, and the rename is a Drive connector
 #     write -- Harrison's to make (plain ASCII, e.g. a straight apostrophe), never a Code session's. Each apply
 #     REFUSES (nothing deleted) if its step-3 dry-run manifest is missing, does not cover every selected file (files
 #     added since -> re-run step 3 first, or add --accept-delta only if you accept them), or --expect-leaf mismatches.

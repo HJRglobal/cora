@@ -12,7 +12,10 @@ NO folder chain in metadata, so ancestry must be resolved per file with
 files.get(fields='id,name,parents,mimeType,trashed') under DWD as the account
 (the same builder + retry helper the sweep uses) and then walked upward with
 drive_sweep._ancestor_chain -- one lookup per DISTINCT folder, cached, and the
-folder cache PERSISTS as JSON so re-runs after an allowlist edit are cheap.
+folder cache PERSISTS as JSON so re-runs after an allowlist edit are cheap. A
+cached folder is never re-read: after a rename or move in Drive, delete the cache
+(or pass --cache <new path>) -- only a purge folder whose name was REFUSED is
+evicted automatically, so its rename is picked up (D-051 r3 docs#r3-0).
 
 Writes: ONLY under --out-dir (the manifest .txt + the folder cache JSON). Never
 the KB, never logs/ by default (both paths are explicit arguments so a test can
@@ -209,7 +212,15 @@ def build_report(
     folder_cache: dict, limit: int = 0, cache_path: Path | None = None,
 ) -> dict[str, Any]:
     """Resolve + classify every KB file of the account. Read-only except the
-    folder cache (flushed every _CACHE_FLUSH_EVERY files when ``cache_path`` is given)."""
+    folder cache (flushed every _CACHE_FLUSH_EVERY files when ``cache_path`` is given).
+
+    A purge folder whose name the renderer will REFUSE is EVICTED from the cache
+    before the final save (D-051 r3 docs#r3-0): ``_ancestor_chain`` never calls
+    files.get for a cached folder, so after the prescribed rename in Drive the
+    re-run rendered the OLD name and the same REFUSED line. Evicted, the next run
+    re-fetches that one folder and sees the new name. A MOVED folder's cached
+    parents are not refreshed this way -- the REFUSED line and runbook 4e / step 2
+    say to delete the cache (or pass --cache <new path>) after a move."""
     files = load_kb_files(conn, account, limit=limit)
     entries: list[dict[str, Any]] = []
     for i, f in enumerate(files, 1):
@@ -218,6 +229,9 @@ def build_report(
         entries.append({**f, **resolved, **cls})
         if cache_path is not None and i % _CACHE_FLUSH_EVERY == 0:
             save_cache(cache_path, folder_cache)
+    for e in entries:
+        if e["bucket"] == OUTSIDE and e["purge_folder"] and not _ps_safe(e["purge_folder"][1]):
+            folder_cache.pop(e["purge_folder"][0], None)
     if cache_path is not None:
         save_cache(cache_path, folder_cache)
     groups: dict[str, dict[str, Any]] = {}
@@ -299,6 +313,15 @@ def ps_single_quote(value: str) -> str:
     return f"'{out}'"
 
 
+def _ps_safe(value: str) -> bool:
+    """Would ``ps_single_quote`` accept ``value`` (i.e. the renderer print a line)?"""
+    try:
+        ps_single_quote(value)
+    except UnsafeLeafName:
+        return False
+    return True
+
+
 def purge_line(folder_id: str, leaf_name: str, account: str) -> str:
     """The ready-to-run dry-run line for the UNCHANGED positive-leaf gate. ``--apply``
     is added ONLY inside the stop window (deployment/runbook.md, slice-8 section).
@@ -378,7 +401,10 @@ def render_manifest(report: dict[str, Any]) -> str:
                 line, row = purge_line(pf["id"], pf["name"], acct), kids_row(pf["id"], pf["name"])
             except UnsafeLeafName as exc:
                 lines.append(f"# REFUSED: folder {pf['id']} -- {exc}; PowerShell 5.1 cannot pass it to "
-                             f"--expect-leaf intact. Rename the folder in Drive, then re-run this manifest.")
+                             f"--expect-leaf intact. Rename the folder in Drive, then re-run this manifest "
+                             f"(this folder was dropped from the folder cache so the re-run re-reads its "
+                             f"name; after MOVING a folder in Drive, delete {CACHE_BASENAME} in the "
+                             f"out-dir or pass --cache <new path> first).")
                 continue
             lines.append(line)
             lines.append(f"#   runbook 4e $kids row (paste as printed): {row}")

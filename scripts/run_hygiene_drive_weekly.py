@@ -24,7 +24,10 @@ WHAT IT DOES (``--apply``, what the task passes)
  8. SANITY FLOOR: files AND folders >= 80% of the HIGH-WATER full run (the
     largest of the newest KEEP_RUNNER_STAMPS eligible runs of step 9 -- the 9/21
     baseline counts only while it is among them; anchoring on the prior alone
-    let the floor ratchet down 20% a week), 0 walk errors (WALK-*/FATAL/
+    let the floor ratchet down 20% a week) AND >= 80% of the CUMULATIVE anchor
+    (the newest operator re-baseline, else the 9/21 baseline -- the window alone
+    slid 20% every four eligible weeks, so any cumulative shrink over 20% now
+    needs ``--rebaseline``, never just waiting), 0 walk errors (WALK-*/FATAL/
     OUTPUT-WRITE run-log lines), both CSVs readable and their row counts == the
     summary totals, and the prior's two CSVs readable. A failure writes an
     INCOMPLETE WALK report (no lists, no deltas), records the stamp as
@@ -33,7 +36,8 @@ WHAT IT DOES (``--apply``, what the task passes)
  9. Prior = the newest earlier FULL-ROOT stamp this runner recorded as passing
     the floor (its stamp ledger), or the 2026-09-21 19:48 hashing baseline;
     never a hand/subtree run, never a run that failed the floor, never a run
-    older than the newest operator re-baseline (below).
+    older than the newest operator re-baseline at or before this week (below; a
+    --from-stamp rebuild of an earlier week keeps that week's own floor).
 10. Writes ``<report_dir>\YYYY-MM-DD_fndr_hygiene-findings.md`` ONLY if
     report_dir exists (never mkdir -- a mkdir on a Drive mount can mint a
     "(1)" twin), only at the exact path, and never over a same-named file that
@@ -54,15 +58,15 @@ row, no rotation. The temp dir (it holds LEX paths) is removed afterwards.
 out-dir without walking (``--apply`` writes the .md + sidecar only).
 
 ``--rebaseline <stamp>`` is the operator's escape hatch for a LEGITIMATE shrink
-(a partition moved out of the tree, a purge) that the high-water floor would
-otherwise refuse every week: a failed floor is ledgered ``incomplete``, never
-becomes eligible, and so could never move the anchor (D-051 R2 rb2#r2-0 /
-lens#r2-1). It names a stamp this runner recorded (full root, NO-HASH) whose
-walk passes every check EXCEPT the floor, and ``--apply`` appends a
-``rebaselined`` row to the stamp ledger: from then on that stamp is eligible
-and no older run -- the 9/21 baseline included -- is a prior or part of the
-high-water. The baseline's files stay on disk (the RIDER B proposer reads
-them). ``--dry-run`` (the default) validates and prints, writing nothing. The
+(a partition moved out of the tree, a purge) that the floors would otherwise
+refuse every week: a failed floor is ledgered ``incomplete``, never becomes
+eligible, and so could never move the anchor (D-051 R2 rb2#r2-0 / lens#r2-1).
+It names a stamp this runner recorded (full root, NO-HASH) whose walk passes
+every check EXCEPT the floor, and ``--apply`` appends a ``rebaselined`` row to
+the stamp ledger: from then on that stamp is eligible and the cumulative
+anchor, and for every later week no older run -- the 9/21 baseline included --
+is a prior or part of the high-water. The baseline's files stay on disk (the
+RIDER B proposer reads them). ``--dry-run`` (the default) validates and prints, writing nothing. The
 INCOMPLETE report prints the exact commands whenever the walk itself was sound.
 
 The Notion ``[Hygiene] Drive`` page stays Cowork-side: the rewritten Cowork
@@ -312,9 +316,11 @@ def read_ledger(path: Path) -> list[dict]:
 
 def ledger_state(rows: list[dict]) -> dict[str, dict]:
     """stamp -> its "created" row, with ``rotated`` set once a rotation row exists
-    and ``rebaselined`` set once an operator re-baseline row names it."""
+    and ``rebaselined`` set once an operator re-baseline row names it (plus
+    ``rebaselined_counts``, that row's files/dirs totals -- the cumulative floor's
+    anchor, readable after rotation has deleted the stamp's own files)."""
     out: dict[str, dict] = {}
-    rebased: set[str] = set()
+    rebased: dict[str, dict] = {}
     for r in rows:
         st = r.get("stamp")
         if not isinstance(st, str):
@@ -324,17 +330,23 @@ def ledger_state(rows: list[dict]) -> dict[str, dict]:
         elif r.get("event") == "rotated" and st in out:
             out[st]["rotated"] = True
         elif r.get("event") == "rebaselined":
-            rebased.add(st)
-    for st in rebased:
+            rebased[st] = r
+    for st, r in rebased.items():
         if st in out:
             out[st]["rebaselined"] = True
+            out[st]["rebaselined_counts"] = {k: r.get(k) for k in ("files_total", "dirs_total")}
     return out
 
 
-def rebaseline_cutoff(ledger: dict[str, dict]) -> str | None:
-    """The newest operator re-baselined stamp: no run older than it is a prior or
-    part of the high-water mark any more (the 9/21 baseline included)."""
-    return max((st for st, r in ledger.items() if r.get("rebaselined")), default=None)
+def rebaseline_cutoff(ledger: dict[str, dict], current: str | None = None) -> str | None:
+    """The newest operator re-baselined stamp -- the newest AT OR BEFORE ``current``
+    when one is given: no run older than it is a prior or part of the high-water
+    mark for a week at or after it (the 9/21 baseline included). A week BEFORE a
+    re-baseline keeps the floor it had: applying the newest cutoff to it dropped
+    every earlier run, so a --from-stamp rebuild of an INCOMPLETE week older than
+    the re-baseline ran with no floor and read UNVERIFIED (D-051 R3 rb2#r3-1)."""
+    return max((st for st, r in ledger.items()
+                if r.get("rebaselined") and (current is None or st <= current)), default=None)
 
 
 def _is_runner_walk(row: dict | None) -> bool:
@@ -354,9 +366,10 @@ def eligible_runs(outdir: Path, current: str, full_root: Path, ledger: dict[str,
     or the 9/21 baseline, AND whose own summary says COMPLETE on the full root
     with 0 walk errors and both CSVs present -- newest first. Hand and subtree
     runs are never eligible, and neither is any run older than the newest
-    re-baseline (``rebaseline_cutoff``) -- the baseline included."""
+    re-baseline at or before ``current`` (``rebaseline_cutoff``) -- the baseline
+    included."""
     out: list[RunInfo] = []
-    cutoff = rebaseline_cutoff(ledger)
+    cutoff = rebaseline_cutoff(ledger, current)
     stamps = sorted({m.group(1) for n in listing(outdir) if (m := _SUMMARY_NAME_RE.match(n))}, reverse=True)
     for st in stamps:
         if st >= current or (cutoff is not None and st < cutoff):
@@ -397,11 +410,11 @@ def high_water(runs: list[RunInfo]) -> dict[str, tuple[int, str]]:
     floor, and the floor would ratchet down 20% a week (D-051 R1 rb2-r8#1: 100
     -> 81 -> 65 read CLEAN, with 16 unwalked offenders reported 'resolved').
 
-    BOUNDED (D-051 R2 lens#r2-1 / rb2#r2-0): the never-rotated baseline used to
-    anchor the floor forever, so a legitimate cumulative 20% shrink since 9/21
-    failed every week and no week could ever pass to move it. Now the anchor is
-    the window rotation keeps, and a shrink larger than the floor allows within
-    it is accepted only by the operator (``--rebaseline``), never by waiting."""
+    BOUNDED (D-051 R2 lens#r2-1 / rb2#r2-0): this window is the one rotation
+    keeps. It is NOT the only floor: bounded alone it re-admitted a slow ratchet
+    (a partial walk at 81% for four weeks became the anchor, and the next 20% read
+    CLEAN -- 50% of the tree gone in ~13 CLEAN weeks, D-051 R3 rb2#r3-0), so
+    ``floor_anchor`` adds a cumulative floor that only ``--rebaseline`` moves."""
     hw: dict[str, tuple[int, str]] = {}
     for info in runs[:KEEP_RUNNER_STAMPS]:
         for key in ("files_total", "dirs_total"):
@@ -411,11 +424,47 @@ def high_water(runs: list[RunInfo]) -> dict[str, tuple[int, str]]:
     return hw
 
 
+def floor_anchor(runs: list[RunInfo], ledger: dict[str, dict], current: str) -> dict[str, tuple[int, str]]:
+    """{'files_total' / 'dirs_total': (count, stamp)} of the CUMULATIVE floor's
+    anchor for a walk of ``current``: the newest re-baseline at or before it (its
+    ledger counts, which outlive rotation), else the 9/21 baseline while it is
+    eligible (``runs``, from ``eligible_runs``). {} when ``current`` IS that
+    re-baseline (the operator accepted it) or no anchor is readable.
+
+    D-051 R3 rb2#r3-0: the high-water window slid with the eligible runs, so a
+    cumulative shrink could pass 20% at a time; against this anchor any
+    cumulative shrink over 20% fails every week until the operator re-baselines
+    -- never by waiting."""
+    cutoff = rebaseline_cutoff(ledger, current)
+    if cutoff == current:
+        return {}
+    out: dict[str, tuple[int, str]] = {}
+    if cutoff is not None:
+        row = ledger.get(cutoff) or {}
+        counts = row.get("rebaselined_counts") or {}
+        info = next((r for r in runs if r.stamp == cutoff), None)
+        for key in ("files_total", "dirs_total"):
+            for n in (counts.get(key), row.get(key), info.summary.get(key) if info else None):
+                if isinstance(n, int) and not isinstance(n, bool) and n > 0:
+                    out[key] = (n, cutoff)
+                    break
+        return out
+    base = next((r for r in runs if r.stamp == BASELINE_STAMP), None)
+    if base is not None:
+        for key in ("files_total", "dirs_total"):
+            n = base.summary.get(key) or 0
+            if n:
+                out[key] = (n, BASELINE_STAMP)
+    return out
+
+
 def sanity(info: RunInfo, full_root: Path, prior: RunInfo | None, *, files_rows: int | None,
-           dirs_rows: int | None, high: dict[str, tuple[int, str]] | None = None) -> list[str]:
+           dirs_rows: int | None, high: dict[str, tuple[int, str]] | None = None,
+           anchor: dict[str, tuple[int, str]] | None = None) -> list[str]:
     """Reasons this walk cannot be trusted (empty list = it passed). A row count
     of None = that CSV is missing or unreadable. ``high`` is the high-water mark
-    the floor is anchored to (``high_water``); None = the prior alone."""
+    the floor is anchored to (``high_water``); None = the prior alone. ``anchor``
+    is the cumulative floor's anchor (``floor_anchor``); None / {} = none."""
     sm, why = info.summary, []
     if sm.get("run_status") != "COMPLETE":
         why.append("the inventory did not report COMPLETE")
@@ -445,6 +494,18 @@ def sanity(info: RunInfo, full_root: Path, prior: RunInfo | None, *, files_rows:
             else:
                 why.append(f"{label} walked {now_n} < {pct}% of the high-water full run's {hw_n} "
                            f"(stamp {hw_stamp})")
+    for key, label in (("files_total", "files"), ("dirs_total", "folders")):
+        if not anchor or key not in anchor:
+            continue
+        an_n, an_stamp = anchor[key]
+        if key in high and high[key][0] >= an_n:
+            continue   # the high-water floor is at least as strict: one reason, not two
+        now_n = sm.get(key) or 0
+        if now_n < FLOOR_RATIO * an_n:
+            what = ("the 2026-09-21 baseline's" if an_stamp == BASELINE_STAMP
+                    else "the newest re-baselined run's")
+            why.append(f"{label} walked {now_n} < {int(FLOOR_RATIO * 100)}% of {what} {an_n} "
+                       f"(stamp {an_stamp}): a cumulative shrink over 20% is accepted only by a re-baseline")
     return why
 
 
@@ -709,7 +770,8 @@ def main(argv: list[str] | None = None) -> int:
         runs = eligible_runs(cfg.outdir, stamp, cfg.root, ledger)
         prior = runs[0] if runs else None
         rows_n = {"files_rows": None if files is None else len(files), "dirs_rows": None if dirs is None else len(dirs)}
-        why = sanity(info, cfg.root, prior, high=high_water(runs), **rows_n)
+        why = sanity(info, cfg.root, prior, high=high_water(runs),
+                     anchor=floor_anchor(runs, ledger, stamp), **rows_n)
         prior_rows = load_prior_rows(cfg.outdir, prior)
         if prior is not None and prior_rows is None:
             why.append(f"the prior run's (stamp {prior.stamp}) files or folders CSV is missing or unreadable, "

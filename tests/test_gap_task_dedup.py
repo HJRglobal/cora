@@ -453,6 +453,53 @@ def test_the_clause_drift_still_collapses():
     assert _tier(DLC[2], DLC[0]) == "A"        # "(..., overdue since 2026-08-15)"
 
 
+# D-051 r3 s1s2#r3-0: a clause-bearing subject vs its OWN truncated copies. The
+# clause starts before the cut and runs past it, so each copy carries a CUT clause.
+_CLAUSE_SUBJ_191 = (
+    "Follow up with Brightwell Packaging on the retail sleeve reprint for the Costco "
+    "roadshow, currently blocked by artwork approval from the design agency and the "
+    "freight booking with the carrier")
+_CLAUSE_SUBJ_300 = (
+    "Follow up with Brightwell Packaging on the retail sleeve reprint order for the "
+    "Costco spring roadshow in Phoenix and the Scottsdale pop-up event series, "
+    "currently blocked by final artwork approval from the outside design agency, "
+    "the freight booking with the carrier and the updated pallet configuration")[:gtd._MAX_INPUT]
+
+
+def test_a_subject_is_tier_A_against_its_own_truncated_copies():
+    """The executor's own Asana task name is f"[{ent}] {subj}"[:150] (plan_create)
+    and a ledger row stores subject[:240]; the clause guard read the copy's cut
+    clause as a different task, so the project-scan net (the only one left after a
+    create that timed out post-commit) no longer recognised the task it made."""
+    assert len(_CLAUSE_SUBJ_191) > 150 and len(_CLAUSE_SUBJ_300) > gtd._MAX_SUBJECT_STORED
+    for subj, copy in (
+            (_CLAUSE_SUBJ_191, f"[F3E] {_CLAUSE_SUBJ_191}"[:150].strip()),  # plan_create name
+            (_CLAUSE_SUBJ_300, _CLAUSE_SUBJ_300[:gtd._MAX_SUBJECT_STORED])):  # ledger subject
+        cut, full = gtd.drift_identity(copy)[2], gtd.drift_identity(subj)[2]
+        assert cut and full and cut < full                    # a CUT clause: strict subset
+        assert gtd.tier_a(subj, copy) and gtd.tier_a(copy, subj)
+        assert _tier(subj, copy) == "A"
+    # every cut point of the 191-char subject past its clause keyword, word boundary or not
+    kw = _CLAUSE_SUBJ_191.index("currently")
+    for n in range(kw + len("currently b"), len(_CLAUSE_SUBJ_191)):
+        assert gtd.tier_a(_CLAUSE_SUBJ_191, _CLAUSE_SUBJ_191[:n]), n
+
+
+def test_a_truncated_copy_is_found_by_the_ledger_but_a_different_clause_is_not(tmp_path,
+                                                                            monkeypatch):
+    _ledger(tmp_path, monkeypatch)
+    _seed_proposed_updates(monkeypatch, tmp_path, [])
+    assert gtd.record_created(update_id="u-trunc-1", entity="F3E", subject=_CLAUSE_SUBJ_300,
+                              gid="1200000000000001")
+    rows = gtd.ledger_rows(persist=True)
+    assert rows[-1]["subject"] == _CLAUSE_SUBJ_300[:gtd._MAX_SUBJECT_STORED]
+    hit = gtd.find_tier_a("F3E", _CLAUSE_SUBJ_300, rows)
+    assert hit is not None and hit["ref"] == "u-trunc-1"
+    # not a copy: the same key with a DIFFERENT clause still falls to tier B
+    other = _CLAUSE_SUBJ_300.split("currently")[0] + "currently blocked by the landlord"
+    assert gtd.find_tier_a("F3E", other, rows) is None
+
+
 def test_a_dropped_clause_conflict_is_listed_by_the_ledger_never_suppressed(tmp_path,
                                                                             monkeypatch):
     _ledger(tmp_path, monkeypatch)
