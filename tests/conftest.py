@@ -610,6 +610,15 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     _SCRIPT_CONSTS = [
         ("scripts.run_knowledge_review", "_MECHANICAL_BATCH_STATE_PATH", "mechanical-batch-card.json"),
         ("run_knowledge_review", "_MECHANICAL_BATCH_STATE_PATH", "mechanical-batch-card.json"),
+        # Code #15 D-051 r1 lens-dryrun#0: the N2 run lock. ~15 tests drive
+        # rkr.main() without --dry-run; each TAKES the lock (os.open O_EXCL) and
+        # registers its release at interpreter exit. Unredirected, a test that
+        # did not patch _LOCK_PATH itself created -- and at exit unlinked -- the
+        # REAL data/state/knowledge-review.lock, which in the primary checkout is
+        # the live 07:00 run's race guard. main() now also binds the path at
+        # registration, so the exit hook unlinks the lock the run actually took.
+        ("scripts.run_knowledge_review", "_LOCK_PATH", "knowledge-review.lock"),
+        ("run_knowledge_review", "_LOCK_PATH", "knowledge-review.lock"),
     ]
     for _mod_name, _attr, _fname in _SCRIPT_CONSTS:
         _mod = _sys.modules.get(_mod_name)

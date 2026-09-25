@@ -162,9 +162,10 @@ def _content(tokens: Iterable[str]) -> list[str]:
     return [t for t in tokens if len(t) >= 2 and t not in _STOP]
 
 
-def _drop_figure_tail(s: str) -> str:
-    """Split once on a spaced dash; drop the tail only when it carries a figure or
-    date AND at most 2 content tokens remain once the figures are gone.
+def _split_figure_tail(s: str) -> tuple[str, str]:
+    """(kept, dropped_tail). Split once on a spaced dash; drop the tail only when
+    it carries a figure or date AND at most 2 content tokens remain once the
+    figures are gone. `dropped_tail` is '' when nothing is dropped.
 
     The 2-token floor is what removed the one false merge the recon found: "REP
     Fitness ... shoot -- finalize filming location and timing for week of 7/30"
@@ -172,18 +173,23 @@ def _drop_figure_tail(s: str) -> str:
     its sibling sub-task."""
     m = _DASH_SPLIT_RE.search(s)
     if not m:
-        return s
+        return s, ""
     tail = s[m.end():]
     if not re.search(r"\d", tail):
-        return s
+        return s, ""
     rest = _NUMRUN_RE.sub(" ", _remove_figures(tail))
     if len(_content(_raw_tokens(rest))) <= 2:
-        return s[:m.start()]
-    return s
+        return s[:m.start()], tail
+    return s, ""
+
+
+def _drop_figure_tail(s: str) -> str:
+    return _split_figure_tail(s)[0]
 
 
 def normalize(text: str) -> str:
-    """The tier-A dedup key: prefix-stripped, figure/date drift removed, lowercased."""
+    """The tier-A dedup key: prefix-stripped, figure/date drift removed, lowercased.
+    The words it drops are NOT all drift -- `drift_identity` guards them (s2#2)."""
     s = strip_task_prefix(text)
     s = _drop_figure_tail(s)
     s = _PAREN_RE.sub(" ", s)
@@ -234,6 +240,36 @@ def body_dates(text: str) -> frozenset[str]:
     return frozenset(out)
 
 
+def drift_identity(text: str) -> tuple[frozenset, frozenset]:
+    """(parenthetical words, dropped-tail words): the content words the tier-A key
+    throws away that can still NAME the task. Stemmed; never used for matching,
+    only as a guard.
+
+    D-051 r1 s2#2. `normalize` deletes every parenthetical and every short
+    figure-bearing dash tail -- right for the drift it was measured on ("($33,487
+    as of 2026-08-27)", "-- cash dropped $23,186 to $35,337"), wrong when those
+    words are the only thing telling two tasks apart: "(Mango flavor)" vs "(Berry
+    flavor)", "(morning shift)" vs "(closing shift)", "- $4,800 setup fee" vs "-
+    $2,100 monthly storage" all came out as tier A (suppressed for 120 days). Only
+    a DIGIT-FREE parenthetical counts (a figure-bearing one is the measured drift;
+    its ids are already guarded by `extract_ids`), and only a tail `normalize`
+    really DROPS. Two non-empty, unequal sets = no tier A -- the pair falls to
+    tier B and is listed, never suppressed (the id / body-date rule)."""
+    s = strip_task_prefix(text)
+    kept, tail = _split_figure_tail(s)
+    paren: set[str] = set()
+    for m in _PAREN_RE.finditer(kept):
+        inner = m.group(0)
+        if re.search(r"\d", inner):
+            continue
+        paren.update(stem(t) for t in _content(_raw_tokens(inner)))
+    tail_words: set[str] = set()
+    if tail:
+        rest = _NUMRUN_RE.sub(" ", _remove_figures(tail))
+        tail_words.update(stem(t) for t in _content(_raw_tokens(rest)))
+    return frozenset(paren), frozenset(tail_words)
+
+
 def stem(tok: str) -> str:
     """Iteratively strip -ation/-ment/-ing/-s (implement == implementation).
     Idempotent: the loop only stops once no suffix applies."""
@@ -266,6 +302,8 @@ class Sig:
     stems: frozenset         # stemmed content tokens incl. digits (token-set rule)
     words: frozenset         # stemmed NON-digit content tokens (tier-B shared rule)
     bigrams: frozenset       # stemmed non-generic adjacent pairs (tier-B bigram rule)
+    paren: frozenset = frozenset()   # digit-free parenthetical words (tier-A guard only)
+    tail: frozenset = frozenset()    # dropped dash-tail words (tier-A guard only)
 
 
 @lru_cache(maxsize=8192)
@@ -279,15 +317,24 @@ def signature(text: str) -> Sig:
         (a, b) for a, b in zip(words, words[1:])
         if not _is_generic(a) and not _is_generic(b)
     )
+    paren, tail = drift_identity(text)
     return Sig(norm=norm, ids=extract_ids(text), dates=body_dates(text), tokens=toks,
                content_n=len(content), stems=frozenset(stems), words=frozenset(words),
-               bigrams=bigrams)
+               bigrams=bigrams, paren=paren, tail=tail)
 
 
 def _id_conflict(a: Sig, b: Sig) -> bool:
     if a.ids and b.ids and a.ids != b.ids:
         return True
     return bool(a.dates) and bool(b.dates) and a.dates != b.dates
+
+
+def _drift_conflict(a: Sig, b: Sig) -> bool:
+    """The words the tier-A key dropped disagree (see drift_identity). Gates tier
+    A ONLY: such a pair is still listed as tier B, never suppressed."""
+    if a.paren and b.paren and a.paren != b.paren:
+        return True
+    return bool(a.tail) and bool(b.tail) and a.tail != b.tail
 
 
 def _is_prefix(short: tuple, long_: tuple) -> bool:
@@ -297,7 +344,7 @@ def _is_prefix(short: tuple, long_: tuple) -> bool:
 def tier_a(a_text: str, b_text: str) -> bool:
     """Same task, auto-suppressible. Caller guarantees the same entity."""
     a, b = signature(str(a_text or "")), signature(str(b_text or ""))
-    if not a.norm or not b.norm or _id_conflict(a, b):
+    if not a.norm or not b.norm or _id_conflict(a, b) or _drift_conflict(a, b):
         return False
     if a.norm == b.norm:
         return True
@@ -467,15 +514,30 @@ def _write_bootstrap(path: Path, rows: list[dict]) -> bool:
 
 def ensure_bootstrapped() -> int:
     """Seed the ledger on disk if it is absent. Returns rows written (0 when the
-    ledger already existed or the write failed). Call only on a path that is
-    allowed to write -- never from a dry run."""
+    ledger already existed or the seed could not be read or written). Call only
+    on a path that is allowed to write -- never from a dry run.
+
+    FAIL-SOFT, and it never loses the seed (D-051 r1 s2#0): a raising
+    `bootstrap_rows` is caught here (it used to escape through `_append` into
+    `record_created` AFTER the Asana create), and the in-memory seed is dropped
+    only once a write has succeeded -- a failed write keeps it for the next try."""
     path = ledger_path()
     if path.exists():
         return 0
-    rows = _BOOT_CACHE.pop(str(path), None)
+    key = str(path)
+    rows = _BOOT_CACHE.get(key)
     if rows is None:
-        rows = bootstrap_rows()
-    return len(rows) if _write_bootstrap(path, rows) else 0
+        try:
+            rows = bootstrap_rows()
+        except Exception:  # noqa: BLE001 -- fail-soft: the ledger stays absent
+            log.warning("gap_task_dedup: bootstrap read failed -- ledger NOT seeded "
+                        "(fail-soft; retried on the next write)", exc_info=True)
+            return 0
+    if _write_bootstrap(path, rows):
+        _BOOT_CACHE.pop(key, None)
+        return len(rows)
+    _BOOT_CACHE[key] = rows
+    return 0
 
 
 def _read_rows(path: Path, window_days: int) -> list[dict]:
@@ -530,10 +592,23 @@ def ledger_rows(*, persist: bool, window_days: int = DEFAULT_WINDOW_DAYS) -> lis
 
 
 def _append(row: dict) -> bool:
-    ensure_bootstrapped()  # never let a first append pre-empt the seed
-    path = ledger_path()
+    """Append one row -- ONLY to a ledger that already exists (seeded).
+
+    The ledger's existence is what stops every later seed attempt, so an append
+    must never be the thing that creates it (D-051 r1 s2#0: a failed seed write
+    followed by an `open("a")` created a ledger holding only the new row, and the
+    430-row propose-once seed was lost for good). When the seed cannot be written
+    this row is dropped, fail-soft: the next write retries the seed, which is
+    rebuilt from the proposed-updates files (so a proposal is not lost), and a
+    created task is still caught by the executor's in-run set and project scan."""
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path = ledger_path()
+        if not path.exists():
+            ensure_bootstrapped()  # never let a first append pre-empt the seed
+        if not path.exists():
+            log.warning("gap_task_dedup: ledger not seeded -- %s row NOT written "
+                        "(fail-soft)", row.get("kind") or "?")
+            return False
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
         return True

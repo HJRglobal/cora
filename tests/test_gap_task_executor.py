@@ -528,6 +528,251 @@ def test_non_asana_cards_render_byte_identically(env):
     assert kr.format_mechanical_dm(u) == before
 
 
+# ── Code #15 D-051 r1 (s2#1 / s2#3 / s2#4 / s2#5 / lens-d082#1) ──────────────
+
+HANNAH = "U0B3AEQS0NB"
+
+
+def _p1(uid: str, subject: str, *, days_ago: float = 3.0, desc_tail: str = "",
+        entity: str = "F3E", **extra) -> dict:
+    """A pass-1 (slack) asana_task row: payload.entity set, so it is delegable --
+    and it has NO ledger `proposed` row (only pass-5 is seeded/recorded)."""
+    r = {"update_id": f"missing_asana_task:slack_C1_1.2:{uid}", "update_type": "asana_task",
+         "description": f"[{entity}] Slack thread suggests a missing task: {subject}{desc_tail}",
+         "payload": {"entity": entity, "suggested_task_name": subject, "source": "slack"},
+         "source_evidence": "", "confidence": "HIGH", "state": "PENDING",
+         "proposed_at": _iso(days_ago), "dm_message_ts": ""}
+    r.update(extra)
+    return r
+
+
+def _p1_state(env, uid: str) -> tuple[str, str]:
+    for ln in env["live"].read_text(encoding="utf-8").splitlines():
+        e = json.loads(ln)
+        if e["update_id"].endswith(f":{uid}"):
+            return e["state"], e.get("resolved_reason") or ""
+    raise AssertionError("row missing")
+
+
+def _delegate_to_hannah(monkeypatch):
+    from cora import review_lanes
+    monkeypatch.setenv("CORA_MECHANICAL_REVIEW", "on")
+    monkeypatch.setattr(review_lanes, "_load_mechanical_approvers", lambda: (HARRISON, HANNAH))
+    review_lanes.reset_cache()
+
+
+def _capture_cards(monkeypatch) -> dict:
+    sent: dict[str, list[str]] = {}
+
+    def _send(batch, tok, cf, block_builder=None, recipient_id=None):
+        for u in batch:
+            sent.setdefault(recipient_id, []).append(block_builder(u)[0])
+        return {u["update_id"]: f"ts-{i}" for i, u in enumerate(batch)}
+    monkeypatch.setattr(rkr, "send_individual_dms", _send)
+    monkeypatch.setattr(rkr, "_send_dm_to_user", lambda *a, **k: "hdr")
+    monkeypatch.setattr(rkr, "send_dm_to_harrison", lambda *a, **k: "hdr")
+    return sent
+
+
+def test_a_delegated_card_lists_only_near_dups_its_recipient_may_approve(env, monkeypatch):
+    """D-051 r1 s2#1: _attach_mechanical_plans was never told the recipient, so a
+    sibling can_approve REFUSES Hannah (content-screened: a LEX token) had its
+    title printed on her card, and so did a ledger-only pass-5 row."""
+    from cora import review_lanes
+    _delegate_to_hannah(monkeypatch)
+    card = _p1("aaaa0001", "Ship Brightwell retail sample kit with COA packet")
+    hidden = _p1("bbbb0002", "Ship Brightwell retail sample kit with COA packet today",
+                 desc_tail=' -- fireflies says: "discussed on the (LEX) call"', days_ago=5)
+    clean = _p1("cccc0003", "Ship Brightwell retail sample kit with COA packet to the lab",
+                days_ago=4)
+    _write_rows(env, card, hidden, clean)
+    gtd.record_proposal(gap_id="pass5:drive:dddd0004", entity="F3E",
+                        subject="Ship Brightwell retail sample kit with COA packet (Zqpass5)")
+    assert review_lanes.can_approve(card, HANNAH) is True
+    assert review_lanes.can_approve(hidden, HANNAH) is False
+    sent = _capture_cards(monkeypatch)
+    rkr._send_mechanical_review_dms([card], "xoxb-test", logging.getLogger("t"))
+    (text,) = sent[HANNAH]
+    assert "COA packet today" not in text          # screened sibling: withheld
+    assert "Zqpass5" not in text                   # ledger-only pass-5 row: withheld
+    assert "COA packet to the lab" in text         # a sibling she may approve: listed
+    rows = {json.loads(ln)["update_id"]: json.loads(ln)
+            for ln in env["live"].read_text(encoding="utf-8").splitlines()}
+    assert rows[card["update_id"]]["near_dups_shown"] == [clean["update_id"]]
+
+
+def test_a_content_screened_near_dup_reaches_no_card_at_all(env):
+    """Even Harrison's card: `near_duplicates` promises a LEX title never reaches a
+    card, and its entity check alone did not keep that for an HJRG/F3E row whose
+    subject carries a LEX token."""
+    gtd.record_created(update_id="pass5:drive:e0000lex", entity="OSN",
+                       subject="Clarify meter coverage of the Lexington suite",
+                       gid="1218000000000077", url="https://app.asana.com/x/77")
+    u = _row("e0000009", "OSN", "Clarify meter coverage of the suite")
+    assert gtd.match_tier(gtd.subject_of(u), "Clarify meter coverage of the Lexington suite") == "B"
+    rkr._attach_mechanical_plans([u], logging.getLogger("t"))
+    assert "Lexington" not in _card(u)
+    assert u["_near_dups"] == []
+
+
+def test_a_phi_shaped_near_dup_is_withheld_from_the_leadership_post(env):
+    """D-051 r1 lens-d082#1: a never-approved (DISMISSED) proposal's subject was
+    posted verbatim to the multi-person #hjrg-leadership as a 'possible duplicate'
+    with no phi_guard screen at that egress."""
+    from cora import phi_guard
+    phi_subj = "Schedule ZZMARK follow-up for diabetes treatment plan at Gilbert clinic"
+    assert phi_guard.is_any_phi(phi_subj)
+    assert gtd.record_proposal(gap_id="pass5:drive:dism0001", entity="HJRP", subject=phi_subj)
+    clean = "Renew the Gilbert clinic parking lease"
+    gtd.record_created(update_id="pass5:drive:okay0001", entity="HJRP", subject=clean,
+                       gid="1218000000000088", url="https://app.asana.com/x/88")
+    new = "Confirm Gilbert clinic lease renewal paperwork"
+    assert gtd.match_tier(new, phi_subj) == "B" and gtd.match_tier(new, clean) == "B"
+    assert not phi_guard.is_any_phi(new) and not phi_guard.is_any_phi(clean)
+    u = _row("new00001", "HJRP", new, days_ago=0.1)
+    _write_rows(env, u)
+    assert _exec(u) is True
+    post = env["posts"][-1]
+    assert "Possible duplicates" in post
+    assert "ZZMARK" not in post and "diabetes" not in post
+    assert "1 more withheld from this channel" in post
+    assert "x/88" in post                            # the clean one is still listed
+
+
+def test_a_phi_shaped_task_name_is_withheld_from_the_leadership_post(env, monkeypatch):
+    from cora import phi_guard
+    subj = "Schedule ZZMARK follow-up for diabetes treatment plan"
+    assert phi_guard.is_any_phi(subj)
+    u = _row("new00002", "HJRP", subj, days_ago=0.1)
+    _write_rows(env, u)
+    assert _exec(u) is True
+    post = env["posts"][-1]
+    assert "ZZMARK" not in post and "diabetes" not in post
+    assert "name withheld" in post
+    # fail-closed: a screen that raises withholds too
+    import cora.phi_guard as pg
+    monkeypatch.setattr(pg, "is_any_phi", lambda t: (_ for _ in ()).throw(RuntimeError("x")))
+    u2 = _row("new00003", "HJRP", "A harmless second chore entirely", days_ago=0.1)
+    _write_rows(env, u2)
+    assert _exec(u2) is True
+    assert "harmless second chore" not in env["posts"][-1]
+
+
+def test_a_timed_out_create_that_committed_holds_its_pass1_sibling(env, monkeypatch):
+    """D-051 r1 s2#3 (narrowed by its verifier: pass-1 rows, which have no ledger
+    `proposed` row to order them): Asana commits A's create, then the read times
+    out (AsanaClientError). B, a tier-A sibling approved in the same run, used to
+    pass every check -- empty ledger, empty in-run set, a scan cached BEFORE A's
+    create -- and create a SECOND task."""
+    from cora.tools import asana_client
+    from cora.tools.asana_client import AsanaClientError
+    server: list[dict] = []
+
+    def _create(**kw):
+        server.append({"gid": f"1219{len(server):012d}", "name": kw["name"],
+                       "permalink_url": "https://app.asana.com/x"})
+        if len(server) == 1:
+            raise AsanaClientError("Asana network error: ReadTimeout")
+        return {"gid": server[-1]["gid"], "permalink_url": "https://app.asana.com/x",
+                "projects": [{"gid": kw["project_gid"], "name": "P"}],
+                "assignee": {"gid": kw["assignee_gid"], "name": "A"}}
+    monkeypatch.setattr(asana_client, "create_task", _create)
+    env["scan"].side_effect = lambda gid, max_tasks=500: [dict(t) for t in server]
+    a = _p1("tmo00001", "Reorder the F3 Pure shrink sleeves from Brightwell", days_ago=3)
+    b = _p1("tmo00002", "Reorder the F3 Pure shrink sleeves from Brightwell ($4,100)",
+            days_ago=1)
+    _write_rows(env, a, b)
+    st = rkr._new_gap_run_state()
+    assert _exec(a, st) is False                       # left PENDING
+    assert _exec(b, st) is False                       # HELD, not created
+    assert len(server) == 1                            # ONE task in Asana
+    assert _p1_state(env, "tmo00001") == ("PENDING", "")
+    assert _p1_state(env, "tmo00002") == ("PENDING", "")
+    assert "did not confirm this run" in env["posts"][-1]
+    assert st["outcomes"][b["update_id"]]["kind"] == "pending"
+    # the scan cached before A's create was dropped: the next run's scan sees it
+    assert PROJECT["F3E"] not in st["project_scan"]
+
+
+def test_executor_posts_and_logs_name_the_row_by_its_hash_tail(env, caplog):
+    """D-051 r1 s2#4: uid[:8] is the lane prefix -- 'pass5:dr' / 'missing_' for
+    EVERY row -- so refusal / duplicate / left-pending lines named nothing."""
+    caplog.set_level(logging.INFO)
+    bdm = _row("tail0001", "BDM", "Finalize the shot list for events")
+    p1 = _p1("tail0002", "Order the retail endcap signage", entity="BDM")
+    _write_rows(env, bdm, p1)
+    _exec(bdm)
+    _exec(p1)
+    posts = env["posts"][-2:]
+    assert "`[tail0001]`" in posts[0] and "`[tail0002]`" in posts[1]
+    assert not any("pass5:dr" in p or "missing_" in p for p in posts)
+    msgs = [r.getMessage() for r in caplog.records if "gap-executor" in r.getMessage()]
+    assert any("uid=tail0001" in m for m in msgs) and any("uid=tail0002" in m for m in msgs)
+    assert not any("uid=pass5:dr" in m or "uid=missing_" in m for m in msgs)
+
+
+def test_asana_ack_overrides_name_each_end(env):
+    st = rkr._new_gap_run_state()
+    u = {"update_id": "u1", "update_type": "asana_task"}
+    assert rkr._asana_ack_overrides(st, u) == {}                   # no outcome: default
+    rkr._gap_outcome(st, "u1", "refused", "no BDM Asana project is configured")
+    kw = rkr._asana_ack_overrides(st, u)
+    assert "no Asana task was created" in kw["text"] and "no BDM Asana project" in kw["text"]
+    assert "didn't go through" not in kw["text"] and kw.get("retire", True) is True
+    rkr._gap_outcome(st, "u1", "duplicate", "123")
+    assert "Dismissed as a duplicate" in rkr._asana_ack_overrides(st, u)["text"]
+    rkr._gap_outcome(st, "u1", "pending")
+    kw = rkr._asana_ack_overrides(st, u)
+    assert kw["retire"] is False and "retry it on the next review run" in kw["text"]
+    rkr._gap_outcome(st, "u1", "created", "9")
+    assert rkr._asana_ack_overrides(st, u) == {}
+    assert rkr._asana_ack_overrides(st, {"update_id": "u1", "update_type": "task_close"}) == {}
+
+
+def test_main_acks_a_duplicate_as_not_created_and_a_transient_as_pending(env, monkeypatch):
+    """D-051 r1 s2#5: every False from the executor was acked ':warning: ... the
+    automatic save didn't go through' and the card stamped Resolved -- a
+    deliberate duplicate-dismiss read as a fault, and a still-PENDING row whose
+    reaction IS retried next run was marked as no longer applying."""
+    from cora.tools import asana_client
+    from cora.tools.asana_client import AsanaClientError
+    a = _row("o0000011", "HJRP", CASH)
+    b = _row("o0000012", "HJRP", CASH_VARIANT)
+    c = _row("o0000013", "OSN", "Clarify meter coverage")
+    real = asana_client.create_task
+
+    def _create(**kw):
+        if kw.get("project_gid") == PROJECT["OSN"]:
+            raise AsanaClientError("Asana 503")
+        return real(**kw)
+    monkeypatch.setattr(asana_client, "create_task", _create)
+    _write_rows(env, a, b, c)
+    ack = _main_env(env, monkeypatch, [(a, _reaction("o0000011")), (b, _reaction("o0000012")),
+                                       (c, _reaction("o0000013"))], [])
+    rkr.main()
+    calls = {cl.args[2]["update_id"]: cl.kwargs for cl in ack.call_args_list}
+    assert calls[a["update_id"]].get("success") is True and "text" not in calls[a["update_id"]]
+    dup = calls[b["update_id"]]
+    assert dup["success"] is False and "Dismissed as a duplicate" in dup["text"]
+    assert dup.get("retire", True) is True             # DISMISSED: the card IS resolved
+    pend = calls[c["update_id"]]
+    assert pend["success"] is False and pend["retire"] is False
+    assert "retry" in pend["text"] and _state(env, "o0000013") == ("PENDING", "")
+
+
+def test_ack_with_retire_false_leaves_the_card_alone():
+    client = MagicMock()
+    reaction = {"action": "APPROVED", "channel_id": "D1", "message_ts": "1.2"}
+    rkr._ack_correlated_reaction(reaction, "APPROVED", {"update_type": "asana_task"},
+                                 "xoxb-test", logging.getLogger("t"),
+                                 _client_factory=lambda: client, success=False,
+                                 text="custom outcome", retire=False)
+    assert client.chat_postMessage.call_args.kwargs["text"] == "custom outcome"
+    client.chat_update.assert_not_called()
+    client.conversations_history.assert_not_called()
+    client.reactions_add.assert_not_called()
+
+
 def test_send_persists_what_was_shown_even_when_empty(env, monkeypatch):
     from cora import review_lanes
     monkeypatch.setenv("CORA_MECHANICAL_REVIEW", "on")

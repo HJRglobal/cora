@@ -366,6 +366,135 @@ def test_fixture_pair_the_second_cash_task_is_a_tier_A_repeat(tmp_path, monkeypa
     assert hit is not None and hit["gid"] == "1218344765000648"
 
 
+# ── Code #15 D-051 r1 (s2#0 / s2#2) ──────────────────────────────────────────
+
+# Each pair differs ONLY in words the tier-A key throws away: a digit-free
+# parenthetical, or a short figure-bearing dash tail. Distinct tasks -- listed
+# (B), never suppressed (A) for the 120-day window.
+_DISTINCT_BY_DROPPED_WORDS = [
+    ("Update Shopify product page (Mango flavor)", "Update Shopify product page (Berry flavor)"),
+    ("Schedule content shoot (REP Fitness)", "Schedule content shoot (Gymshark)"),
+    ("Hire Team Member for Gilbert store (morning shift)",
+     "Hire Team Member for Gilbert store (closing shift)"),
+    ("Pay Deposco invoice - $4,800 setup fee", "Pay Deposco invoice - $2,100 monthly storage"),
+    ("Collect payment from Acme Gym - $5,000 deposit",
+     "Collect payment from Acme Gym - $7,500 final balance"),
+    ("[F3E] Drive doc suggests missing task: Update Shopify product page (Mango flavor)",
+     "Update Shopify product page (Berry flavor)"),
+]
+
+
+@pytest.mark.parametrize("a,b", _DISTINCT_BY_DROPPED_WORDS)
+def test_words_the_key_drops_still_tell_two_tasks_apart(a, b):
+    """D-051 r1 s2#2: `normalize` deleted every parenthetical and every short
+    figure dash-tail, so these came out tier A -- suppressed at proposal and
+    refused at execution. Now two non-empty, unequal dropped-word sets = no tier
+    A; the pair is still LISTED (tier B)."""
+    assert _tier(a, b) == "B"
+    assert _tier(b, a) == "B"
+
+
+def test_the_drift_the_key_was_measured_on_still_collapses():
+    """The guard only reads DIGIT-FREE parentheticals and tails `normalize`
+    really drops -- the figure/date drift stays tier A, as does one side with no
+    parenthetical at all, or the same words re-inflected."""
+    assert _tier(CASH[2], CASH[1]) == "A"      # (currently $35,337) vs '— cash dropped ...'
+    assert _tier(CASH[4], CASH[3]) == "A"      # ($33,487 as of 2026-08-27)
+    assert _tier(WHEY[1], WHEY[0]) == "A"
+    assert _tier("Update Shopify product page (Mango flavor)",
+                 "Update Shopify product page") == "A"
+    assert _tier("Update Shopify product page (Mango flavor)",
+                 "Update Shopify product page (Mango flavors)") == "A"
+    assert _tier("Pay Deposco invoice - $4,800 setup fee",
+                 "Pay Deposco invoice - $4,900 setup fee") == "A"
+
+
+def test_a_dropped_word_conflict_is_listed_by_the_ledger_never_suppressed(tmp_path, monkeypatch):
+    _ledger(tmp_path, monkeypatch)
+    _seed_proposed_updates(monkeypatch, tmp_path, [])
+    assert gtd.record_proposal(gap_id="pass5:drive:fla00001", entity="F3E",
+                               subject="Update Shopify product page (Mango flavor)")
+    rows = gtd.ledger_rows(persist=True)
+    berry = "Update Shopify product page (Berry flavor)"
+    assert gtd.find_tier_a("F3E", berry, rows) is None             # not suppressed
+    assert [n["ref"] for n in gtd.near_duplicates("F3E", berry, rows)] == \
+        ["pass5:drive:fla00001"]                                    # ... listed
+
+
+def _flaky_seed_replace(monkeypatch, fails: int):
+    """Path.replace of the seed's .tmp raises `fails` times (a Windows AV scan /
+    sharing violation on the rename), then works. The APPEND opens a different
+    file, so it is not blocked -- the asymmetry the review found."""
+    real = Path.replace
+    left = {"n": fails}
+
+    def _replace(self, target):
+        if str(self).endswith(".tmp") and left["n"] > 0:
+            left["n"] -= 1
+            raise PermissionError("sharing violation")
+        return real(self, target)
+    monkeypatch.setattr(Path, "replace", _replace)
+    return left
+
+
+def test_a_failed_seed_write_never_lets_an_append_create_the_ledger(tmp_path, monkeypatch):
+    """D-051 r1 s2#0 (a): two failed seed writes (the executor's ledger read,
+    then the append's own attempt) used to be followed by `open("a")`, which
+    CREATED the ledger holding only the new row -- and since the path then
+    existed, the one-time seed never ran again: the propose-once net was gone."""
+    led = _ledger(tmp_path, monkeypatch)
+    _seed_proposed_updates(monkeypatch, tmp_path, [
+        _p5row(f"sd{i:06d}", "OSN", f"Awning installation at store {i} front", "APPROVED",
+               days_ago=10) for i in range(5)])
+    gtd._BOOT_CACHE.clear()
+    _flaky_seed_replace(monkeypatch, fails=2)
+    assert len(gtd.ledger_rows(persist=True)) == 5        # seed write 1 fails: in memory
+    assert gtd.record_created(update_id="pass5:drive:new00001", entity="OSN",
+                              subject="Something else entirely new", gid="1") is False
+    assert not led.exists()                               # never created without the seed
+    # the rename works again: the next write seeds FIRST, then appends
+    assert gtd.record_created(update_id="pass5:drive:new00002", entity="OSN",
+                              subject="Another new thing", gid="2") is True
+    rows = gtd.ledger_rows(persist=True)
+    assert sum(1 for r in rows if r["kind"] == "proposed") == 5
+    assert gtd.find_tier_a("OSN", "Awning installation at store 1 front", rows,
+                           before_ts=_now_iso(0)) is not None
+
+
+def test_a_raising_seed_read_never_escapes_record_created(tmp_path, monkeypatch, caplog):
+    """D-051 r1 s2#0 (b): `bootstrap_rows` raising (a bad byte in the 18 MB
+    archive) escaped `ensure_bootstrapped` -> `_append` -> `record_created` --
+    AFTER the executor's Asana create. A ledger WRITE failure is fail-SOFT."""
+    led = _ledger(tmp_path, monkeypatch)
+    _seed_proposed_updates(monkeypatch, tmp_path, [])
+    gtd._BOOT_CACHE.clear()
+
+    def _boom():
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad byte")
+    monkeypatch.setattr(gtd, "bootstrap_rows", _boom)
+    caplog.set_level(logging.WARNING)
+    assert gtd.ensure_bootstrapped() == 0
+    assert gtd.record_created(update_id="pass5:drive:x1", entity="OSN", subject="s",
+                              gid="1") is False
+    assert gtd.record_proposal(gap_id="pass5:drive:x2", entity="OSN", subject="t") is False
+    assert not led.exists()
+    assert gtd.ledger_rows(persist=True) == []            # the read side: fail OPEN
+
+
+def test_a_failed_seed_write_keeps_the_in_memory_seed(tmp_path, monkeypatch):
+    """The cache used to be popped BEFORE the write, so a failed write lost the
+    in-memory seed too. It is dropped only once a write has succeeded."""
+    led = _ledger(tmp_path, monkeypatch)
+    _seed_proposed_updates(monkeypatch, tmp_path, [_p5row("kc000001", "HJRP", CASH[3])])
+    gtd._BOOT_CACHE.clear()
+    assert len(gtd.ledger_rows(persist=False)) == 1       # builds the cache, writes nothing
+    _flaky_seed_replace(monkeypatch, fails=1)
+    assert gtd.ensure_bootstrapped() == 0
+    assert str(led) in gtd._BOOT_CACHE
+    assert gtd.ensure_bootstrapped() == 1 and led.exists()
+    assert str(led) not in gtd._BOOT_CACHE
+
+
 # ── pass 5: the proposal gate ────────────────────────────────────────────────
 
 def _drive_db(tmp_path, entity="HJRP") -> Path:

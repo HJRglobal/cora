@@ -93,6 +93,60 @@ def test_run_lock_stale_is_reclaimed(tmp_path, monkeypatch):
     rkr._release_run_lock()
 
 
+def test_the_exit_hook_releases_the_lock_this_run_took(tmp_path, monkeypatch):
+    """Code #15 D-051 r1 lens-dryrun#0: main() registered `_release_run_lock` at
+    exit with no argument, and it read the module global only when the
+    interpreter exited -- after every test's monkeypatch was undone, i.e. the
+    REAL <repo>/data/state/knowledge-review.lock (the live 07:00 run's guard).
+    The hook must unlink the lock the run actually took, whatever the global
+    points at by then."""
+    import atexit
+    import importlib
+    from unittest.mock import MagicMock
+    kr = importlib.import_module("cora.knowledge_review")
+    registered = []
+    monkeypatch.setattr(atexit, "register",
+                        lambda fn, *a, **k: registered.append((fn, a, k)))
+    (tmp_path / "proposed.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setattr(kr, "_PROPOSED_UPDATES_PATH", tmp_path / "proposed.jsonl")
+    monkeypatch.setattr(kr, "_REPLY_LOG_PATH", tmp_path / "reply.jsonl")
+    kr._SEEN_IDS_CACHE = None
+    kr._ARCHIVE_IDS_CACHE = None
+    taken = tmp_path / "kr.lock"
+    monkeypatch.setattr(rkr, "_LOCK_PATH", taken)
+    monkeypatch.setattr(rkr, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(rkr, "_attach_coras_read", lambda items, log: None)
+    monkeypatch.setattr(rkr, "correlate_reactions_to_updates", lambda: [])
+    monkeypatch.setattr(rkr, "send_dm_to_harrison", lambda *a, **k: "hdr")
+    monkeypatch.setattr(rkr, "send_individual_dms", lambda *a, **k: {})
+    monkeypatch.setattr(rkr, "_route_operational_to_owners", lambda *a, **k: 0)
+    monkeypatch.setattr(rkr, "resolve_update", MagicMock())
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+    monkeypatch.setattr("sys.argv", ["run_knowledge_review.py"])
+    rkr.main()
+    assert taken.exists()                                  # held until exit
+    hooks = [(fn, a, k) for fn, a, k in registered if fn is rkr._release_run_lock]
+    assert len(hooks) == 1
+    # interpreter exit: the global now points somewhere else (a restored patch)
+    decoy = tmp_path / "decoy.lock"
+    decoy.write_text("live run", encoding="utf-8")
+    monkeypatch.setattr(rkr, "_LOCK_PATH", decoy)
+    fn, a, k = hooks[0]
+    fn(*a, **k)
+    assert decoy.exists()                                  # never the other lock
+    assert not taken.exists()                              # the one this run took
+
+
+def test_conftest_redirects_the_run_lock_off_the_repo(tmp_path):
+    """The same class for every main()-driving test that does not patch the lock
+    itself: the autouse fixture points it at tmp, never <repo>/data/state."""
+    from pathlib import Path
+    repo_lock = (Path(rkr.__file__).resolve().parents[1] / "data" / "state"
+                 / "knowledge-review.lock")
+    assert Path(rkr._LOCK_PATH).resolve() != repo_lock.resolve()
+    assert Path(rkr._LOCK_PATH).parent == tmp_path
+
+
 # ── Phase 2.4 rebuild: auto-expire reason, auto-approve gate, weekly digest ──
 
 def test_dismissed_entry_records_reason():
@@ -865,7 +919,17 @@ def test_dry_run_never_executes_an_approved_update(tmp_path, monkeypatch, caplog
               "payload": {"suggested_task_name": "Collect $1,500 remainder"}}
     reaction = {"action": "APPROVED", "channel_id": "D1", "message_ts": "111.222",
                 "reactor_id": "U0B2RM2JYJ1", "reaction": "+1"}
-    monkeypatch.setattr(rkr, "correlate_reactions_to_updates", lambda: [(update, reaction)])
+    # Code #15 D-051 r1 lens-integration#0: S2 DEFERRED asana_task, so the row
+    # above no longer reaches the executor loop -- and the loop's own `if
+    # args.dry_run:` gate (the 9/9 fix) was left with no test at all (a mutant
+    # dropping it survived the suite). A NON-deferred type (task_close = a real
+    # Asana complete + a Slack post, the incident's other half) pins it again.
+    close = {"update_id": "missing_task_close:x:5c105e00", "update_type": "task_close",
+             "state": "PENDING", "description": "[HJRP] Possible task completion",
+             "payload": {"task_gid": "1218000000000001", "task_name": "t"}}
+    close_reaction = dict(reaction, message_ts="111.333")
+    monkeypatch.setattr(rkr, "correlate_reactions_to_updates",
+                        lambda: [(update, reaction), (close, close_reaction)])
     executor = MagicMock(side_effect=AssertionError("a dry run executed a connector write"))
     monkeypatch.setattr(rkr, "_execute_approved_update", executor)
     resolve = MagicMock(side_effect=AssertionError("a dry run resolved a row"))
@@ -886,6 +950,9 @@ def test_dry_run_never_executes_an_approved_update(tmp_path, monkeypatch, caplog
     # Code #15 S2: an approved asana_task is now DEFERRED (apply-first-then-
     # resolve inside the executor), so the dry run reports it on that path.
     assert any("[DRY RUN] would apply-then-resolve asana_task pass5:dr" in r.getMessage()
+               for r in caplog.records)
+    # ... and the non-deferred row reached the executor loop and stopped at ITS gate
+    assert any("[DRY RUN] would execute [task_close]" in r.getMessage()
                for r in caplog.records)
     assert not (tmp_path / "batch.json").exists()
     # ... and the two write paths S2 added stay untouched: the gap-task ledger

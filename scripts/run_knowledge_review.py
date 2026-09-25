@@ -220,9 +220,13 @@ def _acquire_run_lock(log: logging.Logger) -> bool:
     return True
 
 
-def _release_run_lock() -> None:
+def _release_run_lock(path: Path | None = None) -> None:
+    """Unlink the run lock. `path` is bound when main() registers this at exit
+    (D-051 r1 lens-dryrun#0): reading the module global only at interpreter exit
+    unlinked whatever it pointed at THEN -- after a test's monkeypatch had been
+    undone, that was the REAL data/state lock, not the one this run took."""
     try:
-        _LOCK_PATH.unlink()
+        (path if path is not None else _LOCK_PATH).unlink()
     except OSError:
         pass
 
@@ -269,9 +273,70 @@ def _is_contributed_note(update: dict) -> bool:
 
 def _new_gap_run_state() -> dict:
     """Per-RUN state for the asana_task branch: tasks created earlier in this run
-    (two sibling cards approved together must create ONE task) and a per-project
-    open-task scan cache (one Asana read per target project per run)."""
-    return {"created": [], "project_scan": {}}
+    (two sibling cards approved together must create ONE task), a per-project
+    open-task scan cache (one Asana read per target project per run), every
+    create ATTEMPTED this run (a create Asana may have committed before its error
+    -- a tier-A sibling of one is held, D-051 r1 s2#3), and each row's named
+    outcome (the card ack reads it -- D-051 r1 s2#5)."""
+    return {"created": [], "project_scan": {}, "attempted": [], "outcomes": {}}
+
+
+def _gap_outcome(run_state: dict, uid: str, kind: str, detail: str = "") -> None:
+    """Record how _execute_asana_task ended for `uid`: created | recovered |
+    refused | duplicate | pending. main() turns it into the card ack."""
+    run_state.setdefault("outcomes", {})[uid] = {"kind": kind, "detail": detail}
+
+
+def _asana_ack_overrides(run_state: dict | None, update: dict) -> dict:
+    """The card-ack kwargs for an asana_task row, from its recorded outcome.
+
+    D-051 r1 s2#5: _execute_asana_task returns False for three different ends,
+    and every one was acked ":warning: ... the automatic save didn't go through"
+    with the card stamped Resolved. A refusal / duplicate is a DELIBERATE terminal
+    DISMISSED, so it says what happened; a transient failure leaves the row
+    PENDING and the same reaction is retried next run, so the card is NOT retired
+    (its reaction still applies) and the ack says it will retry. {} = default."""
+    if update.get("update_type") != "asana_task" or not run_state:
+        return {}
+    o = (run_state.get("outcomes") or {}).get(str(update.get("update_id") or ""))
+    kind = (o or {}).get("kind")
+    if kind == "refused":
+        return {"text": (f":no_entry_sign: Approved -- but no Asana task was created: "
+                         f"{o.get('detail') or 'this lane cannot create it'}. Dismissed; "
+                         f"the details are in #hjrg-leadership.")}
+    if kind == "duplicate":
+        return {"text": (":no_entry_sign: Approved -- but no Asana task was created: it "
+                         "repeats a task or proposal that already exists. Dismissed as a "
+                         "duplicate; the details are in #hjrg-leadership.")}
+    if kind == "pending":
+        return {"text": (":warning: Approved -- but the Asana task couldn't be created "
+                         "yet. It is still pending and I retry it on the next review run "
+                         "(details in #hjrg-leadership)."),
+                "retire": False}
+    return {}
+
+
+def _near_dup_withheld(n: dict, source_row: dict | None = None) -> bool:
+    """True = do not render this near-dup's title. FAIL-CLOSED.
+
+    D-051 r1 s2#1 / lens-d082#1: a near-dup title reached a delegated approver's
+    card and the multi-person #hjrg-leadership post with no content screen. The
+    lane's own screen (review_lanes.content_screen_excludes -> screen_decision:
+    lex_entity / lex_token / qa / phi via phi_guard.is_any_phi, fail-closed) runs
+    on the full source row when one is known and always on the subject itself
+    (a ledger row carries only its subject)."""
+    try:
+        if source_row is not None and review_lanes.content_screen_excludes(source_row)[0]:
+            return True
+        subject = str(n.get("subject") or "")
+        synth = {"update_type": "asana_task", "payload": {},
+                 "description": f"[{n.get('entity') or ''}] {subject}"}
+        if review_lanes.content_screen_excludes(synth)[0]:
+            return True
+        from cora.phi_guard import is_any_phi  # the rendered label itself, directly
+        return bool(is_any_phi(subject))
+    except Exception:  # noqa: BLE001 -- an unavailable screen withholds
+        return True
 
 
 def _slack_label(text: str, cap: int = 150) -> str:
@@ -329,15 +394,21 @@ def _execute_asana_task(update: dict, slack_token: str, log: logging.Logger,
       3. tier-A repeat of a created task, of an EARLIER proposal in any state
          (D-030), of a task created earlier in this run, or of an open task in
          the target project                 -> DISMISSED duplicate_of:<ref>
+      3b. tier-A sibling of a create ATTEMPTED this run that did not confirm
+         (Asana may have committed it)      -> stays PENDING (next run's fresh
+                                                project scan decides)
       4. create_task(name, project, assignee) -> APPROVED executed:<gid>
          a transient AsanaClientError        -> stays PENDING (retried next run;
                                                 step 2/3 stop a double create)
-    Never logs a title: ids, codes and counts only (D-082).
+    Each end is recorded in run_state["outcomes"] for the card ack (s2#5).
+    Never logs a title: ids, codes and counts only (D-082). A row is named by
+    the stable-hash TAIL of its id -- `[:8]` is the lane prefix ('pass5:dr',
+    'missing_') and named every row the same (D-051 r1 s2#4).
     """
     from cora import gap_task_dedup as gtd
     from cora.tools import user_identity
     uid = str(update.get("update_id") or "")
-    uid_short = uid[:8]
+    uid_short = uid[-8:]
     notify_ch = "hjrg-leadership"
 
     plan = gtd.plan_create(update)
@@ -348,6 +419,7 @@ def _execute_asana_task(update: dict, slack_token: str, log: logging.Logger,
             f"task: {gtd.refusal_text(plan.refusal)}. Dismissed -- nothing was "
             f"created."))
         log.warning("gap-executor: refused uid=%s reason=%s", uid_short, plan.refusal)
+        _gap_outcome(run_state, uid, "refused", gtd.refusal_text(plan.refusal))
         return False
 
     rows = gtd.ledger_rows(persist=True)
@@ -361,6 +433,7 @@ def _execute_asana_task(update: dict, slack_token: str, log: logging.Logger,
             + (f": <{own.get('url')}|open it in Asana>" if own.get("url") else "")
             + " -- recorded, not re-created."))
         log.info("gap-executor: recovered earlier create uid=%s gid=%s", uid_short, gid)
+        _gap_outcome(run_state, uid, "recovered")
         return True
 
     hit = gtd.find_tier_a(plan.entity, plan.subject, rows, exclude_ref=uid,
@@ -368,6 +441,25 @@ def _execute_asana_task(update: dict, slack_token: str, log: logging.Logger,
     if hit is None:
         hit = gtd.find_tier_a(plan.entity, plan.subject, run_state.get("created") or [],
                               exclude_ref=uid)
+    if hit is None:
+        # D-051 r1 s2#3: an AsanaClientError can follow a create Asana COMMITTED
+        # (a ReadTimeout is wrapped the same way), so an attempted-but-unconfirmed
+        # create is not proof of "nothing created". Its tier-A sibling is HELD
+        # (left PENDING) rather than created: the next run's fresh project scan
+        # sees the committed task if there is one.
+        held = gtd.find_tier_a(plan.entity, plan.subject,
+                               run_state.get("attempted") or [], exclude_ref=uid)
+        if held is not None:
+            _post_to_slack(slack_token, notify_ch, (
+                f":warning: *Gap executor* `[{uid_short}]` did not create the Asana task "
+                f"yet: a create for the same task `[{str(held.get('ref') or '')[-8:]}]` "
+                f"did not confirm this run, and Asana may have made it. Left pending -- "
+                f"I retry on the next review run."))
+            log.warning("gap-executor: held uid=%s -- tier-A sibling %s had an "
+                        "unconfirmed create this run; left PENDING", uid_short,
+                        str(held.get("ref") or "")[-8:])
+            _gap_outcome(run_state, uid, "pending")
+            return False
     if hit is None:
         hit = _project_scan_dup(plan.project_gid, plan.entity, plan.subject, run_state, log)
     if hit is not None:
@@ -384,7 +476,8 @@ def _execute_asana_task(update: dict, slack_token: str, log: logging.Logger,
             f":no_entry_sign: *Gap executor* `[{uid_short}]` did not create an Asana "
             f"task: it repeats {what}{link}. Dismissed as a duplicate."))
         log.warning("gap-executor: duplicate uid=%s of=%s kind=%s", uid_short,
-                    ref[:24], hit.get("kind") or "?")
+                    ref[-24:], hit.get("kind") or "?")
+        _gap_outcome(run_state, uid, "duplicate", ref)
         return False
 
     # Tier-B near-duplicates the approver never saw: a legacy card (carded
@@ -402,18 +495,27 @@ def _execute_asana_task(update: dict, slack_token: str, log: logging.Logger,
         f"Auto-created from a Cora reconciliation gap (ref {uid}).\n\n"
         f"Evidence: {str(update.get('source_evidence') or '')[:400]}"
     )
+    # Recorded BEFORE the call (s2#3): whatever the create raises, a tier-A
+    # sibling later in this run is held rather than created.
+    run_state.setdefault("attempted", []).append({
+        "kind": "attempted", "ref": uid, "entity": plan.entity, "subject": plan.subject,
+        "ts": datetime.now(timezone.utc).isoformat()})
     try:
         task = create_task(name=plan.task_name, assignee_gid=plan.assignee_gid,
                            project_gid=plan.project_gid, notes=notes)
     except AsanaClientError as exc:
         # Transient by default: the row stays PENDING and the next run's
         # correlate retries it (the ledger + scan above stop a double create).
+        # The cached scan predates this create -- which Asana may have committed
+        # before the error -- so drop it: the next row into this project re-scans.
+        (run_state.get("project_scan") or {}).pop(plan.project_gid, None)
         _post_to_slack(slack_token, notify_ch, (
             f":warning: *Gap executor* `[{uid_short}]` could not create the Asana task "
             f"({type(exc).__name__}: {str(exc)[:160]}). Left pending -- I retry on the "
             f"next review run."))
         log.warning("gap-executor: create_task failed uid=%s (%s) -- left PENDING",
                     uid_short, str(exc)[:160])
+        _gap_outcome(run_state, uid, "pending")
         return False
 
     gid = str(task.get("gid") or "")
@@ -432,13 +534,24 @@ def _execute_asana_task(update: dict, slack_token: str, log: logging.Logger,
         "kind": "created", "ref": uid, "gid": gid, "url": url, "entity": plan.entity,
         "subject": plan.subject, "ts": datetime.now(timezone.utc).isoformat()})
     resolve_update(uid, "APPROVED", reason=f"executed:{gid}")
+    _gap_outcome(run_state, uid, "created", gid)
 
     proj_name = ", ".join(str(p.get("name") or "") for p in projects if p.get("name")) \
         or "(no project returned)"
     asg_name = str(assignee.get("name") or "") or user_identity.display_name(plan.assignee_slack)
     src = "entity owner" if plan.assignee_source == "owner" else "default owner"
+    # Render screen at THIS egress (D-051 r1 lens-d082#1): #hjrg-leadership is a
+    # multi-person channel and the read side never trusts write-side redaction
+    # (the lexicon / contributed-note branches, D-051 remediation F1). Fail-closed.
+    try:
+        from cora.phi_guard import is_any_phi
+        name_withheld = bool(is_any_phi(plan.task_name))
+    except Exception:  # noqa: BLE001 -- an unavailable screen withholds
+        name_withheld = True
+    name_label = ("the new task (name withheld -- PHI-shaped)" if name_withheld
+                  else _slack_label(plan.task_name))
     msg = (f":white_check_mark: *Gap executor* `[{uid_short}]` created Asana task "
-           f"<{url}|{_slack_label(plan.task_name)}> in *{_slack_label(proj_name, 80)}* "
+           f"<{url}|{name_label}> in *{_slack_label(proj_name, 80)}* "
            f"-- assignee {_slack_label(asg_name, 60)} ({src})")
     if not (proj_ok and asg_ok):
         # The incident's own signature. Loud, never silent: the create happened
@@ -452,12 +565,20 @@ def _execute_asana_task(update: dict, slack_token: str, log: logging.Logger,
                                if not ok)
                 + " on this task -- please check it.")
     if near:
+        # Same egress, same screen, per near-dup (s2#1 / lens-d082#1): a ledger
+        # row can be a DISMISSED proposal nobody approved; its title is withheld
+        # when the lane's content screen (LEX token / PHI / QA) excludes it.
+        shown_near = [n for n in near if not _near_dup_withheld(n)]
+        withheld = len(near) - len(shown_near)
         msg += "\nPossible duplicates (not auto-blocked -- check before working it):"
-        for n in near:
+        for n in shown_near:
             label = _slack_label(n.get("subject") or "", 90)
             state = "created" if n.get("kind") == "created" else "proposed"
             item = f"<{n.get('url')}|{label}>" if n.get("url") else label
             msg += f"\n• {item} ({state} {_md(n.get('ts'))})"
+        if withheld:
+            msg += (f"\n• {withheld} {'more ' if shown_near else ''}withheld from this channel "
+                    f"(the PHI/LEX content screen excluded {'it' if withheld == 1 else 'them'})")
     _post_to_slack(slack_token, notify_ch, msg)
     log.info("gap-executor: created Asana task uid=%s gid=%s project=%s assignee_source=%s "
              "near_dups_unseen=%d", uid_short, gid, plan.project_gid,
@@ -1352,7 +1473,8 @@ def _ack_reaction_text(action: str, update_type: str, success: bool = True) -> s
 
 def _ack_correlated_reaction(reaction: dict, action: str, update: dict,
                              slack_token: str, log: logging.Logger,
-                             _client_factory=None, success: bool = True) -> None:
+                             _client_factory=None, success: bool = True,
+                             text: str | None = None, retire: bool = True) -> None:
     """D2: acknowledge on the ORIGINAL card that an emoji reaction Harrison already
     made has now been processed by this run -- a threaded one-liner ("Saved to
     known-answers" / "Dismissed") plus, for a SUCCESSFUL approval, a glanceable
@@ -1364,8 +1486,13 @@ def _ack_correlated_reaction(reaction: dict, action: str, update: dict,
     Only fires for the emoji-fallback path: correlate_reactions_to_updates yields
     reaction_added events, never block_action button taps (those resolve + ack
     in-message in app.py), so there is no double-ack. Fail-soft: an ack error must
-    never affect the resolve/execute that already happened."""
-    text = _ack_reaction_text(action, update.get("update_type", ""), success)
+    never affect the resolve/execute that already happened.
+
+    `text` overrides the per-type sentence and `retire=False` skips the terminal
+    card edit -- both set only by main() from an asana_task row's recorded outcome
+    (_asana_ack_overrides, D-051 r1 s2#5): a row left PENDING is NOT resolved, so
+    its card must not be stamped as if it were."""
+    text = text or _ack_reaction_text(action, update.get("update_type", ""), success)
     if not text or not slack_token:
         return
     channel = (reaction or {}).get("channel_id", "")
@@ -1396,7 +1523,8 @@ def _ack_correlated_reaction(reaction: dict, action: str, update: dict,
     # its live "Approve / Dismiss" buttons and its "👍 Approve · 👎 Dismiss" footer
     # indefinitely, under a batch header still reading "N item(s) below for your
     # approval". That is what produced 14 dead reactions out of 19 on 2026-08-24.
-    _terminal_edit_card(client, channel, ts, text, log)
+    if retire:
+        _terminal_edit_card(client, channel, ts, text, log)
 
 
 def _terminal_edit_card(client, channel: str, ts: str, outcome: str,
@@ -1653,8 +1781,10 @@ def _send_mechanical_review_dms(
         else:
             _send_dm_to_user(target, header, slack_token, _client_factory)
         # Code #15 S2: what an asana_task card would create (or why it can't)
-        # and its possible duplicates -- attached in memory, fail-soft.
-        _attach_mechanical_plans(batch, log)
+        # and its possible duplicates -- attached in memory, fail-soft. Told the
+        # RECIPIENT, so a delegated card lists only near-dups that recipient may
+        # see (D-051 r1 s2#1).
+        _attach_mechanical_plans(batch, log, recipient=target)
         sent_map = send_individual_dms(
             batch, slack_token, _client_factory,
             block_builder=build_mechanical_blocks, recipient_id=target)
@@ -1828,7 +1958,8 @@ def _md(ts: str) -> str:
     return f"{dt.month}/{dt.day}"
 
 
-def _attach_mechanical_plans(items: list[dict], log: logging.Logger) -> None:
+def _attach_mechanical_plans(items: list[dict], log: logging.Logger,
+                             recipient: str = HARRISON_SLACK_USER_ID) -> None:
     """Code #15 S2: stash, on each asana_task card about to be sent, what 👍 would
     create (project + assignee) or why it can't, and up to 3 possible duplicates.
 
@@ -1836,7 +1967,16 @@ def _attach_mechanical_plans(items: list[dict], log: logging.Logger) -> None:
     are never persisted by propose/patch), fail-soft per item -- a card is sent
     without these lines rather than not at all. What was SHOWN is persisted after
     the send by _patch_near_dups_shown. No Asana read here: the card-time dup
-    check uses the local ledger; the project scan runs at execution."""
+    check uses the local ledger; the project scan runs at execution.
+
+    WHO SEES A NEAR-DUP TITLE (D-051 r1 s2#1). can_approve is the single screen
+    on what reaches a delegated approver, so it screens the near-dup SOURCES too:
+    for a recipient other than Harrison only PENDING rows that recipient could
+    approve are listed (a ledger-only row -- a pass-5 proposal, a created task --
+    has no row to authorise it and is dropped, fail-closed). On EVERY card a
+    near-dup whose source the lane's content screen excludes (LEX token / PHI /
+    QA) is dropped -- `near_duplicates`' own promise that a LEX title never
+    reaches a card, which its entity check alone did not keep."""
     targets = [u for u in items or [] if u.get("update_type") == "asana_task"]
     if not targets:
         return
@@ -1847,17 +1987,32 @@ def _attach_mechanical_plans(items: list[dict], log: logging.Logger) -> None:
     except Exception as exc:  # noqa: BLE001
         log.warning("mechanical-plan: unavailable (%s) -- cards sent without it", exc)
         return
+    delegated = str(recipient or HARRISON_SLACK_USER_ID) != HARRISON_SLACK_USER_ID
     pend_rows: list[dict] = []
+    pend_src: dict[str, dict] = {}
     try:
         for p in get_pending_updates():
             if p.get("update_type") != "asana_task":
                 continue
+            ref = str(p.get("update_id") or "")
+            pend_src[ref] = p
             pend_rows.append({
-                "kind": "proposed", "ref": str(p.get("update_id") or ""),
+                "kind": "proposed", "ref": ref,
                 "entity": review_lanes.resolve_entity(p), "state": "PENDING",
                 "subject": gtd.subject_of(p), "ts": str(p.get("proposed_at") or "")})
     except Exception:  # noqa: BLE001 -- the ledger alone still lists most
-        pend_rows = []
+        pend_rows, pend_src = [], {}
+
+    def _visible(n: dict) -> bool:
+        src = pend_src.get(str(n.get("ref") or ""))
+        if delegated:
+            try:
+                if (n.get("kind") != "proposed" or src is None
+                        or not review_lanes.can_approve(src, recipient)):
+                    return False
+            except Exception:  # noqa: BLE001 -- fail closed
+                return False
+        return not _near_dup_withheld(n, src)
     for u in targets:
         uid = str(u.get("update_id") or "")
         try:
@@ -1882,8 +2037,10 @@ def _attach_mechanical_plans(items: list[dict], log: logging.Logger) -> None:
                     info["assignee_label"] = who + (" (entity owner)"
                                                     if plan.assignee_source == "owner"
                                                     else " (default owner)")
-            near = gtd.near_duplicates(plan.entity, plan.subject, list(rows) + pend_rows,
-                                       exclude_ref=uid, limit=3)
+            near = [n for n in gtd.near_duplicates(plan.entity, plan.subject,
+                                                   list(rows) + pend_rows,
+                                                   exclude_ref=uid, limit=25)
+                    if _visible(n)][:3]
             u["_create_plan"] = info
             u["_near_dups"] = [{
                 "ref": gtd.ref_of(n) or str(n.get("ref") or ""),
@@ -1893,7 +2050,7 @@ def _attach_mechanical_plans(items: list[dict], log: logging.Logger) -> None:
                                else f"proposed {_md(n.get('ts'))}"),
             } for n in near]
         except Exception as exc:  # noqa: BLE001
-            log.warning("mechanical-plan: attach failed for %s (%s)", uid[:8],
+            log.warning("mechanical-plan: attach failed for %s (%s)", uid[-8:],
                         type(exc).__name__)
     log.info("mechanical-plan: attached to %d asana_task card(s); %d with possible "
              "duplicates", len(targets),
@@ -1984,7 +2141,7 @@ def main() -> int:
             log.warning("Another knowledge-review run holds the lock — skipping this invocation.")
             return 0
         import atexit
-        atexit.register(_release_run_lock)
+        atexit.register(_release_run_lock, _LOCK_PATH)  # the lock THIS run took
 
     exit_code = 0
 
@@ -2211,9 +2368,13 @@ def main() -> int:
             # D2: ack AFTER the apply, gated on its result so "Saved" reflects the
             # durable write and a failed apply is never shown as success (D-051).
             if not args.dry_run:
+                # Code #15 D-051 r1 s2#5: an asana_task's ack says what really
+                # happened (refused / duplicate / still pending), not "didn't go
+                # through" for all three; a PENDING row's card is not retired.
                 _ack_correlated_reaction(
                     reaction_by_uid.get(u["update_id"]) or {}, "APPROVED", u,
-                    slack_token, log, success=ok)
+                    slack_token, log, success=ok,
+                    **_asana_ack_overrides(gap_run_state, u))
 
     if dismissed_updates:
         log.info("DISMISSED %d updates (no action taken)", len(dismissed_updates))
