@@ -422,35 +422,64 @@ def is_lodging_shaped(text: Any) -> bool:
 # STRICT nouns: suite / resort / rental never trigger the lane alone (B5).
 _STRICT_NOUN = (r"(?:hotels?|motels?|hostels?|inns?|air ?bnbs?|vrbos?|lodgings?|accommodations?"
                 r"|(?:vacation|holiday|short-term|short term) rentals?|(?:places?|somewhere) to stay"
-                r"|b&bs?|bnbs?)")
+                r"|(?:air )?b&bs?|bnbs?)")
 _LEAD_RE = re.compile(r"^(?:(?:hey|hi|hello|ok|okay|so|yo|morning|good morning)\b[ ,!.:-]{0,4})?"
                       r"(?:cora\b[ ,!.:-]{0,4})?")
-_POLITE = (r"(?:(?:can|could|would|will) (?:you|u) (?:please |pls |maybe )?|please |pls "
-           r"|i need you to |i'd like you to |would you mind |help me |help us )?")
-_FRAME_VERB = (r"(?:find|search(?: for)?|look(?:ing)? for|look up|recommend|suggest|shortlist|get"
+# Up to TWO polite layers ("can you help me find ...", D-051 r1 c2-trigger#7).
+_POLITE = (r"(?:(?:(?:can|could|would|will) (?:you|u) (?:please |pls |maybe )?|please |pls "
+           r"|i need you to |i'd like you to |would you mind |help me |help us )){0,2}")
+_FRAME_VERB = (r"(?:(?:i|we) (?:need|want|'d like|would like|have) to (?:find|get|look for|search for)"
+               r"|(?:i'm|i am|we're|we are) (?:looking for|looking to find|trying to find"
+               r"|searching for)"
+               r"|(?:need|want|trying) to (?:find|get)"
+               r"|find|search(?: for)?|look(?:ing)? for|look up|recommend|suggest|shortlist|get"
+               r"|pull(?: up)?"
                r"|(?:i|we) (?:need|want|'d like|would like)|need|want"
-               r"|(?:i'm|i am|we're|we are) looking for"
-               r"|(?:any )?(?:good )?(?:recommendations|suggestions|options|ideas) for)")
-_FRAME_RE = re.compile(r"^" + _POLITE + _FRAME_VERB + r"(?: me| us)?"
-                       r"(?: [a-z0-9$'&/.,-]+){0,5}? " + _STRICT_NOUN + r"\b")
+               r"|(?:any )?(?:good )?(?:recommendations|suggestions|options|ideas) (?:for|on))")
+# The frame must GOVERN the lodging noun (B5; D-051 r1 c2-trigger#1): after the verb
+# only an optional me/us, one CLOSED determiner/quantifier and <= 2 CLOSED adjectives
+# may precede the noun. A preposition ("a restaurant NEAR the hotel"), a definite or
+# possessive determiner ("the hotel address", "our hotel") or any other head noun
+# breaks the match. Superlative quantifiers ("the best", "the top 5") ask for options
+# and are in the closed set; a bare "the" is not.
+_DET = (r"(?:a|an|some|any|a few|a couple(?: of)?|several|a handful of|a list of|a shortlist of"
+        r"|more|other|another|few|\d{1,2}|two|three|four|five|six|seven|eight|nine|ten"
+        r"|the best|the top(?: \d{1,2})?|the cheapest|the nicest|the closest)")
+_ADJ = (r"(?:good|great|nice|decent|cheap|cheaper|affordable|inexpensive|budget|reasonable"
+        r"|reasonably priced|modern|quiet|clean|luxury|luxurious|upscale|boutique|fancy|nicer"
+        r"|comfortable|cozy|spacious|safe|central|walkable|photogenic|camera-friendly"
+        r"|family-friendly|kid-friendly|pet-friendly|pet friendly|dog-friendly|dog friendly"
+        r"|highly rated|highly-rated|top-rated|well-reviewed|high-end|mid-range|nearby|local"
+        r"|available|large|big|small|private|whole|entire|last-minute|extended-stay|new|similar"
+        r"|\d-star|\d star|five-star|four-star|three-star|\d{1,2}[- ]?(?:bedroom|br|bed)"
+        r"|one-bedroom|two-bedroom|three-bedroom|four-bedroom|king|queen)")
+_FRAME_RE = re.compile(r"^" + _POLITE + _FRAME_VERB + r"(?: me| us)?(?: " + _DET + r")?"
+                       r"(?: " + _ADJ + r",?(?: and)?){0,2} " + _STRICT_NOUN + r"\b")
 _PLACES_RE = re.compile(r"^" + _POLITE + r"(?:any |some |good |nice )?(?:places|place|somewhere) to stay\b")
 _NOUN_OPTIONS_RE = re.compile(r"^" + _POLITE + r"(?:some |any |good )?" + _STRICT_NOUN
                               + r"(?: [a-z]+){0,2}? (?:options|recommendations|suggestions|ideas)\b")
 
-# Bails (B5): booking / admin / capability words anywhere in the (capped) text.
+# Bails (B5), in two scopes (D-051 r1 c2-trigger#4). BOOKING/ADMIN words bail only in
+# the FIRST clause -- "? dates are confirmed" after a clean ask is not a booking
+# request. CAPABILITY words bail anywhere in the (capped) text -- "... . add the best
+# one to my calendar" asks for another capability the lane would silently drop.
+# "expense" is the expense-report word, never "expensive" (a budget adjective).
 _BAIL_RE = re.compile(
     r"\b(?:booked|book (?:it|that|this|them|one|the|a|an|us|me)"
     r"|booking (?:confirmation|number|ref|reference)"
-    r"|cancel\w*|confirm\w*|expens\w*|reimburs\w*|receipts?|invoices?|refunds?|remind\w*"
-    r"|remember|forget|calendar|add (?:it |this |that |them )?to|tasks?|e-?mails?"
+    r"|cancel\w*|confirm\w*|expens(?:e|es|ed|ing)|reimburs\w*|receipts?|invoices?|refunds?)\b"
+)
+_CAPABILITY_BAIL_RE = re.compile(
+    r"\b(?:remind\w*|remember|forget|calendar|add (?:it |this |that |them )?to|tasks?|e-?mails?"
     r"|code session|build)\b"
 )
 # In a LANE THREAD these belong to other capabilities and reach the ordinary path
 # (web still withheld there by the thread-root leg of B1); booking words do NOT --
-# they get the lane's deterministic "I can't book" reply instead.
+# they get the lane's deterministic "I can't book" reply instead, and a price
+# refinement ("anything less expensive?") stays on the lane's deterministic side.
 _PASSTHROUGH_RE = re.compile(
     r"\b(?:remember|forget|remind\w*|calendar|add (?:it |this |that |them )?to|tasks?|e-?mails?"
-    r"|code session|build|expens\w*|reimburs\w*|receipts?|invoices?|refunds?)\b"
+    r"|code session|build|expens(?:e|es|ed|ing)|reimburs\w*|receipts?|invoices?|refunds?)\b"
 )
 
 
@@ -472,7 +501,9 @@ def _is_strict_ask(text: Any) -> bool:
         return False
     if not (_FRAME_RE.match(clause) or _PLACES_RE.match(clause) or _NOUN_OPTIONS_RE.match(clause)):
         return False
-    return not _BAIL_RE.search(_norm(cleaned))
+    if _BAIL_RE.search(clause):
+        return False
+    return not _CAPABILITY_BAIL_RE.search(_norm(cleaned))
 
 
 def looks_like_travel_ask(text: Any, *, user_id: str, channel_id: str, channel_type: str = "",

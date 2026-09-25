@@ -21,7 +21,8 @@ from cora import travel_shortlist as ts
 from cora.model_router import MODEL_SONNET
 from test_travel_shortlist import MUST_FIRE, _slack_client
 from test_travel_shortlist_wiring import (  # noqa: F401 -- `lane` is a fixture
-    ASK, ASK_TS, TRAVEL_CHANNEL, _drain, _drive_dispatch, _mention, _tessa, _web_rows, lane,
+    ASK, ASK_TS, TRAVEL_CHANNEL, _card_call, _dm, _drain, _drive_dispatch, _mention,
+    _model_path, _say_no_placeholder, _tessa, _web_rows, lane,
 )
 
 _REPO_ROOT = Path(app_module.__file__).resolve().parents[2]
@@ -214,3 +215,104 @@ class TestPriorTurnLegAndSkipLabel:
         assert seen and seen[-1].get("web_tools") is False
         reasons = [r.get("reason") for r in _web_rows()]
         assert "gate_skipped:phi_custodian+travel_lane" in reasons, reasons
+
+
+# ── c2-trigger#1/#4/#7: the frame governs the noun; bails scoped; two polite layers ─
+
+# The review's stolen turns: the lodging noun sits in a prepositional phrase or is a
+# definite reference, so the frame governs something else.
+GOVERNING_MUST_NOT_FIRE = [
+    "can you recommend a restaurant near the hotel in scottsdale for oct 17-21",
+    "any ideas for team dinner near the hotel in scottsdale oct 17-21?",
+    "suggest a coffee shop by the hotel in tempe oct 17-21",
+    "i need the address of the hotel in scottsdale",
+    "get the hotel address in scottsdale",
+    "find out which hotel we're using for the scottsdale offsite",
+    "i need the hotel wifi password",
+    "i want to know which hotel tessa picked",
+    "find parking near the hotel in scottsdale oct 17-21",
+    "recommend a gym by our hotel in mesa oct 17-21",
+]
+# Bail scopes: booking/admin words bail in the FIRST clause; capability words anywhere.
+SCOPED_MUST_NOT_FIRE = [
+    "find a hotel in Scottsdale Oct 17-21 and book it",
+    "find hotels in scottsdale oct 17-21. add the best one to my calendar",
+    "can you find hotels in scottsdale oct 17-21? remember we like the pool",
+    "find my hotel confirmation",
+]
+# Realistic asks that must reach the lane (price words, a trailing sentence, stacked
+# politeness, "pull", governed nouns with closed determiners/adjectives).
+NEW_MUST_FIRE = [
+    "find a hotel in scottsdale oct 17-21, nothing too expensive",
+    "can you find hotels in scottsdale oct 17-21? not too expensive please",
+    "can you find hotels in scottsdale for oct 17-21? dates are confirmed",
+    "can you help me find hotels in scottsdale oct 17-21",
+    "Hi! Can you help me look for hotels or Airbnbs in the Mesa/Gilbert/Scottsdale area "
+    "for Oct 17-21?",
+    "can you pull hotel options in scottsdale for oct 17-21",
+    "could you please help us find a hotel in tempe oct 17-21",
+    "pull up hotels in mesa oct 17-21",
+    "i need to find a hotel in scottsdale oct 17-21",
+    "find the best hotels in scottsdale oct 17-21",
+    "find a nice, quiet hotel in sedona oct 17-21",
+    "find a few good hotels in phoenix oct 17-21",
+    "find a 4-star hotel in phoenix oct 17-21",
+    "can you find a pet friendly hotel in mesa oct 17-21",
+    "we're trying to find an airbnb in sedona oct 17-21",
+    "find an Air B&B in Scottsdale Oct 17-21",
+]
+
+
+class TestStrictFrame:
+    @pytest.mark.parametrize("text", NEW_MUST_FIRE)
+    def test_must_fire(self, text):
+        for v in _wire_variants(text):
+            assert ts.looks_like_travel_ask(v, user_id=HARRISON, channel_id="D0HARRISON",
+                                            channel_type="im"), v
+            assert ts.looks_like_travel_ask(v, user_id="U_ANYONE", channel_id=TRAVEL_CHANNEL), v
+
+    @pytest.mark.parametrize("text", GOVERNING_MUST_NOT_FIRE + SCOPED_MUST_NOT_FIRE)
+    def test_must_not_fire(self, text):
+        assert not ts.looks_like_travel_ask(text, user_id=HARRISON, channel_id="D0HARRISON",
+                                            channel_type="im")
+        assert not ts.looks_like_travel_ask(text, user_id="U_ANYONE", channel_id=TRAVEL_CHANNEL)
+
+    @pytest.mark.parametrize("shape", [
+        "can you " * 5000, "find " + "a " * 20000 + "hotel", "find " + "nice, and " * 4000 + "x",
+        "help me " * 5000 + "find hotels", "find the top " + "9 " * 13000,
+    ], ids=["polite-x5000", "det-x20000", "adj-x4000", "help-x5000", "top-x13000"])
+    def test_the_frame_regexes_are_linear_even_uncapped(self, shape):
+        def run():
+            ts._FRAME_RE.match(shape)
+            ts._NOUN_OPTIONS_RE.match(shape)
+            ts._PLACES_RE.match(shape)
+            ts._BAIL_RE.search(shape)
+            ts._CAPABILITY_BAIL_RE.search(shape)
+            ts.looks_like_travel_ask(shape, user_id=HARRISON, channel_id="D0H", channel_type="im")
+        assert _best_of_3(run) < 0.05
+
+
+class TestStrictFrameThroughRealHandlers:
+    @pytest.mark.parametrize("text", GOVERNING_MUST_NOT_FIRE)
+    def test_the_lane_never_takes_a_governed_elsewhere_turn(self, lane, monkeypatch, text):
+        fired = []
+        monkeypatch.setattr(ts, "execute_route", lambda *a, **k: fired.append(1))
+        seen: list = []
+        said: list = []
+        base = _say_no_placeholder()
+        with _model_path(seen):
+            _mention(_slack_client(), lambda **kw: said.append(kw) or base(**kw), text,
+                     user=_tessa())
+            client = _slack_client()
+            client.chat_postMessage.side_effect = None
+            client.chat_postMessage.return_value = {"ok": True}
+            _dm(client, text, user=HARRISON, ts_="1790000000.000700")
+        assert fired == []
+        assert seen or said
+
+    @pytest.mark.parametrize("text", NEW_MUST_FIRE)
+    def test_harrisons_dm_runs_the_lane(self, lane, text):
+        client = _slack_client()
+        _dm(client, _wire(text), user=HARRISON)
+        _drain()
+        assert _card_call(client)["thread_ts"] == ASK_TS
