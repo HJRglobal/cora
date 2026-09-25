@@ -1,0 +1,499 @@
+{
+ "id": "msg_fixture",
+ "container": null,
+ "content": [
+  {
+   "citations": null,
+   "text": "I'll research lodging options in Scottsdale for your dates and criteria.",
+   "type": "text",
+   "parsed_output": null
+  },
+  {
+   "id": "srvtoolu_014AtJg7jRNj5iVy4DViFizM",
+   "caller": null,
+   "input": {
+    "query": "Scottsdale Arizona modern hotel king bed October 2026 $300-400 night"
+   },
+   "name": "web_search",
+   "type": "server_tool_use"
+  },
+  {
+   "id": "srvtoolu_01Y2fLpoQLMv9fTGu3Qc19cQ",
+   "caller": null,
+   "input": {
+    "query": "Scottsdale vacation rental modern photogenic Airbnb 4 guests king bed"
+   },
+   "name": "web_search",
+   "type": "server_tool_use"
+  },
+  {
+   "caller": {
+    "type": "direct"
+   },
+   "content": [
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "THE 10 BEST Hotels in Scottsdale, AZ 2026 (from $67) - Tripadvisor",
+     "type": "web_search_result",
+     "url": "https://www.tripadvisor.com/Hotels-g31350-Scottsdale_Arizona-Hotels.html"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Top 10 Hotels in Scottsdale, AZ in 2026 (from $74)",
+     "type": "web_search_result",
+     "url": "https://www.hotels.com/de1481439/hotels-scottsdale-arizona/"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "16 Best Hotels in Scottsdale. Hotels from $60/night - KAYAK",
+     "type": "web_search_result",
+     "url": "https://www.kayak.com/Scottsdale-Hotels.8126.hotel.ksp"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Top 10 Hotels in Scottsdale, AZ (from $68) 2026 - Competitive Prices | Expedia",
+     "type": "web_search_result",
+     "url": "https://www.expedia.com/Scottsdale-Hotels.d9829.Travel-Guide-Hotels"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Hotels in Scottsdale (Arizona, USA)",
+     "type": "web_search_result",
+     "url": "https://www.trivago.com/en-US/odr/hotels-scottsdale-arizona?search=200-14226"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "The Best 4 Star Hotels in Scottsdale, AZ from $109 | Expedia",
+     "type": "web_search_result",
+     "url": "https://www.expedia.com/4Star-Scottsdale-Hotels.s40-0-d9829.Travel-Guide-Filter-Hotels"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Hotels in Scottsdale \u2014 Best Prices and Free Cancellation",
+     "type": "web_search_result",
+     "url": "https://www.hotels-scottsdale.com/en/"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "THE 10 BEST Modern Hotels in Scottsdale 2026 (with Prices) - Tripadvisor",
+     "type": "web_search_result",
+     "url": "https://www.tripadvisor.com/HotelsList-Scottsdale-Modern-Hotels-zfp15044.html"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": "July 31, 2025",
+     "title": "Luxurious Accommodations in Scottsdale, AZ \u2013 ADERO Scottsdale",
+     "type": "web_search_result",
+     "url": "https://www.aderoscottsdale.com/amp/rooms-suites"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "$58 Hotels in Scottsdale: BEST Hotel Deals for 2026 | Orbitz",
+     "type": "web_search_result",
+     "url": "https://www.orbitz.com/Scottsdale-Hotels.d9829.Travel-Guide-Hotels"
+    }
+   ],
+   "tool_use_id": "srvtoolu_014AtJg7jRNj5iVy4DViFizM",
+   "type": "web_search_tool_result"
+  },
+  {
+   "caller": {
+    "type": "direct"
+   },
+   "content": [
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Scottsdale, AZ Vacation Rentals - Airbnb",
+     "type": "web_search_result",
+     "url": "https://www.airbnb.com/scottsdale-az/stays"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Scottsdale, AZ Vacation Rentals (5 out of 5) - Airbnb",
+     "type": "web_search_result",
+     "url": "https://www.airbnb.com/scottsdale-az/stays/mansions"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Scottsdale, AZ Vacation Rentals (4.8 out of 5)",
+     "type": "web_search_result",
+     "url": "https://www.airbnb.com/scottsdale-az/stays/vacation-homes"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Scottsdale Resort Vacation Rentals | Airbnb",
+     "type": "web_search_result",
+     "url": "https://www.airbnb.com/scottsdale-az/stays/resorts"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Scottsdale, AZ Vacation rentals & Airbnb | cozycozy",
+     "type": "web_search_result",
+     "url": "https://www.cozycozy.com/us/scottsdale-vacation-rentals"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Scottsdale Guesthouse Vacation Rentals | Airbnb",
+     "type": "web_search_result",
+     "url": "https://www.airbnb.com/scottsdale-az/stays/guesthouses"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Scottsdale Condo Vacation Rentals | Airbnb",
+     "type": "web_search_result",
+     "url": "https://www.airbnb.com/scottsdale-az/stays/condos"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Scottsdale Old Town Plaza, Scottsdale, AZ Vacation Rentals - Airbnb",
+     "type": "web_search_result",
+     "url": "https://www.airbnb.com/scottsdale-old-town-plaza-az/stays"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Scottsdale Apartment Vacation Rentals | Airbnb",
+     "type": "web_search_result",
+     "url": "https://www.airbnb.com/scottsdale-az/stays/apartments"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Scottsdale, AZ Luxury Vacation Rentals | Airbnb",
+     "type": "web_search_result",
+     "url": "https://www.airbnb.com/scottsdale-az/stays/luxury"
+    }
+   ],
+   "tool_use_id": "srvtoolu_01Y2fLpoQLMv9fTGu3Qc19cQ",
+   "type": "web_search_tool_result"
+  },
+  {
+   "citations": null,
+   "text": "These search results give general listing pages without specific pricing tied to your exact dates. Let me search for a couple more specific properties with pricing info to round out the options.",
+   "type": "text",
+   "parsed_output": null
+  },
+  {
+   "id": "srvtoolu_014EuEWMHrDoqtvmRXiyFnfe",
+   "caller": null,
+   "input": {
+    "query": "Hotel Valley Ho Scottsdale rate October 2026 king room"
+   },
+   "name": "web_search",
+   "type": "server_tool_use"
+  },
+  {
+   "id": "srvtoolu_0156J8NDmWerUrHRLw2JByC6",
+   "caller": null,
+   "input": {
+    "query": "\"Scottsdale\" condo rental \"king bed\" modern 4 guests nightly rate $300"
+   },
+   "name": "web_search",
+   "type": "server_tool_use"
+  },
+  {
+   "caller": {
+    "type": "direct"
+   },
+   "content": [
+    {
+     "encrypted_content": "ENC",
+     "page_age": "July 24, 2026",
+     "title": "HOTEL VALLEY HO - Updated 2026 Prices & Reviews (Scottsdale, AZ)",
+     "type": "web_search_result",
+     "url": "https://www.tripadvisor.com/Hotel_Review-g31350-d579764-Reviews-Hotel_Valley_Ho-Scottsdale_Arizona.html"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Hotel Valley Ho from $106. Scottsdale Hotel Deals & Reviews - KAYAK",
+     "type": "web_search_result",
+     "url": "https://www.kayak.com/Scottsdale-Hotels-Hotel-Valley-Ho.4718.ksp"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Hotel Valley Ho in Scottsdale, the United States from $121: Deals, Reviews, Photos | momondo",
+     "type": "web_search_result",
+     "url": "https://www.momondo.com/hotels/scottsdale/Hotel-Valley-Ho.mhd4718.ksp"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": "July 14, 2026",
+     "title": "Hotel Valley Ho: Modern Scottsdale Hotel + Spa",
+     "type": "web_search_result",
+     "url": "https://hotelvalleyho.com/"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Hotel Valley Ho, Scottsdale (updated prices 2026)",
+     "type": "web_search_result",
+     "url": "https://www.booking.com/hotel/us/valley-ho.html"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Hotel Valley Ho: Genuine Reviews & Scottsdale Stays 2026",
+     "type": "web_search_result",
+     "url": "https://www.hotels.com/ho105375/hotel-valley-ho-scottsdale-united-states-of-america/"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Hotel Valley Ho in Scottsdale - 2026 Prices & Reviews",
+     "type": "web_search_result",
+     "url": "https://us.trip.com/hotels/scottsdale-hotel-detail-2872490/hotel-valley-ho/"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Hotel Valley Ho - Guest Reservations",
+     "type": "web_search_result",
+     "url": "https://www.guestreservations.com/hotel-valley-ho/booking"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Spectacular Hotel Valley Ho - King Signature, Phoenix: Hotel Reviews, Rooms & Prices | Hotels.com",
+     "type": "web_search_result",
+     "url": "https://www.hotels.com/ho1730536288/spectacular-hotel-valley-ho-king-signature-scottsdale-united-states-of-america/"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Hotel Valley Ho, Phoenix: Room, Prices & Reviews | Travelocity",
+     "type": "web_search_result",
+     "url": "https://www.travelocity.com/Phoenix-Hotels-Hotel-Valley-Ho.h15298.Hotel-Information"
+    }
+   ],
+   "tool_use_id": "srvtoolu_014EuEWMHrDoqtvmRXiyFnfe",
+   "type": "web_search_tool_result"
+  },
+  {
+   "caller": {
+    "type": "direct"
+   },
+   "content": [
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Scottsdale Condo Vacation Rentals | Airbnb",
+     "type": "web_search_result",
+     "url": "https://www.airbnb.com/scottsdale-az/stays/condos"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": "3 weeks ago",
+     "title": "Scottsdale AZ Condos for Rent - 699 Rentals | Apartments.com",
+     "type": "web_search_result",
+     "url": "https://www.apartments.com/condos/scottsdale-az/"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "North Scottsdale Condo Vacation Rentals (4.9 out of 5) - Scottsdale, AZ | Airbnb",
+     "type": "web_search_result",
+     "url": "https://www.airbnb.com/north-scottsdale-az/stays/condos"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Vacation Rentals By Owner In Scottsdale, AZ",
+     "type": "web_search_result",
+     "url": "https://www.byowner.com/vacation-rentals/arizona/scottsdale"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": "July 17, 2025",
+     "title": "Scottsdale Vacation Condo Rentals | Merdian CondoResorts",
+     "type": "web_search_result",
+     "url": "https://condoresorts.com/luxury-condo-scottsdale-arizona-vacation-rentals/"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Scottsdale Furnished Monthly Rentals Long and Short-Stays. | Vrbo",
+     "type": "web_search_result",
+     "url": "https://www.vrbo.com/tgp/lodging/theme/longstay/9829/scottsdale"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Vacation Homes in Scottsdale Estates Four, Phoenix: House Rentals & More | Vrbo",
+     "type": "web_search_result",
+     "url": "https://www.vrbo.com/vacation-rentals/usa/arizona/scottsdale/scottsdale-estates-four"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": null,
+     "title": "Oldtown Scottsdale Condo Vacation Rentals | Airbnb",
+     "type": "web_search_result",
+     "url": "https://www.airbnb.com/old-town-scottsdale-az/stays/condos"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": "December 14, 2023",
+     "title": "Book One of Our Weekly Rentals in Scottsdale AZ | Scottsdale Rentals",
+     "type": "web_search_result",
+     "url": "https://www.scottsdalerentals.com/vacation-rentals/weekly-rentals/"
+    },
+    {
+     "encrypted_content": "ENC",
+     "page_age": "12 hours ago",
+     "title": "Apartments for Rent in Scottsdale AZ - 4,356 Rentals | Apartments.com",
+     "type": "web_search_result",
+     "url": "https://www.apartments.com/scottsdale-az/"
+    }
+   ],
+   "tool_use_id": "srvtoolu_0156J8NDmWerUrHRLw2JByC6",
+   "type": "web_search_tool_result"
+  },
+  {
+   "citations": null,
+   "text": "Based on my research, here are lodging options in Scottsdale for your dates. Note that exact real-time nightly rates for your specific October 17\u201321, 2026 dates weren't confirmed on listing pages (rates fluctuate with live availability), so I've marked those as \"not shown\" where a firm figure wasn't visible, and included general pricing context where available.\n\n**Hotel Valley Ho** stands out as a strong modern/photogenic hotel fit: ",
+   "type": "text",
+   "parsed_output": null
+  },
+  {
+   "citations": [
+    {
+     "cited_text": "Originally opened in 1956 and restored to its former splendor, this urban retreat blends mid-century-modern style with contemporary amenities. ",
+     "encrypted_index": "ENC",
+     "title": "HOTEL VALLEY HO - Updated 2026 Prices & Reviews (Scottsdale, AZ)",
+     "type": "web_search_result_location",
+     "url": "https://www.tripadvisor.com/Hotel_Review-g31350-d579764-Reviews-Hotel_Valley_Ho-Scottsdale_Arizona.html"
+    }
+   ],
+   "text": "this urban retreat blends mid-century-modern style with contemporary amenities",
+   "type": "text",
+   "parsed_output": null
+  },
+  {
+   "citations": null,
+   "text": ", and ",
+   "type": "text",
+   "parsed_output": null
+  },
+  {
+   "citations": [
+    {
+     "cited_text": "Every room has a private patio or balcony and floor-to-ceiling glass, perfect for enjoying Arizona&#x27;s sunshine. ",
+     "encrypted_index": "ENC",
+     "title": "HOTEL VALLEY HO - Updated 2026 Prices & Reviews (Scottsdale, AZ)",
+     "type": "web_search_result_location",
+     "url": "https://www.tripadvisor.com/Hotel_Review-g31350-d579764-Reviews-Hotel_Valley_Ho-Scottsdale_Arizona.html"
+    }
+   ],
+   "text": "every room has a private patio or balcony and floor-to-ceiling glass",
+   "type": "text",
+   "parsed_output": null
+  },
+  {
+   "citations": null,
+   "text": ". It has a King Signature room type available.\n\nFor vacation rentals, several Old Town Scottsdale condos matched the modern/king bed/4-guest criteria \u2014 one ",
+   "type": "text",
+   "parsed_output": null
+  },
+  {
+   "citations": [
+    {
+     "cited_text": "We offer a chef&#x27;s kitchen, luxury towels &amp; bedding, 4K TV w/Roku &amp; free NETFLIX, Nespresso &amp; classic coffee machines w/Starbucks coff...",
+     "encrypted_index": "ENC",
+     "title": "Oldtown Scottsdale Condo Vacation Rentals | Airbnb",
+     "type": "web_search_result_location",
+     "url": "https://www.airbnb.com/old-town-scottsdale-az/stays/condos"
+    }
+   ],
+   "text": "chef's kitchen, luxury towels & bedding, 4K TV w/Roku & free NETFLIX, Nespresso & classic coffee machines w/Starbucks coffee, A/C, a bedroom ceiling fan, dedicated covered parking, Tempur-Pedic king bed, sofa bed",
+   "type": "text",
+   "parsed_output": null
+  },
+  {
+   "citations": null,
+   "text": " condo ",
+   "type": "text",
+   "parsed_output": null
+  },
+  {
+   "citations": [
+    {
+     "cited_text": "Condo sleeps 4. ",
+     "encrypted_index": "ENC",
+     "title": "Oldtown Scottsdale Condo Vacation Rentals | Airbnb",
+     "type": "web_search_result_location",
+     "url": "https://www.airbnb.com/old-town-scottsdale-az/stays/condos"
+    }
+   ],
+   "text": "sleeps 4",
+   "type": "text",
+   "parsed_output": null
+  },
+  {
+   "citations": null,
+   "text": ". Another Old Town Plaza rental notes ",
+   "type": "text",
+   "parsed_output": null
+  },
+  {
+   "citations": [
+    {
+     "cited_text": "Two 65'' smart TVs, Wi-Fi, king/queen beds, reclining couches, rain-head shower, and custom murals perfect for pictures.\n\n",
+     "encrypted_index": "ENC",
+     "title": "Scottsdale Old Town Plaza, Scottsdale, AZ Vacation Rentals - Airbnb",
+     "type": "web_search_result_location",
+     "url": "https://www.airbnb.com/scottsdale-old-town-plaza-az/stays"
+    }
+   ],
+   "text": "Two 65'' smart TVs, Wi-Fi, king/queen beds, reclining couches, rain-head shower, and custom murals perfect for pictures",
+   "type": "text",
+   "parsed_output": null
+  },
+  {
+   "citations": null,
+   "text": ".\n\n```json\n[\n  {\n    \"property\": \"Hotel Valley Ho (King Signature Room)\",\n    \"nightly_rate\": \"not shown\",\n    \"url\": \"https://hotelvalleyho.com/\",\n    \"fit_note\": \"Iconic mid-century modern hotel in Old Town Scottsdale with floor-to-ceiling glass, private patios, colorful photogenic design, and king rooms; walkable to dining/shops.\",\n    \"kind\": \"hotel\"\n  },\n  {\n    \"property\": \"Old Town Scottsdale Condo w/ Tempur-Pedic King Bed (Airbnb)\",\n    \"nightly_rate\": \"not shown\",\n    \"url\": \"https://www.airbnb.com/old-town-scottsdale-az/stays/condos\",\n    \"fit_note\": \"Modern condo, sleeps 4, chef's kitchen, 4K TV, heated pool, Tempur-Pedic king bed, steps from Old Town restaurants and nightlife.\",\n    \"kind\": \"rental\"\n  },\n  {\n    \"property\": \"Scott Place Townhouse, Old Town Scottsdale Plaza (Airbnb)\",\n    \"nightly_rate\": \"not shown\",\n    \"url\": \"https://www.airbnb.com/scottsdale-old-town-plaza-az/stays\",\n    \"fit_note\": \"Vibrant, photogenic two-story townhouse with king beds, custom murals designed for photos, heated pool, close to Old Town.\",\n    \"kind\": \"rental\"\n  },\n  {\n    \"property\": \"Designer Condo w/ King Bed & Fireplace, North Scottsdale (Airbnb)\",\n    \"nightly_rate\": \"not shown\",\n    \"url\": \"https://www.airbnb.com/north-scottsdale-az/stays/condos\",\n    \"fit_note\": \"Stylish, modern condo with king bed, memory foam mattress, resort pool/gym access, sleek design touches for a photogenic stay.\",\n    \"kind\": \"rental\"\n  },\n  {\n    \"property\": \"Scottsdale-area rental (VRBO, ~$349-380/night rates seen for similar homes)\",\n    \"nightly_rate\": \"$349-$380 (similar listings, exact dates not confirmed)\",\n    \"url\": \"https://www.vrbo.com/vacation-rentals/usa/arizona/scottsdale/scottsdale-estates-four\",\n    \"fit_note\": \"Modern desert villa style homes near Old Town with king beds and photogenic pool/patio areas, priced within your target range on comparable listings.\",\n    \"kind\": \"rental\"\n  }\n]\n```\n\nA note: none of these prices were confirmed as exact live quotes for your specific Oct 17\u201321, 2026 stay \u2014 availability and rates change daily, so you'll want to check the listing pages directly with your exact dates to confirm current pricing within your $300\u2013400/night range.",
+   "type": "text",
+   "parsed_output": null
+  }
+ ],
+ "model": "claude-sonnet-5",
+ "role": "assistant",
+ "stop_details": null,
+ "stop_reason": "end_turn",
+ "stop_sequence": null,
+ "type": "message",
+ "usage": {
+  "cache_creation": {
+   "ephemeral_1h_input_tokens": 0,
+   "ephemeral_5m_input_tokens": 0
+  },
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 0,
+  "inference_geo": "global",
+  "input_tokens": 113917,
+  "output_tokens": 1838,
+  "server_tool_use": {
+   "web_fetch_requests": 0,
+   "web_search_requests": 4
+  },
+  "service_tier": "standard"
+ },
+ "diagnostics": null
+}

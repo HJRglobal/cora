@@ -105,6 +105,13 @@ def _enabled() -> bool:
     return os.environ.get("CORA_WEB_TOOLS", "on").strip().lower() in _TRUTHY
 
 
+def web_tools_enabled() -> bool:
+    """Public read of the CORA_WEB_TOOLS kill switch, for lanes that make their OWN
+    web-only call and never pass through evaluate() (Code #16 C2 travel shortlist):
+    the switch must stop them too."""
+    return _enabled()
+
+
 # LEX lane flag (2026-08-06 Harrison decision -- supersedes the v1 "LEX scope
 # OFF entirely" line in D-097). Default OFF: unset reads as OFF, which is the
 # OPPOSITE default from CORA_WEB_TOOLS above -- extending scope to the most

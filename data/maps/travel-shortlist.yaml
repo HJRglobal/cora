@@ -1,0 +1,100 @@
+# Travel shortlist lane (Code #16 C2, cq-e9ef3f581d60; ladder row travel-shortlist, T0).
+#
+# Read by src/cora/travel_shortlist.py. DATA, not code: the lane's surfaces and its
+# area allowlist live here so a channel rename or a new city is a data edit.
+#
+# Privacy contract (kickoff 2026-09-21 C2): the lane's web request is rendered ONLY
+# from parsed fields -- dates, an area named on THIS list, party size, nightly budget,
+# beds/bedrooms, lodging type and a fixed style vocabulary. A place the list does not
+# carry is never searched (the lane asks for a city instead), because a free-text
+# "area" can carry a name ("near X's gym"). Every token of every `name` / `state`
+# below is part of the request belt's allowlist, so keep entries to real place names.
+
+version: 1
+
+# @mention surface. Keyed by ID (routing is name-based and a rename must not move
+# the lane). C0C145H84JZ = #hjr-travel-booking (private; Cora is a member --
+# verified read-only 2026-09-25). Channel `message` events do not reach the app, so
+# an ask here must @mention Cora.
+channel_ids:
+  - C0C145H84JZ
+
+# DM surface: Harrison (HARRISON_SLACK_USER_ID, always allowed) plus these roster
+# handles, resolved through org_roles.find_by_handle -- never a hardcoded Slack id.
+# An unresolved handle logs a WARN and simply has no DM surface (the normal Q&A path
+# still withholds web tools from any lodging-shaped turn).
+dm_user_handles:
+  - tessa
+
+# Area allowlist: canonical `name` + `state` (rendered "Name, State") and lowercase
+# `aliases` (matched as whole words, and only in locative context -- "in X",
+# "near X", "the X area", or a slash/comma list that is -- so a surname or a
+# possessive "X's" is never read as a place). `key` is the stable id stored in the
+# lane's thread store.
+areas:
+  # --- Phoenix metro + Arizona ---
+  - {key: phoenix, name: Phoenix, state: Arizona, aliases: [phoenix, downtown phoenix, phx]}
+  - {key: scottsdale, name: Scottsdale, state: Arizona, aliases: [scottsdale, old town scottsdale, north scottsdale, south scottsdale]}
+  - {key: mesa, name: Mesa, state: Arizona, aliases: [mesa]}
+  - {key: gilbert, name: Gilbert, state: Arizona, aliases: [gilbert]}
+  - {key: tempe, name: Tempe, state: Arizona, aliases: [tempe]}
+  - {key: chandler, name: Chandler, state: Arizona, aliases: [chandler]}
+  - {key: glendale-az, name: Glendale, state: Arizona, aliases: [glendale]}
+  - {key: peoria-az, name: Peoria, state: Arizona, aliases: [peoria]}
+  - {key: surprise, name: Surprise, state: Arizona, aliases: [surprise]}
+  - {key: goodyear, name: Goodyear, state: Arizona, aliases: [goodyear]}
+  - {key: avondale, name: Avondale, state: Arizona, aliases: [avondale]}
+  - {key: buckeye, name: Buckeye, state: Arizona, aliases: [buckeye]}
+  - {key: paradise-valley, name: Paradise Valley, state: Arizona, aliases: [paradise valley]}
+  - {key: fountain-hills, name: Fountain Hills, state: Arizona, aliases: [fountain hills]}
+  - {key: cave-creek, name: Cave Creek, state: Arizona, aliases: [cave creek]}
+  - {key: carefree, name: Carefree, state: Arizona, aliases: [carefree]}
+  - {key: queen-creek, name: Queen Creek, state: Arizona, aliases: [queen creek]}
+  - {key: apache-junction, name: Apache Junction, state: Arizona, aliases: [apache junction]}
+  - {key: litchfield-park, name: Litchfield Park, state: Arizona, aliases: [litchfield park]}
+  - {key: tucson, name: Tucson, state: Arizona, aliases: [tucson]}
+  - {key: oro-valley, name: Oro Valley, state: Arizona, aliases: [oro valley]}
+  - {key: sedona, name: Sedona, state: Arizona, aliases: [sedona]}
+  - {key: flagstaff, name: Flagstaff, state: Arizona, aliases: [flagstaff]}
+  - {key: prescott, name: Prescott, state: Arizona, aliases: [prescott]}
+  - {key: page-az, name: Page, state: Arizona, aliases: [page]}
+  - {key: lake-havasu-city, name: Lake Havasu City, state: Arizona, aliases: [lake havasu city, lake havasu]}
+  - {key: yuma, name: Yuma, state: Arizona, aliases: [yuma]}
+  # --- major US cities ---
+  - {key: new-york-city, name: New York City, state: New York, aliases: [new york city, nyc, new york, manhattan, brooklyn]}
+  - {key: los-angeles, name: Los Angeles, state: California, aliases: [los angeles]}
+  - {key: san-diego, name: San Diego, state: California, aliases: [san diego]}
+  - {key: san-francisco, name: San Francisco, state: California, aliases: [san francisco]}
+  - {key: san-jose, name: San Jose, state: California, aliases: [san jose]}
+  - {key: sacramento, name: Sacramento, state: California, aliases: [sacramento]}
+  - {key: palm-springs, name: Palm Springs, state: California, aliases: [palm springs]}
+  - {key: las-vegas, name: Las Vegas, state: Nevada, aliases: [las vegas, vegas]}
+  - {key: reno, name: Reno, state: Nevada, aliases: [reno]}
+  - {key: denver, name: Denver, state: Colorado, aliases: [denver]}
+  - {key: salt-lake-city, name: Salt Lake City, state: Utah, aliases: [salt lake city, salt lake]}
+  - {key: park-city, name: Park City, state: Utah, aliases: [park city]}
+  - {key: seattle, name: Seattle, state: Washington, aliases: [seattle]}
+  - {key: portland-or, name: Portland, state: Oregon, aliases: [portland]}
+  - {key: austin, name: Austin, state: Texas, aliases: [austin]}
+  - {key: dallas, name: Dallas, state: Texas, aliases: [dallas]}
+  - {key: houston, name: Houston, state: Texas, aliases: [houston]}
+  - {key: san-antonio, name: San Antonio, state: Texas, aliases: [san antonio]}
+  - {key: chicago, name: Chicago, state: Illinois, aliases: [chicago]}
+  - {key: nashville, name: Nashville, state: Tennessee, aliases: [nashville]}
+  - {key: atlanta, name: Atlanta, state: Georgia, aliases: [atlanta]}
+  - {key: miami, name: Miami, state: Florida, aliases: [miami, miami beach]}
+  - {key: orlando, name: Orlando, state: Florida, aliases: [orlando]}
+  - {key: tampa, name: Tampa, state: Florida, aliases: [tampa]}
+  - {key: fort-lauderdale, name: Fort Lauderdale, state: Florida, aliases: [fort lauderdale, ft lauderdale]}
+  - {key: charlotte, name: Charlotte, state: North Carolina, aliases: [charlotte]}
+  - {key: boston, name: Boston, state: Massachusetts, aliases: [boston]}
+  - {key: philadelphia, name: Philadelphia, state: Pennsylvania, aliases: [philadelphia, philly]}
+  - {key: washington-dc, name: Washington, state: District of Columbia, aliases: [washington dc, washington d.c.]}
+  - {key: new-orleans, name: New Orleans, state: Louisiana, aliases: [new orleans]}
+  - {key: minneapolis, name: Minneapolis, state: Minnesota, aliases: [minneapolis]}
+  - {key: detroit, name: Detroit, state: Michigan, aliases: [detroit]}
+  - {key: st-louis, name: St. Louis, state: Missouri, aliases: [st. louis, st louis, saint louis]}
+  - {key: kansas-city, name: Kansas City, state: Missouri, aliases: [kansas city]}
+  - {key: albuquerque, name: Albuquerque, state: New Mexico, aliases: [albuquerque]}
+  - {key: santa-fe, name: Santa Fe, state: New Mexico, aliases: [santa fe]}
+  - {key: honolulu, name: Honolulu, state: Hawaii, aliases: [honolulu, waikiki]}

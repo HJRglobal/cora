@@ -491,6 +491,16 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
         "CORA_WEB_SEARCH_DAILY_CAP", "CORA_WEB_KB_MISS_DISTANCE",
     ):
         monkeypatch.delenv(_wv, raising=False)
+    # Code #16 C2 (travel shortlist lane): the kill switch and the lane's daily
+    # search sub-cap are pinned to their CODE defaults (on / 8) -- a live .env flip
+    # must never redden the suite -- and the lane's thread store (structured fields
+    # + events, per-call env path) is redirected so no test reads or writes
+    # data/state/travel-shortlist-threads.jsonl.
+    monkeypatch.delenv("CORA_TRAVEL_SHORTLIST", raising=False)
+    monkeypatch.delenv("CORA_TRAVEL_SHORTLIST_DAILY_SEARCHES", raising=False)
+    monkeypatch.setenv(
+        "CORA_TRAVEL_SHORTLIST_THREADS_PATH", str(tmp_path / "travel-shortlist-threads.jsonl")
+    )
     # cq-d9432f552a33 (bug-hunt Slice 10): the known-answers WRITE targets resolve
     # via PER-CALL env reads (gap_autofill._known_answers_dir/_resolved_path), so
     # the module-constant belt below cannot cover them -- and .env carries the
@@ -913,6 +923,9 @@ _GUARDED_LEDGERS = (
     "data/state/channel-archive-proposals.jsonl",
     "logs/channel-archive-ledger.jsonl",
     "data/state/channel-archive-scan.lock",
+    # Code #16 C2: the travel shortlist lane's thread store (writer:
+    # travel_shortlist.append_event; redirected via CORA_TRAVEL_SHORTLIST_THREADS_PATH).
+    "data/state/travel-shortlist-threads.jsonl",
 )
 
 
