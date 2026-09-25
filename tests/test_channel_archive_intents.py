@@ -494,3 +494,58 @@ class TestClearedDemotionR2:
     def test_an_empty_ledger_still_says_nothing_has_been_archived(self):
         assert st.read_ledger() == []
         assert it.followup_reply().endswith("Lane at T0: nothing has been archived.")
+
+
+#: r2:c1-intents-copy#0 -- the natural card confirmations A21(d) names ("a bare
+#: yes/ok/go ahead/do it"): a short run of affirmatives with punctuation, a
+#: softener (please / just / now), a leading or trailing vocative, a thumbs-up.
+AFFIRM_FIRE_R2 = [
+    "yes, go ahead", "Yes, go ahead.", "yes go ahead", "ok do it", "ok, do it", "go for it",
+    "yes do it", "sounds good", "sounds good, go ahead", "yes please do", "ok go", "sure, go ahead",
+    "yup", "yep go ahead", "\U0001f44d", ":+1:", ":thumbsup:", "go ahead and do it", "yes confirm",
+    "yes — do it", "cora, do it", "cora go ahead", "go ahead, cora", "yes please, go ahead",
+    "please go ahead", "go ahead please", "just do it", "let's do it", "ok \U0001f44d",
+    ":+1::skin-tone-3:", "yes!", "<@U0B44MDGC5R> yes, go ahead", "Yep, do it!", "sounds great", "k",
+    "okay, go for it", "yes cora", "yes", "ok", "go ahead", "do it", "Yes please!", "please do",
+    "approved", "confirm",
+]
+#: ... and the replies that carry content, a condition, a stop, or a question stay
+#: with the normal path (D-173: a false refusal is a stolen turn).
+AFFIRM_NOT_R2 = [
+    "ok thanks for that", "yes, and also send the report", "ok thanks", "thanks", "yes but hold off",
+    "no", "nope", "not yet", "don't", "hold off", "wait", "go ahead and send it to tommy",
+    "sure, what's the 13-week view?", "ok let me check", "yes that's right", "yes, the 13-week one",
+    "confirm the order", "approve the invoice", "do it later", "do it tomorrow", "yeah no", "ok cool",
+    "sounds good, but keep #social", "cora what's our cash?", "yes cancel it", "do it for osn only",
+    "proceed with the order", "go ahead and book the flight", "yes please send the report",
+    "sure thing, what about osn?", "ok, one question first", "yes to the first, no to the rest",
+    "\U0001f44d but keep #social", "no, go ahead and wait", "ok go ahead and cancel",
+    "ok i'll do it myself", "yes - the dtc one", "yes yes yes yes yes",
+]
+
+
+class TestAffirmativesR2:
+    @pytest.mark.parametrize("t", AFFIRM_FIRE_R2)
+    def test_natural_confirmations_are_affirmatives(self, t):
+        assert it.followup_shape(t) == "affirmative", t
+        assert it.looks_like_live_followup(t, card_ts=NOW - 60, now=NOW), t
+        assert not it.looks_like_live_followup(t, card_ts=NOW - 31 * 60, now=NOW), t   # 30-min window
+
+    @pytest.mark.parametrize("t", AFFIRM_NOT_R2)
+    def test_replies_with_content_are_not(self, t):
+        assert it.followup_shape(t) is None, t
+
+    @pytest.mark.parametrize("shape", ["yes" + "!" * 296 + "x", "yes, " * 59 + "x", "cora " * 59 + "yes",
+                                       "yes " + "- " * 147 + "x", "go ahead and " * 23 + "x",
+                                       ":+1:" * 74 + "x", "please " * 42 + "x"],
+                             ids=["bangs", "yes-commas", "vocatives", "dashes", "and-chain", "codes",
+                                  "softeners"])
+    def test_the_affirmative_grammar_is_fast_on_capped_worst_cases(self, shape):
+        best = float("inf")
+        for _ in range(3):
+            t0 = time.perf_counter()
+            it.followup_shape(shape)
+            it.followup_shape(" " * 40000)
+            it.followup_shape("yes," + " " * 40000 + "x")
+            best = min(best, time.perf_counter() - t0)
+        assert best < 0.05

@@ -815,3 +815,44 @@ class TestEveryLiveCardR2:
         client = MagicMock()
         app_module.handle_message_event(_event("ok", thread_ts=a_ts), client)
         assert _texts(client) == [intents.followup_reply()] and not quiet_dm.qa.called
+
+
+class TestAffirmativesR2:
+    """r2:c1-intents-copy#0: the natural card confirmations get the A21(d) code reply
+    through the REAL handle_message_event; replies with content still reach the model."""
+
+    @pytest.mark.parametrize("text", [
+        "yes, go ahead", "Yes, go ahead.", "yes go ahead", "ok do it", "ok, do it", "go for it", "yes do it",
+        "sounds good", "sounds good, go ahead", "yes please do", "ok go", "sure, go ahead", "yup",
+        "yep go ahead", "\U0001f44d", ":+1:", ":thumbsup:", "go ahead and do it", "yes confirm",
+        "yes — do it", "cora, do it", "cora go ahead", "go ahead, cora", "<@U0B44MDGC5R> yes, go ahead",
+    ])
+    def test_a_natural_confirmation_of_a_live_card_gets_the_code_reply(self, quiet_dm, text):
+        _live_card()
+        client = MagicMock()
+        app_module.handle_message_event(_event(text), client)
+        assert _texts(client) == [intents.followup_reply()], text
+        assert not quiet_dm.qa.called and not quiet_dm.capture.called, text
+
+    @pytest.mark.parametrize("text", [
+        "ok thanks for that", "yes, and also send the report", "ok thanks", "yes but hold off",
+        "go ahead and send it to tommy", "sure, what's the 13-week view?", "ok let me check",
+        "confirm the order", "do it later", "yes cancel it", "sounds good, but keep #social",
+        "go ahead and book the flight", "yes please send the report",
+    ])
+    def test_a_reply_with_content_is_not_the_cards(self, quiet_dm, text):
+        _live_card()
+        client = MagicMock()
+        app_module.handle_message_event(_event(text), client)
+        assert intents.FOLLOWUP_REPLY_LEAD not in " ".join(t or "" for t in _texts(client)), text
+        assert quiet_dm.qa.called, text
+
+    def test_a_widened_yes_still_yields_to_cora_s_newer_question(self, quiet_dm):
+        _live_card()
+        client = MagicMock()
+        client.conversations_history.return_value = _history(
+            {"ts": f"{time.time() - 1:.6f}", "bot_id": "BCORA", "user": BOT,
+             "text": "Cash is $1.2M. Want the 13-week view too?"})
+        app_module.handle_message_event(_event("yes, go ahead"), client)
+        assert quiet_dm.qa.called
+        assert intents.FOLLOWUP_REPLY_LEAD not in " ".join(t or "" for t in _texts(client))

@@ -165,9 +165,21 @@ _FOREIGN_PLACE_RE = re.compile(
     r"\b(?:in|from|inside|on|at) (?:(?:my|the|our|his|her|their) )?(?:[a-z0-9-]+ ){0,2}"
     r"(?:folders?|drives?|inbox(?:es)?|gmail|e-?mail|asana|hubspot|notion|dropbox|quickbooks|"
     r"qbo|shopify|deposco|airtable|trello|jira|github|calendar)\b")
+#: A21(d) "a bare yes / ok / go ahead / do it", as people type it (D-051 r2
+#: c1-intents-copy#0): a short run (max 4) of affirmatives and softeners joined by
+#: punctuation / "and", an optional leading or trailing "cora", a thumbs-up. Any
+#: other word (a condition, a stop, "thanks", a question's content) fails it.
+_AFF = (r"(?:yes|yep|yeah|yup|ya|yea|y|ok|okay|k|kk|sure|go ahead|go for it|go|do it|"
+        r"let's do it|lets do it|please do|sounds good|sounds great|confirm|confirmed|"
+        # (normalize strips a message's LEADING ':' -- a bare ":+1:" arrives as "+1:")
+        r"approve|approved|proceed|:?\+1:(?::skin-tone-[2-6]:)?|:?thumbsup:|:?thumbs_up:|"
+        "\U0001f44d[\U0001f3fb-\U0001f3ff]?)")
+_AFF_SOFT = "(?:please|pls|plz|just|now)"
+_AFF_SEP = "(?: ?[,.!;:—–-]* (?:and )?)"
 _BARE_YES_RE = re.compile(
-    r"\A(?:yes|yep|yeah|y|ok|okay|go ahead|do it|go|sure|please do|yes please|confirm|"
-    r"confirmed|approved|approve)[?.!]*\Z")
+    r"\A(?:@?cora ?[,:;!.—–-]* )?(?:" + _AFF_SOFT + " )?" + _AFF
+    + "(?:" + _AFF_SEP + "(?:" + _AFF + "|" + _AFF_SOFT + ")){0,3}"
+    r"(?:,? @?cora)?[?.!]*\Z")
 
 
 def normalize(text: str, *, bot_user_id: str | None = None) -> str:
