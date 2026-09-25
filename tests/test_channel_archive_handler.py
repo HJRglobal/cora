@@ -493,6 +493,162 @@ class TestDemotionHistoryA12:
             assert handler.button_tier(cards.ACTION_ROW, value) == "T0"
 
 
+def _landing_posts(fake, *, notice=None, correction=None):
+    """post_behaviour: every post to A1 LANDS in the channel's history (as Slack would
+    show it); *notice* / *correction* are then raised AFTER the landing (a timeout after
+    Slack accepted the post), or -- with landed=False -- instead of it."""
+    import time as _t
+
+    def _pb(kw):
+        if kw["channel"] != A1:
+            return None
+        text = kw["text"]
+        want = notice if text.startswith(cards.NOTICE_PREFIX) else \
+            correction if text == cards.CORRECTION_TEXT else None
+        landed = not (isinstance(want, tuple) and want[1] is False)
+        exc = want[0] if isinstance(want, tuple) else want
+        if landed:
+            fake.history[A1].insert(0, {"ts": f"{_t.time():.6f}", "type": "message",
+                                        "user": BOT_UID, "text": text})
+        return exc
+    fake.post_behaviour = _pb
+
+
+def _notices_to(fake, cid=A1):
+    return [p for p in fake.posts if p["channel"] == cid and p["text"].startswith(cards.NOTICE_PREFIX)]
+
+
+def _http_error(status, body_error):
+    from _chanarch_fakes import resp as _resp
+    from slack_sdk.errors import SlackApiError
+    r = _resp({"ok": False, "error": body_error})
+    r.status_code = status
+    return SlackApiError(message="The request to the Slack API failed.", response=r)
+
+
+class TestIndeterminateWrites:
+    """c1-authority-tier#2 / c1-state-machine#0 / c1-state-machine#5: a write that may
+    have landed is never reported as 'did not post' / 'stays open', a correction is
+    claimed only when it posted, and a retry never posts the notice twice."""
+
+    @pytest.mark.parametrize("err", [TimeoutError("read timed out"), api_error("internal_error"),
+                                     _http_error(503, "Received a response in a non-JSON format: <html>")],
+                             ids=["timeout", "internal_error", "http_503"])
+    def test_an_indeterminate_notice_says_may_have_posted_and_corrects(self, fake, armed, err):
+        stage(tier="T1")
+        _landing_posts(fake, notice=err)
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
+        assert r.outcome == "failed" and "may have posted" in r.msg, r.msg
+        assert "did not post" not in r.msg and "<html>" not in r.msg
+        assert f"I posted a correction in <#{A1}>" in r.msg
+        assert [p["text"] for p in fake.posts if p["channel"] == A1] == [cards.CORRECTION_TEXT]
+        assert "conversations_archive" not in fake.method_names()
+        out = st.read_ledger()[-1]["outcome"]
+        assert out.startswith("notice_indeterminate:") and "<" not in out
+        assert state(A1) == st.FAILED
+
+    def test_a_failed_correction_is_never_claimed(self, fake, armed):
+        stage(tier="T1")
+        _landing_posts(fake, notice=TimeoutError("t1"), correction=(TimeoutError("t2"), False))
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
+        assert "I could not post a correction" in r.msg and "I posted a correction" not in r.msg
+
+    def test_a_definite_notice_refusal_still_says_did_not_post(self, fake, armed):
+        stage(tier="T1")
+        fake.post_behaviour = lambda kw: api_error("not_in_channel") if kw["channel"] == A1 else None
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
+        assert "did not post (not_in_channel)" in r.msg and not fake.posts
+
+    def test_a_retry_after_an_uncorrected_standing_notice_never_posts_it_twice(self, fake, armed):
+        stage(tier="T1")
+        _landing_posts(fake, notice=TimeoutError("t"), correction=(TimeoutError("t2"), False))
+        tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")                  # notice landed, no correction
+        _landing_posts(fake)
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1", now=NOW + 30)
+        assert r.outcome == "archived", r.msg
+        assert _notices_to(fake) == [] and "already standing (not posted twice)" in r.msg
+        assert fake.method_names().count("conversations_archive") == 1
+
+    def test_a_retry_after_a_corrected_notice_posts_a_fresh_one(self, fake, armed):
+        stage(tier="T1")
+        _landing_posts(fake, notice=TimeoutError("t"))            # notice + correction landed
+        tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
+        _landing_posts(fake)
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1", now=NOW + 30)
+        assert r.outcome == "archived", r.msg
+        assert len(_notices_to(fake)) == 1 and "The notice went in first" in r.msg
+
+    def test_a_retry_that_cannot_read_the_channel_posts_nothing(self, fake, armed):
+        stage(tier="T1")
+        _landing_posts(fake, notice=TimeoutError("t"), correction=(TimeoutError("t2"), False))
+        tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
+        real = fake.conversations_history
+
+        def _hist(channel, oldest=None, latest=None, limit=100, cursor=None, inclusive=False, **kw):
+            if limit == 20 and oldest is not None:          # the dedupe read
+                raise api_error("ratelimited")
+            return real(channel, oldest=oldest, latest=latest, limit=limit, cursor=cursor,
+                        inclusive=inclusive)
+        fake.conversations_history = _hist
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1", now=NOW + 30)
+        assert r.outcome == "failed" and "posted nothing" in r.msg, r.msg
+        assert _notices_to(fake) == [] and "conversations_archive" not in fake.method_names()
+        assert state(A1, now=NOW + 40) == st.OPEN
+
+    def test_an_indeterminate_notice_stops_archive_all(self, fake, armed):
+        rows = [_row(A1, "fx-dead-one", tier="T1"), _row(A2, "fx-dead-two", tier="T1"),
+                _row(A3, "fx-dead-three", tier="T1")]
+        stage(tier="T1", rows=rows)
+        _landing_posts(fake, notice=TimeoutError("t"))
+        r = tap(cards.ACTION_ALL, f"{PID}:p1:T1")
+        assert "2 of 3 not attempted" in r.msg, r.msg
+        assert _notices_to(fake, A2) == [] and _notices_to(fake, A3) == []
+
+    @pytest.mark.parametrize("err", [api_error("internal_error"), api_error("fatal_error"),
+                                     api_error("service_unavailable"), api_error("request_timeout"),
+                                     _http_error(500, "Received a response in a non-JSON format: x")],
+                             ids=["internal_error", "fatal_error", "service_unavailable",
+                                  "request_timeout", "http_500"])
+    @pytest.mark.parametrize("readback", [True, False, "error"])
+    def test_a_maybe_succeeded_archive_error_gets_the_read_back(self, fake, armed, err, readback):
+        stage(tier="T1")
+
+        def _arch(channel):
+            if readback is True:
+                fake.archived.add(channel)
+            return err
+        fake.archive_behaviour = _arch
+        if readback == "error":
+            calls = {"n": 0}
+            orig_info = fake.conversations_info
+
+            def _info(channel, **kw):
+                calls["n"] += 1
+                if "conversations_archive" in fake.method_names():
+                    raise api_error("internal_error")
+                return orig_info(channel, **kw)
+            fake.conversations_info = _info
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
+        assert fake.method_names().count("conversations_archive") == 1
+        want = {True: "archived", False: "failed", "error": "unknown"}[readback]
+        assert r.outcome == want, r.msg
+        if readback is False:
+            assert "read-back shows" in r.msg and "partly went through" in r.msg
+            assert fake.posts[-1]["text"] == cards.CORRECTION_TEXT and state(A1) == st.FAILED
+            assert "Received" not in r.msg
+        if readback is True:
+            assert state(A1) == st.ARCHIVED and cards.CORRECTION_TEXT not in [p["text"] for p in fake.posts]
+
+    def test_a_definite_archive_refusal_whose_correction_fails_says_so(self, fake, armed):
+        stage(tier="T1")
+        fake.archive_behaviour = api_error("restricted_action")
+        fake.post_behaviour = lambda kw: (TimeoutError("t") if kw["text"] == cards.CORRECTION_TEXT
+                                          else None)
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
+        assert "Slack refused (restricted_action)" in r.msg
+        assert "I could not post a correction" in r.msg and "I posted a correction" not in r.msg
+
+
 BUSY = "C0BUSYBOT01"
 
 
@@ -736,4 +892,24 @@ class TestRoundOneRepliesPassTheRails:
             blocks, text = cards.render_page(st.fold(now=NOW + 20), PID, 1, now=NOW + 20)
             out += [e["text"] for b in blocks if b.get("type") == "section"
                     for e in [b["text"]]] + [text]
+        _assert_rails(out, monkeypatch, caplog)
+
+
+    def test_indeterminate_write_and_read_error_replies(self, fake, armed, monkeypatch, caplog):
+        out = []
+        stage(tier="T1")
+        _landing_posts(fake, notice=TimeoutError("t"), correction=(TimeoutError("t2"), False))
+        out.append(tap(cards.ACTION_ROW, f"{PID}:{A1}:T1").msg)            # may have posted
+        _landing_posts(fake)
+        out.append(tap(cards.ACTION_ROW, f"{PID}:{A1}:T1", now=NOW + 30).msg)   # reused notice
+        st.store_path().unlink()
+        st.ledger_path().unlink()
+        fake.archived.clear()
+        stage(tier="T1")
+        fake.archive_behaviour = api_error("internal_error")
+        out.append(tap(cards.ACTION_ROW, f"{PID}:{A2}:T1").msg)            # read-back: open
+        fake.archive_behaviour = None
+        fake.members[A1] = api_error("ratelimited")
+        out.append(tap(cards.ACTION_ROW, f"{PID}:{A1}:T1").msg)            # members unknown
+        assert len(out) == 4 and all(out)
         _assert_rails(out, monkeypatch, caplog)

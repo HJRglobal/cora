@@ -407,12 +407,114 @@ def _finish(p: st.Proposal, row: dict, actor: str, now: float, outcome: str, *,
                     cid=row["cid"], by=actor, code=code or None, ts=time.time())
 
 
-def _correction(write: Any, cid: str) -> None:
+def _correction(write: Any, cid: str) -> bool:
+    """Post the correction line; True only when Slack accepted it (the reply says "I
+    posted a correction" only then)."""
     try:
         write.chat_postMessage(channel=cid, text=cards.CORRECTION_TEXT,
                                unfurl_links=False, unfurl_media=False)
-    except Exception:  # noqa: BLE001 -- best effort; the card says it did not go through
+    except Exception:  # noqa: BLE001 -- best effort; the reply says whether it landed
         log.warning("channel_archive: correction line failed cid=%s", cid)
+        return False
+    return True
+
+
+def _correction_said(posted: bool, row: dict) -> str:
+    return (f"I posted a correction in {_label(row)}" if posted
+            else f"I could not post a correction in {_label(row)}")
+
+
+#: Slack errors after which "it's possible some aspect of the operation succeeded"
+#: (Slack's own wording) -- an INDETERMINATE write, like a timeout (A16).
+MAYBE_DONE_CODES: frozenset = frozenset({"internal_error", "fatal_error", "service_unavailable",
+                                         "request_timeout", "slackapierror"})
+_SAFE_CODE_RE = re.compile(r"\A[a-z0-9_]{1,60}\Z")
+
+
+def _write_code(exc: BaseException) -> str:
+    """A short, safe error code for a failed write: the Slack error token, "http_<n>"
+    for a 5xx (a non-JSON body never reaches a reply or the ledger), else the class."""
+    code = cl._err_code(exc)
+    resp = getattr(exc, "response", None)
+    try:
+        status = int(getattr(resp, "status_code", 0) or 0)
+    except (TypeError, ValueError):
+        status = 0
+    if resp is not None and status >= 500 and code not in MAYBE_DONE_CODES:
+        return f"http_{status}"
+    return code if _SAFE_CODE_RE.match(code) else "unexpected_response"
+
+
+def _indeterminate(exc: BaseException) -> bool:
+    """True when the write may have landed: no response (a timeout / dropped
+    connection on the no-retry client), a maybe-succeeded Slack code, or HTTP 5xx."""
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return True
+    if cl._err_code(exc) in MAYBE_DONE_CODES:
+        return True
+    try:
+        return int(getattr(resp, "status_code", 0) or 0) >= 500
+    except (TypeError, ValueError):
+        return False
+
+
+PRIOR_ATTEMPT_WINDOW_S = st.EXPIRY_DAYS * st.DAY_S
+
+
+def _prior_attempt_ts(cid: str, now_wall: float) -> float | None:
+    """The intent ts of this lane's latest attempt on *cid* inside the card window
+    that did NOT end archived -- its notice may still be the channel's last word. A
+    ledger we cannot read counts as a prior attempt 14 days back (check, never guess)."""
+    ledger = st.read_ledger()
+    if ledger is None:
+        return now_wall - PRIOR_ATTEMPT_WINDOW_S
+    last_intent: dict | None = None
+    for r in ledger:
+        if str(r.get("channel_id") or "") != cid or r.get("event") != "intent":
+            continue
+        if last_intent is None or float(r.get("ts") or 0) >= float(last_intent.get("ts") or 0):
+            last_intent = r
+    if last_intent is None:
+        return None
+    its = float(last_intent.get("ts") or 0)
+    if now_wall - its > PRIOR_ATTEMPT_WINDOW_S:
+        return None
+    for r in ledger:
+        if (r.get("event") == "outcome" and str(r.get("channel_id") or "") == cid
+                and float(r.get("ts") or 0) >= its
+                and str(r.get("outcome") or "").startswith(("archived", "already_archived"))):
+            return None
+    return its
+
+
+def _notice_still_standing(read: Any, cid: str, bot_uid: str, bot_id: str,
+                           since: float) -> bool | None:
+    """After an earlier attempt: True when Cora's newest lane line in the channel since
+    that attempt is the NOTICE (it stands -- never post it twice), False when it is the
+    correction or there is none (a fresh notice is due), None when the channel cannot
+    be read (the caller refuses, retryably). Reads only Cora's own two lane lines."""
+    try:
+        resp = read.conversations_history(channel=cid, oldest=f"{max(0.0, since - 60):.6f}",
+                                          limit=20)
+        msgs = resp.get("messages")
+        if not isinstance(msgs, list):
+            return None
+        for m in msgs:                                     # newest first
+            if not isinstance(m, dict):
+                continue
+            mine = (bool(bot_uid) and m.get("user") == bot_uid) or \
+                   (bool(bot_id) and m.get("bot_id") == bot_id)
+            text = m.get("text")
+            if not mine or not isinstance(text, str):
+                continue
+            if text.startswith(cards.CORRECTION_TEXT):
+                return False
+            if text.startswith(cards.NOTICE_PREFIX):
+                return True
+        return False
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _archive_one(p: st.Proposal, row: dict, actor: str, *, now: float,
@@ -438,6 +540,7 @@ def _archive_one(p: st.Proposal, row: dict, actor: str, *, now: float,
         return TapResult("refused_transient", f"Nothing was archived — {gwhy}.", pid), None
     # the age as of THIS tap (the card's figure can be up to 14 days old)
     age = fresh.last_person_days if fresh is not None else row.get("last_person_days")
+    prior = _prior_attempt_ts(cid, time.time())      # read BEFORE this attempt's own intent
     if not st.append_ledger("intent", proposal_id=pid, channel_id=cid,
                             channel_name=None if row.get("lex") else row.get("name"),
                             lex=True if row.get("lex") else None, age_days=age,
@@ -458,19 +561,46 @@ def _archive_one(p: st.Proposal, row: dict, actor: str, *, now: float,
                 release=True)
         return TapResult("failed", f"Nothing was archived — no Slack write client ({type(exc).__name__}).",
                          pid), None
-    # (1) the notice goes FIRST (kickoff section 3)
-    try:
-        write.chat_postMessage(channel=cid, text=cards.notice_text(age, actor),
-                               unfurl_links=False, unfurl_media=False)
-    except Exception as exc:  # noqa: BLE001
-        code = cl._err_code(exc)
-        _finish(p, row, actor, now, f"notice_failed:{code}", store_event=st.FAILED,
-                code=f"notice_failed:{code}")
-        return (TapResult("failed", (f"Not archived: the notice in {_label(row)} did not post "
-                                     f"({code}), so I stopped there. The Archive button stays."),
-                          pid), code if code in SYSTEMIC_CODES else None)
-    # (2) the archive, on a client with NO retry handlers
     bot_uid, bot_id = _identity(read)
+    # (1) the notice goes FIRST (kickoff section 3) -- but NEVER twice: after an earlier
+    # attempt on this channel (an indeterminate notice may have landed), read the
+    # channel's newest lane lines first (clients.py: an indeterminate write is read
+    # back, never re-sent)
+    reused = False
+    if prior is not None:
+        standing = _notice_still_standing(read, cid, bot_uid, bot_id, prior)
+        if standing is None:
+            _finish(p, row, actor, now, "not_attempted:notice_check_unreadable",
+                    store_event="released", release=True)
+            return TapResult("failed", (f"Not archived: an earlier notice in {_label(row)} may "
+                                        "still be standing and I couldn't read the channel to "
+                                        "check, so I posted nothing. The buttons stay; tap "
+                                        "again."), pid), None
+        reused = standing
+    if not reused:
+        try:
+            write.chat_postMessage(channel=cid, text=cards.notice_text(age, actor),
+                                   unfurl_links=False, unfurl_media=False)
+        except Exception as exc:  # noqa: BLE001
+            code = _write_code(exc)
+            if _indeterminate(exc):
+                # the notice may be in the channel: say so, correct it best-effort, stop
+                # here (a retry reads the channel first), and stop an Archive-all loop
+                corrected = _correction(write, cid)
+                _finish(p, row, actor, now, f"notice_indeterminate:{code}", store_event=st.FAILED,
+                        code=f"notice_indeterminate:{code}")
+                return (TapResult("failed", (
+                    f"Not archived: the notice in {_label(row)} may have posted — Slack did not "
+                    f"confirm it ({code}) — so I stopped before archiving. "
+                    f"{_correction_said(corrected, row)}. The Archive button stays; a retry "
+                    "checks the channel first and never posts the notice twice."), pid),
+                        "notice_indeterminate")
+            _finish(p, row, actor, now, f"notice_failed:{code}", store_event=st.FAILED,
+                    code=f"notice_failed:{code}")
+            return (TapResult("failed", (f"Not archived: the notice in {_label(row)} did not post "
+                                         f"({code}), so I stopped there. The Archive button stays."),
+                              pid), code if code in SYSTEMIC_CODES else None)
+    # (2) the archive, on a client with NO retry handlers
     try:
         write.conversations_archive(channel=cid)
         archived = _readback_archived(read, cid)
@@ -479,39 +609,44 @@ def _archive_one(p: st.Proposal, row: dict, actor: str, *, now: float,
         else:
             outcome = "unknown"
     except Exception as exc:  # noqa: BLE001
-        code = cl._err_code(exc)
+        code = _write_code(exc)
         if getattr(exc, "response", None) is not None and code == "already_archived":
             mine = _archiver_is_cora(read, cid, bot_uid, bot_id)
             outcome = "archived" if mine else "already_archived"
-        elif getattr(exc, "response", None) is not None:
-            _correction(write, cid)
+        elif not _indeterminate(exc):
+            corrected = _correction(write, cid)
             _finish(p, row, actor, now, f"failed:{code}", store_event=st.FAILED, code=code)
-            return (TapResult("failed", (f"Not archived: Slack refused ({code}). I posted a "
-                                         f"correction in {_label(row)} — the channel stays open. "
-                                         "The Archive button stays."), pid),
+            return (TapResult("failed", (f"Not archived: Slack refused ({code}). "
+                                         f"{_correction_said(corrected, row)} — the channel stays "
+                                         "open. The Archive button stays."), pid),
                     code if code in SYSTEMIC_CODES else None)
         else:
-            # A16: a timeout / dropped connection -> ONE bounded read-back, never a retry
+            # A16: a timeout / dropped connection / a maybe-succeeded Slack error (internal_
+            # error, fatal_error, 5xx ...) -> ONE bounded read-back, never a retry
+            timed_out = getattr(exc, "response", None) is None
             archived = _readback_archived(read, cid)
             if archived is True:
                 outcome = "archived"
             elif archived is False:
-                _correction(write, cid)
-                _finish(p, row, actor, now, "failed:timeout_not_archived", store_event=st.FAILED,
-                        code="timeout_not_archived")
-                return (TapResult("failed", (f"Not archived: the request to Slack timed out and a "
-                                             f"read-back shows {_label(row)} still open. I posted "
-                                             "a correction there. The Archive button stays."),
-                                  pid), None)
+                corrected = _correction(write, cid)
+                ocode = "timeout_not_archived" if timed_out else f"{code}_not_archived"
+                _finish(p, row, actor, now, f"failed:{ocode}", store_event=st.FAILED, code=ocode)
+                why = ("the request to Slack timed out" if timed_out
+                       else f"Slack answered {code}, which can mean it partly went through")
+                return (TapResult("failed", (f"Not archived: {why}, and a read-back shows "
+                                             f"{_label(row)} still open. "
+                                             f"{_correction_said(corrected, row)}. The Archive "
+                                             "button stays."), pid), None)
             else:
                 outcome = "unknown"
     if outcome == "archived":
         _finish(p, row, actor, now, "archived", store_event=st.ARCHIVED)
         log.info("channel_archive ARCHIVED proposal=%s cid=%s", pid, cid)
         agetxt = f"{age} days since a person posted" if age else "no person post in 90+ days"
-        return TapResult("archived", (f"Archived {_label(row)} — {agetxt}. The notice went in "
-                                      "first; ledger row written. Reversible from the channel "
-                                      "settings."), pid), None
+        notice = ("The notice from the earlier attempt was already standing (not posted twice)"
+                  if reused else "The notice went in first")
+        return TapResult("archived", (f"Archived {_label(row)} — {agetxt}. {notice}; ledger row "
+                                      "written. Reversible from the channel settings."), pid), None
     if outcome == "already_archived":
         _finish(p, row, actor, now, "already_archived", store_event=st.ALREADY_ARCHIVED)
         return TapResult("already_archived", (f"{_label(row)} was already archived by someone "

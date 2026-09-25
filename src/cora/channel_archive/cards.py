@@ -479,10 +479,13 @@ def _context(text: str) -> dict:
 
 
 # ── the channel posts (the ONLY two things the lane ever says inside a channel) ──
+NOTICE_PREFIX = cl.LANE_LINE_PREFIXES[0]     # ":package: Archiving for inactivity"
+
+
 def notice_text(age_days: int | None, actor_id: str) -> str:
     age = f"{age_days} days since the last message from a person" if age_days \
         else "no message from a person in 90+ days"
-    return _clean(f":package: Archiving for inactivity — {age}. Archiving is reversible: anyone "
+    return _clean(f"{NOTICE_PREFIX} — {age}. Archiving is reversible: anyone "
                   f"here can unarchive it from the channel settings. (Approved by <@{actor_id}> "
                   "via Cora's dead-channel proposal.)")
 

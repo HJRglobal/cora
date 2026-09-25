@@ -309,7 +309,26 @@ class TestMetadataOnly:
     def test_the_projection_drops_message_bodies(self):
         m = msg(3, text="the body", blocks=[{"x": 1}], files=[{"id": "F"}])
         p = cl._project(m)
-        assert set(p) == {"ts", "user", "bot_id", "app_id", "subtype", "reply_count", "latest_reply"}
+        assert set(p) == {"ts", "user", "bot_id", "app_id", "subtype", "reply_count", "latest_reply",
+                          "lane_line"}
+        assert p["lane_line"] is False and "the body" not in repr(p)   # one bool, never text
+
+    def test_the_lanes_own_notice_and_correction_are_not_traffic(self):
+        """A failed archive leaves Cora's notice (and maybe the correction) in the channel;
+        a retry must re-verify exactly as the card did, not as bot_traffic."""
+        from cora.channel_archive import cards
+        assert cl.LANE_LINE_PREFIXES == (cards.NOTICE_PREFIX, cards.CORRECTION_TEXT)
+        notice = cards.notice_text(200, HARRISON)
+        v, _ = run([msg(1, user=BOT_UID, text=cards.CORRECTION_TEXT),
+                    msg(1.1, user=BOT_UID, text=notice), msg(200)])
+        assert v.kind == cl.SECTION_A and v.bot_posts == 0, v
+        v2, _ = run([msg(1, user=BOT_UID, text="Daily health: all green"), msg(200)])
+        assert v2.kind == cl.SECTION_B and v2.reason == cl.B_BOT_TRAFFIC
+        v3, _ = run([msg(1, user=PERSON, text=notice), msg(200)])     # a person quoting it
+        assert v3.kind == cl.ACTIVE
+        v4, _ = run([msg(1, user=BOT_UID, text=notice, reply_count=2,
+                         latest_reply=f"{NOW - DAY:.6f}"), msg(200)])  # people replied to it
+        assert v4.kind == cl.ACTIVE
 
     def test_the_scan_logs_ids_and_counts_never_names(self, caplog):
         caplog.set_level(logging.DEBUG)

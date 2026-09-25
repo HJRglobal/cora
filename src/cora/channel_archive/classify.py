@@ -61,6 +61,13 @@ SYSTEM_SUBTYPES: frozenset = frozenset({
 })
 UNARCHIVE_SUBTYPES: frozenset = frozenset({"channel_unarchive", "group_unarchive"})
 
+#: The dead-channel lane's OWN two in-channel lines: the notice (cards.notice_text) and
+#: the correction (cards.CORRECTION_TEXT) -- a pin test keeps them equal. Posted by
+#: Cora's bot user they are the lane's own act, neither a person's activity nor bot
+#: traffic: a retry after a failed archive must re-verify exactly as the card did.
+LANE_LINE_PREFIXES: tuple = (":package: Archiving for inactivity",
+                             "Archive did not go through — the channel stays open.")
+
 # Verdict kinds
 EXEMPT, ACTIVE, UNKNOWN, SECTION_A, SECTION_B = "exempt", "active", "unknown", "A", "B"
 
@@ -132,10 +139,15 @@ def _ts(value: Any) -> float | None:
 
 
 def _project(m: Any) -> dict:
+    """Metadata only (D-082): the text never leaves here -- ``lane_line`` is one bool,
+    True when the text starts with one of the lane's own two in-channel lines."""
     if not isinstance(m, dict):
         return {}
-    return {k: m.get(k) for k in ("ts", "user", "bot_id", "app_id", "subtype",
-                                  "reply_count", "latest_reply")}
+    out = {k: m.get(k) for k in ("ts", "user", "bot_id", "app_id", "subtype",
+                                 "reply_count", "latest_reply")}
+    text = m.get("text")
+    out["lane_line"] = isinstance(text, str) and text.startswith(LANE_LINE_PREFIXES)
+    return out
 
 
 def _history_page(client: Any, cid: str, *, oldest: float | None, latest: float,
@@ -187,6 +199,8 @@ def message_kind(client: Any, m: dict, ctx: reg.Context) -> str:
     """"person" | "system" | "bot" for one projected message."""
     st = str(m.get("subtype") or "")
     uid = str(m.get("user") or "")
+    if m.get("lane_line") and uid and uid == ctx.bot_uid and not st:
+        return "system"          # the lane's own notice / correction line (only Cora posts as her)
     if st in UNARCHIVE_SUBTYPES:
         return "person" if is_person(client, uid, ctx) else "system"
     if st in SYSTEM_SUBTYPES:
