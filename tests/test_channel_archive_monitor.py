@@ -255,3 +255,26 @@ def test_a_scan_that_started_and_never_staged_warns():
     assert any("never staged a card" in f for f in out["findings"])
     st.append_event("staged", proposal_id="chanarch-aaaaaaaaaaaa", scan_id="abc123", ts=NOW - 7000, rows=[])
     assert run(MonSlack())["status"] == "ok"
+
+
+class TestScanStallSettles:
+    """D-051 r1 c1-monitor#0: a crashed scan (already DM'd honestly) must not pin the
+    lane's ONE health row at WARN forever -- lesson 52, an alarm the right action
+    cannot clear gets ignored."""
+
+    def test_a_crash_recorded_as_scan_failed_then_a_good_scan_reads_ok(self):
+        st.append_event("scan_started", scan_id="crashed001", trigger="ask", ts=NOW - 3 * 3600)
+        st.append_event("scan_failed", scan_id="crashed001", trigger="ask", error="RuntimeError",
+                        ts=NOW - 3 * 3600 + 60)
+        st.append_event("scan_started", scan_id="good000001", trigger="ask", ts=NOW - 2 * 3600)
+        st.append_event("staged", proposal_id="chanarch-aaaaaaaaaaaa", scan_id="good000001",
+                        ts=NOW - 2 * 3600 + 300, rows=[])
+        out = run(MonSlack())
+        assert out["status"] == "ok", out["findings"]
+
+    def test_an_unsettled_stall_warns_for_seven_days_then_drops(self):
+        st.append_event("scan_started", scan_id="killed0001", trigger="monthly", ts=NOW - 6 * DAY)
+        out = run(MonSlack())
+        assert any("never staged a card" in f for f in out["findings"])
+        later = mon.reconcile(MonSlack(), now=NOW + 2 * DAY, sleep=lambda s: None)
+        assert later["status"] == "ok", later["findings"]

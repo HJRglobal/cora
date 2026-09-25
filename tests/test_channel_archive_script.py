@@ -121,6 +121,34 @@ class TestMonthly:
         assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 5)) == 0
         assert markers()[-1]["outcome"] == "delivered"
 
+    def test_a_crashing_monthly_scan_writes_a_failed_marker_and_settles_its_stall(self, fake, monkeypatch):
+        """D-051 r1 harness-isolation#2 + c1-monitor#0: a raise inside deliver_proposal
+        is an undelivered month (ok=False month_undelivered + exit 1), and the crash
+        path records scan_failed for the scan it started, so the stall settles."""
+        def _boom(*a, **k):
+            raise RuntimeError("scan blew up")
+        monkeypatch.setattr("cora.channel_archive.scan.scan", _boom)
+        assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 5)) == 1
+        m = markers()[-1]
+        assert m["ok"] is False and m["outcome"] == "month_undelivered"
+        assert "crashed: RuntimeError" in m["detail"] and "scan blew up" not in m["detail"]
+        evs = st.read_events()
+        started = [e["scan_id"] for e in evs if e["event"] == "scan_started"]
+        failed = [e["scan_id"] for e in evs if e["event"] == "scan_failed"]
+        assert len(started) == 1 and failed == started
+        from cora.channel_archive import monitor as mon
+        from test_channel_archive_monitor import MonSlack
+        out = mon.reconcile(MonSlack(), now=az(2026, 10, 5) + 2 * 3600, sleep=no_sleep)
+        assert not any("never staged" in f for f in out["findings"]), out["findings"]
+
+    def test_a_crashing_manual_scan_exits_1_and_records_scan_failed(self, fake, monkeypatch, capsys):
+        def _boom(*a, **k):
+            raise RuntimeError("scan blew up")
+        monkeypatch.setattr("cora.channel_archive.scan.scan", _boom)
+        assert SCRIPT.main(["--apply"], now=az(2026, 10, 5)) == 1
+        assert "crashed" in capsys.readouterr().out and markers() == []
+        assert [e["event"] for e in st.read_events()] == ["scan_started", "scan_failed"]
+
     def test_lane_off_is_an_ok_skip(self, fake, monkeypatch):
         monkeypatch.setenv("CORA_CHANNEL_ARCHIVE", "off")
         assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 5)) == 0

@@ -5157,10 +5157,15 @@ def _ca_run_scan(client, notify_channel: str, notify_thread, trigger: str) -> No
     the ask was made (A18: the 'card will follow' promise can never fail silently),
     and the in-process guard is released in finally."""
     try:
+        started = time.time()
         try:
             out = channel_archive_deliver.deliver_proposal(trigger=trigger)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             log.exception("channel_archive: scan crashed")
+            # settles the monitor's stall finding for the scan this body started (the
+            # crash is said below); never raises (D-051 r1 c1-monitor#0)
+            channel_archive_store.record_scan_failed(trigger=trigger, since=started,
+                                                     error=type(exc).__name__)
             out = {"delivered": False, "reason": "crashed"}
         reason = str(out.get("reason") or "")
         if reason == "scan_running":

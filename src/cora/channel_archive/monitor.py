@@ -23,8 +23,11 @@ FAIL CLASSES
   (5) DEMOTED -- the demotion file exists -> WARN daily until Harrison clears it.
 Plus: an archived channel (in window) whose newest 20 messages hold no archive-type
 message -> "cannot attribute" WARN; a scan_started with no staged card after 1 h ->
-WARN. The OK line carries coverage counts (lesson 63: a zero count certifies nothing
-without positive coverage).
+WARN, settled by a ``scan_failed`` the crash path recorded (the bot's scan pool and the
+monthly script; the crash was already said where the scan was asked) and dropped after
+7 days when nothing was recorded (a killed process) -- an alarm the right action cannot
+clear gets ignored (lesson 52). The OK line carries coverage counts (lesson 63: a zero
+count certifies nothing without positive coverage).
 """
 from __future__ import annotations
 
@@ -50,6 +53,8 @@ INTENT_BEFORE_S = 15 * 60
 INTENT_AFTER_S = 120
 UNRESOLVED_S = 3600
 SCAN_STALL_S = 3600
+#: A stall no crash path recorded (a killed process) stops WARNing after this long.
+SCAN_STALL_MAX_S = 7 * 86400
 HISTORY_LIMIT = 20
 UNARCHIVE_SEARCH_PAGES = 5
 LIST_MAX_PAGES = 20
@@ -347,12 +352,18 @@ def reconcile(client: Any, *, now: float | None = None, dry_run: bool = False,
                 continue
             findings.append(f"UNRESOLVED: {cid} intent {pid} has no settled outcome")
 
-    # -- scan stall --
-    staged_scans = {str(e.get("scan_id")) for e in events if e.get("event") == "staged" and e.get("scan_id")}
+    # -- scan stall: settled by a staged card OR a recorded crash (scan_failed, already
+    # DM'd where the scan was asked); a kill that recorded nothing drops after 7 days --
+    settled = {str(e.get("scan_id")) for e in events
+               if e.get("event") in ("staged", "scan_failed") and e.get("scan_id")}
     for e in events:
-        if e.get("event") == "scan_started" and str(e.get("scan_id")) not in staged_scans \
-                and now - float(e.get("ts") or 0) > SCAN_STALL_S:
-            findings.append(f"a scan started {e.get('at') or '?'} and never staged a card")
+        if e.get("event") != "scan_started" or str(e.get("scan_id") or "") in settled:
+            continue
+        age = now - float(e.get("ts") or 0)
+        if SCAN_STALL_S < age <= SCAN_STALL_MAX_S:
+            findings.append(f"a scan started {e.get('at') or '?'} and never staged a card (no crash "
+                            f"was recorded; this finding drops {SCAN_STALL_MAX_S // st.DAY_S:.0f} days "
+                            "after the start)")
     if findings:
         out["status"] = "warn"
     log.info("channel_archive monitor status=%s findings=%d coverage=%s dry_run=%s",

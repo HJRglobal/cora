@@ -78,6 +78,14 @@ def _print(line: str = "") -> None:
     sys.stdout.write(line + "\n")
 
 
+def _crashed(trigger: str, now: float, exc: BaseException) -> None:
+    """The script's crash path: log the traceback, and settle the monitor's stall
+    finding for the scan this run started (``scan_failed``; the class name only)."""
+    import traceback  # noqa: PLC0415
+    traceback.print_exc(file=sys.stderr)
+    st.record_scan_failed(trigger=trigger, since=now, error=type(exc).__name__)
+
+
 def _dry_run(now: float) -> int:
     out = deliver.deliver_proposal(trigger="dry_run", now=now, dry_run=True)
     if out.get("reason") in ("off", "eval_mode"):
@@ -137,13 +145,20 @@ def main(argv: list[str] | None = None, *, now: float | None = None) -> int:
 
     t0 = time.time()
     if args.monthly:
-        due, why = monthly_due(now, st.fold(now=now))
-        if not due:
-            run_marker.write(TASK_NAME, script=SCRIPT, ok=True, outputs=0, outcome=f"skipped:{why}",
-                             detail=why, elapsed_s=round(time.time() - t0, 1))
-            _print(f"Monthly dead-channel card not due ({why}).")
-            return 0
-        out = deliver.deliver_proposal(trigger="monthly", now=now)
+        try:
+            due, why = monthly_due(now, st.fold(now=now))
+            if not due:
+                run_marker.write(TASK_NAME, script=SCRIPT, ok=True, outputs=0, outcome=f"skipped:{why}",
+                                 detail=why, elapsed_s=round(time.time() - t0, 1))
+                _print(f"Monthly dead-channel card not due ({why}).")
+                return 0
+            out = deliver.deliver_proposal(trigger="monthly", now=now)
+        except Exception as exc:  # noqa: BLE001 -- a crash is an undelivered month (A28), said out loud
+            _crashed("monthly", now, exc)
+            run_marker.write(TASK_NAME, script=SCRIPT, ok=False, outputs=0, outcome="month_undelivered",
+                             detail=f"crashed: {type(exc).__name__}", elapsed_s=round(time.time() - t0, 1))
+            _print(f"FAILED: the monthly dead-channel scan crashed ({type(exc).__name__}) -- no card.")
+            return 1
         if out.get("reason") == "off":
             run_marker.write(TASK_NAME, script=SCRIPT, ok=True, outputs=0, outcome="skipped:lane_off",
                              detail="CORA_CHANNEL_ARCHIVE=off", elapsed_s=round(time.time() - t0, 1))
@@ -164,7 +179,12 @@ def main(argv: list[str] | None = None, *, now: float | None = None) -> int:
         _print(f"FAILED: the monthly card is due and was not delivered ({out.get('reason')}).")
         return 1
 
-    out = deliver.deliver_proposal(trigger="manual", now=now)
+    try:
+        out = deliver.deliver_proposal(trigger="manual", now=now)
+    except Exception as exc:  # noqa: BLE001
+        _crashed("manual", now, exc)
+        _print(f"FAILED: the dead-channel scan crashed ({type(exc).__name__}) -- no card.")
+        return 1
     _print(f"Manual dead-channel card: delivered={out.get('delivered')} reason={out.get('reason')} "
            f"pages={out.get('pages')}")
     return 0 if out.get("delivered") or out.get("reason") == "off" else 1

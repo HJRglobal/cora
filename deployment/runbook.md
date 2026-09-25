@@ -237,6 +237,10 @@ any T0 card.**
   `.\.venv\Scripts\python.exe scripts\run_channel_archive_proposal.py --clear-demotion`
   (shows it) and the same with `--apply` (appends an `acknowledged` ledger row for that
   exact archive event, then deletes the file -- the same event never re-demotes).
+  A scan that started and never staged a card WARNs after 1 h; a crash the bot's scan
+  pool or the script recorded (`scan_failed` in the proposals store -- the crash was
+  already said where the scan was asked) settles it, and a kill that recorded nothing
+  drops after 7 days. A monthly-run crash is `month_undelivered` + exit 1.
 - **Dry-run (reads Slack, writes nothing; prints the candidate IDS only + the archive
   scopes' state):** `.\.venv\Scripts\python.exe scripts\run_channel_archive_proposal.py`
 - **Register (elevated, AFTER the restart that loads the lane -- the card's buttons are

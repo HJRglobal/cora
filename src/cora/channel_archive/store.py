@@ -687,3 +687,32 @@ def clear_demotion(*, actor: str, dry_run: bool) -> dict:
         return out
     out["cleared"] = True
     return out
+
+
+# ── a crashed scan settles its own stall finding (D-051 r1 c1-monitor#0) ─────
+def record_scan_failed(*, trigger: str, since: float, error: str = "") -> list[str]:
+    """The CRASH PATH of a scan (the bot's scan pool, the monthly script) appends one
+    ``scan_failed`` event per scan it started -- a ``scan_started`` of *trigger* at or
+    after *since* that neither staged nor was already settled -- so the monitor's
+    stall finding settles (the crash was already said where the scan was asked).
+    *error* is an exception CLASS name only, never its message (lesson 7). Never
+    raises; returns the scan ids it settled."""
+    try:
+        events = read_events() or []
+        done = {str(e.get("scan_id")) for e in events
+                if e.get("event") in ("staged", "scan_failed") and e.get("scan_id")}
+        settled: list[str] = []
+        for e in events:
+            sid = str(e.get("scan_id") or "")
+            if (e.get("event") != "scan_started" or not sid or sid in done
+                    or str(e.get("trigger") or "") != trigger
+                    or float(e.get("ts") or 0) < float(since) - 1):
+                continue
+            if append_event("scan_failed", scan_id=sid, trigger=trigger,
+                            error=str(error or "")[:60] or None):
+                settled.append(sid)
+                done.add(sid)
+        return settled
+    except Exception:  # noqa: BLE001 -- a crash path must never raise
+        log.error("channel_archive: recording scan_failed failed", exc_info=True)
+        return []
