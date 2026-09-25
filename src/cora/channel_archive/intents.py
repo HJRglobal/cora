@@ -160,10 +160,12 @@ _PASSIVE_AUX = ("(?:all|already|ever|actually|really|now|yet|finally|just|been|b
                 "got|gotten|were|was|are|is|be|have|has|had)")
 #: A21(c), tightened to lane-status OBJECTS (c1-intents-copy#0): "did you archive
 #: <channels>", "<channels> got archived", "<channels> (did) you archive(d)", or the
-#: lane's own nouns ("the archive card / proposal", "the dead channels archive").
+#: lane's own nouns ("the archive card / proposal", "the dead channels archive"). The
+#: active leg takes the attempt rail's coordinated modifier list too ("did you archive
+#: the dead and inactive channels?" -- D-051 r3 c1-intents-copy#2).
 _STATUS_LANE_RE = re.compile(
     r"\b(?:did|have|has|had|were|was) " + _AGENT + " (?:" + _ADV + " ){0,2}"
-    r"(?:archive[ds]?|archiving) " + _OBJECT_NP + _CHAN_OBJ +
+    r"(?:archive[ds]?|archiving) (?:" + _OBJECT_NP + "|" + _OBJECT_NP_COORD + ")" + _CHAN_OBJ +
     "|" + _CHAN_OBJ + "(?: " + _PASSIVE_AUX + r"){0,3} archived\b"
     r"(?! (?:[a-z0-9-]+ ){0,2}" + _OBJ_NOUNS + r"\b)" +   # not "archived excel reports"
     "|" + _CHANREF + r"\b (?:(?:did|have|has|had|that) )?" + _AGENT

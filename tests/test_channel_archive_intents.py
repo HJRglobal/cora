@@ -730,3 +730,47 @@ class TestStatusScopeR2:
             it.looks_like_archive_status("did you archive the channels in" + " " * 40000 + "june", now=NOW)
             best = min(best, time.perf_counter() - t0)
         assert best < 0.05
+
+
+# ── D-051 round 3 (Code #16) ────────────────────────────────────────────────
+#: r3:c1-intents-copy#2 -- the STATUS leg takes the same coordinated modifier list
+#: the attempt rail does (round 2's _OBJECT_NP_COORD): "did you archive the dead and
+#: inactive channels?" is the natural follow-up to the round-2 ask and gets the
+#: ledger line, never a zero-tool model turn (A21(c)) ...
+STATUS_FIRE_R3_COORD = [
+    "did you archive the dead and inactive channels?", "have you archived the dead and inactive channels?",
+    "did you archive the promo and launch channels?", "did you archive the promo/event channels?",
+    "did you archive the dead and inactive channels yet?", "did cora archive the promo, event and launch channels?",
+]
+#: ... while two objects or a second clause still are not a channel object.
+STATUS_NOT_R3_COORD = [
+    "did you archive the email and the channel?", "did you archive it and tell the channel?",
+    "did you archive the promo and event channel deals?", "did you archive the email or channel?",
+    "did you archive my inbox and the channel?", "did you archive the deals and tasks for the channel?",
+    "did you archive the amazon and walmart channel reports?",
+]
+
+
+class TestStatusCoordinationR3:
+    @pytest.mark.parametrize("text", STATUS_FIRE_R3_COORD)
+    def test_a_coordinated_status_question_gets_the_ledger_line(self, text):
+        assert it.looks_like_archive_status(text, now=NOW), text
+
+    @pytest.mark.parametrize("text", STATUS_NOT_R3_COORD)
+    def test_two_objects_or_a_second_clause_are_still_not_lane_status(self, text):
+        assert not it.looks_like_archive_status(text, now=NOW), text
+
+    @pytest.mark.parametrize("shape", ["did you archive " + "a and " * 49, "did you archive " + "a, " * 99,
+                                       "did you archive the " + "x/" * 140,
+                                       "did you archive the " + "a or " * 57 + "channels",
+                                       "have you archived " + "a and b " * 35 + "channels"],
+                             ids=["and-run", "comma-run", "slash-run", "or-run", "pairs"])
+    def test_the_coordinated_status_leg_is_fast_on_capped_worst_cases(self, shape):
+        best = float("inf")
+        for _ in range(3):
+            t0 = time.perf_counter()
+            it.looks_like_archive_status(shape, now=NOW)
+            it.looks_like_archive_status(" " * 40000, now=NOW)
+            it.looks_like_archive_status("did you archive the a and" + " " * 40000 + "channels", now=NOW)
+            best = min(best, time.perf_counter() - t0)
+        assert best < 0.05
