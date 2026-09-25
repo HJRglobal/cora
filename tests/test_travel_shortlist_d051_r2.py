@@ -314,3 +314,150 @@ class TestPriorTurnLegByOriginalAuthor:
         # the API only ever sees plain role/content dicts (consumers copy the list)
         assert list(hist) == [{"role": "user", "content": app_module._CORA_OPENED_MARK
                                + SUITE_GREEN + app_module._CORA_REPLY_MARK + "nice"}]
+
+
+# ── r2:c2-trigger#0 + #1: the lodging noun must HEAD the object; "pull" scoped ──
+
+MODIFIER_MUST_NOT_FIRE = [
+    # the lodging noun modifies another head noun
+    "suggest hotel restaurants in tempe for oct 17-21",
+    "find the top hotel spas in scottsdale oct 17-21",
+    "find hotel conference rooms in scottsdale for oct 17-21",
+    "find hotel meeting space in scottsdale oct 17-21",
+    "recommend hotel bars in scottsdale for a client dinner oct 17-18",
+    "hotel partnership options in scottsdale for oct 17-21",
+    "hotel sponsorship ideas for the ufl fight in vegas oct 17-18",
+    "find hotel partners for OSN in mesa", "find hotel leads in hubspot",
+    "need new hotel photos for the website", "hotel marketing ideas for F3",
+    "find the best hotel restaurant in scottsdale", "get hotel address in scottsdale",
+    "i need hotel wifi password", "find hotel reviews for the phoenician",
+    "find hotel reservations for tessa", "need hotel rates for the budget",
+    # the round-1 widening's finance / CRM / retrieval hijacks
+    "pull hotel spend from quickbooks for q3", "pull up hotel charges on the amex for september",
+    "pull up hotel charges in scottsdale for sep 1-15",
+    "pull up lodging costs for the ufl event in vegas oct 17-18",
+    "suggestions on hotel marketing", "we're trying to find hotels that carry f3 in tempe",
+    "i'm searching for hotel buyers in phoenix", "can you pull airbnb payouts for q3",
+    "pull up airbnb bookings for rogers ranch in october", "pull hotels from quickbooks for q3",
+    # a first clause naming a system of record is a data / CRM pull, whatever the noun
+    "search for hotels in hubspot", "find hotels in quickbooks for q3",
+    "get hotels from the amex statement", "find airbnbs in the crm",
+    "look for hotels in the p&l for september", "find hotels from last year's trip",
+]
+HEAD_NOUN_MUST_FIRE = [
+    "find hotels near old town scottsdale oct 17-21", "find a hotel downtown phoenix oct 17-21",
+    "find hotels scottsdale oct 17-21", "find hotels for oct 17-21 in scottsdale",
+    "find hotels, oct 17-21, scottsdale", "find an airbnb for 6 people in sedona oct 17-21",
+    "find hotels with a pool in scottsdale oct 17-21",
+    "find hotels that have a pool in scottsdale oct 17-21",
+    "find hotels that allow dogs in mesa oct 17-21",
+    "recommend hotels close to the stadium in glendale oct 17-18",
+    "find hotel rooms in tempe oct 17-21", "find hotels under $300 in scottsdale oct 17-21",
+    "find hotels this weekend in sedona", "find a hotel oct 17-21 scottsdale",
+    "find hotels 10/17-10/21 scottsdale", "find airbnbs/vrbos in sedona oct 17-21",
+    "find a hotel or resort in scottsdale oct 17-21",
+    "find hotels available oct 17-21 in scottsdale",
+    "find a hotel walking distance from old town scottsdale oct 17-21",
+    "find hotels w/ pool in scottsdale oct 17-21", "find hotels along the strip in vegas oct 17-18",
+    "find hotels the weekend of oct 17 in sedona", "find some hotels!",
+    "any suggestions on hotels in scottsdale for oct 17-21?",
+    "we're trying to find an airbnb in sedona oct 17-21",
+    "i'm searching for hotels in phoenix oct 17-21",
+    "can you pull hotel options in scottsdale for oct 17-21", "pull up hotels in mesa oct 17-21",
+    "pull up hotels for oct 17-21 in mesa", "pull up some hotel and airbnb options in tempe",
+    "hotel or airbnb options in gilbert for oct 17-21", "hotel room options in tempe oct 17-21",
+    "find hotels from $200 a night in mesa oct 17-21", "find hotels from oct 17 to 21 in tempe",
+]
+
+
+class TestHeadNounFrame:
+    @pytest.mark.parametrize("text", MODIFIER_MUST_NOT_FIRE)
+    def test_must_not_fire(self, text):
+        assert not ts.looks_like_travel_ask(text, user_id=HARRISON, channel_id="D0HARRISON",
+                                            channel_type="im"), text
+        assert not ts.looks_like_travel_ask(text, user_id="U_ANYONE",
+                                            channel_id=TRAVEL_CHANNEL), text
+        assert ts.route_turn(text, user_id=HARRISON, channel_id="D0HARRISON",
+                             channel_name="dm", today=TODAY) is None
+
+    @pytest.mark.parametrize("text", HEAD_NOUN_MUST_FIRE)
+    def test_must_fire(self, text):
+        for v in (text, _wire(text), text.replace("-", "–")):
+            assert ts.looks_like_travel_ask(v, user_id=HARRISON, channel_id="D0HARRISON",
+                                            channel_type="im"), v
+            assert ts.is_lodging_shaped(v), v                    # strict stays a subset of loose
+
+    @pytest.mark.parametrize("text", [
+        "suggest hotel restaurants in tempe for oct 17-21",
+        "pull up hotel charges in scottsdale for sep 1-15",
+        "pull hotel spend from quickbooks for q3",
+        "hotel sponsorship ideas for the ufl fight in vegas oct 17-18",
+    ])
+    def test_through_the_real_handlers_the_lane_never_takes_them(self, lane, monkeypatch, text):
+        fired = []
+        monkeypatch.setattr(ts, "execute_route", lambda *a, **k: fired.append(1))
+        seen: list = []
+        said: list = []
+        base = _say_no_placeholder()
+        with _model_path(seen):
+            _mention(_slack_client(), lambda **kw: said.append(kw) or base(**kw), text,
+                     user=_tessa())
+            client = _slack_client()
+            client.chat_postMessage.side_effect = None
+            client.chat_postMessage.return_value = {"ok": True}
+            _dm(client, text, user=HARRISON, ts_="1790000000.000700")
+        assert fired == []
+        assert seen or said
+        assert lane.calls == []                                  # nothing billed
+
+    @pytest.mark.parametrize("shape", [
+        " " * 40000, "find hotel" + " " * 40000, "find hotels " + "and " * 10000,
+        "pull up " * 5000 + "hotels", "pull hotels" + " or hotels" * 4000,
+        "hotels" + " and hotels" * 4000 + " options", "find hotels that " * 2500,
+        "find hotel" + "s" * 40000,
+    ], ids=["spaces", "noun-spaces", "noun-and", "pull-x5000", "pull-or", "options-and",
+            "that", "noun-s"])
+    def test_the_head_rule_and_pull_are_linear(self, shape):
+        def run():
+            ts._HEAD_NEXT_RE.match(shape, 10)
+            ts._PULL_RE.match(shape)
+            ts._NOUN_OPTIONS_RE.match(shape)
+            ts._FRAME_RE.match(shape)
+            ts.looks_like_travel_ask(shape, user_id=HARRISON, channel_id="D0H", channel_type="im")
+        assert _best_of_3(run) < 0.05
+
+
+# ── r2:c2-trigger#6: "free cancellation" / "cancellable" is a filter, not a bail ──
+
+class TestCancellationIsAFilter:
+    @pytest.mark.parametrize("text", [
+        "find hotels in sedona oct 17-21 with free cancellation",
+        "can you find a hotel in scottsdale oct 17-21 with free cancellation?",
+        "find hotels in scottsdale oct 17-21 with a flexible cancellation policy",
+        "find hotels in scottsdale oct 17-21 with free cancelation",
+        "find hotels in scottsdale oct 17-21 that are cancellable",
+    ])
+    def test_must_fire(self, text):
+        assert ts.looks_like_travel_ask(text, user_id=HARRISON, channel_id="D0HARRISON",
+                                        channel_type="im"), text
+        r = ts.route_turn(text, user_id=HARRISON, channel_id="D0HARRISON", channel_name="dm",
+                          today=TODAY)
+        assert r is not None and r.kind == "search", (text, r)
+
+    @pytest.mark.parametrize("text", [
+        "cancel the hotel in scottsdale for oct 17-21",
+        "can you find a hotel in scottsdale oct 17-21 and cancel the other one",
+        "find hotels in scottsdale oct 17-21, i cancelled the old ones",
+        "find hotels in scottsdale oct 17-21, we're canceling the airbnb",
+        "can you confirm the hotel in scottsdale oct 17-21",
+    ])
+    def test_the_verb_still_bails(self, text):
+        assert not ts.looks_like_travel_ask(text, user_id=HARRISON, channel_id="D0HARRISON",
+                                            channel_type="im"), text
+
+    def test_through_harrisons_dm_the_lane_posts_the_card(self, lane):
+        client = _slack_client()
+        _dm(client, "find hotels in sedona oct 17-21 with free cancellation", user=HARRISON)
+        _drain()
+        assert _card_call(client)["thread_ts"] == ASK_TS
+        assert "Sedona" in lane.calls[-1]["messages"][0]["content"]

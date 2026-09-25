@@ -530,7 +530,6 @@ _FRAME_VERB = (r"(?:(?:i|we) (?:need|want|'d like|would like|have) to (?:find|ge
                r"|searching for)"
                r"|(?:need|want|trying) to (?:find|get)"
                r"|find|search(?: for)?|look(?:ing)? for|look up|recommend|suggest|shortlist|get"
-               r"|pull(?: up)?"
                r"|(?:i|we) (?:need|want|'d like|would like)|need|want"
                r"|(?:any )?(?:good )?(?:recommendations|suggestions|options|ideas) (?:for|on))")
 # The frame must GOVERN the lodging noun (B5; D-051 r1 c2-trigger#1): after the verb
@@ -552,19 +551,60 @@ _ADJ = (r"(?:good|great|nice|decent|cheap|cheaper|affordable|inexpensive|budget|
         r"|one-bedroom|two-bedroom|three-bedroom|four-bedroom|king|queen)")
 _FRAME_RE = re.compile(r"^" + _POLITE + _FRAME_VERB + r"(?: me| us)?(?: " + _DET + r")?"
                        r"(?: " + _ADJ + r",?(?: and)?){0,2} " + _STRICT_NOUN + r"\b")
+# ...and the noun must be the HEAD of the object (D-051 r2 c2-trigger#0/#1): after it only
+# a closed continuation -- the end, punctuation, a digit/$, a preposition/conjunction, a
+# date word, a lodging head ("rooms", "options"), "that/which" + a closed verb, or an
+# allowlisted area (_head_noun_ends). A lodging noun used as a MODIFIER ("hotel
+# restaurants", "hotel conference rooms", "hotel spend", "hotel buyers") is not the thing
+# asked for, so "pull hotel spend from quickbooks" or "suggest hotel restaurants in tempe
+# oct 17-21" reach the model, never a clarify reply or a billed lodging search.
+_HEAD_NEXT_RE = re.compile(
+    r"$|[^a-z0-9 ']| [\d$]| from (?:\$|\d|" + _MONTH_WORD + r")"
+    r"| (?:in|near|around|at|for|with|w|by|close|closer|to|on|under|below"
+    r"|between|within|inside|outside|over|along|across|off|beside|just|less|during|this|next"
+    r"|tonight|tomorrow|the (?:week|weekend|night|nights)|starting|arriving|checking|walking|or"
+    r"|and|plus|either|only|somewhere|where|available|nearby|downtown|preferably|ideally|please"
+    r"|pls|asap|thanks|thx|if|so|but|rooms?|suites?|options|listings|recommendations|suggestions"
+    r"|ideas|availability|accommodations?|lodging|stays?|" + _MONTH_WORD
+    + r"|(?:that|which) (?:have|has|are|is|allow|allows|accept|accepts|take|takes|offer|offers"
+    r"|include|includes|sleep|sleeps|fit|fits|can|could|will|would|welcome|welcomes|let|lets"
+    r"|permit|permits))(?![a-z0-9])"
+)
+# "pull (up)" is a DATA verb ("pull hotel spend from quickbooks", "pull up airbnb payouts
+# for q3") -- it frames a lodging ask only when options-shaped or locative (D-051 r2
+# c2-trigger#1): "can you pull hotel options in scottsdale", "pull up hotels in mesa".
+_PULL_RE = re.compile(r"^" + _POLITE + r"pull(?: up)?(?: me| us)?(?: " + _DET + r")?"
+                      r"(?: " + _ADJ + r",?(?: and)?){0,2} " + _STRICT_NOUN
+                      + r"(?:(?: ?/ ?| and | or | & )" + _STRICT_NOUN + r")?"
+                      r"(?: (?:options|listings|recommendations|suggestions|ideas)(?![a-z0-9])"
+                      r"| (?:in|near|around|close to) | (?:for )?(?:" + _MONTH_WORD
+                      + r"\.? \d|\d{1,2}/\d))")
 _PLACES_RE = re.compile(r"^" + _POLITE + r"(?:any |some |good |nice )?(?:places|place|somewhere) to stay\b")
+# The words between the noun and "options" are lodging words only (D-051 r2
+# c2-trigger#0): "hotel or airbnb options", "hotel room options" -- never "hotel
+# partnership options" or "hotel sponsorship ideas".
 _NOUN_OPTIONS_RE = re.compile(r"^" + _POLITE + r"(?:some |any |good )?" + _STRICT_NOUN
-                              + r"(?: [a-z]+){0,2}? (?:options|recommendations|suggestions|ideas)\b")
+                              + r"(?:(?: ?/ ?| and | or | & )" + _STRICT_NOUN + r")?"
+                              r"(?: rooms?| suites?)? (?:options|listings|recommendations"
+                              r"|suggestions|ideas)\b")
 
 # Bails (B5), in two scopes (D-051 r1 c2-trigger#4). BOOKING/ADMIN words bail only in
 # the FIRST clause -- "? dates are confirmed" after a clean ask is not a booking
 # request. CAPABILITY words bail anywhere in the (capped) text -- "... . add the best
 # one to my calendar" asks for another capability the lane would silently drop.
-# "expense" is the expense-report word, never "expensive" (a budget adjective).
+# "expense" is the expense-report word, never "expensive" (a budget adjective); "cancel"
+# is the VERB, never "cancellation"/"cancellable" -- "with free cancellation" is a
+# lodging filter (D-051 r2 c2-trigger#6; B5 lists the bail unstarred).
 _BAIL_RE = re.compile(
     r"\b(?:booked|book (?:it|that|this|them|one|the|a|an|us|me)"
     r"|booking (?:confirmation|number|ref|reference)"
-    r"|cancel\w*|confirm\w*|expens(?:e|es|ed|ing)|reimburs\w*|receipts?|invoices?|refunds?)\b"
+    r"|cancel(?:s|ed|led|ing|ling)?|confirm\w*|expens(?:e|es|ed|ing)|reimburs\w*|receipts?"
+    r"|invoices?|refunds?"
+    # D-051 r2 (c2-trigger#1): a first clause that names a SYSTEM of record is a data /
+    # CRM pull ("search for hotels in hubspot", "get hotels from the amex statement",
+    # "find airbnbs in quickbooks for q3") -- the model with its tools answers it.
+    r"|hubspot|quickbooks|qbo|amex|american express|asana|shopify|deposco|notion|crm"
+    r"|p ?& ?l|ledger|spreadsheet)\b"
 )
 _CAPABILITY_BAIL_RE = re.compile(
     r"\b(?:remind\w*|remember|forget|calendar|add (?:it |this |that |them )?to|tasks?|e-?mails?"
@@ -591,12 +631,25 @@ def _first_clause(cleaned: str) -> str:
     return body[:cut].strip()
 
 
+def _head_noun_ends(clause: str, end: int) -> bool:
+    """Does the frame's lodging noun (ending at *end*) head its object? A closed
+    continuation (_HEAD_NEXT_RE) or an allowlisted area ("find hotels scottsdale
+    oct 17-21") -- anything else makes the noun a modifier ("hotel restaurants")."""
+    if _HEAD_NEXT_RE.match(clause, end):
+        return True
+    lm = _load_map()
+    return bool(lm.alias_re is not None and clause.startswith(" ", end)
+                and lm.alias_re.match(clause, end + 1))
+
+
 def _is_strict_ask(text: Any) -> bool:
     cleaned = _clean(text)
     clause = _first_clause(cleaned)
     if not clause:
         return False
-    if not (_FRAME_RE.match(clause) or _PLACES_RE.match(clause) or _NOUN_OPTIONS_RE.match(clause)):
+    m = _FRAME_RE.match(clause)
+    if not ((m and _head_noun_ends(clause, m.end())) or _PULL_RE.match(clause)
+            or _PLACES_RE.match(clause) or _NOUN_OPTIONS_RE.match(clause)):
         return False
     if _BAIL_RE.search(clause):
         return False
