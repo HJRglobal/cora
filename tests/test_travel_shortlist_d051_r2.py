@@ -455,6 +455,13 @@ MUST_RERUN = [
     ("hotels near old town with free breakfast oct 20-22", {"check_in": date(2026, 10, 20)}),
     ("find hotels near the meeting venue in mesa oct 18-22", {"areas": ("mesa",)}),
     ("in the scottsdale area oct 20-22?", {"check_in": date(2026, 10, 20)}),
+    # an other-subject word beside the lodging noun is an amenity or an aside
+    ("hotels in mesa with a gym", {"areas": ("mesa",)}),
+    ("what about flights and hotels in phoenix?", {"areas": ("phoenix",)}),
+    ("hotels with a restaurant on site, oct 20-22", {"check_in": date(2026, 10, 20)}),
+    ("hotels within a short drive of old town scottsdale oct 20-22",
+     {"check_in": date(2026, 10, 20)}),
+    ("something with a pool and an airport shuttle", {"styles": ("pool",)}),
 ]
 MUST_HELP = [
     "in the meantime, what's the weather in phoenix?",

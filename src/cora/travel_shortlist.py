@@ -2131,9 +2131,9 @@ def _clarify(pr: ParseResult) -> Route:
 # a pool") -- and the gate reads the TOPIC first: a turn about another subject (flights,
 # weather, dinner, a car, the agenda, a meeting, the gym ...) is never a lodging
 # refinement even when it carries a date or an area ("in the meantime, what's the
-# weather in phoenix?", "what about flights to phoenix on oct 17?") unless it is itself
-# a strict lodging ask. The "in <place>" opener needs an allowlisted area right after it
-# ("in any case ..." is not one).
+# weather in phoenix?", "what about flights to phoenix on oct 17?") unless it names the
+# lodging itself. The "in <place>" opener needs an allowlisted area right after it ("in
+# any case ..." is not one).
 _REFINE_RE = re.compile(
     _WB + r"(?:try|what about|how about|instead|make it|cheaper|less expensive|more expensive"
     r"|pricier|more affordable|same dates|other dates|different (?:dates?|days|nights|area|city"
@@ -2162,8 +2162,12 @@ _REFINE_START_RE = re.compile(
 )
 _OFF_TOPIC_RE = re.compile(
     _WB + r"(?:flights?|fly|flying|flew|lands?|landing|weather|forecast|dinner|lunch"
-    r"|restaurants?|cars?|uber|lyft|shuttle|drive|driving|agenda|meetings?|gym)" + _WE
+    r"|restaurants?|cars?|uber|lyft|agenda|meetings?|gym)" + _WE
 )
+# ...unless the turn names the lodging itself ("hotels in mesa with a gym", "what about
+# flights and hotels in phoenix?") -- the other-subject word is then an amenity or an
+# aside, not the topic.
+_LODGING_NOUN_RE = re.compile(r"\b" + _STRICT_NOUN + r"(?![a-z0-9])")
 
 
 def _refine_opener(t: str) -> bool:
@@ -2178,8 +2182,8 @@ def _refine_opener(t: str) -> bool:
 
 def _is_refinement(text: Any) -> bool:
     t = _norm(_clean(text))
-    if _OFF_TOPIC_RE.search(t):
-        return _is_strict_ask(text)
+    if _OFF_TOPIC_RE.search(t) and not _LODGING_NOUN_RE.search(t):
+        return False
     return bool(_REFINE_RE.search(t) or _refine_opener(t)) or is_lodging_shaped(text)
 
 
