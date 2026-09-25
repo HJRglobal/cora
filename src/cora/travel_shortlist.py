@@ -371,7 +371,7 @@ _LODGING_STRONG_RE = re.compile(
     r"|towneplace suites|candlewood suites|staybridge suites|w scottsdale|loews|le meridien"
     r"|st\.? regis|guest ?houses?|timeshares?|glamping|furnished (?:apartments?|rentals?|homes?"
     r"|condos?)|booking\.com|expedia|priceline|trivago|kayak\.com"
-    r"|where (?:[a-z']{1,30} ){1,3}(?:can|could|will|would|should|might) (?:sleep|crash))" + _WE
+    r"|where (?:[a-z']{1,30} ){1,3}(?:can|could|will|would|should|might) sleep)" + _WE
     + r"|" + _WB + _LOYALTY_HEAD + r" (?:no\.|#)"
     + r"|" + _WB + r"(?:" + _LOYALTY_HEAD + r"|bonvoy)" + _ID_CONNECTOR + r"{0,3}[ :#.-]{0,3}\d{5}"
     + r"|" + _WB + r"(?:accounts?|acct)" + _ID_CONNECTOR + r"{0,3}[ :#.-]{0,3}\d{6}"

@@ -90,6 +90,8 @@ LOYALTY_BRAND_MUST_NOT_WITHHOLD = [
     "according to the report", "the apartment complex in Mesa we're underwriting",
     "apartment units in Tempe for the Oct 17 report", "the townhouse development in Gilbert",
     "Booking a demo with Deposco", "rewards program ideas for F3", "google the Deposco API changelog",
+    # a software crash is not a place to crash (Cora's own prose reads STRONG-only)
+    "that's where the bot could crash", "find where the importer might crash",
 ]
 
 
