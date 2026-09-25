@@ -1056,14 +1056,14 @@ class TestFieldSanitizer:
     # INSIDE the word -- the \b-anchored neutralizer never saw 'booked' and Slack
     # rendered 'Booked for 4 guests' on the T0 card.
     @pytest.mark.parametrize("raw", [
-        "Boo️ked for 4 guests", "Boo︀ked for 4 guests", "Bᅟooked for 4 guests",
-        "Booᅠked for 4 guests", "Booㅤked for 4 guests", "Booﾠked for 4 guests",
-        "Boo͏ked for 4 guests", "Boo᠋ked for 4 guests", "Boo᠏ked for 4 guests",
-        "Boo឴ked for 4 guests", "Boo\U000e0100ked for 4 guests", "Boo\U000e01efked for you",
-        "Boo̲ked for 4 guests", "Boo⃝ked for 4 guests", "Book̶ed for you",
-        "Boo̲̳ked for you", "Booked️for you", "Booked̲for you",
-        "Con️firmed: king suite", "Res͏erved under your name", "Doㅤne",
-        "He᠋ld for you", "Ho️ld on it", "Boo️king confirmed",
+        "Boo\ufe0fked for 4 guests", "Boo\ufe00ked for 4 guests", "B\u115fooked for 4 guests",
+        "Boo\u1160ked for 4 guests", "Boo\u3164ked for 4 guests", "Boo\uffa0ked for 4 guests",
+        "Boo\u034fked for 4 guests", "Boo\u180bked for 4 guests", "Boo\u180fked for 4 guests",
+        "Boo\u17b4ked for 4 guests", "Boo\U000e0100ked for 4 guests", "Boo\U000e01efked for you",
+        "Boo\u0332ked for 4 guests", "Boo\u20ddked for 4 guests", "Book\u0336ed for you",
+        "Boo\u0332\u0333ked for you", "Booked\ufe0ffor you", "Booked\u0332for you",
+        "Con\ufe0ffirmed: king suite", "Res\u034ferved under your name", "Do\u3164ne",
+        "He\u180bld for you", "Ho\ufe0fld on it", "Boo\ufe0fking confirmed",
     ])
     def test_invisible_and_non_spacing_characters_never_split_a_booking_word(self, raw):
         import unicodedata
@@ -1076,11 +1076,11 @@ class TestFieldSanitizer:
         assert not ts._INVISIBLE_RE.search(out), (raw, out)
 
     @pytest.mark.parametrize("raw", [
-        "Café Monarch", "Café Monarch", "Hôtel Valley Ho", "Diné Inn", "Kinłání Lodge",
-        "ที่พัก Scottsdale",             # Thai marks on Thai letters
-        "מָלוֹן",                          # Hebrew points
-        "संग्रह suites",                   # Devanagari anusvara + virama
-        "Casa Yorùbá ẹ́",                         # a mark on a NON-ASCII base stays
+        "Café Monarch", "Cafe\u0301 Monarch", "Hôtel Valley Ho", "Diné Inn", "Kinłání Lodge",
+        "ท\u0e35\u0e48พ\u0e31ก Scottsdale",             # Thai marks on Thai letters
+        "מ\u05b8לו\u05b9ן",                          # Hebrew points
+        "स\u0902ग\u094dरह suites",                   # Devanagari anusvara + virama
+        "Casa Yoru\u0300ba\u0301 e\u0323\u0301",                         # a mark on a NON-ASCII base stays
     ])
     def test_real_diacritics_and_non_latin_marks_are_kept(self, raw):
         """Precision: only default-ignorable characters and a combining mark on an
@@ -1091,7 +1091,7 @@ class TestFieldSanitizer:
         if raw.startswith("Casa"):
             # 'u'+grave and 'a'+acute compose under NFKC; 'e'+dot-below composes to U+1EB9,
             # whose acute (a non-ASCII base) stays
-            assert ts.sanitize_field(raw, 160) == want and "́" in want
+            assert ts.sanitize_field(raw, 160) == want and "\u0301" in want
         else:
             assert ts.sanitize_field(raw, 160) == want
 
@@ -1126,13 +1126,13 @@ class TestFieldSanitizer:
         urls, _e = ts.collect_record_urls([m])
         raw = [{"property": "Hotel Valley Ho Scottsdale Mid Century Modern Resor Bookedforyourteam",
                 "nightly_rate": "$329", "url": "https://hotelvalleyho.com/", "kind": "hotel",
-                "fit_note": "Boo️ked for 4 guests — you're all set"}]
+                "fit_note": "Boo\ufe0fked for 4 guests — you're all set"}]
         opts, dropped = ts.validate_options(raw, urls)
         assert dropped == 0 and len(opts) == 1
         _t, blocks = ts.render_card(ts.parse_constraints(
             "find hotels in scottsdale oct 17-21 for 4 people", today=TODAY).constraints, opts, now=NOW)
         body = blocks[1]["text"]["text"]
-        seen = body.replace("️", "").lower()
+        seen = body.replace("\ufe0f", "").lower()
         assert "booked" not in seen and not ts._BOOKING_WORD_RE.search(body), body
 
     @pytest.mark.parametrize("raw", ["_@here_ great pool", "heads up @channel_", "*@everyone*",
@@ -1146,11 +1146,11 @@ class TestFieldSanitizer:
 
     def test_the_sanitizer_is_linear_on_degenerate_input(self):
         for shape in (" " * 40000, "a." * 20000, "_" * 40000, "​" * 40000, "book" * 10000,
-                      "*a.bc*" * 6000, "@" * 40000, "️" * 40000, "o̲" * 20000,
+                      "*a.bc*" * 6000, "@" * 40000, "\ufe0f" * 40000, "o\u0332" * 20000,
                       "Bookedforyou " * 3000):
             assert _best_of_3(lambda: ts.sanitize_field(shape, 160)) < 0.05, shape[:10]
         # D-051 r2: the new character class + mark pass, on the UNCAPPED 40k inputs
-        for shape in (" " * 40000, "️" * 40000, "o̲" * 20000, "\U000e0100" * 40000):
+        for shape in (" " * 40000, "\ufe0f" * 40000, "o\u0332" * 20000, "\U000e0100" * 40000):
             assert _best_of_3(lambda: ts._INVISIBLE_RE.sub(" ", shape)) < 0.05, repr(shape[:2])
             assert _best_of_3(lambda: ts._space_hidden(shape)) < 0.25, repr(shape[:2])
 

@@ -1782,8 +1782,8 @@ _FIELD_CAPS = {"property": 80, "nightly_rate": 40, "fit_note": 160}
 # inherent vowels are Mn, the Hangul fillers Lo, the reserved ones Cn. One fixed-width
 # character class (linear).
 _INVISIBLE_RE = re.compile(
-    "[­͏؜ᅟᅠ឴឵᠋-᠏​-‏‪-‮"
-    "⁠-⁯ㅤ︀-️﻿ﾠ￰-￸"
+    "[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e"
+    "\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufff8"
     "\U0001bca0-\U0001bca3\U0001d173-\U0001d17a\U000e0000-\U000e0fff]")
 _MARK_CATEGORIES = frozenset({"Mn", "Me"})
 
