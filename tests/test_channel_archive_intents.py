@@ -417,3 +417,45 @@ class TestLaneRepliesR2:
         from cora.channel_archive import deliver
         assert deliver.MISSING_PARTS_LEAD in it._LANE_REPLY_PREFIXES
         assert _missing_parts_line(1, 2).startswith(deliver.MISSING_PARTS_LEAD)
+
+
+def _card(pid, *, created, pages, n_pages=None, dm="DH", rows=True):
+    """Stage *pid* and post the given {page: ts} pages (n_pages defaults to them all)."""
+    rr = ([{"cid": f"C0{pid[-8:].upper()}{i}", "section": "A", "tier": "T0"} for i in (1, 2)]
+          if rows else [])
+    st.append_event("staged", proposal_id=pid, ts=created, expires_ts=created + 14 * DAY, rows=rr,
+                    counts={}, n_pages=len(pages) if n_pages is None else n_pages,
+                    blind=None if rows else "list_incomplete")
+    for page, ts in pages.items():
+        st.append_event("delivered", proposal_id=pid, page=page, dm_channel=dm, message_ts=ts,
+                        rendered_cids=[r["cid"] for r in rr], buttons=True, ts=created)
+
+
+class TestEveryLiveCardR2:
+    """r2:integration#2: a partly delivered (or blind / empty) newer card supersedes
+    nothing, so an older complete card stays LIVE (its buttons still act) -- the DM
+    rail must see every live card page, not only the newest proposal's."""
+
+    def test_both_live_cards_pages_count_and_the_newest_page_times_the_window(self):
+        a_ts, c_ts = f"{NOW - 3600:.6f}", f"{NOW - 60:.6f}"
+        _card("chanarch-aaaaaaaaaaaa", created=NOW - 3700, pages={1: a_ts})
+        _card("chanarch-cccccccccccc", created=NOW - 120, pages={1: c_ts}, n_pages=2)   # partial
+        f = st.fold(now=NOW)
+        assert f.is_live("chanarch-aaaaaaaaaaaa", NOW) and f.is_live("chanarch-cccccccccccc", NOW)
+        assert it.live_card_message_ts("DH", now=NOW) == {a_ts, c_ts}
+        assert it.live_card_ts("DH", now=NOW) == pytest.approx(NOW - 60)
+
+    def test_a_newer_blind_card_leaves_the_older_card_counted(self):
+        a_ts, b_ts = f"{NOW - 3600:.6f}", f"{NOW - 60:.6f}"
+        _card("chanarch-aaaaaaaaaaaa", created=NOW - 3700, pages={1: a_ts})
+        _card("chanarch-bbbbbbbbbbbb", created=NOW - 120, pages={1: b_ts}, rows=False)
+        assert it.live_card_message_ts("DH", now=NOW) == {a_ts, b_ts}
+
+    def test_a_superseded_card_and_another_dms_card_do_not_count(self):
+        a_ts, c_ts, o_ts = f"{NOW - 3600:.6f}", f"{NOW - 60:.6f}", f"{NOW - 30:.6f}"
+        _card("chanarch-aaaaaaaaaaaa", created=NOW - 3700, pages={1: a_ts})
+        _card("chanarch-cccccccccccc", created=NOW - 120, pages={1: c_ts})               # complete
+        _card("chanarch-oooooooooooo", created=NOW - 90, pages={1: o_ts}, n_pages=2, dm="DOTHER")
+        assert it.live_card_message_ts("DH", now=NOW) == {c_ts}
+        assert it.live_card_ts("DH", now=NOW) == pytest.approx(NOW - 60)
+        assert it.live_card_message_ts("DOTHER", now=NOW) == {o_ts}

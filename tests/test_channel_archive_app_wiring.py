@@ -781,3 +781,37 @@ class TestPartialCardR2:
         app_module.handle_message_event(_event("yes"), client)
         assert _texts(client) == [intents.followup_reply()]
         assert quiet_dm.qa.call_count == before and not quiet_dm.capture.called
+
+
+class TestEveryLiveCardR2:
+    """r2:integration#2: a newer partly delivered (or blind) card supersedes nothing, so
+    the older complete card stays live and its buttons still act -- a bare 'yes' typed
+    in ITS thread is still a card follow-up, never a model turn."""
+
+    def _older_complete_card(self):
+        now = time.time()
+        a_ts = f"{now - 20:.6f}"
+        st.append_event("staged", proposal_id=PID, ts=now - 30, expires_ts=now + 14 * DAY,
+                        rows=_rows(A1, "C0DEADAAA2"), counts={}, n_pages=1)
+        st.append_event("delivered", proposal_id=PID, page=1, dm_channel="DHARRISON1",
+                        message_ts=a_ts, rendered_cids=[A1, "C0DEADAAA2"], buttons=True, ts=now - 30)
+        return now, a_ts
+
+    def test_a_yes_in_the_older_live_cards_thread_after_a_partial_newer_card(self, quiet_dm):
+        now, a_ts = self._older_complete_card()
+        _partial_card(PID2, created=now - 10, page1_ts=f"{now - 5:.6f}")
+        f = st.fold()
+        assert f.is_live(PID, time.time()) and f.live_proposal(time.time()).proposal_id == PID2
+        client = MagicMock()
+        app_module.handle_message_event(_event("yes", thread_ts=a_ts), client)
+        assert _texts(client) == [intents.followup_reply()] and not quiet_dm.qa.called
+
+    def test_a_yes_in_the_older_live_cards_thread_after_a_blind_newer_card(self, quiet_dm):
+        now, a_ts = self._older_complete_card()
+        st.append_event("staged", proposal_id=PID2, ts=now - 10, expires_ts=now + 14 * DAY, rows=[],
+                        counts={}, n_pages=1, blind="list_incomplete")
+        st.append_event("delivered", proposal_id=PID2, page=1, dm_channel="DHARRISON1",
+                        message_ts=f"{now - 5:.6f}", rendered_cids=[], buttons=True, ts=now - 10)
+        client = MagicMock()
+        app_module.handle_message_event(_event("ok", thread_ts=a_ts), client)
+        assert _texts(client) == [intents.followup_reply()] and not quiet_dm.qa.called

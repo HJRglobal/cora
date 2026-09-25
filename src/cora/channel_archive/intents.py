@@ -345,35 +345,42 @@ def status_reply(*, now: float | None = None) -> str:
             "channel settings.")
 
 
-def live_card_message_ts(dm_channel: str, *, now: float | None = None) -> set[str]:
-    """Every page message ts of the LIVE proposal delivered in *dm_channel* (a threaded
-    follow-up counts only inside one of these threads)."""
+def _live_cards(dm_channel: str, now: float) -> list:
+    """EVERY live, delivered proposal in *dm_channel* (D-051 r2 integration#2): a newer
+    partly delivered, blind or empty card supersedes nothing, so an older complete card
+    stays live -- its buttons still act, and a typed reply in its thread is the card's."""
     from . import store as st  # noqa: PLC0415
+    f = st.fold(now=now)
+    return [p for pid, p in f.proposals.items()
+            if p.delivered and f.is_live(pid, now)
+            and (not dm_channel or p.dm_channel() == dm_channel)]
+
+
+def live_card_message_ts(dm_channel: str, *, now: float | None = None) -> set[str]:
+    """Every page message ts of every LIVE proposal delivered in *dm_channel* (a
+    threaded follow-up counts only inside one of these threads)."""
     now = time.time() if now is None else float(now)
     try:
-        p = st.fold(now=now).live_proposal(now)
+        cards_ = _live_cards(dm_channel, now)
     except Exception:  # noqa: BLE001
         return set()
-    if p is None or (dm_channel and p.dm_channel() != dm_channel):
-        return set()
-    return {str(i.get("message_ts")) for i in p.pages.values() if i.get("message_ts")}
+    return {str(i.get("message_ts")) for p in cards_ for i in p.pages.values() if i.get("message_ts")}
 
 
 def live_card_ts(dm_channel: str, *, now: float | None = None) -> float | None:
-    """The newest card message time of a LIVE proposal delivered in *dm_channel*."""
-    from . import store as st  # noqa: PLC0415
+    """The newest card message time across the LIVE proposals delivered in *dm_channel*."""
     now = time.time() if now is None else float(now)
     try:
-        f = st.fold(now=now)
+        cards_ = _live_cards(dm_channel, now)
     except Exception:  # noqa: BLE001
         return None
-    p = f.live_proposal(now)
-    if p is None or (dm_channel and p.dm_channel() != dm_channel):
+    if not cards_:
         return None
     stamps = []
-    for info in p.pages.values():
-        try:
-            stamps.append(float(info.get("message_ts") or 0))
-        except (TypeError, ValueError):
-            continue
-    return max(stamps) if stamps else p.created
+    for p in cards_:
+        for info in p.pages.values():
+            try:
+                stamps.append(float(info.get("message_ts") or 0))
+            except (TypeError, ValueError):
+                continue
+    return max(stamps) if stamps else max(p.created for p in cards_)
