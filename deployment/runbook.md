@@ -199,6 +199,54 @@ is regenerated. **Weekly Sat 02:40 AZ** -> `scripts/run_hygiene_drive_weekly.py 
 - **Register (elevated):** `.\deployment\setup-hygiene-drive-weekly-task.ps1`, then
   `.\.venv\Scripts\python.exe scripts\generate_task_estate_manifest.py --update-docs`.
 
+### Pending registration: `cowork-cora-channel-archive-proposal` (Code #16 C1, cq-be90cea867c3)
+
+Not in the generated table above until Harrison registers it and the manifest is
+regenerated. **Weekly Monday 07:07 AZ** -> `scripts/run_channel_archive_proposal.py
+--apply --monthly` (windowless, Interactive/Limited, StartWhenAvailable, 30 min limit).
+Ladder row `slack-channel-archive`, **born T0: nothing is archived by this task or by
+any T0 card.**
+
+- **What it does:** a metadata-only scan (ids, names, ages, counts -- never message
+  text, D-082) of the public + private channels Cora belongs to (DMs / group DMs
+  never), then ONE proposal card in Harrison's DM (continuation messages past 20
+  rows). Section A = clean candidates (no message from a PERSON for >= 90 days, no
+  exemption, no bot/app traffic); section B = per-row only (registry / LEX / sprawl
+  keep-list exemptions to override, bot-only traffic, private channels he is not in,
+  previously unarchived, history longer than 2,000 messages). Non-overridable and never
+  listed: the sweep deny-list (never read, never named), general, Slack Connect,
+  #info-for-cora, `*-leadership` / `*-finance`, pinned, < 30 days old, a 90-day Keep.
+- **Monthly gate:** the task fires every Monday; the script delivers only when today
+  (AZ) is on/after the month's first Monday AND no monthly card went out this month,
+  so a Tuesday catch-up still delivers. Run marker every `--apply --monthly` fire:
+  ok delivered / ok skipped / **FAILED `month_undelivered` + exit 1** (WARNs until a
+  card goes out). Dry runs and `--clear-demotion` write no marker.
+- **Blind scans propose nothing and say why** (registry / deny-list / store
+  unreadable, Slack's list incomplete, bot identity unknown). The registry is read from
+  `_shared\playbooks\slack-channel-registry.md` and counts only when all nine entity
+  sections, the `_Coverage note` line and >= max(100, 90% of the last good parse) ids
+  are present.
+- **T1 (after promotion ONLY):** a `promoted` event on the registry row (a Code/Cowork
+  commit) + `CORA_CHANNEL_ARCHIVE=act` + one restart. Then a tap posts a one-line
+  notice in the channel, archives it on a no-retry client, reads it back, and ledgers
+  intent (fsynced BEFORE any Slack write) + outcome in `logs/channel-archive-ledger.jsonl`.
+- **Evidence monitor:** `check_channel_archive` in the 08:45 health check reconciles the
+  ledger against Slack. An archive by Cora the ledger cannot attribute to a tap WRITES
+  `data/state/channel-archive-demotion.json` (the lane acts at T0 whatever the flag
+  says) and WARNs daily. **Clearing is Harrison's:** investigate, then
+  `.\.venv\Scripts\python.exe scripts\run_channel_archive_proposal.py --clear-demotion`
+  (shows it) and the same with `--apply` (appends an `acknowledged` ledger row for that
+  exact archive event, then deletes the file -- the same event never re-demotes).
+- **Dry-run (reads Slack, writes nothing; prints the candidate IDS only + the archive
+  scopes' state):** `.\.venv\Scripts\python.exe scripts\run_channel_archive_proposal.py`
+- **Register (elevated, AFTER the restart that loads the lane -- the card's buttons are
+  handled by the bot):** `.\deployment\setup-channel-archive-proposal-task.ps1 -Register`
+  (without `-Register` it only checks the 07:07 slot against the live registry), then
+  `.\.venv\Scripts\python.exe scripts\generate_task_estate_manifest.py --update-docs` and
+  `.\.venv\Scripts\python.exe scripts\dr_manifest_probes.py --update-docs`.
+- **After the restart:** re-read `data\state\egress-rails-armed.json` and confirm
+  `first_armed_at 2026-09-10T08:45:06` is intact (kickoff section 5).
+
 ---
 
 ## External Health Check

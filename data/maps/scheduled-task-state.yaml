@@ -113,6 +113,10 @@ enabled:
   # (scripts/run_meeting_ask_capture.py; deployment/setup-meeting-ask-capture-task.ps1).
   # Documentary entry added Code #14 R14-7a alongside its run_markers row below.
   - Cora - Meeting Ask Capture
+  # Code #16 C1: weekly Monday 07:07 AZ fire, first-Monday self-gate in the script ->
+  # the monthly dead-channel proposal card (deployment/setup-channel-archive-proposal-task.ps1;
+  # Harrison registers it AFTER the restart that loads the lane). Nothing is archived by it.
+  - cowork-cora-channel-archive-proposal
 
 # ── Run-marker contract (session #11 S4, retires the cq-a251dee3f5cf class) ────
 # Task Scheduler knows a task RAN and its exit code; it cannot know the run
@@ -165,3 +169,7 @@ run_markers:
     cadence_hours: 24         # daily 06:11 AZ (Code #13 Rider 1 S-A; deployment/setup-mailbox-intake-task.ps1; 06:10 is gap-autofill's LIVE slot)
     expects_output: false     # a day with no human note emailed to cora@ legitimately queues 0 proposals
     registered: 2026-09-19T00:00:00+00:00   # the marker WARNs 'never recorded' until Harrison registers the task -- that is the reminder
+  - name: cowork-cora-channel-archive-proposal
+    cadence_hours: 168        # weekly Monday 07:07 AZ (Code #16 C1; deployment/setup-channel-archive-proposal-task.ps1); EVERY --apply --monthly fire writes a marker (delivered / skipped / FAILED month_undelivered)
+    expects_output: false     # three Mondays a month legitimately skip (not due / already delivered)
+    registered: 2026-09-25T00:00:00+00:00   # the marker WARNs 'never recorded' until Harrison registers the task (after the restart) -- that is the reminder

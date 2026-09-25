@@ -903,6 +903,48 @@ def check_ladder_registry() -> CheckResult:
     return CheckResult(name, "ok", head + " | schema clean, no acting drift")
 
 
+# ── Code #16 C1: the dead-channel archive lane's evidence monitor ────────────────
+def check_channel_archive(*, dry_run: bool = False, client_factory=None,
+                          now: float | None = None) -> CheckResult:
+    """Code #16 C1 (ladder row slack-channel-archive): reconcile the lane's archive
+    ledger against Slack's own record (cora.channel_archive.monitor.reconcile) -- the
+    row's failing-capable evidence monitor. WARN on an archive by Cora the ledger
+    cannot attribute to a tap (which also WRITES the demotion file, so the lane acts
+    at T0 until Harrison clears it), on a ledger archive Slack does not show, on an
+    unresolved intent, on a scan that never staged a card, while demoted, and on any
+    BLIND read (a blind read never reads OK). ONE CheckResult.
+
+    `dry_run` (the script's --dry-run, D-290) classifies exactly as a real run and
+    writes NOTHING: no demotion file, no reconciled ledger/store rows. The Slack
+    client is injectable; the default refuses to build a live client under pytest.
+    """
+    name = "Dead-channel archive lane"
+    try:
+        sys.path.insert(0, str(_REPO_ROOT / "src"))
+        from cora.channel_archive import clients as ca_clients  # noqa: PLC0415
+        from cora.channel_archive import monitor as ca_monitor  # noqa: PLC0415
+        from cora.channel_archive import policy as ca_policy  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(name, "warn", f"channel_archive module unavailable: {exc}")
+    try:
+        client = (client_factory or ca_clients.read_client)()
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(name, "warn", f"BLIND: no Slack client ({type(exc).__name__}) -- "
+                                         "nothing was verified")
+    try:
+        out = ca_monitor.reconcile(client, now=now, dry_run=dry_run)
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(name, "warn", f"monitor crashed ({type(exc).__name__}) -- nothing verified")
+    cov = ca_monitor.coverage_line(out.get("coverage") or {})
+    head = f"acting {ca_policy.acting_tier()}"
+    if out.get("status") == "ok":
+        return CheckResult(name, "ok", f"{head} | ledger reconciled against Slack | {cov}")
+    findings = list(out.get("findings") or [])
+    shown = "; ".join(findings[:6]) + (f"; +{len(findings) - 6} more" if len(findings) > 6 else "")
+    tail = " | demotion WRITTEN" if out.get("demotion_written") else ""
+    return CheckResult(name, "warn", f"{head} | {shown}{tail} | {cov}")
+
+
 def check_qbo_monitor(now: datetime | None = None) -> CheckResult:
     """The QBO token monitor must keep FIRING daily -- if it silently stops, a
     realm could expire unnoticed and finance answers fail silently. WARN if it's
@@ -2936,6 +2978,10 @@ def main() -> int:
 
     log.info("Reading the autonomy-ladder registry for drift (Code #13 slice 7)...")
     all_results.append(check_ladder_registry())
+
+    # Code #16 C1: the dead-channel lane's ledger reconciled against Slack
+    log.info("Reconciling the dead-channel archive ledger against Slack (Code #16 C1)...")
+    all_results.append(check_channel_archive(dry_run=args.dry_run))
 
     log.info("Reading the egress-rail observe week (sentinel + phantom-write-claim + phantom-capability-claim)...")
     all_results.append(check_egress_rails())

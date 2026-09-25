@@ -258,3 +258,51 @@ def test_main_threads_dry_run_into_every_write_site_check(monkeypatch, tmp_path,
     assert calls["check_heartbeat"]["args"] == (expect,)
     for name in _WRITE_SITE_CHECKS[1:]:
         assert calls[name]["kwargs"].get("dry_run") is expect, name
+
+
+# ── Code #16 C1: check_channel_archive is a write-site check ─────────────────────
+# Its monitor WRITES the demotion file and reconciled ledger/store rows, so it joins
+# the entry-point pin above (the tuple is read at test time), and main(--dry-run) is
+# driven end to end over a fixture that WOULD demote: the demotion file and the
+# ledger bytes must be unchanged (lesson 64: a dry run is a claim about every write
+# site). The real run over the same fixture demotes, proving the fixture bites.
+_WRITE_SITE_CHECKS = _WRITE_SITE_CHECKS + ("check_channel_archive",)
+
+
+@pytest.mark.parametrize("argv,demotes", [(["--dry-run"], False), ([], True)])
+def test_main_dry_run_holds_at_the_channel_archive_write_sites(monkeypatch, tmp_path, capfd,
+                                                               argv, demotes):
+    import time as _time
+
+    import nightly_health_check as hc
+    from _chanarch_fakes import BOT_UID
+    from cora.channel_archive import clients as ca_clients
+    from cora.channel_archive import monitor as ca_monitor
+    from cora.channel_archive import policy as ca_policy
+    from cora.channel_archive import store as ca_store
+    from test_channel_archive_monitor import MonSlack
+
+    real_check = hc.check_channel_archive
+    calls: dict[str, dict] = {}
+    _stub_every_check(hc, monkeypatch, calls)
+    monkeypatch.setattr(hc, "check_channel_archive", real_check)
+    monkeypatch.setattr(ca_monitor, "PACE_S", 0.0)
+    # an archive by Cora with no intent (-> demotion) + a stale intent on a channel Slack
+    # shows open (-> a reconciled `failed` ledger row): two write sites, both gated
+    fake = MonSlack(archived={"C0ARCHIVE01": {}, "C0OTHER001": {"is_archived": False}},
+                    events={"C0ARCHIVE01": [{"ts": f"{_time.time() - 60:.6f}",
+                                             "subtype": "channel_archive", "user": BOT_UID}]})
+    monkeypatch.setattr(ca_clients, "read_client_factory", lambda: fake)
+    ca_store.append_ledger("intent", proposal_id="chanarch-000000000001", channel_id="C0OTHER001",
+                           tapped_by="U0B2RM2JYJ1", ts=_time.time() - 7200)
+    ledger_before = ca_store.ledger_path().read_bytes()
+    monkeypatch.setattr(hc, "_LOG_DIR", tmp_path)
+    monkeypatch.setattr(hc, "_post_to_slack", lambda *a, **k: None)
+    monkeypatch.setattr(hc.logging, "basicConfig", lambda **_k: None)
+    monkeypatch.setattr(sys, "argv", ["nightly_health_check.py", *argv])
+    hc.main()
+    assert ca_policy.is_demoted() is demotes
+    changed = ca_store.ledger_path().read_bytes() != ledger_before
+    assert changed is demotes                   # the real run reconciles; the dry run cannot
+    if not demotes:
+        assert not ca_policy.demotion_path().exists()

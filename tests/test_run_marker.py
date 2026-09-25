@@ -193,6 +193,8 @@ class TestRegistryAndWiring:
             "Cora - Mailbox Intake Sweep": "scripts/run_mailbox_intake_sweep.py",
             # Code #14 R14-7a: the every-15-min meeting-ask / recap poll
             "Cora - Meeting Ask Capture": "scripts/run_meeting_ask_capture.py",
+            # Code #16 C1: the monthly dead-channel proposal card (weekly fire)
+            "cowork-cora-channel-archive-proposal": "scripts/run_channel_archive_proposal.py",
         }
         for entry in data.get("run_markers") or []:
             path = scripts.get(entry["name"])

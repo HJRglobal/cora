@@ -78,10 +78,15 @@ def deliver_proposal(*, trigger: str, now: float | None = None,
     if dry_run:
         ctx = load_context(read, now=now)
         res = scan_mod.scan(read, ctx, now=now, sleep=sleep)
+        scopes = gates.granted_scopes(read, force=True)
         out.update(reason="dry_run", scanned=res["scanned"], blind=res["blind"],
                    counts=res["counts"], candidate_ids=list(res["candidate_ids"]),
                    rows=len(res["rows"]), blind_detail=res.get("blind_detail", ""),
-                   b_ids=[r["cid"] for r in res["rows"] if r["section"] == "B"])
+                   b_ids=[r["cid"] for r in res["rows"] if r["section"] == "B"],
+                   b_reasons={r["cid"]: r["reason"] for r in res["rows"] if r["section"] == "B"},
+                   scopes={s: gates.scope_state(scopes, priv) for s, priv in
+                           ((gates.SCOPE_PUBLIC, False), (gates.SCOPE_PRIVATE, True))},
+                   acting_tier=policy.acting_tier(), registry_t1=gates.registry_allows_t1())
         return out
     token = st.acquire_scan_lock(now=now)
     if token is None:
