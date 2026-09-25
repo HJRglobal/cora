@@ -258,6 +258,36 @@ class TestScanLock:
         assert st.acquire_scan_lock(now=NOW)
         assert t1
 
+    def _hold(self, **body):
+        st.scan_lock_path().parent.mkdir(parents=True, exist_ok=True)
+        st.scan_lock_path().write_text(json.dumps({"ts": NOW, "token": "theirs", **body}),
+                                       encoding="utf-8")
+
+    def test_a_lock_left_by_a_dead_process_is_taken_over_at_once(self):
+        """c1-state-machine#7: a hard kill (the doctrine-5 restart's Stop-Process -Force)
+        skips the finally that releases the lock; the next ask must not answer 'A scan
+        is already running; its card will arrive here' for 30 minutes."""
+        import subprocess
+        import sys
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait(timeout=60)
+        self._hold(pid=proc.pid, nonce="n-dead")
+        assert st.acquire_scan_lock(now=NOW + 60)                  # well inside 30 min
+
+    def test_our_own_pid_from_a_previous_instance_is_taken_over(self):
+        self._hold(pid=os.getpid(), nonce="a-previous-instance")
+        assert st.acquire_scan_lock(now=NOW + 60)
+        self._hold(pid=os.getpid())                                 # a pre-nonce body
+        assert st.acquire_scan_lock(now=NOW + 60)
+
+    def test_a_live_holder_still_holds(self):
+        self._hold(pid=os.getppid(), nonce="n-parent")              # a live process
+        assert st.acquire_scan_lock(now=NOW + 60) is None
+        tok = None
+        st.scan_lock_path().unlink()
+        tok = st.acquire_scan_lock(now=NOW)                         # THIS process, this run
+        assert tok and st.acquire_scan_lock(now=NOW + 60) is None
+
 
 class TestDemotionHelpers:
     def test_dry_run_writes_nothing(self):

@@ -532,13 +532,71 @@ def append_intent_if_claimed(pid: str, cid: str, claim_ts: float, *, now: float,
 
 
 # ── the cross-process scan lock (A18) ────────────────────────────────────────
+#: This process's identity in the lock body, beside its pid: a lock carrying OUR pid
+#: but another nonce was left by a previous instance that happened to get the same pid.
+_PROCESS_NONCE = secrets.token_hex(8)
+
+
+def _pid_alive(pid: Any) -> bool:
+    """REAL liveness probe (copied from scripts/run_delegated_work_runner.py). On
+    Windows ``os.kill(pid, 0)`` is NOT one -- signal 0 maps to GenerateConsoleCtrlEvent
+    -- so OpenProcess + GetExitCodeProcess; access denied counts as ALIVE (fail closed:
+    never take over a lock we cannot inspect)."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes  # noqa: PLC0415
+        process_query_limited_information = 0x1000
+        still_active = 259
+        error_access_denied = 5
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            return ctypes.get_last_error() == error_access_denied
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True          # can't tell -- treat as alive (fail closed)
+            return code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _holder_gone(held: dict) -> bool:
+    """c1-state-machine#7: True when the lock's holder is certainly not running -- its
+    pid is dead, or it is OUR pid from a previous instance (another nonce). A hard kill
+    skips deliver's ``finally``; without this, every ask for 30 minutes was told 'A scan
+    is already running; its card will arrive here' and no card came. A lock with no
+    readable pid keeps the age rule; a reused pid keeps it too (fail closed)."""
+    pid = held.get("pid")
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid == os.getpid():
+        return held.get("nonce") != _PROCESS_NONCE
+    return not _pid_alive(pid)
+
+
 def acquire_scan_lock(*, now: float | None = None) -> str | None:
     """A token when this process now holds the scan lock; None when another live
-    scan holds it. A lock older than 30 minutes (or unreadable) is stale."""
+    scan holds it. A lock older than 30 minutes, unreadable, or left by a process
+    that is no longer running is stale."""
     now = time.time() if now is None else float(now)
     p = scan_lock_path()
     token = secrets.token_hex(8)
-    body = json.dumps({"pid": os.getpid(), "ts": now, "token": token})
+    body = json.dumps({"pid": os.getpid(), "nonce": _PROCESS_NONCE, "ts": now, "token": token})
     for _attempt in range(2):
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -546,7 +604,8 @@ def acquire_scan_lock(*, now: float | None = None) -> str | None:
         except FileExistsError:
             try:
                 held = json.loads(p.read_text(encoding="utf-8"))
-                stale = now - float(held.get("ts") or 0) > SCAN_LOCK_STALE_S
+                stale = (now - float(held.get("ts") or 0) > SCAN_LOCK_STALE_S
+                         or _holder_gone(held))
             except Exception:  # noqa: BLE001 -- unreadable lock = stale
                 stale = True
             if not stale:
