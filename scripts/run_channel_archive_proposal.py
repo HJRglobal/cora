@@ -237,9 +237,9 @@ def _rebaseline(now: float, *, apply: bool) -> int:
             _print(f"REFUSED: {below[0]} -- the registry parses complete, but a re-baseline cannot go "
                    f"below the {reg.MIN_REGISTRY_IDS}-id minimum; nothing re-baselined.")
         else:
-            _print(f"REFUSED: the registry is structurally incomplete ({r.reason}) -- a re-baseline "
-                   "accepts only a registry with every entity section, the coverage line and at least "
-                   f"{reg.MIN_REGISTRY_IDS} ids.")
+            _print(f"REFUSED: the registry did not read structurally complete ({r.reason}) -- a "
+                   "re-baseline accepts only a registry with every entity section, the coverage line "
+                   f"and at least {reg.MIN_REGISTRY_IDS} ids.")
         return 1
     new_floor = reg.registry_floor(r.count)
     if not apply:
