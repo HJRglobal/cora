@@ -120,6 +120,68 @@ class TestDeliver:
             assert len(p["blocks"]) <= 48
 
 
+class TestPartialDelivery:
+    """c1-state-machine#6: page 1 posted, a later page failed -- Harrison is told which
+    parts are missing, the result says it was only partly delivered, and the partly
+    delivered card does not supersede (and so strand) an older, complete card."""
+
+    def _many(self, monkeypatch, n=45, fail_page=2):
+        chans = [chan(f"C0DEAD{i:04d}", f"fx-dead-{i}") for i in range(n)]
+        f = FakeSlack(channels=chans, history={c["id"]: [msg(200)] for c in chans})
+        cards_seen = {"n": 0}
+
+        def _post(kw):
+            if kw.get("blocks"):
+                cards_seen["n"] += 1
+                if cards_seen["n"] == fail_page:
+                    return api_error("ratelimited")
+            return None
+        f.post_behaviour = _post
+        monkeypatch.setattr(clients, "read_client_factory", lambda: f)
+        monkeypatch.setattr(clients, "write_client_factory", lambda: f)
+        return f
+
+    def test_a_missing_page_is_named_in_the_dm_and_the_result_says_partial(self, monkeypatch):
+        f = self._many(monkeypatch)
+        out = deliver.deliver_proposal(trigger="ask", now=NOW, sleep=no_sleep)
+        assert out["pages"] == 1 and out["pages_expected"] == 3 and out["partial"] is True
+        assert out["reason"] == "post_failed:ratelimited"
+        lines = [p["text"] for p in f.posts if not p.get("blocks")]
+        assert len(lines) == 1 and "parts 2 and 3 of 3" in lines[0], lines
+        assert "nothing was archived" in lines[0] and f.posts[-1]["channel"] == "DHARRISON1"
+        from cora import slack_egress as se                 # A27: both honesty rails
+        assert se.screen_phantom_write_claims(lines[0], tool_use_count=0) == lines[0]
+        assert se.sanitize_text(lines[0]) == lines[0]
+        monkeypatch.setenv("CORA_SENTINEL_ENFORCE", "enforce")
+        assert se.screen_phantom_write_claims(lines[0], tool_use_count=0) == lines[0]
+
+    def test_a_partly_delivered_card_does_not_supersede_an_older_complete_one(self, monkeypatch):
+        st.append_event("staged", proposal_id="chanarch-000000000001", ts=NOW - 100,
+                        expires_ts=NOW + 14 * 86400, rows=[{"cid": "C0OLDROW01", "section": "A"}],
+                        n_pages=1)
+        st.append_event("delivered", proposal_id="chanarch-000000000001", page=1,
+                        dm_channel="DHARRISON1", message_ts="1.1", rendered_cids=["C0OLDROW01"],
+                        buttons=True, ts=NOW - 100)
+        self._many(monkeypatch)
+        out = deliver.deliver_proposal(trigger="ask", now=NOW, sleep=no_sleep)
+        f = st.fold(now=NOW + 1)
+        assert f.superseded_by("chanarch-000000000001") is None
+        assert f.is_live("chanarch-000000000001", NOW + 1)
+        assert not f.proposals[out["proposal_id"]].fully_delivered
+
+    def test_a_complete_delivery_still_supersedes(self, monkeypatch):
+        st.append_event("staged", proposal_id="chanarch-000000000001", ts=NOW - 100,
+                        expires_ts=NOW + 14 * 86400, rows=[{"cid": "C0OLDROW01", "section": "A"}])
+        st.append_event("delivered", proposal_id="chanarch-000000000001", page=1,
+                        dm_channel="DHARRISON1", message_ts="1.1", rendered_cids=["C0OLDROW01"],
+                        buttons=True, ts=NOW - 100)
+        self._many(monkeypatch, fail_page=99)
+        out = deliver.deliver_proposal(trigger="ask", now=NOW, sleep=no_sleep)
+        assert out["pages"] == 3 and not out.get("partial")
+        f = st.fold(now=NOW + 1)
+        assert f.superseded_by("chanarch-000000000001").proposal_id == out["proposal_id"]
+
+
 class TestTierGate:
     def test_default_registry_t0_stages_every_row_t0_even_with_act(self, fake, monkeypatch):
         monkeypatch.setenv("CORA_CHANNEL_ARCHIVE", "act")

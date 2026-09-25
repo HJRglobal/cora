@@ -105,15 +105,17 @@ def deliver_proposal(*, trigger: str, now: float | None = None,
                                            registry_t1=reg_t1, acting=acting)
         pid = st.mint_proposal_id()
         tier_at_stage = "T1" if any(r.get("tier") == "T1" for r in res["rows"]) else "T0"
+        page_plan = cards.paginate(res["rows"])
         out.update(proposal_id=pid, scanned=res["scanned"], blind=res["blind"],
                    counts=res["counts"], candidate_ids=list(res["candidate_ids"]),
-                   rows=len(res["rows"]))
+                   rows=len(res["rows"]), pages_expected=len(page_plan))
         if not st.append_event(
                 "staged", proposal_id=pid, scan_id=scan_id, trigger=trigger, ts=now,
                 expires_ts=now + st.EXPIRY_DAYS * st.DAY_S, tier_at_stage=tier_at_stage,
                 blind=res["blind"], blind_detail=res.get("blind_detail") or "",
                 scanned=res["scanned"], counts=res["counts"], rows=res["rows"],
-                registry_count=ctx.registry.count if ctx.registry.ok else 0):
+                registry_count=ctx.registry.count if ctx.registry.ok else 0,
+                n_pages=len(page_plan)):
             out["reason"] = "store_write_failed"
             return out
         buttons = confirm_cards.confirm_buttons_enabled()
@@ -129,7 +131,7 @@ def deliver_proposal(*, trigger: str, now: float | None = None,
             out["reason"] = out["reason"] or "dm_open_failed"
             st.append_event("delivery_failed", proposal_id=pid, page=1, error=out["reason"], ts=now)
             return out
-        for page, cids in enumerate(cards.paginate(res["rows"]), start=1):
+        for page, cids in enumerate(page_plan, start=1):
             blocks, text = cards.render_page(f, pid, page, now=now, buttons=buttons, page_cids=cids)
             try:
                 resp = write.chat_postMessage(channel=dm, text=text, blocks=blocks,
@@ -150,12 +152,32 @@ def deliver_proposal(*, trigger: str, now: float | None = None,
         out["delivered"] = out["pages"] > 0
         if out["delivered"] and not out["reason"]:
             out["reason"] = "delivered"
+        if 0 < out["pages"] < len(page_plan):
+            # c1-state-machine#6: never a silent partial card -- the posted part says
+            # "Part 1 of N", so name the parts that did not arrive (best effort), and
+            # the result says partial (reason stays post_failed:<code>)
+            out["partial"] = True
+            _say_missing_parts(write, dm, out["pages"], len(page_plan), out["reason"])
         log.info("channel_archive deliver trigger=%s proposal=%s pages=%d blind=%s a=%d rows=%d",
                  trigger, pid, out["pages"], res["blind"], len(res["candidate_ids"]),
                  len(res["rows"]))
         return out
     finally:
         st.release_scan_lock(token)
+
+
+def _say_missing_parts(write: Any, dm: str, posted: int, total: int, reason: str) -> None:
+    missing = list(range(posted + 1, total + 1))
+    names = (f"part {missing[0]}" if len(missing) == 1
+             else "parts " + ", ".join(str(n) for n in missing[:-1]) + f" and {missing[-1]}")
+    code = reason.split(":", 1)[1] if ":" in reason else reason
+    text = (f"The dead-channel card is incomplete: {names} of {total} did not post ({code}), so "
+            "those rows can't be acted on from this card. Ask 'archive the dead channels' for "
+            "a fresh scan — nothing was archived.")
+    try:
+        write.chat_postMessage(channel=dm, text=text, unfurl_links=False, unfurl_media=False)
+    except Exception:  # noqa: BLE001 -- best effort; the result and the store say partial
+        log.warning("channel_archive: missing-parts line failed dm=%s", dm)
 
 
 def _code(exc: BaseException) -> str:

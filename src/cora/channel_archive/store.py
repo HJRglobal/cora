@@ -182,6 +182,7 @@ class Proposal:
     counts: dict = field(default_factory=dict)
     rows: list = field(default_factory=list)
     registry_count: int = 0
+    n_pages: int = 0                                # pages the card was split into (0 = legacy/unknown)
     pages: dict = field(default_factory=dict)      # page -> {dm_channel, message_ts, rendered_cids, buttons}
     row_state: dict = field(default_factory=dict)  # cid -> {"state", "by", "ts", "override", "code", ...}
     card_agreed_by: str = ""
@@ -203,6 +204,14 @@ class Proposal:
     @property
     def delivered(self) -> bool:
         return any(p.get("message_ts") for p in self.pages.values())
+
+    @property
+    def fully_delivered(self) -> bool:
+        """Every page of the card posted (c1-state-machine#6). A legacy staged event
+        without ``n_pages`` falls back to "any page posted"."""
+        if self.n_pages <= 0:
+            return self.delivered
+        return all((self.pages.get(n) or {}).get("message_ts") for n in range(1, self.n_pages + 1))
 
     def state_of(self, cid: str) -> str:
         return str((self.row_state.get(cid) or {}).get("state") or OPEN)
@@ -228,8 +237,9 @@ class Fold:
         return self.proposals[self.order[-1]] if self.order else None
 
     def superseded_by(self, pid: str) -> Proposal | None:
-        """The newer DELIVERED proposal with rows that supersedes *pid* (A14), or None.
-        A blind, empty or undelivered scan retires nothing: it has nothing to act on."""
+        """The newer FULLY DELIVERED proposal with rows that supersedes *pid* (A14), or
+        None. A blind, empty, undelivered or only partly delivered scan retires nothing:
+        rows on its missing pages would be actionable from neither card."""
         p = self.proposals.get(pid)
         if p is None:
             return None
@@ -237,7 +247,7 @@ class Fold:
             o = self.proposals[other_id]
             if o.proposal_id == pid:
                 return None
-            if o.created > p.created and o.rows and o.delivered:
+            if o.created > p.created and o.rows and o.fully_delivered:
                 return o
         return None
 
@@ -319,6 +329,7 @@ def fold(events: list[dict] | None = None, ledger: list[dict] | None = None, *,
                 scanned=int(e.get("scanned") or 0), counts=dict(e.get("counts") or {}),
                 rows=[r for r in (e.get("rows") or []) if isinstance(r, dict)],
                 registry_count=int(e.get("registry_count") or 0),
+                n_pages=int(e.get("n_pages") or 0),
             )
             f.proposals[pid] = p
             f.order.append(pid)
