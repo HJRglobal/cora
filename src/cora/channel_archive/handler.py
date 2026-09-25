@@ -55,6 +55,8 @@ SYSTEMIC_CODES: frozenset = frozenset({
     "team_access_not_granted",
 })
 RERENDER_EVERY = 5
+#: classify.Verdict.extra["unreadable"] -> the retryable re-verify code (A5)
+_UNREADABLE_CODES = {"members": "members_unknown", "users_info": "users_unknown"}
 
 _PID_RE = re.compile(r"\Achanarch-[0-9a-f]{12}\Z")
 _CID_RE = re.compile(r"\AC[A-Z0-9]{8,24}\Z")
@@ -337,6 +339,12 @@ def _reverify(p: st.Proposal, row: dict, read: Any, *, now: float,
     v = cl.classify_channel(read, meta, ctx, now=now, sleep=sleep)
     if v.kind == cl.UNKNOWN:
         return "retry", f"reverify_{v.reason}", v
+    # A5: a class the classifier reached through a FAIL-SAFE substitution (members
+    # unreadable -> LEX / not a member; a failed users.info -> "a person") is a read
+    # error at tap time -- retryable, never a terminal stale with an untrue reason
+    unread = [str(x) for x in (v.extra.get("unreadable") or [])]
+    if unread:
+        return "retry", f"reverify_{_UNREADABLE_CODES.get(unread[0], unread[0])}", v
     if v.kind == cl.ACTIVE:
         return "stale", "a person posted since the card", v
     if v.kind == cl.EXEMPT:

@@ -502,6 +502,51 @@ def _busy_history(older: int):
     return hist + [msg(91 + i * 0.1) for i in range(older)]
 
 
+class TestReverifyReadErrorsAreRetryable:
+    """c1-authority-tier#1 (A5): a read error during the tap-time re-verify is a
+    RETRYABLE failure (claim released, button kept) -- never a terminal stale_refused
+    with a false reason ('reclassified as LEX' / 'a person posted')."""
+
+    @pytest.mark.parametrize("err", [api_error("ratelimited"), api_error("internal_error"),
+                                     TimeoutError("read timed out")],
+                             ids=["ratelimited", "internal_error", "timeout"])
+    def test_members_unreadable_at_tap_time_is_retryable_not_lex(self, fake, armed, err):
+        stage(tier="T1")
+        fake.members[A1] = err
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
+        assert r.outcome == "failed" and "reverify_members_unknown" in r.msg, r.msg
+        assert "lex" not in r.msg and state(A1) == st.OPEN
+        assert not fake.posts and "conversations_archive" not in fake.method_names()
+        fake.members.pop(A1)                                  # the read works again
+        assert tap(cards.ACTION_ROW, f"{PID}:{A1}:T1").outcome == "archived"
+
+    def test_a_users_info_failure_that_decides_active_is_retryable(self, fake, armed):
+        stage(tier="T1")
+        fake.history[A1].insert(0, msg(1, user="UNEWPOSTER"))
+        fake.users["UNEWPOSTER"] = api_error("ratelimited")
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
+        assert r.outcome == "failed" and "reverify_users_unknown" in r.msg, r.msg
+        assert "a person posted" not in r.msg and state(A1) == st.OPEN and not fake.posts
+
+    def test_a_bot_traffic_row_whose_poster_lookup_fails_is_retryable(self, fake, armed):
+        from _chanarch_fakes import BOTUSER
+        row = _row(BUSY, "fx-bot-room", section="B", reason="bot_traffic", tier="T1",
+                   bot_posts=1, bot_latest_days=3)
+        fake.channels.append(chan(BUSY, "fx-bot-room"))
+        fake.history[BUSY] = [msg(3, user=BOTUSER, bot_id="BOTHER"), msg(200)]
+        fake.users[BOTUSER] = api_error("internal_error")
+        stage(tier="T1", rows=[row])
+        r = tap(cards.ACTION_OVERRIDE, f"{PID}:{BUSY}:T1")
+        assert r.outcome == "failed" and "reverify_users_unknown" in r.msg, r.msg
+        assert state(BUSY) == st.OPEN and not fake.posts
+
+    def test_a_readable_person_post_is_still_stale(self, fake, armed):
+        stage(tier="T1")
+        fake.history[A1].insert(0, msg(1))
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
+        assert r.outcome == "stale_refused" and "a person posted since the card" in r.msg
+
+
 class TestReverifySecondaryFlags:
     """c1-false-inactive#0: the T1 re-verify of a B row requires the SAME thread-cap and
     private-not-member flags the card disclosed -- a changed flag is stale_refused with

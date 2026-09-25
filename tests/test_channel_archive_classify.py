@@ -272,6 +272,18 @@ class TestOverridableAndLookCloser:
         v, _ = run([msg(300)], members={CID: api_error("missing_scope")})
         assert v.reason == cl.B_LEX
 
+    def test_a_fail_safe_substitution_is_reported_on_the_verdict(self):
+        """c1-authority-tier#1: the scan keeps its fail-safe classes, but the verdict SAYS
+        a read fell back, so the T1 re-verify can refuse retryably instead of 'stale'."""
+        v, _ = run([msg(300)], members={CID: api_error("ratelimited")})
+        assert v.reason == cl.B_LEX and "members" in v.extra.get("unreadable", [])
+        v2, _ = run([msg(5, user="UUNKNOWN9"), msg(300)])
+        assert v2.kind == cl.ACTIVE and "users_info" in v2.extra.get("unreadable", [])
+        v3, _ = run([msg(5), msg(300)])                     # a real, readable person
+        assert v3.kind == cl.ACTIVE and not v3.extra.get("unreadable")
+        v4, _ = run([msg(300)])
+        assert v4.kind == cl.SECTION_A and not v4.extra.get("unreadable")
+
     def test_keep_list_channel_is_section_b(self):
         v, _ = run([msg(300)], meta=chan(CID, "cowork-daily-briefs"))
         assert v.reason == cl.B_KEEP_LIST

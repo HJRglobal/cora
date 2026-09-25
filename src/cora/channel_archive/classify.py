@@ -156,6 +156,12 @@ def _history_page(client: Any, cid: str, *, oldest: float | None, latest: float,
     return msgs, resp.get("has_more"), nxt
 
 
+#: ``ctx.user_cache`` value for a users.info lookup that FAILED: truthy (unknown = a
+#: person, fail safe = active) but distinguishable, so a verdict decided by it can say
+#: so (``Verdict.extra["unreadable"]``) and the T1 re-verify retries (A5).
+USER_UNREADABLE = "unreadable"
+
+
 def is_person(client: Any, uid: str, ctx: reg.Context) -> bool:
     if not uid or uid in (ctx.bot_uid, SLACKBOT):
         return False
@@ -165,11 +171,16 @@ def is_person(client: Any, uid: str, ctx: reg.Context) -> bool:
     try:
         resp = client.users_info(user=uid)
         u = resp.get("user") or {}
-        person = not bool(u.get("is_bot")) and not bool(u.get("is_app_user"))
+        person: Any = not bool(u.get("is_bot")) and not bool(u.get("is_app_user"))
     except Exception:  # noqa: BLE001 -- unknown = a person (fail safe = active)
-        person = True
+        person = USER_UNREADABLE
     ctx.user_cache[uid] = person
-    return person
+    return bool(person)
+
+
+def person_unreadable(uid: str, ctx: reg.Context) -> bool:
+    """True when *uid* counted as a person only because users.info failed."""
+    return bool(uid) and ctx.user_cache.get(uid) == USER_UNREADABLE
 
 
 def message_kind(client: Any, m: dict, ctx: reg.Context) -> str:
@@ -228,11 +239,14 @@ def _phase1(client: Any, cid: str, ctx: reg.Context, *, now: float,
             ts = _ts(m.get("ts"))
             kind = message_kind(client, m, ctx)
             if kind == "person":
+                # a person ONLY because users.info failed: the verdict says so (A5)
+                unread = person_unreadable(str(m.get("user") or ""), ctx)
                 if ts is None:
-                    return {"state": "active", "age_days": None}
+                    return {"state": "active", "age_days": None, "unreadable_user": unread}
                 age = (now - ts) / DAY_S
                 if age < THRESHOLD_DAYS:
-                    return {"state": "active", "age_days": round(age, 2)}
+                    return {"state": "active", "age_days": round(age, 2),
+                            "unreadable_user": unread}
             elif kind == "bot" and ts is not None and ts >= cutoff:
                 bot_posts += 1
                 bot_latest = ts if bot_latest is None else max(bot_latest, ts)
@@ -392,7 +406,10 @@ def _classify(client: Any, meta: dict, ctx: reg.Context, *, now: float,
     if p1["state"] == "unknown":
         return Verdict(kind=UNKNOWN, reason=p1["code"], lex=lex)
     if p1["state"] == "active":
-        return Verdict(kind=ACTIVE, age_days=p1.get("age_days"), lex=lex)
+        v = Verdict(kind=ACTIVE, age_days=p1.get("age_days"), lex=lex)
+        if p1.get("unreadable_user"):
+            v.extra["unreadable"] = ["users_info"]
+        return v
     p2 = _phase2(client, cid, ctx, now=now, sleep=sleep)
     if p2["state"] == "unknown":
         return Verdict(kind=UNKNOWN, reason=p2["code"], lex=lex)
@@ -426,6 +443,10 @@ def _classify(client: Any, meta: dict, ctx: reg.Context, *, now: float,
         harrison_member=harrison_member, created_days=created_days,
         canvas=canvas, tabs=len(tabs) if isinstance(tabs, list) else 0,
     )
+    if members is None:
+        # the fail-safe LEX / not-a-member classes below came from a READ FAILURE: the
+        # scan keeps them, the T1 re-verify retries on them (A5)
+        v.extra["unreadable"] = ["members"]
     un = ctx.unarchive_state.get(cid) or {}
     in_registry = cid in ctx.registry.ids or (name.lower() in ctx.registry.names if name else False)
     if lex:
