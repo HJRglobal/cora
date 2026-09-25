@@ -261,6 +261,8 @@ any T0 card.**
   `.\.venv\Scripts\python.exe scripts\run_channel_archive_proposal.py --clear-demotion`
   (lists every event) and the same with `--apply` (appends an `acknowledged` ledger row
   for EACH listed archive event, then deletes the file -- none of them re-demotes).
+  Every card staged before the demotion, or drawn while it stood, stays T0 for good
+  after the clear: ask for a fresh card before anything archives at T1.
   An attempt with no settled outcome is settled from Slack's own history (the first
   archive message in [intent - 2 min, intent + 1 h] -- the host clock may run ahead of
   Slack's), never from "open now": Cora's -> archived (and a reopen is recorded as

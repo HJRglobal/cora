@@ -452,6 +452,45 @@ def test_clear_demotion_names_and_acks_every_listed_event(capsys):
     assert acks == [("C0ROGUE001", "1790.5"), ("C0ROGUE002", "1791.5")] and not policy.is_demoted()
 
 
+class TestLadderRowMatchesTheCodeD051R2:
+    """D-051 r2 registry-ops#3: the slack-channel-archive row Harrison is asked to
+    confirm still described the pre-fix clear ('an acknowledged ledger row for that exact
+    event') and implied the lane simply resumes. The row and the runbook must say what
+    the code does: one ack per LISTED event, cards older than the demotion T0 for good,
+    and the monthly gate (first-Monday week + the failed-month retry)."""
+
+    def _row(self):
+        import yaml
+        reg = yaml.safe_load((REPO / "data" / "ladder-registry.yaml").read_text(encoding="utf-8"))
+        return next(r for r in reg["lanes"] if r["lane"] == "slack-channel-archive")
+
+    def test_the_row_describes_the_multi_event_clear_and_t0_for_good(self):
+        dem = self._row()["demotion_triggers"]
+        assert "for that exact event" not in dem
+        assert "for EVERY listed event" in dem and "appended even while already demoted" in dem
+        assert "stays T0 FOR GOOD after the clear" in dem and "fresh card" in dem
+
+    def test_the_row_describes_the_monthly_gate(self):
+        title = self._row()["title"]
+        assert "first-Monday week" in title and "monthly attempt failed" in title
+
+    def test_the_code_does_what_the_row_says(self):
+        st.write_demotion({"since": "2026-10-06T00:00:00-07:00", "channel_id": "C0ROGUE001",
+                           "archive_ts": "1790.5", "events": [
+                               {"channel_id": "C0ROGUE001", "archive_ts": "1790.5"},
+                               {"channel_id": "C0ROGUE002", "archive_ts": "1791.5"}]}, dry_run=False)
+        st.append_event("staged", proposal_id="chanarch-000000000009", ts=az(2026, 10, 5), rows=[
+            {"cid": "C0CANDID01", "section": "A", "tier": "T1"}], expires_ts=az(2026, 10, 19))
+        assert st.clear_demotion(actor=HARRISON, dry_run=False)["cleared"]
+        acks = [r for r in st.read_ledger() if r["event"] == "acknowledged"]
+        assert len(acks) == 2                                          # one per listed event
+        assert st.fold(now=az(2026, 10, 7)).proposals["chanarch-000000000009"].demoted  # T0 for good
+
+    def test_the_runbook_clearing_bullet_says_older_cards_stay_t0(self):
+        text = (REPO / "deployment" / "runbook.md").read_text(encoding="utf-8")
+        assert "stays T0 for good" in text and "fresh card before anything archives at T1" in text
+
+
 def test_the_script_never_archives_or_imports_the_bot():
     import ast
     tree = ast.parse((REPO / "scripts" / "run_channel_archive_proposal.py").read_text(encoding="utf-8"))
