@@ -1314,13 +1314,13 @@ def run_sweep(
     log.info(
         "drive_sweep: COMPLETE -- accounts=%d enumerated=%d extracted=%d "
         "ingested=%d phi_skipped=%d noise=%d dedup=%d excluded_folder=%d "
-        "static_md_owned=%d ancestry_unresolved=%d skipped_outside_allowlist=%d",
+        "static_md_owned=%d ancestry_unresolved=%d skipped_outside_allowlist=%d os_junk=%d",
         aggregate["accounts_swept"], aggregate["files_enumerated"],
         aggregate["files_extracted"], aggregate["chunks_ingested"],
         aggregate["phi_skipped"], aggregate["noise_filtered"],
         aggregate["dedup_skipped"], aggregate.get("dashboard_excluded_skipped", 0),
         aggregate.get("static_md_owned_skipped", 0), aggregate.get("ancestry_unresolved_skipped", 0),
-        aggregate.get("skipped_outside_allowlist", 0),
+        aggregate.get("skipped_outside_allowlist", 0), aggregate.get("os_junk_skipped", 0),
     )
     return aggregate
 
@@ -1334,6 +1334,15 @@ AGGREGATE_COUNTER_KEYS: tuple[str, ...] = (
     "phi_skipped", "noise_filtered", "dedup_skipped",
     "dashboard_excluded_skipped", "static_md_owned_skipped",
     "ancestry_unresolved_skipped", "skipped_outside_allowlist",
+    "os_junk_skipped",          # Code #15 RIDER B item 4 (desktop.ini belt; D-051 r1 rb-pins#1)
+)
+
+# The tree walk (sweep_founders_os) folds these per-entity counters into its
+# aggregate + COMPLETE line (its per-entity stats dict has no disposition keys
+# besides these; os_junk_skipped joined with D-051 r1 rb-pins#1).
+FOUNDERS_OS_AGGREGATE_KEYS: tuple[str, ...] = (
+    "files_enumerated", "files_extracted", "chunks_ingested",
+    "phi_skipped", "noise_filtered", "dedup_skipped", "os_junk_skipped",
 )
 
 
@@ -1866,7 +1875,7 @@ def sweep_founders_os(
     aggregate: dict = {
         "entities_swept": 0, "files_enumerated": 0, "files_extracted": 0,
         "chunks_ingested": 0, "phi_skipped": 0, "noise_filtered": 0,
-        "dedup_skipped": 0, "entities_deferred": 0, "budget_interrupted": False,
+        "dedup_skipped": 0, "os_junk_skipped": 0, "entities_deferred": 0, "budget_interrupted": False,
     }
     seen_file_ids: set[str] = set()
     run_start = datetime.now(timezone.utc)
@@ -1996,9 +2005,8 @@ def sweep_founders_os(
             )
 
         aggregate["entities_swept"] += 1
-        for k in ("files_enumerated", "files_extracted", "chunks_ingested",
-                  "phi_skipped", "noise_filtered", "dedup_skipped"):
-            aggregate[k] += stats.get(k, 0)
+        for k in FOUNDERS_OS_AGGREGATE_KEYS:
+            aggregate[k] = aggregate.get(k, 0) + stats.get(k, 0)
 
         if entity_completed:
             if not dry_run:
@@ -2035,11 +2043,11 @@ def sweep_founders_os(
 
     log.info(
         "founders_os: COMPLETE -- entities=%d enumerated=%d extracted=%d "
-        "ingested=%d phi=%d noise=%d dedup=%d deferred=%d%s",
+        "ingested=%d phi=%d noise=%d dedup=%d os_junk=%d deferred=%d%s",
         aggregate["entities_swept"], aggregate["files_enumerated"],
         aggregate["files_extracted"], aggregate["chunks_ingested"],
         aggregate["phi_skipped"], aggregate["noise_filtered"],
-        aggregate["dedup_skipped"], aggregate["entities_deferred"],
+        aggregate["dedup_skipped"], aggregate["os_junk_skipped"], aggregate["entities_deferred"],
         " [budget-interrupted]" if aggregate["budget_interrupted"] else "",
     )
     return aggregate

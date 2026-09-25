@@ -244,7 +244,8 @@ class TestPowerShellSafeLeaves:
         assert mod.ps_single_quote("2025") == "'2025'"
         assert mod.ps_single_quote("Harrison's Files") == "'Harrison''s Files'"
         assert mod.ps_single_quote("it''s") == "'it''''s'"
-        assert mod.ps_single_quote("Harrison’s") == "'Harrison’’s'"   # typographic quote, also PS-special
+        # (the typographic-quote case "Harrison’s" was doubled here until D-051 r1 rb-pins#0;
+        #  every non-ASCII name is now REFUSED -- see test_non_ascii_names_are_refused)
         assert mod.ps_single_quote("$env:X `n (1) [a] & b") == "'$env:X `n (1) [a] & b'"   # literal in '...'
         assert mod.purge_line("F1", "Harrison's Files", ACCOUNT).endswith(
             "--expect-leaf 'Harrison''s Files' --impersonate harrison@hjrglobal.com")
@@ -257,6 +258,33 @@ class TestPowerShellSafeLeaves:
                 mod.ps_single_quote(bad)
             with pytest.raises(mod.UnsafeLeafName):
                 mod.purge_line("F1", bad, ACCOUNT)
+
+    # D-051 r1 rb-pins#0: PS 5.1 reads a BOM-less UTF-8 .ps1 as Windows-1252 -- the
+    # continuation byte 0x82 of U+00C2 (and of Cyrillic te, U+0442) decodes to U+201A,
+    # 0x91 of U+00D1 to U+2018: single-quote closers, so the literal ended early and the
+    # rest of the name ran as PowerShell. Every non-ASCII name is REFUSED (D-016).
+    def test_non_ascii_names_are_refused(self):
+        mod = _load()
+        payload = "Â; Write-Output INJECTED-VIA-NAME; #"
+        for bad in (payload, "Ñ; x", "тest", "Harrison’s", "Café", "Q3 — plan"):
+            with pytest.raises(mod.UnsafeLeafName, match="non-ASCII"):
+                mod.ps_single_quote(bad)
+            with pytest.raises(mod.UnsafeLeafName):
+                mod.purge_line("F1", bad, ACCOUNT)
+            with pytest.raises(mod.UnsafeLeafName):
+                mod.kids_row("F1", bad)
+
+    def test_the_renderer_refuses_a_non_ascii_leaf_and_every_runnable_line_is_ascii(self, tmp_path):
+        mod = _load()
+        rep, _, _ = _report(mod, tmp_path)
+        rep["groups"]["DL"]["purge_folders"]["DLSUB"]["name"] = "Â; Write-Output INJECTED-VIA-NAME; #"
+        text = mod.render_manifest(rep)
+        section = text.split("PURGE LINES", 1)[1].split("UNRESOLVED / STALE", 1)[0]
+        assert "# REFUSED: folder DLSUB -- the folder name contains a non-ASCII character" in section
+        assert "--folder-id DLSUB " not in section and "@{id='DLSUB'" not in section
+        runnable = [l for l in section.splitlines() if l.startswith(".venv") or "$kids row" in l]
+        assert runnable and all(l.isascii() for l in runnable)
+        assert "--expect-leaf 'scans' --impersonate" in section                 # the ASCII sibling still prints
 
     def test_the_renderer_prints_refused_never_a_mangled_line(self, tmp_path):
         mod = _load()

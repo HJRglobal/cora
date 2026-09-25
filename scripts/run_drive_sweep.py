@@ -160,9 +160,10 @@ def _notify_after_run(stats: dict, *, with_slack: bool, dry_run: bool) -> None:
 
 def _format_slack_summary(stats: dict, dry_run: bool) -> str:
     """The --with-slack text. Carries EVERY aggregate counter, incl. the 9/8
-    disposition counters (excluded folder / static_md-owned / ancestry unresolved)
-    and the D-303 skipped_outside_allowlist -- both surfaces here had shown only
-    the legacy seven (Code #13 slice 8 brought them up to date)."""
+    disposition counters (excluded folder / static_md-owned / ancestry unresolved),
+    the D-303 skipped_outside_allowlist and the Code #15 os_junk_skipped
+    (desktop.ini belt) -- both surfaces here had shown only the legacy seven (Code
+    #13 slice 8 brought them up to date; D-051 r1 rb-pins#1 added os_junk)."""
     mode = " *(dry-run)*" if dry_run else ""
     return (
         f":file_folder: *Drive Sweep complete{mode}*\n"
@@ -176,7 +177,8 @@ def _format_slack_summary(stats: dict, dry_run: bool) -> str:
         f"Excluded-folder skipped: {stats.get('dashboard_excluded_skipped', 0)}\n"
         f"static_md-owned (in-tree .md) skipped: {stats.get('static_md_owned_skipped', 0)}\n"
         f"Ancestry unresolved (held): {stats.get('ancestry_unresolved_skipped', 0)}\n"
-        f"Outside allowlist skipped (D-303): {stats.get('skipped_outside_allowlist', 0)}"
+        f"Outside allowlist skipped (D-303): {stats.get('skipped_outside_allowlist', 0)}\n"
+        f"OS junk skipped (desktop.ini): {stats.get('os_junk_skipped', 0)}"
     )
 
 
@@ -186,13 +188,13 @@ def _format_done_line(stats: dict) -> str:
     return (
         "Drive sweep DONE -- accounts=%d enumerated=%d extracted=%d "
         "ingested=%d phi=%d noise=%d dedup=%d excluded_folder=%d "
-        "static_md_owned=%d ancestry_unresolved=%d skipped_outside_allowlist=%d" % (
+        "static_md_owned=%d ancestry_unresolved=%d skipped_outside_allowlist=%d os_junk=%d" % (
             stats.get("accounts_swept", 0), stats.get("files_enumerated", 0),
             stats.get("files_extracted", 0), stats.get("chunks_ingested", 0),
             stats.get("phi_skipped", 0), stats.get("noise_filtered", 0),
             stats.get("dedup_skipped", 0), stats.get("dashboard_excluded_skipped", 0),
             stats.get("static_md_owned_skipped", 0), stats.get("ancestry_unresolved_skipped", 0),
-            stats.get("skipped_outside_allowlist", 0),
+            stats.get("skipped_outside_allowlist", 0), stats.get("os_junk_skipped", 0),
         )
     )
 

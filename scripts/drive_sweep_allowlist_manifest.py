@@ -26,7 +26,8 @@ The manifest has three decision sections:
       scripts/purge_cora_internal_kb.py --folder-id <id> --expect-leaf '<name>' --impersonate <account>
     line (the leaf a PowerShell SINGLE-quoted literal, every single-quote character
     doubled; a name PS 5.1 cannot pass intact -- a double quote, a trailing backslash,
-    a control character -- prints a REFUSED line instead; Code #15 C13-02) plus the
+    a control character, any non-ASCII character -- prints a REFUSED line instead;
+    Code #15 C13-02) plus the
     runbook 4e ``$kids`` row to paste as printed, for the UNCHANGED positive-leaf gate (option (a): no new selector was
     added to the purge script). The gate refuses a chain shorter than 3
     ([folder, ..., root]), so a TOP-LEVEL folder (depth 2 under My Drive) is
@@ -265,7 +266,9 @@ class UnsafeLeafName(ValueError):
 
 #: PowerShell treats ALL of these as single-quote characters (it also closes a
 #: single-quoted string on the typographic ones): inside '...' each is escaped by
-#: DOUBLING it (Code #15 C13-02 -- "Harrison's ..." folder names are common).
+#: DOUBLING it (Code #15 C13-02 -- "Harrison's ..." folder names are common). Only the
+#: ASCII one can reach the doubling now (a non-ASCII name is refused first, D-051 r1
+#: rb-pins#0); the typographic ones stay listed as a belt.
 _PS_SINGLE_QUOTES = ("'", "‘", "’", "‚", "‛")
 
 
@@ -274,7 +277,11 @@ def ps_single_quote(value: str) -> str:
     every single-quote character doubled). Refuses (UnsafeLeafName) what PS 5.1 cannot
     hand to a native exe intact: an ASCII double quote (5.1 does not escape an embedded
     ``"`` when it re-quotes an argument), a trailing backslash (it would escape that
-    re-added closing quote), a CR / LF / NUL / other control character, or an empty name."""
+    re-added closing quote), a CR / LF / NUL / other control character, an empty name,
+    or ANY non-ASCII character -- PS 5.1 reads a BOM-less UTF-8 .ps1 (and Get-Content
+    shows a BOM-less .txt) as Windows-1252, where UTF-8 continuation bytes such as 0x82 /
+    0x91 / 0x92 decode to single-quote characters that close the literal early (D-016:
+    the emitted PowerShell stays ASCII)."""
     raw = str(value or "")
     if not raw:
         raise UnsafeLeafName("empty folder name")
@@ -284,6 +291,8 @@ def ps_single_quote(value: str) -> str:
         raise UnsafeLeafName("the folder name ends with a backslash")
     if any(ord(c) < 32 or ord(c) == 127 for c in raw):
         raise UnsafeLeafName("the folder name contains a control character")
+    if not raw.isascii():
+        raise UnsafeLeafName("the folder name contains a non-ASCII character")
     out = raw
     for q in _PS_SINGLE_QUOTES:
         out = out.replace(q, q + q)

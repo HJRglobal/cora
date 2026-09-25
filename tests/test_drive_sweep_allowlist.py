@@ -394,6 +394,18 @@ class TestRunSweepAllowlist:
         assert {"dashboard_excluded_skipped", "static_md_owned_skipped", "ancestry_unresolved_skipped"} <= set(
             drive_sweep.AGGREGATE_COUNTER_KEYS)
 
+    # D-051 r1 rb-pins#1: the desktop.ini belt's counter reaches the run-level surfaces.
+    def test_os_junk_counter_reaches_the_aggregate_and_the_complete_line(self, tmp_path, caplog):
+        assert "os_junk_skipped" in drive_sweep.AGGREGATE_COUNTER_KEYS
+        with patch("cora.connectors.drive_sweep.sweep_user") as sw, \
+             caplog.at_level(logging.INFO, logger="cora.drive_sweep"):
+            sw.return_value = {"files_enumerated": 1, "files_extracted": 0, "chunks_ingested": 0, "phi_skipped": 0,
+                               "noise_filtered": 0, "dedup_skipped": 0, "os_junk_skipped": 4}
+            agg = drive_sweep.run_sweep("/fake/sa.json", _two_account_yaml(tmp_path), MagicMock(), MagicMock())
+        assert agg["os_junk_skipped"] == 8
+        complete = [r.getMessage() for r in caplog.records if "drive_sweep: COMPLETE --" in r.getMessage()]
+        assert complete and "os_junk=8" in complete[-1]
+
     def test_aggregate_sums_the_counter_across_accounts(self, tmp_path):
         kb = MagicMock()
         with patch("cora.connectors.drive_sweep.sweep_user") as sw:
@@ -431,6 +443,16 @@ class TestRunDriveSweepSurfaces:
             assert tok in text
         legacy = mod._format_slack_summary({"accounts_swept": 1}, dry_run=True)         # a legacy-shaped dict
         assert "(dry-run)" in legacy and "Outside allowlist skipped (D-303): 0" in legacy
+
+    def test_both_surfaces_carry_the_os_junk_counter(self):
+        # D-051 r1 rb-pins#1: the desktop.ini belt (Code #15 RIDER B item 4) is counted on
+        # the run-level DONE line and the --with-slack summary, not only per account.
+        mod = _load_run_drive_sweep()
+        stats = {**_STATS, "os_junk_skipped": 5}
+        assert "os_junk=5" in mod._format_done_line(stats)
+        assert "OS junk skipped (desktop.ini): 5" in mod._format_slack_summary(stats, dry_run=False)
+        assert "os_junk=0" in mod._format_done_line({"accounts_swept": 1})
+        assert "OS junk skipped (desktop.ini): 0" in mod._format_slack_summary({"accounts_swept": 1}, dry_run=True)
 
 
 # ── self-inventory (I4): the mode renders beside the pinned exclusions ───────

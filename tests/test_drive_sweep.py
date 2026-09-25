@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, PropertyMock
@@ -1263,6 +1264,25 @@ class TestSweepFoundersOsOrchestration:
         # every entity completed -> all watermarks advanced
         assert {k for k, _ in kb.sync_writes} == {
             "founders_os_FNDR_f_fndr", "founders_os_F3E_f_f3e", "founders_os_OSN_f_osn"}
+
+    def test_os_junk_counter_reaches_the_aggregate_and_the_complete_line(self, caplog):
+        # D-051 r1 rb-pins#1: _sweep_folder_tree counts desktop.ini into the per-entity
+        # stats; the tree walk used to fold only six fixed keys and drop it.
+        top = [{"id": "f_fndr", "name": "00-Founder"}, {"id": "f_f3e", "name": "02-F3-Energy"}]
+
+        def fake_tree(**kw):
+            kw["stats"]["os_junk_skipped"] = kw["stats"].get("os_junk_skipped", 0) + 3
+            return True
+
+        with self._patch_build(), \
+             patch("cora.connectors.drive_sweep._list_subfolders",
+                   side_effect=lambda svc, fid: top if fid == _ds.FOUNDERS_OS_ROOT_ID else []), \
+             patch("cora.connectors.drive_sweep._sweep_folder_tree", side_effect=fake_tree), \
+             caplog.at_level(logging.INFO, logger="cora.drive_sweep"):
+            agg = _ds.sweep_founders_os("/sa.json", _FakeKB(), None, time_budget_min=None)
+        assert agg["os_junk_skipped"] == 6
+        complete = [r.getMessage() for r in caplog.records if "founders_os: COMPLETE --" in r.getMessage()]
+        assert complete and "os_junk=6" in complete[-1]
 
     def test_interrupted_entity_does_not_advance_watermark(self):
         top = [{"id": "f_fndr", "name": "00-Founder"},
