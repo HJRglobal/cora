@@ -362,6 +362,36 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
         "CORA_CHANNEL_ARCHIVE_DEMOTION_PATH", str(tmp_path / "channel-archive-demotion.json")
     )
     monkeypatch.delenv("CORA_CHANNEL_ARCHIVE", raising=False)
+    # Code #16 C1 (dead-channel archive lane): the proposals store, the fsync'd
+    # archive ledger and the cross-process scan lock are per-call env paths -> tmp,
+    # so a suite run never writes data/state/channel-archive-proposals.jsonl,
+    # logs/channel-archive-ledger.jsonl or data/state/channel-archive-scan.lock
+    # (all three are in _GUARDED_LEDGERS). The channel REGISTRY is a read-only input
+    # on G:, so every test reads the committed SYNTHETIC fixture instead (9 entity
+    # sections incl. LEX, the coverage sentinel, >= 100 fake ids) -- hermetic, and a
+    # fixture id can never collide with a live registry row.
+    monkeypatch.setenv(
+        "CORA_CHANNEL_ARCHIVE_STORE_PATH", str(tmp_path / "channel-archive-proposals.jsonl")
+    )
+    monkeypatch.setenv(
+        "CORA_CHANNEL_ARCHIVE_LEDGER_PATH", str(tmp_path / "channel-archive-ledger.jsonl")
+    )
+    monkeypatch.setenv(
+        "CORA_CHANNEL_ARCHIVE_SCAN_LOCK_PATH", str(tmp_path / "channel-archive-scan.lock")
+    )
+    monkeypatch.setenv(
+        "CORA_CHANNEL_REGISTRY_PATH",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures",
+                     "channel-archive-registry.md"),
+    )
+    # A29: slack_file_upload caches ONE scope set process-wide for 600 s, not keyed by
+    # client -- a test that injects x-oauth-scopes would leak "channels:manage present"
+    # into a later "scope unknown -> record-only" test. Reset per test.
+    try:
+        from cora.tools import slack_file_upload as _sfu_c1
+        _sfu_c1.reset_scope_cache()
+    except Exception:
+        pass
     # WS-4 drive-extractor pause: .env carries DRIVE_EXTRACTOR_PROPOSALS_ENABLED=0
     # (the D-066 production pause) and config.py's import-time load_dotenv() pulls
     # it into the test process, short-circuiting run_proposal_loop and reddening
@@ -835,6 +865,10 @@ _GUARDED_LEDGERS = (
     "data/state/info-for-cora-watermark.json",
     # Code #16 C1: the dead-channel archive lane's automatic-demotion state.
     "data/state/channel-archive-demotion.json",
+    # Code #16 C1: the lane's proposals store, fsync'd archive ledger and scan lock.
+    "data/state/channel-archive-proposals.jsonl",
+    "logs/channel-archive-ledger.jsonl",
+    "data/state/channel-archive-scan.lock",
 )
 
 
