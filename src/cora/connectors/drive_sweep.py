@@ -1338,8 +1338,12 @@ AGGREGATE_COUNTER_KEYS: tuple[str, ...] = (
 )
 
 # The tree walk (sweep_founders_os) folds these per-entity counters into its
-# aggregate + COMPLETE line (its per-entity stats dict has no disposition keys
-# besides these; os_junk_skipped joined with D-051 r1 rb-pins#1).
+# aggregate + COMPLETE line (os_junk_skipped joined with D-051 r1 rb-pins#1).
+# NOT the full list (D-051 r2 purge#r2-0): _process_single_folder_files also
+# counts cora_internal_skipped, personal_books_skipped and
+# dashboard_excluded_skipped into the same per-entity stats, and those counts
+# reach neither the aggregate nor any log line -- to surface one, add it here
+# AND to the COMPLETE line.
 FOUNDERS_OS_AGGREGATE_KEYS: tuple[str, ...] = (
     "files_enumerated", "files_extracted", "chunks_ingested",
     "phi_skipped", "noise_filtered", "dedup_skipped", "os_junk_skipped",

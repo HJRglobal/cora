@@ -1284,6 +1284,39 @@ class TestSweepFoundersOsOrchestration:
         complete = [r.getMessage() for r in caplog.records if "founders_os: COMPLETE --" in r.getMessage()]
         assert complete and "os_junk=6" in complete[-1]
 
+    def test_the_aggregate_key_comment_names_every_tree_walk_counter_it_does_not_fold(self):
+        # D-051 r2 purge#r2-0: the comment above FOUNDERS_OS_AGGREGATE_KEYS said the
+        # tree walk's per-entity stats had "no disposition keys besides these", while
+        # _process_single_folder_files wrote three more that the fold throws away.
+        # Every counter that processor writes is folded, or NAMED as not folded there.
+        import ast
+        import inspect
+        from pathlib import Path
+
+        fn = ast.parse(inspect.getsource(_ds._process_single_folder_files))
+        written = set()
+        for n in ast.walk(fn):
+            if (isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name)
+                    and n.value.id == "stats" and isinstance(n.slice, ast.Constant)):
+                written.add(n.slice.value)
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Name) and n.func.value.id == "stats"
+                    and n.func.attr in ("get", "setdefault") and n.args
+                    and isinstance(n.args[0], ast.Constant)):
+                written.add(n.args[0].value)
+        assert {"files_enumerated", "os_junk_skipped", "cora_internal_skipped",
+                "personal_books_skipped", "dashboard_excluded_skipped"} <= written  # the scan sees them
+        lines = Path(_ds.__file__).read_text(encoding="utf-8").splitlines()
+        at = next(i for i, ln in enumerate(lines) if ln.startswith("FOUNDERS_OS_AGGREGATE_KEYS"))
+        comment = []
+        while at > 0 and lines[at - 1].startswith("#"):
+            at -= 1
+            comment.append(lines[at])
+        text = " ".join(comment)
+        unfolded = written - set(_ds.FOUNDERS_OS_AGGREGATE_KEYS)
+        assert sorted(k for k in unfolded if k not in text) == []
+        assert "no disposition keys besides these" not in text
+
     def test_interrupted_entity_does_not_advance_watermark(self):
         top = [{"id": "f_fndr", "name": "00-Founder"},
                {"id": "f_lex", "name": "08-Lexington-Services"}]

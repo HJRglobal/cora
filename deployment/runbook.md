@@ -415,7 +415,11 @@ Start-Sleep 310
 #     paste each "runbook 4e $kids row (paste as printed)" line EXACTLY as printed -- the name is already a PowerShell
 #     single-quoted literal with every apostrophe doubled (Code #15 C13-02: "Harrison's ..." names broke the old
 #     hand-typed name='...' row). A "# REFUSED: folder <id>" line means the name cannot pass through PS 5.1 intact
-#     (a double quote, a trailing backslash, a control character): rename it in Drive and re-run step 1. Each apply
+#     (a double quote, a trailing backslash, a control character, an empty name, or ANY non-ASCII character --
+#     including a typographic/curly apostrophe, which macOS/iOS autocorrect types in place of a straight one, or an
+#     accented letter; D-051 r1 rb-pins#0 -- a plain ASCII apostrophe is fine, it is doubled): rename it in Drive
+#     and re-run step 1. Such a folder gets NO PURGE line until it is renamed, and the rename is a Drive connector
+#     write -- Harrison's to make (plain ASCII, e.g. a straight apostrophe), never a Code session's. Each apply
 #     REFUSES (nothing deleted) if its step-3 dry-run manifest is missing, does not cover every selected file (files
 #     added since -> re-run step 3 first, or add --accept-delta only if you accept them), or --expect-leaf mismatches.
 #     A folder whose dry-run showed 0 chunks deletes nothing.

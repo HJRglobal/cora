@@ -40,8 +40,9 @@ SAFETY
     equal the original document with EXACTLY the dropped ids removed -- same other
     cases, same order, same top-level keys. Otherwise the whole run is REFUSED and
     nothing is written.
-  * Atomic temp + os.replace; a one-time backup `<file>.bak-2026-09-24` (an existing
-    backup is never overwritten, so a second --apply keeps the first original).
+  * Atomic temp + os.replace; a one-time backup `<file>.bak-2026-09-24` holding the
+    exact bytes the plan was verified against (an existing backup is never
+    overwritten, so a second --apply keeps the first original).
   * Every other byte is preserved: header comments, the other cases' formatting,
     and the file's own line terminator (the live file is CRLF).
   * An absent id is a no-op, reported as clean.
@@ -55,9 +56,17 @@ WHAT IS DELIBERATELY NOT TOUCHED
     scout listed (stale portfolio-cash figure, one-off calculation, a fragment).
 
 CONCURRENCY
-    The bot rewrites the WHOLE file on each approved append (read, append, write).
-    An append racing --apply can resurrect a dropped case; it can never corrupt the
-    file. That is why the last step above is a second dry run that must say clean.
+    The bot rewrites the WHOLE file on each approved append (read, append, temp +
+    replace), so an append can race --apply two ways; neither corrupts the file.
+  * The bot read BEFORE --apply and replaced AFTER it: its rewrite RESURRECTS a
+    dropped case. That is why the last step above is a second dry run that must
+    say clean.
+  * The bot replaced the file AFTER --apply read it: writing the plan would silently
+    drop the bot's new case, and the second dry run could not see that. So --apply
+    re-reads the file immediately before its os.replace and REFUSES -- nothing
+    written, no backup, no temp left -- unless it is byte-identical to what was
+    planned and verified. Re-run the same command. What is left is the
+    sub-millisecond gap between that re-read and the os.replace itself.
 """
 from __future__ import annotations
 
@@ -89,17 +98,36 @@ def _norm(text: object) -> str:
     return " ".join(str(text or "").split())
 
 
-def _safe_write(path: Path, text: str) -> Path | None:
-    """Atomic write + one-time backup; returns the backup path when one was made."""
+def _safe_write(path: Path, text: str, original: bytes) -> Path | None:
+    """Atomic write + one-time backup of *original* -- the bytes the plan was built
+    and verified on, never a second read. Returns the backup path when one was made.
+
+    Raises Refused, leaving nothing behind (no write, no new backup, no temp), when
+    the file no longer holds *original* at the moment before the replace: the bot
+    rewrote it after it was read, and writing the plan would drop that rewrite.
+    """
     backup = path.with_name(path.name + BACKUP_SUFFIX)
-    made = None
-    if path.exists() and not backup.exists():
-        backup.write_bytes(path.read_bytes())
-        made = backup
     tmp = path.with_name(path.name + ".tmp-purge")
-    with io.open(tmp, "w", encoding="utf-8", newline="") as fh:
-        fh.write(text)
-    os.replace(tmp, path)
+    made = None
+    try:
+        if not backup.exists():
+            backup.write_bytes(original)
+            made = backup
+        with io.open(tmp, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+        try:
+            current = path.read_bytes()
+        except OSError:
+            current = None
+        if current != original:
+            raise Refused("the file changed after it was read and verified (the bot "
+                          "rewrote it -- an approved append?) -- nothing written; re-run")
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        if made is not None:
+            made.unlink(missing_ok=True)
+        raise
     return made
 
 
@@ -196,14 +224,18 @@ def purge(path: Path, apply: bool) -> tuple[int, list[str]]:
     notes = [f"target: {path}"]
     if not path.exists():
         return 0, notes + ["SKIP: file not found"]
-    raw = io.open(path, encoding="utf-8", newline="").read()
+    original = path.read_bytes()
+    raw = original.decode("utf-8")      # no newline translation: the bytes, as text
     try:
         new_text, dropped, plan_notes = plan(raw)
     except Refused as exc:
         return 0, notes + [f"REFUSED: {exc}"]
     notes += plan_notes
     if apply and dropped:
-        backup = _safe_write(path, new_text)
+        try:
+            backup = _safe_write(path, new_text, original)
+        except Refused as exc:
+            return 0, notes + [f"REFUSED: {exc}"]
         if backup is not None:
             notes.append(f"backup: {backup}")
     return len(dropped), notes

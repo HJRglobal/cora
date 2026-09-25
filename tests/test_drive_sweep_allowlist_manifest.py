@@ -274,6 +274,25 @@ class TestPowerShellSafeLeaves:
             with pytest.raises(mod.UnsafeLeafName):
                 mod.kids_row("F1", bad)
 
+    # D-051 r2 purge#r2-1: runbook step 4e still listed only the pre-rb-pins#0 causes,
+    # so its likeliest real trigger (a typographic apostrophe) was missing from the doc.
+    def test_runbook_4e_names_every_cause_ps_single_quote_refuses(self):
+        mod = _load()
+        text = (_REPO_ROOT / "deployment" / "runbook.md").read_text(encoding="utf-8")
+        start = text.index("# 4e. The purges:")
+        block = text[start:text.index("$env:PYTHONIOENCODING", start)]
+        assert block.isascii()                                   # D-016: pasted PS stays ASCII
+        prose = " ".join(ln.lstrip("# ").strip() for ln in block.splitlines())
+        causes = {'say "hi"': "a double quote", "trailing\\": "a trailing backslash",
+                  "line\nbreak": "a control character", "": "an empty name",
+                  "Harrison’s": "ANY non-ASCII character", "Café": "an accented letter"}
+        for bad, words in causes.items():
+            with pytest.raises(mod.UnsafeLeafName):
+                mod.ps_single_quote(bad)
+            assert words in prose, words
+        assert "typographic/curly apostrophe" in prose
+        assert "gets NO PURGE line until it is renamed" in prose and "Harrison's to make" in prose
+
     def test_the_renderer_refuses_a_non_ascii_leaf_and_every_runnable_line_is_ascii(self, tmp_path):
         mod = _load()
         rep, _, _ = _report(mod, tmp_path)

@@ -8,7 +8,8 @@ Pinned: dry run writes nothing; --apply removes exactly the two target ids and
 nothing else (other cases byte-identical, header kept, CRLF kept, backup made);
 an absent id is a no-op; a content-key mismatch refuses that id; a second apply
 is clean; the re-parse safety check refuses a result that is not "original minus
-the dropped cases".
+the dropped cases"; a bot rewrite landing after the read is REFUSED, never
+replaced away (D-051 r2 rider#r2-0).
 """
 from __future__ import annotations
 
@@ -175,6 +176,67 @@ def test_the_reparse_safety_net_refuses_every_wrong_result():
         pg.plan("cases: not-a-list\n")
     with pytest.raises(pg.Refused):
         pg.plan("cases: [\n")
+
+
+_RACED = {"id": "auto-note-fedcba987654", "entity": "OSN",
+          "question": "Which dock receives the pallet returns?",
+          "expect_substring": "Pallet returns go to the Mesa dock",
+          "source": "contributed_note_approval"}
+
+
+def _race_after_plan(monkeypatch, p: Path, rewrite) -> None:
+    """The bot's _append_case replacing the file AFTER purge() read and planned it,
+    before purge()'s own os.replace (D-051 r2 rider#r2-0)."""
+    real_plan = pg.plan
+
+    def racing_plan(raw, targets=None):
+        out = real_plan(raw, targets)
+        rewrite(p)
+        return out
+    monkeypatch.setattr(pg, "plan", racing_plan)
+
+
+def test_an_append_landing_after_the_read_is_refused_not_dropped(tmp_path, monkeypatch):
+    # D-051 r2 rider#r2-0: --apply used to write its stale plan over the bot's
+    # rewrite -- the new case vanished and the closing dry run still said clean.
+    p = _write(tmp_path, _corpus())
+    appended = _corpus(_CASES + [_RACED]).encode("utf-8")
+    _race_after_plan(monkeypatch, p, lambda q: q.write_bytes(appended))
+    count, notes = pg.purge(p, apply=True)
+    assert count == 0
+    assert any(n.startswith("REFUSED:") and "changed after it was read" in n for n in notes)
+    assert p.read_bytes() == appended                      # the bot's case is kept
+    assert _siblings(p) == {"golden-set-auto.yaml"}        # no backup, no temp left
+    # the operator re-runs: the drop now plans on the file WITH the bot's case,
+    # and the backup is exactly the bytes that plan was verified against
+    monkeypatch.undo()
+    assert pg.purge(p, apply=True)[0] == 2
+    ids = [c["id"] for c in yaml.safe_load(p.read_text(encoding="utf-8"))["cases"]]
+    assert _RACED["id"] in ids and _TARGET_IDS.isdisjoint(ids)
+    assert p.with_name(p.name + ".bak-2026-09-24").read_bytes() == appended
+
+
+def test_a_refused_apply_keeps_an_existing_backup(tmp_path, monkeypatch):
+    raw = _corpus()
+    p = _write(tmp_path, raw)
+    assert pg.purge(p, apply=True)[0] == 2                 # first apply makes the backup
+    backup = p.with_name(p.name + ".bak-2026-09-24")
+    p.write_bytes(raw.encode("utf-8"))                      # a resurrecting rewrite
+    appended = _corpus(_CASES + [_RACED]).encode("utf-8")
+    _race_after_plan(monkeypatch, p, lambda q: q.write_bytes(appended))
+    count, notes = pg.purge(p, apply=True)
+    assert count == 0 and any(n.startswith("REFUSED:") for n in notes)
+    assert p.read_bytes() == appended
+    assert backup.read_bytes() == raw.encode("utf-8")       # the first original, untouched
+    assert _siblings(p) == {"golden-set-auto.yaml", backup.name}
+
+
+def test_a_file_that_vanished_after_the_read_is_not_recreated(tmp_path, monkeypatch):
+    p = _write(tmp_path, _corpus())
+    _race_after_plan(monkeypatch, p, lambda q: q.unlink())
+    count, notes = pg.purge(p, apply=True)
+    assert count == 0 and any(n.startswith("REFUSED:") for n in notes)
+    assert not p.exists() and not any(p.parent.iterdir())
 
 
 def test_an_unexpected_layout_is_refused_not_guessed(tmp_path):
