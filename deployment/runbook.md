@@ -224,8 +224,13 @@ any T0 card.**
   surprise card that would supersede an open ask card. Run marker every `--apply
   --monthly` fire: ok delivered / ok skipped / **FAILED `month_undelivered` (incl. a
   crash), `month_blind` (the card proposed nothing) or `month_partial` (a continuation
-  message did not post) + exit 1**. A blind or partial card is not the month's card:
-  re-run `--apply --monthly` inside the same week once the cause is fixed. Dry runs and
+  message did not post) + exit 1**. A blind or partial card is not the month's card.
+  **A month whose monthly attempt failed stays due on EVERY later Monday** (the next
+  fire retries; the FAILED marker keeps the check WARN until then) until a non-blind,
+  fully delivered card lands -- asking 'archive the dead channels' in the DM after the
+  failure also settles it, so no retry card supersedes that ask card. A month with no
+  monthly attempt at all (a late registration, or the host off the whole first-Monday
+  week) is skipped green and waits for the next first Monday. Dry runs and
   `--clear-demotion` write no marker.
 - **Blind scans propose nothing and say why** (registry / deny-list / store
   unreadable, Slack's list incomplete, bot identity unknown). The registry is read from

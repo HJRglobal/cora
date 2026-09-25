@@ -2,9 +2,10 @@
 # cq-be90cea867c3, ladder row slack-channel-archive, born T0).
 #
 # Runs scripts/run_channel_archive_proposal.py --apply --monthly once a week. The
-# script itself decides whether this month's card is due: it delivers only inside the
-# month's first-Monday week (AZ) and only until a non-blind, fully delivered monthly
-# card went out this calendar month, otherwise it skips. A weekly trigger + that
+# script itself decides whether this month's card is due: it delivers inside the
+# month's first-Monday week (AZ) until a non-blind, fully delivered monthly card went
+# out this calendar month (and on every later Monday of a month whose monthly attempt
+# failed, until a full card lands), otherwise it skips. A weekly trigger + that
 # self-gate (rather than a schtasks /MO FIRST trigger, which this repo has never
 # exercised and which registers with StartWhenAvailable=false) means a first Monday
 # the host was off is caught up the next time it is on that week; a registration late

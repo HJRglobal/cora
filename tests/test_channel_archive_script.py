@@ -212,6 +212,117 @@ class TestMonthlyGateD051:
         assert markers()[-1]["outcome"] == "skipped:lane_off"
 
 
+class TestMonthlyRetryAfterAFailedAttemptD051R2:
+    """D-051 r2 registry-ops#0 (orchestrator adjudication): the first-Monday-week bound
+    dropped the next-Monday retry, and the next Monday's ok=True skip marker cleared the
+    ok=False WARN -- a crash, an undelivered card or a partial card on the first Monday
+    lost the month with a green check. A month whose MONTHLY attempt failed (a month_*
+    marker, or a monthly scan / blind / partial proposal this month) is due on EVERY
+    later Monday until a non-blind, fully delivered card lands; a month with no attempt
+    stays bound to the first-Monday week (the 9/28 pin in TestMonthlyGateD051)."""
+
+    def _no_green_skip_after(self, first_failed_index):
+        later = markers()[first_failed_index + 1:]
+        return not any(m["ok"] is True and str(m["outcome"]).startswith("skipped") for m in later)
+
+    def test_an_undelivered_first_monday_is_retried_the_next_monday_not_skipped_green(self, fake):
+        from _chanarch_fakes import api_error
+        fake.post_behaviour = lambda kw: api_error("channel_not_found")
+        assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 5)) == 1
+        assert markers()[-1]["outcome"] == "month_undelivered"
+        fake.post_behaviour = None
+        assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 12)) == 0
+        assert markers()[-1]["outcome"] == "delivered" and self._no_green_skip_after(0)
+        assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 19)) == 0
+        assert markers()[-1]["outcome"] == "skipped:already_delivered_this_month"
+
+    def test_a_crashed_first_monday_is_retried_the_next_monday(self, fake, monkeypatch):
+        import cora.channel_archive.scan as scan_mod
+        real = scan_mod.scan
+        monkeypatch.setattr(scan_mod, "scan", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+        assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 5)) == 1
+        monkeypatch.setattr(scan_mod, "scan", real)
+        assert SCRIPT.monthly_due(az(2026, 10, 12), st.fold(now=az(2026, 10, 12)),
+                                  SCRIPT.run_marker.read_markers()) == (True, "due")
+        assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 12)) == 0
+        assert markers()[-1]["outcome"] == "delivered"
+
+    def test_a_first_monday_that_left_only_a_marker_is_still_retried(self, fake):
+        """A scan already running (the lock held) returns before any store event, so the
+        month_undelivered marker is the only record of the attempt."""
+        token = st.acquire_scan_lock(now=az(2026, 10, 5))
+        assert token is not None
+        assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 5)) == 1
+        assert markers()[-1]["outcome"] == "month_undelivered" and st.read_events() in ([], None)
+        st.release_scan_lock(token)
+        assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 12)) == 0
+        assert markers()[-1]["outcome"] == "delivered" and self._no_green_skip_after(0)
+
+    def test_a_partial_first_monday_is_retried_on_every_later_monday(self, monkeypatch):
+        from _chanarch_fakes import api_error
+        t = az(2026, 10, 5)
+        chans = [chan(f"C0DEAD{i:04d}", f"fx-dead-{i:02d}", now=t) for i in range(21)]
+        f = FakeSlack(channels=chans, history={c["id"]: [msg(200, now=t)] for c in chans},
+                      scopes=["channels:manage", "chat:write"])
+        monkeypatch.setattr(clients, "read_client_factory", lambda: f)
+        monkeypatch.setattr(clients, "write_client_factory", lambda: f)
+        monkeypatch.setattr("cora.channel_archive.classify.PACE_S", 0.0)
+        f.post_behaviour = lambda kw: api_error("ratelimited") if len(f.posts) >= 1 else None
+        assert SCRIPT.main(["--apply", "--monthly"], now=t) == 1
+        assert markers()[-1]["outcome"] == "month_partial"
+        for d in (12, 19, 26):
+            assert SCRIPT.monthly_due(az(2026, 10, d), st.fold(now=az(2026, 10, d)),
+                                      SCRIPT.run_marker.read_markers()) == (True, "due")
+
+    def test_a_blind_first_monday_is_due_on_every_later_monday_until_a_full_card(self, fake, monkeypatch):
+        from cora.channel_archive import registry as reg
+        real_policy = reg.load_deny_policy
+        monkeypatch.setattr(reg, "load_deny_policy", lambda *a, **k: None)
+        assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 5)) == 1
+        assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 12)) == 1     # still blind
+        assert markers()[-1]["outcome"] == "month_blind" and self._no_green_skip_after(0)
+        monkeypatch.setattr(reg, "load_deny_policy", real_policy)
+        assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 19)) == 0
+        assert markers()[-1]["outcome"] == "delivered"
+
+    def test_a_full_ask_card_after_the_failed_attempt_settles_the_month(self, fake):
+        """The recovery the marker names ('ask in the DM') must not be superseded by a
+        surprise retry card the next Monday (A14)."""
+        from _chanarch_fakes import api_error
+        from cora.channel_archive import deliver
+        fake.post_behaviour = lambda kw: api_error("channel_not_found")
+        assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 5)) == 1
+        fake.post_behaviour = None
+        assert deliver.deliver_proposal(trigger="ask", now=az(2026, 10, 6, 9, 0), sleep=no_sleep)["delivered"]
+        posts = len(fake.posts)
+        assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 12)) == 0
+        m = markers()[-1]
+        assert m["ok"] is True and m["outcome"] == "skipped:delivered_after_failed_attempt"
+        assert len(fake.posts) == posts
+
+    def test_another_months_failure_does_not_reopen_this_month(self):
+        failed = [{"task": SCRIPT.TASK_NAME, "ok": False, "outcome": "month_undelivered",
+                   "month": "2026-09", "attempt_ts": az(2026, 9, 7), "ts": "2026-09-07T14:07:00+00:00"}]
+        assert SCRIPT.monthly_due(az(2026, 10, 12), st.fold(events=[], ledger=[]), failed) == (
+            False, "not_due_after_first_monday_week")
+        failed[0]["month"] = "2026-10"
+        assert SCRIPT.monthly_due(az(2026, 10, 12), st.fold(events=[], ledger=[]), failed) == (True, "due")
+
+    def test_every_failure_marker_leads_with_the_recovery_step_inside_the_120_char_cut(self, fake, monkeypatch):
+        from _chanarch_fakes import api_error
+        from cora.channel_archive import registry as reg
+        fake.post_behaviour = lambda kw: api_error("channel_not_found")
+        SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 5))
+        fake.post_behaviour = None
+        monkeypatch.setattr(reg, "load_deny_policy", lambda *a, **k: None)
+        SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 12))
+        failed = [m for m in markers() if m["ok"] is False]
+        assert [m["outcome"] for m in failed] == ["month_undelivered", "month_blind"]
+        for m in failed:
+            assert "retried next Monday" in m["detail"][:120], m["detail"]
+            assert m["month"] == "2026-10"
+
+
 class TestManualAndClear:
     def test_manual_apply_delivers_without_a_marker(self, fake):
         assert SCRIPT.main(["--apply"], now=az(2026, 10, 5)) == 0

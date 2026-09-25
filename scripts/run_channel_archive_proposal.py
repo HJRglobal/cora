@@ -17,12 +17,13 @@ Usage (from the repo root, main's tree checked out):
     .venv\\Scripts\\python.exe scripts\\run_channel_archive_proposal.py --apply
 
     # THE SCHEDULED TASK (cowork-cora-channel-archive-proposal, weekly Monday 07:07 AZ):
-    # delivers only inside the month's first-Monday week (AZ; so a Tuesday
+    # delivers inside the month's first-Monday week (AZ; so a Tuesday
     # StartWhenAvailable catch-up still delivers, but a late-month registration waits
-    # for the NEXT first Monday) and only until a non-blind, fully delivered monthly
-    # card went out this calendar month; else skips. Writes the run marker (ok
-    # delivered / ok skipped / FAILED month_undelivered | month_blind | month_partial
-    # + exit 1).
+    # for the NEXT first Monday) until a non-blind, fully delivered monthly card went
+    # out this calendar month -- and, once a monthly attempt FAILED this month, on every
+    # later Monday too until a full, sighted card (any trigger) lands; else skips.
+    # Writes the run marker (ok delivered / ok skipped / FAILED month_undelivered |
+    # month_blind | month_partial + exit 1).
     .venv\\Scripts\\python.exe scripts\\run_channel_archive_proposal.py --apply --monthly
 
     # Harrison only: show / clear the automatic demotion (clearing appends an
@@ -74,16 +75,58 @@ def fully_delivered(p: st.Proposal) -> bool:
     return all((p.pages.get(i) or {}).get("message_ts") for i in range(1, n + 1))
 
 
-def monthly_due(now: float, fold: st.Fold) -> tuple[bool, str]:
-    """(due, why). Due ONLY inside the month's first-Monday week (AZ: first Monday <=
-    today < first Monday + 7 days), and only until a NON-blind, FULLY delivered MONTHLY
-    card went out this calendar month (D-051 r1 registry-ops#0 + #4).
+#: The ok=False outcomes of a monthly fire that did not deliver this month's card.
+FAILED_MONTH_OUTCOMES = ("month_undelivered", "month_blind", "month_partial")
+#: Leads every FAILED marker detail: the nightly shows only its first 120 characters.
+RETRY_STEP = "retried next Monday until a full card lands (or DM Cora 'archive the dead channels')"
+
+
+def _month_key(ts: float) -> str:
+    return datetime.fromtimestamp(ts, _AZ).strftime("%Y-%m")
+
+
+def failed_monthly_attempt(now: float, fold: st.Fold, markers: list[dict] | None) -> float | None:
+    """The epoch of this AZ calendar month's EARLIEST failed monthly attempt, or None
+    (D-051 r2 registry-ops#0): a monthly ``scan_started`` or monthly proposal this month
+    (by the time monthly_due asks, none of them is a sighted, fully delivered card), or
+    an ok=False month_* run marker of this task for this month -- a crash before the
+    scan, a scan already running or a refused client leave no store event."""
+    key = _month_key(now)
+    seen: list[float] = []
+    for e in fold.scans_started:
+        ts = float(e.get("ts") or 0)
+        if str(e.get("trigger") or "") == "monthly" and _month_key(ts) == key:
+            seen.append(ts)
+    seen += [p.created for p in fold.proposals.values()
+             if p.trigger == "monthly" and _month_key(p.created) == key]
+    for m in markers or []:
+        if (str(m.get("task") or "") != TASK_NAME or m.get("ok") is not False
+                or str(m.get("outcome") or "") not in FAILED_MONTH_OUTCOMES):
+            continue
+        try:
+            at = float(m.get("attempt_ts") or 0) or datetime.fromisoformat(str(m.get("ts"))).timestamp()
+        except (TypeError, ValueError):
+            continue
+        if str(m.get("month") or _month_key(at)) == key:
+            seen.append(at)
+    return min(seen) if seen else None
+
+
+def monthly_due(now: float, fold: st.Fold, markers: list[dict] | None = None) -> tuple[bool, str]:
+    """(due, why). Due inside the month's first-Monday week (AZ: first Monday <= today <
+    first Monday + 7 days) until a NON-blind, FULLY delivered MONTHLY card went out this
+    calendar month (D-051 r1 registry-ops#0 + #4) -- and, in a month whose monthly
+    attempt FAILED (``failed_monthly_attempt``; *markers* = this ledger's run markers), on
+    EVERY later Monday too, until a non-blind, fully delivered card of any trigger lands
+    after that failure (D-051 r2 registry-ops#0: the next Monday's green skip marker
+    replaced the failure's WARN and lost the month).
 
     The week bound keeps the Tuesday StartWhenAvailable catch-up (A28) but stops a task
     registered late in a month from firing a surprise catch-up card the next Monday
-    (which would supersede an open ask card, A14) -- it waits for the NEXT first Monday.
-    A blind card proposes nothing and a partial one leaves rows unposted, so neither is
-    the month's card: a re-run inside the week retries."""
+    (which would supersede an open ask card, A14) -- a month with NO attempt waits for
+    the NEXT first Monday. A blind card proposes nothing and a partial one leaves rows
+    unposted, so neither is the month's card. A full ask card after a failed attempt
+    settles the month, so the recovery the marker names is never superseded by a retry."""
     today = datetime.fromtimestamp(now, _AZ).date()
     fm = first_monday(today.year, today.month)
     if today < fm:
@@ -94,6 +137,13 @@ def monthly_due(now: float, fold: st.Fold) -> tuple[bool, str]:
         made = datetime.fromtimestamp(p.created, _AZ).date()
         if (made.year, made.month) == (today.year, today.month):
             return False, "already_delivered_this_month"
+    failed_at = failed_monthly_attempt(now, fold, markers)
+    if failed_at is not None:
+        for p in fold.proposals.values():
+            if p.created >= failed_at and not p.blind and fully_delivered(p) \
+                    and _month_key(p.created) == _month_key(now):
+                return False, "delivered_after_failed_attempt"
+        return True, "due"
     if today >= fm + timedelta(days=7):
         return False, "not_due_after_first_monday_week"
     return True, "due"
@@ -107,22 +157,23 @@ def _month_not_done(out: dict, now: float) -> tuple[str, str] | None:
     """A delivered monthly card that is NOT this month's card (D-051 r1 registry-ops#0):
     a BLIND one proposed nothing (-> month_blind), a PARTIAL one left rows unposted
     (-> month_partial). Both are ok=False + exit 1 so the run-marker check WARNs, and
-    monthly_due retries them inside the first-Monday week. None = a full, sighted card."""
+    monthly_due retries them every later Monday of the month (r2 registry-ops#0). The
+    detail LEADS with that recovery step: the nightly shows only 120 characters. None =
+    a full, sighted card."""
     pid = str(out.get("proposal_id") or "")
     p = st.fold(now=now).proposals.get(pid)
     if out.get("blind"):
         detail = (p.blind_detail if p is not None else "") or ""
-        return "month_blind", (f"proposal {pid}: the scan was BLIND ({out.get('blind')}"
-                               f"{': ' + detail if detail else ''}) -- the card proposed nothing; fix "
-                               "the cause, then re-run --apply --monthly inside the first-Monday week "
-                               "(or ask 'archive the dead channels' in the DM)")
+        return "month_blind", (f"{RETRY_STEP} -- BLIND ({out.get('blind')}): proposal {pid} proposed "
+                               f"nothing{': ' + detail if detail else ''}; fix the cause, or a re-run "
+                               "reads blind again")
     expected = len(cards.paginate(p.rows)) if p is not None else 0
     posted = int(out.get("pages") or 0)
     if str(out.get("reason") or "").startswith("post_failed") or out.get("partial") \
             or (p is not None and not fully_delivered(p)):
-        return "month_partial", (f"proposal {pid}: {posted} of {expected or '?'} message(s) posted "
-                                 f"({out.get('reason')}) -- the unposted rows were not proposed; re-run "
-                                 "--apply --monthly inside the first-Monday week")
+        return "month_partial", (f"{RETRY_STEP} -- PARTIAL ({posted} of {expected or '?'} message(s) "
+                                 f"posted, {out.get('reason')}): proposal {pid}; the unposted rows were "
+                                 "not proposed")
     return None
 
 
@@ -244,30 +295,36 @@ def main(argv: list[str] | None = None, *, now: float | None = None) -> int:
 
     t0 = time.time()
     if args.monthly:
+        # every monthly marker carries the AZ month + this run's clock, so the next
+        # Monday's monthly_due can tell a FAILED month from an untried one (r2 registry-ops#0)
+        month = {"month": _month_key(now), "attempt_ts": now}
         try:
-            due, why = monthly_due(now, st.fold(now=now))
+            due, why = monthly_due(now, st.fold(now=now), run_marker.read_markers())
             if not due:
                 run_marker.write(TASK_NAME, script=SCRIPT, ok=True, outputs=0, outcome=f"skipped:{why}",
-                                 detail=why, elapsed_s=round(time.time() - t0, 1))
+                                 detail=why, elapsed_s=round(time.time() - t0, 1), extra=month)
                 _print(f"Monthly dead-channel card not due ({why}).")
                 return 0
             out = deliver.deliver_proposal(trigger="monthly", now=now)
         except Exception as exc:  # noqa: BLE001 -- a crash is an undelivered month (A28), said out loud
             _crashed("monthly", now, exc)
             run_marker.write(TASK_NAME, script=SCRIPT, ok=False, outputs=0, outcome="month_undelivered",
-                             detail=f"crashed: {type(exc).__name__}", elapsed_s=round(time.time() - t0, 1))
+                             detail=f"{RETRY_STEP} -- crashed: {type(exc).__name__}",
+                             elapsed_s=round(time.time() - t0, 1), extra=month)
             _print(f"FAILED: the monthly dead-channel scan crashed ({type(exc).__name__}) -- no card.")
             return 1
         if out.get("reason") == "off":
             run_marker.write(TASK_NAME, script=SCRIPT, ok=True, outputs=0, outcome="skipped:lane_off",
-                             detail="CORA_CHANNEL_ARCHIVE=off", elapsed_s=round(time.time() - t0, 1))
+                             detail="CORA_CHANNEL_ARCHIVE=off", elapsed_s=round(time.time() - t0, 1),
+                             extra=month)
             _print("Lane switched off (CORA_CHANNEL_ARCHIVE=off) -- no card.")
             return 0
         failed = _month_not_done(out, now) if out.get("delivered") else None
         if failed is not None:
             outcome, detail = failed
             run_marker.write(TASK_NAME, script=SCRIPT, ok=False, outputs=int(out.get("pages") or 0),
-                             outcome=outcome, detail=detail, elapsed_s=round(time.time() - t0, 1))
+                             outcome=outcome, detail=detail, elapsed_s=round(time.time() - t0, 1),
+                             extra=month)
             _print(f"FAILED ({outcome}): {detail}")
             return 1
         if out.get("delivered"):
@@ -276,12 +333,12 @@ def main(argv: list[str] | None = None, *, now: float | None = None) -> int:
                              detail=f"proposal {out.get('proposal_id')}: {out.get('rows', 0)} rows, "
                                     f"{len(out.get('candidate_ids') or [])} in section A, blind="
                                     f"{out.get('blind') or 'no'}",
-                             elapsed_s=round(time.time() - t0, 1))
+                             elapsed_s=round(time.time() - t0, 1), extra=month)
             _print(f"Monthly dead-channel card delivered ({out.get('pages')} message(s)).")
             return 0
         run_marker.write(TASK_NAME, script=SCRIPT, ok=False, outputs=0, outcome="month_undelivered",
-                         detail=f"this month's card is due and was not delivered: {out.get('reason')}",
-                         elapsed_s=round(time.time() - t0, 1))
+                         detail=f"{RETRY_STEP} -- NOT DELIVERED: {out.get('reason')}",
+                         elapsed_s=round(time.time() - t0, 1), extra=month)
         _print(f"FAILED: the monthly card is due and was not delivered ({out.get('reason')}).")
         return 1
 
