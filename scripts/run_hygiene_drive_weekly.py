@@ -16,18 +16,24 @@ WHAT IT DOES (``--apply``, what the task passes)
     a NO-HASH, read-only walk of the whole tree (~90 s measured 9/24).
  5. A non-zero PS1 exit -> no report, exit 4.
  6. Finds the new stamp by diffing the listing (a pre-existing stamp = a
-    collision -> exit 5; Export-Csv would have overwritten someone's run).
+    collision -> exit 5; Export-Csv would have overwritten someone's run). A
+    walk that wrote its CSVs / run log but NO summary (the PS1 still exits 0
+    when the summary write fails) is an INCOMPLETE WALK: report + an
+    ``incomplete`` ledger row, so rotation reaches its files -- exit 1.
  7. Parses the summary + run log (counts only; the run log's lines carry paths).
  8. SANITY FLOOR: files AND folders >= 80% of the HIGH-WATER full run (the
-    largest eligible run of step 9, the 9/21 baseline included -- anchoring on
-    the prior alone let the floor ratchet down 20% a week), 0 walk errors
-    (WALK-*/FATAL/OUTPUT-WRITE run-log lines), both CSVs readable and their row
-    counts == the summary totals. A failure writes an INCOMPLETE WALK report (no
-    lists, no deltas), records the stamp as ``incomplete``, and exits 1 -- never
-    a clean report on a partial walk (the "0 violations" failure mode).
+    largest of the newest KEEP_RUNNER_STAMPS eligible runs of step 9 -- the 9/21
+    baseline counts only while it is among them; anchoring on the prior alone
+    let the floor ratchet down 20% a week), 0 walk errors (WALK-*/FATAL/
+    OUTPUT-WRITE run-log lines), both CSVs readable and their row counts == the
+    summary totals, and the prior's two CSVs readable. A failure writes an
+    INCOMPLETE WALK report (no lists, no deltas), records the stamp as
+    ``incomplete``, and exits 1 -- never a clean report on a partial walk (the
+    "0 violations" failure mode).
  9. Prior = the newest earlier FULL-ROOT stamp this runner recorded as passing
     the floor (its stamp ledger), or the 2026-09-21 19:48 hashing baseline;
-    never a hand/subtree run, never a run that failed the floor.
+    never a hand/subtree run, never a run that failed the floor, never a run
+    older than the newest operator re-baseline (below).
 10. Writes ``<report_dir>\YYYY-MM-DD_fndr_hygiene-findings.md`` ONLY if
     report_dir exists (never mkdir -- a mkdir on a Drive mount can mint a
     "(1)" twin), only at the exact path, and never over a same-named file that
@@ -46,6 +52,18 @@ the counts, and writes NOTHING: no report, no manifest, no sidecar, no ledger
 row, no rotation. The temp dir (it holds LEX paths) is removed afterwards.
 ``--from-stamp <stamp>`` rebuilds the report from an existing run in the
 out-dir without walking (``--apply`` writes the .md + sidecar only).
+
+``--rebaseline <stamp>`` is the operator's escape hatch for a LEGITIMATE shrink
+(a partition moved out of the tree, a purge) that the high-water floor would
+otherwise refuse every week: a failed floor is ledgered ``incomplete``, never
+becomes eligible, and so could never move the anchor (D-051 R2 rb2#r2-0 /
+lens#r2-1). It names a stamp this runner recorded (full root, NO-HASH) whose
+walk passes every check EXCEPT the floor, and ``--apply`` appends a
+``rebaselined`` row to the stamp ledger: from then on that stamp is eligible
+and no older run -- the 9/21 baseline included -- is a prior or part of the
+high-water. The baseline's files stay on disk (the RIDER B proposer reads
+them). ``--dry-run`` (the default) validates and prints, writing nothing. The
+INCOMPLETE report prints the exact commands whenever the walk itself was sound.
 
 The Notion ``[Hygiene] Drive`` page stays Cowork-side: the rewritten Cowork
 hygiene-drive task reads this .md and publishes it (Cora has no Notion write
@@ -218,6 +236,25 @@ def detect_new_stamp(before: set[str], after: set[str]) -> tuple[str | None, str
     return stamp, None
 
 
+def detect_summaryless_stamp(before: set[str], after: set[str]) -> str | None:
+    """The stamp of a walk that wrote files but NO summary, else None. The PS1
+    writes the two CSVs, then the summary, then the run log in its finally
+    block and exits 0 even when the summary's Set-Content fails (it only logs
+    'OUTPUT-WRITE-ERROR (summary)'), so ``detect_new_stamp`` -- keyed on the
+    summary -- saw nothing and those files were never ledgered, never rotated
+    (D-051 R2 rb2#r2-2). Exactly one such stamp, no new summary at all, and
+    none of its four names pre-existing (else it may be someone else's run)."""
+    if any(_SUMMARY_NAME_RE.match(n) for n in after - before):
+        return None
+    new = sorted({m.group(1) for n in after - before if (m := ROTATION_RE.match(n))})
+    if len(new) != 1:
+        return None
+    stamp = new[0]
+    if any(n in before for n in stamp_files(stamp)):
+        return None
+    return stamp
+
+
 # ── steps 7-9: parse, prior, sanity ─────────────────────────────────────────
 
 @dataclass
@@ -274,8 +311,10 @@ def read_ledger(path: Path) -> list[dict]:
 
 
 def ledger_state(rows: list[dict]) -> dict[str, dict]:
-    """stamp -> its "created" row, with ``rotated`` set once a rotation row exists."""
+    """stamp -> its "created" row, with ``rotated`` set once a rotation row exists
+    and ``rebaselined`` set once an operator re-baseline row names it."""
     out: dict[str, dict] = {}
+    rebased: set[str] = set()
     for r in rows:
         st = r.get("stamp")
         if not isinstance(st, str):
@@ -284,7 +323,23 @@ def ledger_state(rows: list[dict]) -> dict[str, dict]:
             out[st] = dict(r)
         elif r.get("event") == "rotated" and st in out:
             out[st]["rotated"] = True
+        elif r.get("event") == "rebaselined":
+            rebased.add(st)
+    for st in rebased:
+        if st in out:
+            out[st]["rebaselined"] = True
     return out
+
+
+def rebaseline_cutoff(ledger: dict[str, dict]) -> str | None:
+    """The newest operator re-baselined stamp: no run older than it is a prior or
+    part of the high-water mark any more (the 9/21 baseline included)."""
+    return max((st for st, r in ledger.items() if r.get("rebaselined")), default=None)
+
+
+def _is_runner_walk(row: dict | None) -> bool:
+    """A ledger "created" row for a full-root, NO-HASH walk this runner launched."""
+    return bool(row) and row.get("full_root") is True and row.get("max_hash_mb") == 0
 
 
 def append_ledger(path: Path, row: dict) -> None:
@@ -295,17 +350,22 @@ def append_ledger(path: Path, row: dict) -> None:
 
 def eligible_runs(outdir: Path, current: str, full_root: Path, ledger: dict[str, dict]) -> list[RunInfo]:
     """Every earlier stamp that is a runner run which passed the floor (ledger
-    status clean/unverified, not rotated) or the 9/21 baseline, AND whose own
-    summary says COMPLETE on the full root with 0 walk errors and both CSVs
-    present -- newest first. Hand and subtree runs are never eligible."""
+    status clean/unverified, not rotated) or that the operator re-baselined onto,
+    or the 9/21 baseline, AND whose own summary says COMPLETE on the full root
+    with 0 walk errors and both CSVs present -- newest first. Hand and subtree
+    runs are never eligible, and neither is any run older than the newest
+    re-baseline (``rebaseline_cutoff``) -- the baseline included."""
     out: list[RunInfo] = []
+    cutoff = rebaseline_cutoff(ledger)
     stamps = sorted({m.group(1) for n in listing(outdir) if (m := _SUMMARY_NAME_RE.match(n))}, reverse=True)
     for st in stamps:
-        if st >= current:
+        if st >= current or (cutoff is not None and st < cutoff):
             continue
         row = ledger.get(st)
         if st != BASELINE_STAMP:
-            if not row or row.get("rotated") or row.get("status") not in ("clean", "unverified"):
+            if not row or row.get("rotated"):
+                continue
+            if row.get("status") not in ("clean", "unverified") and not row.get("rebaselined"):
                 continue
         info = read_run(outdir, st)
         if info is None:
@@ -329,15 +389,21 @@ def find_prior(outdir: Path, current: str, full_root: Path, ledger: dict[str, di
 
 
 def high_water(runs: list[RunInfo]) -> dict[str, tuple[int, str]]:
-    """{'files_total' / 'dirs_total': (largest total, its stamp)} over the eligible
-    runs -- every retained runner run that passed the floor PLUS the 9/21
-    baseline. The sanity floor is anchored HERE, not on the prior alone: a walk
-    that passed 80% of an already-partial prior would otherwise become next
-    week's floor, and the floor would ratchet down 20% a week (D-051 R1
-    rb2-r8#1: 100 -> 81 -> 65 read CLEAN, with 16 unwalked offenders reported
-    'resolved')."""
+    """{'files_total' / 'dirs_total': (largest total, its stamp)} over the newest
+    KEEP_RUNNER_STAMPS eligible runs (``runs`` is newest first) -- the runner
+    runs that passed the floor, plus the 9/21 baseline only while it is among
+    them. The sanity floor is anchored HERE, not on the prior alone: a walk that
+    passed 80% of an already-partial prior would otherwise become next week's
+    floor, and the floor would ratchet down 20% a week (D-051 R1 rb2-r8#1: 100
+    -> 81 -> 65 read CLEAN, with 16 unwalked offenders reported 'resolved').
+
+    BOUNDED (D-051 R2 lens#r2-1 / rb2#r2-0): the never-rotated baseline used to
+    anchor the floor forever, so a legitimate cumulative 20% shrink since 9/21
+    failed every week and no week could ever pass to move it. Now the anchor is
+    the window rotation keeps, and a shrink larger than the floor allows within
+    it is accepted only by the operator (``--rebaseline``), never by waiting."""
     hw: dict[str, tuple[int, str]] = {}
-    for info in runs:
+    for info in runs[:KEEP_RUNNER_STAMPS]:
         for key in ("files_total", "dirs_total"):
             n = info.summary.get(key) or 0
             if n and (key not in hw or n > hw[key][0]):
@@ -453,13 +519,23 @@ def _report_date(stamp: str) -> str:
     return f"{stamp[0:4]}-{stamp[4:6]}-{stamp[6:8]}"
 
 
-def build_outputs(stamp: str, prior_dir: Path, prior: RunInfo | None, info: RunInfo,
-                  files: list[dict], dirs: list[dict], status: str):
+def load_prior_rows(prior_dir: Path, prior: RunInfo | None) -> tuple[list[dict], list[dict]] | None:
+    """The prior's (files, dirs) rows, or None when either CSV is missing or
+    unreadable. Read through ``load_rows`` BEFORE the ledger row is written:
+    ``eligible_runs`` checks only that the CSVs exist, and an unguarded read in
+    ``build_outputs`` raised after the current stamp was already ledgered
+    'clean' -- a traceback, no report, no rotation (D-051 R2 rb2#r2-2)."""
+    if prior is None:
+        return None
+    pf = load_rows(prior_dir / stamp_files(prior.stamp)[0])
+    pd = load_rows(prior_dir / stamp_files(prior.stamp)[1])
+    return None if pf is None or pd is None else (pf, pd)
+
+
+def build_outputs(stamp: str, prior_rows: tuple[list[dict], list[dict]] | None, prior: RunInfo | None,
+                  info: RunInfo, files: list[dict], dirs: list[dict], status: str):
     now = hdr.categories(files, dirs)
-    prior_cats = None
-    if prior is not None:
-        prior_cats = hdr.categories(hdr.load_csv_rows(prior_dir / stamp_files(prior.stamp)[0]),
-                                    hdr.load_csv_rows(prior_dir / stamp_files(prior.stamp)[1]))
+    prior_cats = None if prior_rows is None else hdr.categories(*prior_rows)
     diffs = hdr.diff(now, prior_cats)
     date = _report_date(stamp)
     sidecar_name = f"hygiene-findings-full-{date}.csv"
@@ -472,12 +548,92 @@ def build_outputs(stamp: str, prior_dir: Path, prior: RunInfo | None, info: RunI
     return now, diffs, md, sidecar_name, sidecar, withheld, ini_rows, ini_lex
 
 
+def rebaseline(cfg: Config, stamp: str, ledger: dict[str, dict], *, apply: bool, now_iso: str) -> int:
+    """``--rebaseline <stamp>``: accept a legitimate shrink (module docstring).
+    Refuses unless ``stamp`` is a full-root NO-HASH walk this runner recorded,
+    not rotated, not older than an earlier re-baseline, and passing every
+    sanity check except the floor. Counts only."""
+    row = ledger.get(stamp)
+    if not _is_runner_walk(row):
+        _say("REFUSE: --rebaseline names a stamp this runner did not record as a full-root NO-HASH walk")
+        return EXIT_REFUSED
+    if row.get("rotated"):
+        _say("REFUSE: --rebaseline names a rotated stamp (its files are gone)")
+        return EXIT_REFUSED
+    cutoff = rebaseline_cutoff(ledger)
+    if cutoff is not None and stamp < cutoff:
+        _say(f"REFUSE: a newer re-baseline ({cutoff}) is already recorded")
+        return EXIT_REFUSED
+    info = read_run(cfg.outdir, stamp)
+    if info is None:
+        _say("REFUSE: --rebaseline names a stamp with no readable summary")
+        return EXIT_REFUSED
+    files = load_rows(cfg.outdir / stamp_files(stamp)[0])
+    dirs = load_rows(cfg.outdir / stamp_files(stamp)[1])
+    own = sanity(info, cfg.root, None, files_rows=None if files is None else len(files),
+                 dirs_rows=None if dirs is None else len(dirs), high={})
+    if own:
+        _say(f"REFUSE: --rebaseline {stamp}: the walk itself failed {len(own)} checks -- " + "; ".join(own))
+        return EXIT_REFUSED
+    hw = high_water(eligible_runs(cfg.outdir, stamp, cfg.root, ledger))
+    was = ", ".join(f"{k} {n} ({st})" for k, (n, st) in sorted(hw.items())) or "none"
+    _say(f"re-baseline {stamp}: files {info.summary.get('files_total')} dirs {info.summary.get('dirs_total')}; "
+         f"replaces the high-water [{was}] and retires every older run as prior / anchor")
+    if not apply:
+        _say("DRY-RUN: nothing written (pass --apply to record the re-baseline in the stamp ledger)")
+        return EXIT_OK
+    append_ledger(cfg.ledger, {"event": "rebaselined", "stamp": stamp, "ts": now_iso,
+                               "files_total": info.summary.get("files_total"),
+                               "dirs_total": info.summary.get("dirs_total")})
+    _say(f"re-baseline recorded; rebuild this week's report with --from-stamp {stamp} --apply")
+    return EXIT_OK
+
+
+def summaryless_walk(cfg: Config, run_dir: Path, stamp: str, after: set[str], ledger: dict[str, dict], *,
+                     apply: bool, now_iso: str) -> int:
+    """A walk that wrote files but no summary (``detect_summaryless_stamp``): an
+    INCOMPLETE WALK report plus an ``incomplete`` ledger row for the files that
+    exist, so the keep-4 rotation reaches them. The row records the runner's own
+    invocation (-Root <the audit root> -MaxHashMB 0) -- the summary that would
+    have confirmed it was never written."""
+    walk_errors = None
+    try:
+        runlog = (run_dir / stamp_files(stamp)[3]).read_text(encoding="utf-8-sig", errors="replace")
+        walk_errors = hdr.walk_error_count(hdr.count_run_log(runlog))
+    except OSError:
+        pass
+    why = ["the inventory summary was not written (the PS1 exited 0 without it)"]
+    if walk_errors is None:
+        why.append("the run log is missing")
+    elif walk_errors:
+        why.append(f"{walk_errors} walk errors logged")
+    _say(f"INCOMPLETE WALK: stamp {stamp} has no summary ({len(why)} reasons)")
+    if not apply:
+        _say("DRY-RUN: nothing written")
+        return EXIT_INCOMPLETE
+    append_ledger(cfg.ledger, {"event": "created", "stamp": stamp, "status": "incomplete", "ts": now_iso,
+                               "files": sorted(n for n in stamp_files(stamp) if n in after),
+                               "full_root": True, "max_hash_mb": 0, "summary": False})
+    runs = eligible_runs(cfg.outdir, stamp, cfg.root, ledger)
+    prior = runs[0] if runs else None
+    date = _report_date(stamp)
+    md = hdr.render_incomplete_md(date=date, stamp=stamp, reasons=why, files_total=None, dirs_total=None,
+                                  prior_stamp=prior.stamp if prior else None,
+                                  prior_files=prior.summary.get("files_total") if prior else None,
+                                  walk_errors=walk_errors)
+    _say(f"report: {write_report(cfg.report_dir, date, md)}")
+    return EXIT_INCOMPLETE
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Weekly Drive hygiene inventory + report (dry-run default)")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--apply", action="store_true", help="write the report, sidecars, ledger, rotation")
     g.add_argument("--dry-run", action="store_true", help="(default) walk into a temp dir, write nothing")
     ap.add_argument("--from-stamp", default=None, help="rebuild from an existing out-dir stamp (no walk)")
+    ap.add_argument("--rebaseline", default=None, metavar="STAMP",
+                    help="accept a legitimate shrink: make STAMP (a runner walk that failed only the "
+                         "floor) the new floor anchor, retiring every older run (ledger row; --apply writes it)")
     a = ap.parse_args(argv)
     apply = bool(a.apply)
     cfg = load_config()
@@ -488,6 +644,9 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_REFUSED
     if a.from_stamp and not re.fullmatch(_STAMP_RE, a.from_stamp):
         _say("REFUSE: --from-stamp is not a yyyyMMdd-HHmm stamp")
+        return EXIT_REFUSED
+    if a.rebaseline is not None and (a.from_stamp or not re.fullmatch(_STAMP_RE, a.rebaseline)):
+        _say("REFUSE: --rebaseline takes one yyyyMMdd-HHmm stamp and no --from-stamp")
         return EXIT_REFUSED
     # 1. mount
     if not root_available(cfg.root):
@@ -500,6 +659,8 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_REFUSED
 
     ledger = ledger_state(read_ledger(cfg.ledger))
+    if a.rebaseline is not None:
+        return rebaseline(cfg, a.rebaseline, ledger, apply=apply, now_iso=now_iso)
     tmp: Path | None = None
     try:
         if a.from_stamp:
@@ -528,6 +689,9 @@ def main(argv: list[str] | None = None) -> int:
                                                "full_root": None, "max_hash_mb": None, "ts": now_iso})
                 return EXIT_PS1
             if err or not stamp:
+                orphan = detect_summaryless_stamp(before, after)
+                if orphan is not None:
+                    return summaryless_walk(cfg, run_dir, orphan, after, ledger, apply=apply, now_iso=now_iso)
                 _say(f"REFUSE: {err}")
                 return EXIT_STAMP
             _say(f"walk done in {elapsed:.0f}s, stamp {stamp}")
@@ -544,8 +708,16 @@ def main(argv: list[str] | None = None) -> int:
         dirs = load_rows(run_dir / stamp_files(stamp)[1])
         runs = eligible_runs(cfg.outdir, stamp, cfg.root, ledger)
         prior = runs[0] if runs else None
-        why = sanity(info, cfg.root, prior, files_rows=None if files is None else len(files),
-                     dirs_rows=None if dirs is None else len(dirs), high=high_water(runs))
+        rows_n = {"files_rows": None if files is None else len(files), "dirs_rows": None if dirs is None else len(dirs)}
+        why = sanity(info, cfg.root, prior, high=high_water(runs), **rows_n)
+        prior_rows = load_prior_rows(cfg.outdir, prior)
+        if prior is not None and prior_rows is None:
+            why.append(f"the prior run's (stamp {prior.stamp}) files or folders CSV is missing or unreadable, "
+                       "so there is nothing to compare this walk with")
+        # The walk's OWN checks (everything but the comparison): when they all pass,
+        # only the floor / the prior failed, and a re-baseline onto this stamp is
+        # the operator's recovery (the INCOMPLETE report prints it).
+        own_ok = not sanity(info, cfg.root, None, high={}, **rows_n)
         status = "incomplete" if why else ("clean" if prior else "unverified")
         full_root = hdr.norm_root(info.summary.get("root")) == hdr.norm_root(cfg.root)
         _say(f"files {info.summary.get('files_total')} dirs {info.summary.get('dirs_total')} "
@@ -561,10 +733,14 @@ def main(argv: list[str] | None = None) -> int:
 
         date = _report_date(stamp)
         if why:
+            # the hint only where the re-baseline would be accepted: the walk is
+            # sound and the stamp is (now) a runner-recorded full-root NO-HASH walk
+            hint = own_ok and (not a.from_stamp or _is_runner_walk(ledger.get(stamp)))
             md = hdr.render_incomplete_md(
                 date=date, stamp=stamp, reasons=why, files_total=info.summary.get("files_total"),
                 dirs_total=info.summary.get("dirs_total"), prior_stamp=prior.stamp if prior else None,
-                prior_files=prior.summary.get("files_total") if prior else None, walk_errors=info.walk_errors)
+                prior_files=prior.summary.get("files_total") if prior else None, walk_errors=info.walk_errors,
+                rebaseline_stamp=stamp if hint else None)
             if apply:
                 _say(f"INCOMPLETE WALK ({len(why)} reasons) -- report: {write_report(cfg.report_dir, date, md)}")
             else:
@@ -572,7 +748,7 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_INCOMPLETE
 
         now, diffs, md, sidecar_name, sidecar, withheld, ini_rows, ini_lex = build_outputs(
-            stamp, cfg.outdir, prior, info, files, dirs, status)
+            stamp, prior_rows, prior, info, files, dirs, status)
         for key in hdr.CATEGORY_LABELS:
             d = diffs[key]
             _say(f"{key}: now {d.now} last {d.last if d.last is not None else 'n/a'} "

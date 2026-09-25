@@ -884,3 +884,317 @@ def test_the_runner_end_to_end_with_the_real_ps1(tmp_path, monkeypatch):
     assert "intake" not in md and "1 LEX (counts only)" in md
     rows = rh.read_ledger(tmp_path / "stamps.jsonl")
     assert rows and rows[0]["full_root"] is True and rows[0]["max_hash_mb"] == 0
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 4. D-051 R2 (rb2#r2-0, rb2#r2-1, rb2#r2-2, lens#r2-1)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# rb2#r2-1: LEX-named forms that passed all three screens (fabricated names; the
+# leads are the detector's own lead identifiers, already in fireflies_connector).
+LEX_NAMED_R2 = [
+    "01-HJR-Global\\legal\\COPA_LOI_v3 (1).pdf",                      # '_' is a \b word char
+    "_shared\\meetings\\COPA2 diligence (1).gdoc",                    # so is a digit
+    "_shared\\meetings\\Jared Harker + Sandy Patel sync (1).gdoc",     # two leads, two sub-entities
+    "_shared\\meetings\\Justin Gilmore and Jared Harker (1).gdoc",
+    "_shared\\meetings\\Justin_Gilmore 1-1 (1).gdoc",                 # separator-joined
+    "_shared\\meetings\\Jared-Harker check-in (1).gdoc",
+    "_shared\\meetings\\Shaun_Hawkins budget (1).gdoc",
+    "_shared\\meetings\\jeff.montgomery notes (1).gdoc",
+    "_shared\\meetings\\Gilmore, Justin review (1).gdoc",             # last-first
+    "_shared\\meetings\\Montgomery, Jeff review (1).gdoc",            # a title-keyword lead, last-first
+    "01-HJR-Global\\accounting\\LexServices P&L (1).xlsx",           # glued
+    "01-HJR-Global\\accounting\\LexLTS payroll (1).xlsx",
+    "01-HJR-Global\\accounting\\LTSpayroll (1).xlsx",
+    "_shared\\meetings\\BHRFs licensing (1).gdoc",                    # plural
+    "01-HJR-Global\\accounting\\LLAs roster (1).xlsx",
+    "01-HJR-Global\\accounting\\provider revalidation (1).pdf",      # cross_entity_guard's LEX row
+    "01-HJR-Global\\accounting\\Revalidation_packet (1).pdf",
+]
+# Must stay LISTABLE under the widened belt.
+NOT_LEX_R2 = [
+    "02-F3-Energy\\copay schedule (1).pdf",
+    "02-F3-Energy\\Lexus lease (1).pdf",
+    "02-F3-Energy\\llama photos (1).jpg",
+    "04-UFL\\Copacabana event (1).pdf",
+]
+
+
+def test_r2_lex_named_forms_every_screen_missed_are_counts_only():
+    md, now, diffs = _render([frow(p, suffix="paren-n") for p in LEX_NAMED_R2 + NOT_LEX_R2 + NOT_LEX], [])
+    missed = [i for i, p in enumerate(LEX_NAMED_R2) if not hdr.is_lex_relpath(p)]
+    assert missed == [], "LEX_NAMED_R2 indexes still listable"
+    for p in LEX_NAMED_R2:
+        assert p.rsplit("\\", 1)[-1] not in md, p
+    for p in NOT_LEX_R2 + NOT_LEX:
+        assert not hdr.is_lex_relpath(p), p
+        assert f"`{p}`" in md, p
+    assert f"{len(LEX_NAMED_R2)} LEX (counts only)" in md
+    side, withheld = hdr.render_full_list_csv(now, diffs)
+    assert withheld["lex"] == len(LEX_NAMED_R2)
+    for p in LEX_NAMED_R2:
+        assert p.rsplit("\\", 1)[-1].encode("utf-8") not in side, p
+
+
+def _fresh_lex_screens() -> None:
+    """Drop the once-per-process screen caches (a test that patches a source)."""
+    for name in ("_LEX_LEADS", "_LEX_ENTITIES"):
+        getattr(hdr, name, []).clear()
+    hdr._segment_names_lex.cache_clear()
+
+
+def test_r2_named_lex_people_come_from_the_org_roles_roster(monkeypatch):
+    """(d): the roster's LEX staff, not only the detector's four leads -- and only
+    people whose PRIMARY entity is LEX (a founder or finance lead with LEX among
+    several entities is not a LEX person). Fabricated registry records."""
+    from cora import org_roles
+
+    lex_person = org_roles.RoleRecord(slack_id="U0FAKE1", name="Zorin Quell", role="Program lead", entity="LEX-LLA")
+    multi = org_roles.RoleRecord(slack_id="U0FAKE2", name="Pim Vandor", role="Finance", entity="HJRG",
+                                 entities=["LEX", "OSN"])
+    shapes = ["_shared\\meetings\\{f} {l} 1-1 (1).gdoc", "_shared\\meetings\\{f}_{l}_notes (1).gdoc",
+              "_shared\\meetings\\{f}-{l} sync (1).gdoc", "_shared\\meetings\\{l}, {f} review (1).gdoc",
+              "01-HJR-Global\\accounting\\{f}.{l} reimbursements (1).xlsx",
+              "01-HJR-Global\\hr\\{f} {l}\\offer letter (1).pdf"]
+    try:
+        monkeypatch.setattr(org_roles, "all_roles", lambda: [lex_person, multi])
+        _fresh_lex_screens()
+        for sh in shapes:
+            assert hdr.is_lex_relpath(sh.format(f="Zorin", l="Quell")), sh
+            assert not hdr.is_lex_relpath(sh.format(f="Pim", l="Vandor")), sh
+    finally:
+        monkeypatch.undo()
+        _fresh_lex_screens()
+
+
+def test_r2_the_live_roster_and_detector_leads_are_counts_only_in_every_shape():
+    """Every LEX-primary person in the repo's org-roles.yaml plus every lead the
+    detector names, in six filename shapes. Failures report indexes only."""
+    from cora import org_roles
+    from cora.connectors import fireflies_connector as ff
+
+    names = {r.name for r in org_roles.all_roles() if str(r.entity).upper().startswith("LEX")}
+    names |= {ids[-1] for ids, _ in ff._FIREFLIES_PARTICIPANT_SUB_ENTITY} | {ff._SHAUN_IDENTIFIERS[-1]}
+    shapes = ["_shared\\meetings\\{f} {l} 1-1 (1).gdoc", "_shared\\meetings\\{f}_{l}_notes (1).gdoc",
+              "_shared\\meetings\\{f}-{l} sync (1).gdoc", "_shared\\meetings\\{l}, {f} review (1).gdoc",
+              "01-HJR-Global\\accounting\\{f}.{l} reimbursements (1).xlsx",
+              "01-HJR-Global\\hr\\{f} {l}\\offer letter (1).pdf"]
+    missed = []
+    for i, name in enumerate(sorted(names)):
+        parts = name.split()
+        for j, sh in enumerate(shapes):
+            if not hdr.is_lex_relpath(sh.format(f=parts[0], l=parts[-1])):
+                missed.append((i, j))
+    assert len(names) >= 4 and missed == []
+
+
+def test_r2_cross_entity_guard_lex_keywords_are_imported_not_copied(monkeypatch):
+    from cora import cross_entity_guard as ceg
+
+    lex = ceg._ENTITY_DEFS["LEX"]
+    for pat in lex.patterns:
+        kw = pat.pattern.replace("\\b", "").replace("\\", "")
+        seg = kw.replace(" ", "_")                       # joined the way a filename joins it
+        assert hdr.is_lex_relpath(f"01-HJR-Global\\notes\\{seg} (1).pdf"), kw
+    probe = "01-HJR-Global\\notes\\zqxwidget ops (1).pdf"
+    try:
+        _fresh_lex_screens()
+        assert not hdr.is_lex_relpath(probe)
+        grown = ceg._EntityDef(lex.name, lex.channel_hint, lex.patterns + ceg._compile("zqxwidget"))
+        monkeypatch.setitem(ceg._ENTITY_DEFS, "LEX", grown)
+        _fresh_lex_screens()
+        assert hdr.is_lex_relpath(probe), "a keyword added to the guard's LEX row reaches the report gate"
+    finally:
+        monkeypatch.undo()
+        _fresh_lex_screens()
+
+
+def test_r2_the_new_lex_screens_fail_closed(monkeypatch):
+    plain = "02-F3-Energy\\plain zzfailclosed (1).pdf"
+    try:
+        _fresh_lex_screens()
+        assert not hdr.is_lex_relpath(plain)
+
+        def boom():
+            raise RuntimeError("roster unreadable")
+        monkeypatch.setattr(hdr, "_lex_person_names", boom)
+        _fresh_lex_screens()
+        assert hdr._lex_lead_re() is None and hdr.is_lex_relpath(plain), "a failed name load withholds"
+        monkeypatch.undo()
+        monkeypatch.setattr(hdr, "_lex_person_names", lambda: set())
+        _fresh_lex_screens()
+        assert hdr.is_lex_relpath(plain), "an EMPTY name list withholds too"
+        monkeypatch.undo()
+        monkeypatch.setattr(hdr, "_lex_entities", lambda: None)
+        _fresh_lex_screens()
+        assert hdr.is_lex_relpath(plain), "an unavailable cross-entity keyword list withholds"
+    finally:
+        monkeypatch.undo()
+        _fresh_lex_screens()
+    assert not hdr.is_lex_relpath(plain)
+
+
+def _weekly(n: int, start: int = 0) -> list[str]:
+    from datetime import date, timedelta
+    return [(date(2026, 9, 26) + timedelta(days=7 * (start + i))).strftime("%Y%m%d") + "-0240" for i in range(n)]
+
+
+def _day(stamp: str) -> str:
+    return rh._report_date(stamp)
+
+
+def test_r2_rebaseline_accepts_a_legitimate_shrink_and_retires_the_baseline(world, monkeypatch):
+    """rb2#r2-0 + lens#r2-1: a partition moves out of the tree (78 < 80% of the
+    never-rotated 9/21 baseline). Every later week failed the floor, the failure
+    was never eligible, so nothing could ever move the anchor -- and the report
+    told the operator to wait for the G: mount."""
+    full = [frow(f"02-F3-Energy\\r\\f{i:03d}.pdf") for i in range(100)]
+    write_stamp(world.outdir, rh.BASELINE_STAMP, full, BASE_DIRS, root=world.root, max_hash=200)
+    s = _weekly(4)
+    fake_ps(monkeypatch, world, stamp=s[0], files=full)
+    assert rh.main(["--apply"]) == rh.EXIT_OK
+    for st in s[1:3]:
+        fake_ps(monkeypatch, world, stamp=st, files=full[:78])
+        assert rh.main(["--apply"]) == rh.EXIT_INCOMPLETE
+    md = world.report(_day(s[2])).read_text(encoding="utf-8")
+    assert "INCOMPLETE WALK" in md and "files walked 78 < 80%" in md
+    assert f"--rebaseline {s[2]} --apply" in md and f"--from-stamp {s[2]} --apply" in md
+    # the dry run (default) validates and writes nothing
+    ledger_before = world.ledger.read_bytes()
+    assert rh.main(["--rebaseline", s[2]]) == rh.EXIT_OK
+    assert world.ledger.read_bytes() == ledger_before
+    assert rh.main(["--rebaseline", s[2], "--apply"]) == rh.EXIT_OK
+    reb = [r for r in world.ledger_rows() if r["event"] == "rebaselined"]
+    assert len(reb) == 1 and reb[0]["stamp"] == s[2] and (reb[0]["files_total"], reb[0]["dirs_total"]) == (78, 3)
+    # the rebuilt report for the re-baselined week has nothing to compare with
+    assert rh.main(["--from-stamp", s[2], "--apply"]) == rh.EXIT_OK
+    md = world.report(_day(s[2])).read_text(encoding="utf-8")
+    assert "UNVERIFIED" in md and "INCOMPLETE" not in md
+    # next week compares with the re-baselined walk and reads CLEAN
+    fake_ps(monkeypatch, world, stamp=s[3], files=full[:78])
+    assert rh.main(["--apply"]) == rh.EXIT_OK
+    md = world.report(_day(s[3])).read_text(encoding="utf-8")
+    assert "CLEAN" in md and f"stamp `{s[2]}`" in md
+    # the baseline stays on disk (the RIDER B proposer reads it) but anchors nothing
+    assert all((world.outdir / n).exists() for n in rh.stamp_files(rh.BASELINE_STAMP))
+    runs = rh.eligible_runs(world.outdir, "20991231-2359", world.root, rh.ledger_state(rh.read_ledger(world.ledger)))
+    assert [r.stamp for r in runs] == [s[3], s[2]]
+
+
+def test_r2_rebaseline_refuses_what_it_cannot_vouch_for(world, monkeypatch):
+    write_stamp(world.outdir, rh.BASELINE_STAMP, BASE_FILES, BASE_DIRS, root=world.root, max_hash=200)
+    seed_prior(world, "20260926-0240")                                              # a sound runner walk
+    write_stamp(world.outdir, "20260927-1111", BASE_FILES, BASE_DIRS, root=world.root)  # hand run, not ledgered
+    seed_prior(world, "20261003-0240", status="incomplete", runlog=["WALK-FILE-ERROR: x :: y"])
+    seed_prior(world, "20261010-0240")
+    rh.append_ledger(world.ledger, {"event": "rotated", "stamp": "20261010-0240", "removed": 0})
+    seed_prior(world, "20261017-0240", status="incomplete", files_total=len(BASE_FILES) + 2)  # row count mismatch
+    before = world.ledger.read_bytes()
+    for st in (rh.BASELINE_STAMP, "20260927-1111", "20261003-0240", "20261010-0240", "20261017-0240",
+               "20991231-2359"):
+        assert rh.main(["--rebaseline", st, "--apply"]) == rh.EXIT_REFUSED, st
+    assert rh.main(["--rebaseline", "20260926-0240", "--from-stamp", "20260926-0240", "--apply"]) == rh.EXIT_REFUSED
+    assert rh.main(["--rebaseline", "not-a-stamp", "--apply"]) == rh.EXIT_REFUSED
+    assert world.ledger.read_bytes() == before, "a refused re-baseline writes nothing"
+    seed_prior(world, "20261024-0240")
+    assert rh.main(["--rebaseline", "20261024-0240", "--apply"]) == rh.EXIT_OK
+    assert rh.main(["--rebaseline", "20260926-0240", "--apply"]) == rh.EXIT_REFUSED, "older than a recorded re-baseline"
+
+
+def test_r2_the_high_water_is_bounded_to_the_newest_four_eligible_runs(world, monkeypatch):
+    """lens#r2-1: the baseline anchors the floor only while it is among the newest
+    KEEP_RUNNER_STAMPS eligible runs -- the window rotation keeps."""
+    full = [frow(f"02-F3-Energy\\r\\f{i:03d}.pdf") for i in range(100)]
+    write_stamp(world.outdir, rh.BASELINE_STAMP, full, BASE_DIRS, root=world.root, max_hash=200)
+    s = _weekly(rh.KEEP_RUNNER_STAMPS + 1)
+    for st in s[:-1]:
+        fake_ps(monkeypatch, world, stamp=st, files=full[:85])
+        assert rh.main(["--apply"]) == rh.EXIT_OK
+    runs = rh.eligible_runs(world.outdir, s[-1], world.root, rh.ledger_state(rh.read_ledger(world.ledger)))
+    assert runs[-1].stamp == rh.BASELINE_STAMP and len(runs) == rh.KEEP_RUNNER_STAMPS + 1
+    assert rh.high_water(runs)["files_total"][0] == 85
+    assert rh.high_water(runs[-3:])["files_total"] == (100, rh.BASELINE_STAMP), "inside the window it still anchors"
+    fake_ps(monkeypatch, world, stamp=s[-1], files=full[:70])     # >= 80% of 85, < 80% of the baseline's 100
+    assert rh.main(["--apply"]) == rh.EXIT_OK
+    assert "CLEAN" in world.report(_day(s[-1])).read_text(encoding="utf-8")
+
+
+def test_r2_the_rebaseline_hint_appears_only_when_the_walk_itself_is_sound(world, monkeypatch):
+    seed_prior(world, "20260919-0240")
+    fake_ps(monkeypatch, world, runlog=["WALK-DIR-ERROR: G:\\x :: denied"])
+    assert rh.main(["--apply"]) == rh.EXIT_INCOMPLETE
+    md = world.report().read_text(encoding="utf-8")
+    assert "--rebaseline" not in md and "once the G: mount is healthy" in md
+
+
+def test_r2_a_failed_summary_write_is_an_incomplete_walk_with_a_rotatable_ledger_row(world, monkeypatch):
+    """rb2#r2-2 case 1: the PS1 exits 0 when the summary's Set-Content fails, and
+    stamp detection keys on the summary -- exit 5, no report, and the stamp's
+    CSVs + run log (~27 MB live) were never ledgered, so never rotated."""
+    seed_prior(world, "20260919-0240")
+    st = "20260926-0240"
+    real = fake_ps(monkeypatch, world, stamp=st, runlog=["OUTPUT-WRITE-ERROR (summary): denied"])
+
+    def fake(cmd, **kw):
+        cp = real(cmd, **kw)
+        (Path(cmd[cmd.index("-OutDir") + 1]) / f"inventory-summary-{st}.txt").unlink()
+        return cp
+    monkeypatch.setattr(rh.subprocess, "run", fake)
+    assert rh.main(["--apply"]) == rh.EXIT_INCOMPLETE
+    md = world.report().read_text(encoding="utf-8")
+    assert "INCOMPLETE WALK" in md and "the inventory summary was not written" in md
+    assert "1 walk errors logged" in md and "--rebaseline" not in md and "stamp `20260919-0240`" in md
+    row = [r for r in world.ledger_rows() if r.get("stamp") == st and r["event"] == "created"]
+    assert row and row[0]["status"] == "incomplete"
+    assert sorted(row[0]["files"]) == sorted([f"inventory-files-{st}.csv", f"inventory-dirs-{st}.csv",
+                                              f"_run-log-{st}.txt"])
+    assert not list(world.outdir.glob("manifest-desktopini-*"))
+    for s2 in _weekly(5, start=1):
+        fake_ps(monkeypatch, world, stamp=s2)
+        assert rh.main(["--apply"]) == rh.EXIT_OK
+    assert not list(world.outdir.glob(f"*-{st}.*")), "the keep-4 rotation reaches the summary-less stamp"
+
+
+def test_r2_a_failed_summary_write_in_a_dry_run_writes_nothing(world, monkeypatch):
+    st = "20260926-0240"
+    real = fake_ps(monkeypatch, world, stamp=st, runlog=["OUTPUT-WRITE-ERROR (summary): denied"])
+
+    def fake(cmd, **kw):
+        cp = real(cmd, **kw)
+        (Path(cmd[cmd.index("-OutDir") + 1]) / f"inventory-summary-{st}.txt").unlink()
+        return cp
+    monkeypatch.setattr(rh.subprocess, "run", fake)
+    assert rh.main([]) == rh.EXIT_INCOMPLETE
+    assert not world.ledger.exists() and not any(world.report_dir.iterdir()) and not any(world.outdir.iterdir())
+
+
+def test_r2_summaryless_stamp_detection():
+    files = set(rh.stamp_files("20260926-0240"))
+    no_summary = files - {"inventory-summary-20260926-0240.txt"}
+    assert rh.detect_summaryless_stamp(set(), no_summary) == "20260926-0240"
+    assert rh.detect_summaryless_stamp(set(), files) is None, "a summary appeared: the normal path"
+    two = no_summary | {"inventory-files-20260926-0241.csv"}
+    assert rh.detect_summaryless_stamp(set(), two) is None
+    pre = {"inventory-files-20260926-0240.csv"}
+    assert rh.detect_summaryless_stamp(pre, pre | no_summary) is None, "pre-existing files may be someone else's run"
+    assert rh.detect_summaryless_stamp(set(), {"manifest-desktopini-2026-09-26.csv"}) is None
+
+
+@pytest.mark.parametrize("which", ["files", "dirs"])
+def test_r2_an_unreadable_prior_csv_is_an_incomplete_walk_not_a_traceback(world, monkeypatch, which):
+    """rb2#r2-2 case 2: eligible_runs checks only that the prior's CSVs exist, and
+    build_outputs read them unguarded -- a UnicodeDecodeError after the current
+    stamp was already ledgered 'clean': no report, no rotation."""
+    seed_prior(world, "20260919-0240")
+    (world.outdir / f"inventory-{which}-20260919-0240.csv").write_bytes(b"\xef\xbb\xbf\"RelPath\"\r\n\"\xff\xfe\"\r\n")
+    fake_ps(monkeypatch, world, stamp="20260926-0240")
+    assert rh.main(["--apply"]) == rh.EXIT_INCOMPLETE
+    md = world.report().read_text(encoding="utf-8")
+    assert "INCOMPLETE WALK" in md and "the prior run's (stamp 20260919-0240)" in md
+    assert "--rebaseline 20260926-0240 --apply" in md, "the walk is sound: the recovery is a re-baseline"
+    row = [r for r in world.ledger_rows() if r.get("stamp") == "20260926-0240" and r["event"] == "created"]
+    assert row and row[0]["status"] == "incomplete"
+    assert rh.main(["--rebaseline", "20260926-0240", "--apply"]) == rh.EXIT_OK
+    fake_ps(monkeypatch, world, stamp="20261003-0240")
+    assert rh.main(["--apply"]) == rh.EXIT_OK
+    assert "stamp `20260926-0240`" in world.report("2026-10-03").read_text(encoding="utf-8")

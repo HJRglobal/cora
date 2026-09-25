@@ -139,17 +139,42 @@ is regenerated. **Weekly Sat 02:40 AZ** -> `scripts/run_hygiene_drive_weekly.py 
   `Downloads\hjr-folder-audit`, `hygiene-findings-full-YYYY-MM-DD.csv` (full
   non-LEX list) and `manifest-desktopini-YYYY-MM-DD.csv` (DELETE rows, non-LEX,
   apply.ps1 schema; trend only -- Drive for Desktop recreates desktop.ini).
-- **Disclosure:** the report folder is static_md-ingested, so `08-Lexington-Services`
-  and every KB-pinned container (incl. `_archive` + `00-Founder\personal-finances`)
-  are COUNTS ONLY and listed names pass `phi_guard.is_any_phi`.
+- **Disclosure:** the report folder is static_md-ingested, so `08-Lexington-Services`,
+  any path elsewhere naming LEX (a sub-entity / program code, COPA, a
+  cross_entity_guard LEX keyword, or a LEX person from the detector's lead lists or
+  the org_roles roster, however joined) and every KB-pinned container (incl.
+  `_archive` + `00-Founder\personal-finances`) are COUNTS ONLY, and listed names
+  pass `phi_guard.is_any_phi`.
 - **Safety:** never mkdirs the report folder; never overwrites a same-named file
-  without the generator marker; a walk that fails the 80% floor / has walk errors
-  writes an INCOMPLETE WALK report and exits 1 (never a clean report). Keep-4
-  rotation deletes only stamps the runner itself recorded
+  without the generator marker; a walk that fails the floor / has walk errors /
+  wrote no summary / cannot read its prior's CSVs writes an INCOMPLETE WALK report,
+  records the stamp `incomplete` in the ledger, and exits 1 (never a clean report).
+  Keep-4 rotation deletes only stamps the runner itself recorded
   (`data/state/hygiene-drive-stamps.jsonl`), never `20260921-1948`, hand or subtree
   runs, `manifest-*`, `_applied-*` or `_dryrun-*`.
+- **The floor (high-water):** files AND folders must be >= 80% of the LARGEST of the
+  newest four eligible runs (runner runs that passed the floor; the `20260921-1948`
+  baseline counts only while it is one of those four), never of a run older than
+  the newest re-baseline. It is anchored on that high-water mark, not on last
+  week, so a partial walk cannot ratchet the floor down; a run that fails it is
+  never eligible, so a LEGITIMATE shrink bigger than 20% (a partition moved out of
+  the tree, a purge) fails every week until the operator re-baselines.
+- **Re-baseline (operator, after checking the shrink is real):** the INCOMPLETE
+  report prints the exact commands whenever the walk itself was sound (COMPLETE,
+  full root, 0 walk errors, CSV counts match). Dry-run first, then record it, then
+  rebuild that week's report:
+  `.\.venv\Scripts\python.exe scripts\run_hygiene_drive_weekly.py --rebaseline <stamp>`
+  then the same with `--apply`, then `--from-stamp <stamp> --apply` (reads
+  UNVERIFIED -- nothing is compared that week). It appends a `rebaselined` row to the
+  stamp ledger; from then on `<stamp>` is the prior and no older run (the baseline
+  included) is a prior or part of the high-water. The baseline's files stay on disk
+  (the RIDER B proposer reads them). Refused (exit 3, writes nothing) for a stamp the
+  runner did not record, a rotated one, one with its own walk failures, or one older
+  than an earlier re-baseline. If the mount was degraded instead, just re-run
+  `--apply` once it is healthy.
 - **Exit codes:** 0 ok; 1 incomplete walk; 2 G: unavailable; 3 refused (PS1 hash /
-  config); 4 PS1 failed; 5 stamp detection / collision; 6 report write refused.
+  config / a refused re-baseline); 4 PS1 failed; 5 stamp detection / collision; 6
+  report write refused.
 - **Notion:** the `[Hygiene] Drive` page stays Cowork-side -- the rewritten Cowork
   `hygiene-drive` task publishes this `.md` (keeps the orchestrator's 8-page count).
 - **Dry-run (writes nothing):** `.\.venv\Scripts\python.exe scripts\run_hygiene_drive_weekly.py`

@@ -25,8 +25,9 @@ whatever it names, and gets its own belt:
   * LEX -- ``08-Lexington-Services``, plus any path outside it with a segment
     naming LEX, a LEX sub-entity / program / lead, or COPA (``is_lex_relpath``:
     the ONE LEX title detector ``fireflies_connector.classify_lex_meeting`` per
-    segment, plus a word-bounded sub-entity belt) -- counts only, never a name
-    or a path.
+    segment, cross_entity_guard's LEX keyword row, the named LEX people from
+    the detector's lists and the org_roles roster, plus a non-letter bounded
+    sub-entity belt) -- counts only, never a name or a path.
   * every KB-pinned container (the ``kb_exclusions`` pins inside the tree, plus
     the two RIDER B pins ``_archive`` and ``00-Founder\personal-finances``) --
     counts only: a pinned folder listed by name here would leak back into the
@@ -39,11 +40,11 @@ whatever it names, and gets its own belt:
     archive working as designed) and counted separately.
 
 Everything here is a pure function of its inputs: no filesystem writes, no
-environment reads, no network. (The two screens above are imported lazily, once,
+environment reads, no network. (The screens above are imported lazily, once,
 from their owning modules -- importing ``incremental_sync_static`` runs its own
-non-override ``load_dotenv()``, which never changes a variable already set.
-Either import failing makes its screen withhold every path: fail closed, never
-list.)
+non-override ``load_dotenv()``, which never changes a variable already set; the
+org_roles roster is a read of the repo's ``data/maps/org-roles.yaml``. Any import
+or load failing makes its screen withhold every path: fail closed, never list.)
 """
 
 from __future__ import annotations
@@ -123,13 +124,33 @@ _LEX_NAME_RE = re.compile(r"(?<![a-z])(?<!non-)(?<!non )(?<!non_)lexington", re.
 # The sub-entity / program belt (D-051 R1 rb2-r8#0 + lens-d082#0): the LEX
 # codes the rest of Cora files as LEX (cross_entity_guard's LEX list,
 # drive_entity_detect's 'lbhs') that the title detector below does not key on
-# alone. "Word-bounded" = any NON-LETTER on both sides, looser than a regex \b on
-# purpose: it fires on "LBHS_report", "LTS-weekly", "Copy of Lex Services",
-# "LexLLC", "DDD contract" -- and never inside "Alex", "flex", "complex",
-# "results", "villa" or "Lexington" (that word has the rule above, with its
-# Non-Lexington exception).
+# alone. "Word-bounded" = any NON-LETTER on the left, looser than a regex \b on
+# purpose ('_' and digits are word characters to \b): it fires on "LBHS_report",
+# "LTS-weekly", "Copy of Lex Services", "LexLLC", "DDD contract", "COPA_LOI",
+# "COPA2" -- and never inside "Alex", "flex", "complex", "results", "villa",
+# "Maricopa", "copay", "Lexus" or "Lexington" (that word has the rule above, with
+# its Non-Lexington exception). D-051 R2 rb2#r2-1 widened it three ways:
+#   * lex glued or joined to a code / 'services' -- LexServices, LexLTS, Lex_LBHS;
+#   * lbhs / lts / bhrf / hcbs with a glued TAIL -- LTSpayroll, BHRFs, HCBSrates
+#     (no English word starts with those letters, so the left bound suffices);
+#   * lex / lla / ddd / copa with an optional plural (LLAs, DDDs) -- a digit tail
+#     (LEX2026, COPA2) already passes the non-letter right bound. COPA joins the
+#     belt because kb_exclusions' whole-word ``\bcopa\b`` misses COPA_LOI / COPA2.
 _LEX_BELT_RE = re.compile(
-    r"(?<![a-z])(?:lex[\s_-]*ll[ac]|lex|lbhs|lla|lts|ddd|hcbs|bhrf)(?![a-z])", re.IGNORECASE)
+    r"(?<![a-z])(?:"
+    r"lex[\s_.-]*(?:ll[ac]|lts|lbhs|lla|services?|svcs?)"
+    r"|lbhs|lts|bhrf|hcbs"
+    r"|(?:lex|lla|ddd|copa)s?(?![a-z])"
+    r")", re.IGNORECASE)
+
+# Separators a hand- or Drive-named file joins words with. The detector and the
+# cross-entity keyword list below match literal spaced phrases ('jared harker',
+# 'tucson dta'), so each also sees the segment with these turned into spaces.
+_SEP_RE = re.compile(r"[_.\-]+")
+# The HJRG 'Non-Lexington' binder folder, once separators are spaces: masked
+# before cross_entity_guard's keywords run (its 'lexington' keyword has no such
+# exception) -- the same sanctioned exception _LEX_NAME_RE carries.
+_NON_LEXINGTON_RE = re.compile(r"(?<![a-z])non\s+lexington", re.IGNORECASE)
 
 # The ONE LEX title detector, imported once (a list so a failed import is cached
 # too): [classify_lex_meeting], or [None] when the import failed.
@@ -146,23 +167,106 @@ def _lex_detector():
     return _LEX_DETECTOR[0]
 
 
+# cross_entity_guard's entity keyword table (its LEX row carries 'tucson dta',
+# 'revalidation', ... that neither the belt nor the detector knows), imported
+# once through its public read-only view so the two lists cannot drift:
+# [detect_entities], or [None] when the import failed.
+_LEX_ENTITIES: list = []
+
+
+def _lex_entities():
+    if not _LEX_ENTITIES:
+        try:
+            from cora.cross_entity_guard import detect_entities
+        except Exception:  # noqa: BLE001 -- an unavailable keyword list withholds, never lists
+            detect_entities = None
+        _LEX_ENTITIES.append(detect_entities)
+    return _LEX_ENTITIES[0]
+
+
+# The named LEX people, as ONE compiled regex: [pattern], or [None] when a source
+# failed to load. Sources (each read from its owner, never copied here): the LEX
+# detector's own lead identifiers (the per-sub-entity participant lists, the
+# Shaun list, the person names among its LEX title keywords) and every
+# org_roles registry person whose PRIMARY entity is a LEX entity (the one
+# roster). Each name matches first-last OR last-first, joined by any run of
+# spaces / '_' / '.' / ',' / '-' / '+' ("Justin_Gilmore", "Gilmore, Justin",
+# "jeff.montgomery") -- and on its own, so a segment naming two leads of
+# different sub-entities (which the detector deliberately leaves untagged) is
+# still LEX-named. Primary entity only: a founder or finance lead with LEX among
+# several entities is not a LEX person, and a file named after them is not LEX.
+_LEX_LEADS: list = []
+_LEAD_SEP = r"[\s_.,+\-]+"
+
+
+def _lex_person_names() -> set[str]:
+    from cora import org_roles
+    from cora.connectors import fireflies_connector as ff
+
+    names: set[str] = set()
+    for identifiers, _code in ff._FIREFLIES_PARTICIPANT_SUB_ENTITY:
+        names.update(identifiers)
+    names.update(ff._SHAUN_IDENTIFIERS)
+    for kw in ff._LEX_TITLE_KEYWORDS:
+        # only the PERSON names among the title keywords ('shaun hawkins'); the
+        # entity phrases ('lex services', 'lexington services') are the belt's
+        if not (_LEX_BELT_RE.search(kw) or _LEX_NAME_RE.search(kw)):
+            names.add(kw)
+    for rec in org_roles.all_roles():
+        if str(rec.entity or "").strip().upper().startswith("LEX"):
+            names.add(rec.name)
+    return names
+
+
+def _lex_lead_re():
+    if not _LEX_LEADS:
+        try:
+            alts: set[str] = set()
+            for name in _lex_person_names():
+                toks = [t for t in re.split(_LEAD_SEP, str(name).strip().lower()) if t]
+                if len(toks) < 2 or not all(t.replace("'", "").isalpha() for t in toks):
+                    continue   # a person name is two or more words
+                first, last = re.escape(toks[0]), re.escape(toks[-1])
+                alts.add(f"{first}{_LEAD_SEP}{last}")
+                alts.add(f"{last}{_LEAD_SEP}{first}")
+            if not alts:
+                raise ValueError("no LEX person names loaded")
+            rx = re.compile(r"(?<![a-z])(?:" + "|".join(sorted(alts)) + r")(?![a-z])", re.IGNORECASE)
+        except Exception:  # noqa: BLE001 -- an unavailable name list withholds, never lists
+            rx = None
+        _LEX_LEADS.append(rx)
+    return _LEX_LEADS[0]
+
+
 @functools.lru_cache(maxsize=65536)
 def _segment_names_lex(seg: str) -> bool:
     """True when ONE path segment names the LEX world. Fails CLOSED: any
-    detector error (or an unavailable detector) counts the path as LEX."""
+    screen error (or an unavailable detector / keyword list / name list) counts
+    the path as LEX."""
     if _LEX_NAME_RE.search(seg) or _LEX_BELT_RE.search(seg):
         return True
     try:
         if kb_exclusions.is_copa_meeting_title(seg):
+            return True
+        leads = _lex_lead_re()
+        if leads is None or leads.search(seg):
+            return True
+        spaced = _SEP_RE.sub(" ", seg)
+        entities = _lex_entities()
+        if entities is None or "LEX" in entities(_NON_LEXINGTON_RE.sub(" ", spaced)):
             return True
         detect = _lex_detector()
         if detect is None:
             return True
         # The segment is offered as the title AND as an attendee name: the
         # detector's named-lead signal (the LEX sub-entity leads) keys on
-        # attendee names, and a file named after a LEX lead is LEX-named.
-        verdict = detect({"title": seg, "meeting_attendees": [{"displayName": seg, "email": ""}]})
-        return bool(verdict.is_lex)
+        # attendee names, and a file named after a LEX lead is LEX-named. It
+        # sees the raw segment and the separator-spaced one ("jeff.montgomery").
+        for text in dict.fromkeys((seg, spaced)):
+            verdict = detect({"title": text, "meeting_attendees": [{"displayName": text, "email": ""}]})
+            if verdict.is_lex:
+                return True
+        return False
     except Exception:  # noqa: BLE001 -- a screen error withholds, never lists
         return True
 
@@ -217,12 +321,20 @@ def is_lex_relpath(relpath: str) -> bool:
         Entities", "Lexington - Progress (16).gdoc"; not "Non-Lexington");
       * any segment the ONE LEX title detector (``fireflies_connector.
         classify_lex_meeting``) calls LEX -- 'LBHS', 'Lex-LLC', 'Lex Services',
-        the named LEX leads, DDD / care / clinical titles;
+        the named LEX leads, DDD / care / clinical titles -- as named, and with
+        '_' / '.' / '-' read as spaces;
       * any segment carrying a sub-entity / program code (``_LEX_BELT_RE``:
-        lex, lbhs, lla, lts, lex-llc/lla, ddd, hcbs, bhrf, non-letter bounded);
-      * any segment naming the NDA'd COPA diligence (``kb_exclusions.
-        is_copa_meeting_title``: whole-word ``copa``, so never "Maricopa") --
-        its meeting exports live OUTSIDE the copa-bhrf folder.
+        lex, lbhs, lla, lts, lex-llc/lla, ddd, hcbs, bhrf, copa, left
+        non-letter bounded, plurals and glued forms included);
+      * any segment cross_entity_guard's LEX keyword row matches ('tucson
+        dta', 'revalidation', ...; the same table, never a copy);
+      * any segment naming a LEX person (the detector's lead lists plus every
+        org_roles person whose primary entity is LEX), first-last or
+        last-first, however joined, one lead or several;
+      * any segment naming the NDA'd COPA diligence (the belt's non-letter
+        bounded ``copa`` -- COPA_LOI, COPA2 -- plus ``kb_exclusions.
+        is_copa_meeting_title``; never "Maricopa" or "copay") -- its meeting
+        exports live OUTSIDE the copa-bhrf folder.
 
     A detector error counts the path as LEX (fail closed). Over-matching is the
     safe direction here: the report is a KB ingest door, and a LEX path is only
@@ -530,7 +642,8 @@ def render_md(facts: RunFacts, now: CategorySet, diffs: dict[str, Diff],
     lines: list[str] = [GENERATOR_MARKER, ""]
     lines.append(f"# [Hygiene] Drive -- {facts.date} (Cora weekly inventory)")
     lines.append("")
-    status = ("CLEAN (walk passed the sanity floor: at least 80% of the largest retained full run)"
+    status = ("CLEAN (walk passed the sanity floor: at least 80% of the largest of the last four "
+              "comparable full runs)"
               if facts.status == "clean" else
               "UNVERIFIED (no prior full-root run to compare; the sanity floor was not applied)")
     lines.append(f"- Status: **{status}**")
@@ -600,10 +713,13 @@ def render_md(facts: RunFacts, now: CategorySet, diffs: dict[str, Diff],
 
 def render_incomplete_md(*, date: str, stamp: str, reasons: list[str], files_total: int | None,
                          dirs_total: int | None, prior_stamp: str | None, prior_files: int | None,
-                         walk_errors: int | None) -> str:
+                         walk_errors: int | None, rebaseline_stamp: str | None = None) -> str:
     """The report for a walk that failed the sanity floor. Deliberately carries NO
     offender lists and NO deltas: a partial walk reads as a false improvement
-    (the "0 violations" failure mode), so nothing here may look like a result."""
+    (the "0 violations" failure mode), so nothing here may look like a result.
+    ``rebaseline_stamp`` (set only when the walk passed every check of its own
+    and a re-baseline onto it would be accepted) prints the operator's recovery
+    commands instead of the mount-health next step."""
     lines = [GENERATOR_MARKER, "",
              f"# [Hygiene] Drive -- {date} (Cora weekly inventory): INCOMPLETE WALK", "",
              "This week's inventory did NOT pass the sanity floor, so this report carries no "
@@ -617,7 +733,21 @@ def render_incomplete_md(*, date: str, stamp: str, reasons: list[str], files_tot
                  f"{walk_errors if walk_errors is not None else '?'} walk errors")
     if prior_stamp:
         lines.append(f"- Prior full run: stamp `{prior_stamp}` ({prior_files} files)")
-    lines.append("- Next step: re-run `scripts\\run_hygiene_drive_weekly.py --apply` once the G: mount is healthy.")
+    if rebaseline_stamp:
+        # D-051 R2 rb2#r2-0 / lens#r2-1: the walk itself is sound and only the
+        # COMPARISON failed (the high-water floor, or an unreadable prior), which
+        # re-running can never clear -- so name both causes and the recovery.
+        lines.append("- Next step: this walk is internally consistent (COMPLETE, full root, 0 walk errors, "
+                     "CSV row counts match the summary); only the comparison with earlier runs failed. "
+                     "If the G: mount was degraded (a partial sync), re-run "
+                     "`scripts\\run_hygiene_drive_weekly.py --apply` once it is healthy. If the change is "
+                     "real and intended (a folder moved out of the tree, a purge), accept it: "
+                     f"`scripts\\run_hygiene_drive_weekly.py --rebaseline {rebaseline_stamp} --apply`, then "
+                     f"`scripts\\run_hygiene_drive_weekly.py --from-stamp {rebaseline_stamp} --apply` rebuilds "
+                     f"this report. The re-baseline is recorded in the stamp ledger, and no run older than "
+                     f"`{rebaseline_stamp}` (the 2026-09-21 baseline included) anchors the floor again.")
+    else:
+        lines.append("- Next step: re-run `scripts\\run_hygiene_drive_weekly.py --apply` once the G: mount is healthy.")
     return "\n".join(lines) + "\n"
 
 
