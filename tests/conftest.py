@@ -595,6 +595,19 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
         _mod = _sys.modules.get(_mod_name)
         if _mod is not None and hasattr(_mod, _attr):
             monkeypatch.setattr(_mod, _attr, tmp_path / _fname, raising=False)
+    # Code #15 RIDER B (cq-59c5048d0891): the combined KB purge script's Drive lanes
+    # build a REAL Drive service on first use -- after load_dotenv(<repo>/.env,
+    # override=True), which would overwrite this fixture's env redirects with the live
+    # .env values. Whenever a test has loaded the script (the tests load it as
+    # purge_kb_code15_2026_09), its factory is replaced by one that raises, so no
+    # test reaches a real Drive or the repo .env; a test that needs Drive installs an
+    # in-memory fake on top. (Its only new WRITE path -- the id-only folder manifests
+    # -- lives under the CORA_KB_PURGE_OUT_DIR redirect above.)
+    _kbp = _sys.modules.get("purge_kb_code15_2026_09")
+    if _kbp is not None and hasattr(_kbp, "DRIVE_SERVICE_FACTORY"):
+        def _no_real_drive():
+            raise RuntimeError("tests/conftest.py: the real Drive service is disabled in tests")
+        monkeypatch.setattr(_kbp, "DRIVE_SERVICE_FACTORY", _no_real_drive, raising=False)
     yield
     os.environ["CORA_DISABLE_HUBSPOT_PORTAL_GUARD"] = "1"
     try:

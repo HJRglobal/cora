@@ -61,6 +61,16 @@ Manifests (every selected file, for the human eyeball BEFORE any --apply):
     row from it does not spare that file -- the file becomes an unreviewed delta
     (refused), and ``--accept-delta`` would then delete it.
 
+Function-level modes (Code #15 RIDER B, 2026-09-24; the CLI and every gate above are
+UNCHANGED): ``run_folder_mode`` / ``write_folder_manifest`` / ``dump_selected_rows`` /
+``write_applied_records`` take ``names=False`` -- the ID-ONLY mode (folder chains by
+id, manifest name columns ``-``, titles as a 16-hex digest, the first-40-names log
+suppressed; D-082) -- and ``run_folder_mode`` / ``target_folder_descendants`` take
+``sources=("drive_sweep",)`` to select one Drive-copy source while COUNTING the
+other (``FolderSelection.kept``). Their consumer is
+``scripts/purge_kb_code15_2026-09.py``, which calls ``run_folder_mode`` directly and
+never ``main()`` -- so this CLI's always-on static_md / title passes never run there.
+
 Exit codes: 0 ok, 1 fatal.
 """
 
@@ -209,6 +219,17 @@ def format_chain(chain: list[tuple[str, str]]) -> str:
     return " <- ".join(f"{name} ({fid})" for name, fid in chain)
 
 
+def format_chain_ids(chain: list[tuple[str, str]]) -> str:
+    """The resolved chain by folder ID only -- the ID-ONLY (names-suppressed) mode
+    of every folder-mode log line, refusal and manifest header (Code #15 RIDER B,
+    D-082: a LEX or personal folder name never reaches a record)."""
+    return " <- ".join(str(fid) for _name, fid in chain)
+
+
+def _chain_txt(chain: list[tuple[str, str]], names: bool) -> str:
+    return format_chain(chain) if names else format_chain_ids(chain)
+
+
 def enumerate_folder_files(
     service: Any, folder_id: str, *, max_folders: int = _FOLDER_ENUM_MAX_FOLDERS
 ) -> tuple[dict[str, str], bool]:
@@ -275,33 +296,66 @@ def enumerate_folder_files(
     return files, complete
 
 
+def _normalize_sources(sources: Iterable[str] | None) -> tuple[str, ...]:
+    """The Drive-copy sources a folder selection DELETES. None = both (the
+    unchanged default). Anything outside the Drive-copy pair is refused -- a
+    folder id can never select a static_md / gmail / slack row."""
+    if sources is None:
+        return _DRIVE_COPY_SOURCES
+    out = tuple(dict.fromkeys(str(s) for s in sources))
+    if not out or any(s not in _DRIVE_COPY_SOURCES for s in out):
+        raise RuntimeError(f"REFUSED: folder-mode sources must be a non-empty subset of {_DRIVE_COPY_SOURCES}")
+    return out
+
+
+def target_folder_descendants_ex(
+    conn, file_names: Mapping[str, str], *, sources: Iterable[str] | None = None,
+) -> tuple[list[str], dict[str, tuple[str, int]], dict[str, dict[str, int]]]:
+    """target_folder_descendants plus the KEPT side: ``(chunk_ids, hits, kept)``
+    where ``kept`` = ``{source: {"chunks": n, "files": m}}`` for the Drive-copy
+    rows of the same descendant files whose source is NOT in ``sources`` (counted,
+    never selected -- Code #15 RIDER B's drive_sweep-only lanes keep drive_asset)."""
+    selected = _normalize_sources(sources)
+    if not file_names:
+        return [], {}, {}
+    ph = ",".join("?" * len(_DRIVE_COPY_SOURCES))
+    rows = conn.execute(
+        f"SELECT chunk_id, source, source_id, title FROM knowledge_chunks WHERE source IN ({ph})",
+        _DRIVE_COPY_SOURCES,
+    ).fetchall()
+    ids: list[str] = []
+    hits: dict[str, tuple[str, int]] = {}
+    kept_chunks: Counter = Counter()
+    kept_files: dict[str, set[str]] = {}
+    for chunk_id, source, source_id, title in rows:
+        sid = str(source_id or "")
+        key = sid if sid in file_names else sid.split(":", 1)[0]
+        if key not in file_names:
+            continue
+        if source not in selected:
+            kept_chunks[source] += 1
+            kept_files.setdefault(source, set()).add(key)
+            continue
+        ids.append(chunk_id)
+        name, n = hits.get(key, (file_names[key] or str(title or ""), 0))
+        hits[key] = (name, n + 1)
+    kept = {s: {"chunks": int(kept_chunks[s]), "files": len(kept_files.get(s, ()))} for s in sorted(kept_chunks)}
+    return ids, hits, kept
+
+
 def target_folder_descendants(
-    conn, file_names: Mapping[str, str]
+    conn, file_names: Mapping[str, str], *, sources: Iterable[str] | None = None,
 ) -> tuple[list[str], dict[str, tuple[str, int]]]:
     """Read-only. drive_sweep/drive_asset chunks whose source_id is one of the
     enumerated descendant file ids (the bare id every Drive connector writes, or a
     legacy ``<id>:chunkN`` form). Only the Drive-copy sources are scanned: a
     static_md row is path-keyed and a gmail/slack row can never carry a Drive file
-    id as its source_id, so neither is touched by this pass.
+    id as its source_id, so neither is touched by this pass. ``sources``
+    (Code #15 RIDER B) narrows the selection to a subset of the Drive-copy pair,
+    e.g. ``("drive_sweep",)``; None = both (unchanged).
 
     Returns ``(chunk_ids, {file_id: (name, chunk_count)})``."""
-    if not file_names:
-        return [], {}
-    ph = ",".join("?" * len(_DRIVE_COPY_SOURCES))
-    rows = conn.execute(
-        f"SELECT chunk_id, source_id, title FROM knowledge_chunks WHERE source IN ({ph})",
-        _DRIVE_COPY_SOURCES,
-    ).fetchall()
-    ids: list[str] = []
-    hits: dict[str, tuple[str, int]] = {}
-    for chunk_id, source_id, title in rows:
-        sid = str(source_id or "")
-        key = sid if sid in file_names else sid.split(":", 1)[0]
-        if key not in file_names:
-            continue
-        ids.append(chunk_id)
-        name, n = hits.get(key, (file_names[key] or str(title or ""), 0))
-        hits[key] = (name, n + 1)
+    ids, hits, _kept = target_folder_descendants_ex(conn, file_names, sources=sources)
     return ids, hits
 
 
@@ -321,33 +375,56 @@ class FolderSelection:
     hits: dict[str, tuple[str, int]]
     chunk_ids: list[str]
     allowlisted: list[str] = field(default_factory=list)
+    #: Code #15 RIDER B: the Drive-copy sources this selection DELETES, and the
+    #: same files' rows in the other Drive-copy source(s) -- counted, kept.
+    sources: tuple[str, ...] = _DRIVE_COPY_SOURCES
+    kept: dict[str, dict[str, int]] = field(default_factory=dict)
+
+
+#: The name column of an ID-ONLY manifest row (parse_manifest_file_ids reads the
+#: id from the right, so the placeholder never shifts the id column).
+NAME_WITHHELD = "-"
 
 
 def write_folder_manifest(
     path: Path, *, folder_id: str, chain: list[tuple[str, str]], complete: bool,
     n_descendants: int, hits: Mapping[str, tuple[str, int]],
     allowlisted: Iterable[str] = (), footer: str | None = None,
+    names: bool = True, sources: Iterable[str] | None = None,
+    kept: Mapping[str, Mapping[str, int]] | None = None,
 ) -> None:
     """The full, auditable per-folder manifest: header (id, resolved chain,
     completeness, enumeration size) then one row per selected file --
     ``name <TAB> file_id <TAB> chunks`` -- and an optional ``#`` footer (the
     applied record's DELETED totals). The dry-run writes the reviewed manifest;
-    the applied record is written after the delete by write_applied_records()."""
+    the applied record is written after the delete by write_applied_records().
+
+    ``names=False`` (Code #15 RIDER B, D-082) is the ID-ONLY mode: the chain is
+    rendered by folder id, every name column is ``-`` and the allowlisted line
+    carries a count -- the manifest holds ids and counts only. ``sources`` /
+    ``kept`` add the source restriction and the kept counts to the header."""
     path.parent.mkdir(parents=True, exist_ok=True)
     total_chunks = sum(n for _, n in hits.values())
     with path.open("w", encoding="utf-8") as fh:
-        fh.write(f"# Cora-internal purge manifest -- FOLDER MODE  folder_id={folder_id}\n")
-        fh.write(f"# resolved chain (leaf <- root): {format_chain(chain)}\n")
+        fh.write(f"# Cora-internal purge manifest -- FOLDER MODE  folder_id={folder_id}"
+                 + ("" if names else "  (ID-ONLY: names withheld)") + "\n")
+        fh.write(f"# resolved chain (leaf <- root): {_chain_txt(chain, names)}\n")
         fh.write(f"# enumeration complete: {complete}  (relative to the service account's Drive view; "
                  f"trashed files excluded)\n")
         fh.write(f"# descendant files enumerated: {n_descendants}\n")
         fh.write(f"# files with KB chunks: {len(hits)}   chunks: {total_chunks}\n")
+        if sources is not None:
+            fh.write(f"# sources selected: {', '.join(_normalize_sources(sources))}"
+                     f"   kept (counted, never selected): {json.dumps(dict(kept or {}), sort_keys=True)}\n")
         allow = sorted(allowlisted)
-        fh.write("# allowlisted basenames selected (drive_sweep twin only; the static_md copy stays): "
-                 + (", ".join(allow) if allow else "none") + "\n")
+        if names:
+            fh.write("# allowlisted basenames selected (drive_sweep twin only; the static_md copy stays): "
+                     + (", ".join(allow) if allow else "none") + "\n")
+        else:
+            fh.write(f"# allowlisted basenames selected: {len(allow)}\n")
         fh.write("# name\tfile_id\tchunks\n")
-        for fid, (name, n) in sorted(hits.items(), key=lambda kv: (kv[1][0].lower(), kv[0])):
-            fh.write(f"  {_one_line(name)}\t{fid}\t{n}\n")
+        for fid, (name, n) in sorted(hits.items(), key=lambda kv: (kv[1][0].lower() if names else "", kv[0])):
+            fh.write(f"  {_one_line(name) if names else NAME_WITHHELD}\t{fid}\t{n}\n")
         if footer:
             fh.write("# " + _one_line(footer).lstrip("# ") + "\n")
 
@@ -366,11 +443,21 @@ def parse_manifest_file_ids(path: Path) -> set[str]:
     return ids
 
 
-def dump_selected_rows(conn, chunk_ids: list[str], path: Path) -> int:
+def _sha16(text: str | None) -> str:
+    import hashlib  # noqa: PLC0415 -- only the id-only record needs it
+    return hashlib.sha256(str(text or "").encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+
+def dump_selected_rows(conn, chunk_ids: list[str], path: Path, *, names: bool = True) -> int:
     """Write every chunk row about to be deleted (chunk_id, source, source_id,
     title) as JSON -- the full record of an irreversible action, written BEFORE
     the delete. Returns the row count. Raises on any failure (the caller must then
-    NOT delete)."""
+    NOT delete).
+
+    ``names=False`` (Code #15 RIDER B, D-082) is the ID-ONLY record: the title is
+    replaced by ``title_sha256_16`` (a 16-hex digest -- enough to match a row, never
+    its text) and a path-shaped (static_md) source_id likewise; Drive-copy
+    source_ids are file ids and are kept."""
     rows: list[dict[str, Any]] = []
     ids = list(chunk_ids)
     for i in range(0, len(ids), _BATCH):
@@ -380,12 +467,21 @@ def dump_selected_rows(conn, chunk_ids: list[str], path: Path) -> int:
             f"SELECT chunk_id, source, source_id, title FROM knowledge_chunks WHERE chunk_id IN ({ph})",
             batch,
         ).fetchall():
-            rows.append({"chunk_id": chunk_id, "source": source,
-                         "source_id": source_id, "title": title})
+            if names:
+                rows.append({"chunk_id": chunk_id, "source": source,
+                             "source_id": source_id, "title": title})
+            elif source in _DRIVE_COPY_SOURCES:
+                rows.append({"chunk_id": chunk_id, "source": source, "source_id": source_id,
+                             "title_sha256_16": _sha16(title)})
+            else:
+                rows.append({"chunk_id": chunk_id, "source": source,
+                             "source_id_sha256_16": _sha16(source_id), "title_sha256_16": _sha16(title)})
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"written_utc": datetime.now(timezone.utc).isoformat(),
-                                "count": len(rows), "rows": rows},
-                               indent=1, ensure_ascii=False), encoding="utf-8")
+    payload: dict[str, Any] = {"written_utc": datetime.now(timezone.utc).isoformat(),
+                               "count": len(rows), "rows": rows}
+    if not names:
+        payload["id_only"] = True
+    path.write_text(json.dumps(payload, indent=1, ensure_ascii=False), encoding="utf-8")
     return len(rows)
 
 
@@ -393,6 +489,7 @@ def run_folder_mode(
     conn, service: Any, folder_ids: list[str], logs_dir: Path, *,
     apply: bool = False, expect_leaf: str | None = None, accept_delta: bool = False,
     computers_root: bool = False, my_drive_root_id: str | None = None,
+    sources: Iterable[str] | None = None, names: bool = True,
 ) -> tuple[list[str], int, int, bool, list[FolderSelection]]:
     """Resolve, enumerate and select for every --folder-id (read-only).
 
@@ -405,7 +502,15 @@ def run_folder_mode(
     complete -- and any failure raises BEFORE a record could exist. The applied
     records are written by write_applied_records() AFTER the delete, from what
     actually happened. Also raises, in every mode, for the Founder-OS root, a
-    non-folder, an unresolvable id and a root/top-level chain."""
+    non-folder, an unresolvable id and a root/top-level chain.
+
+    Code #15 RIDER B (the gates above are UNCHANGED): ``sources`` narrows the
+    selection to a subset of the Drive-copy pair (``("drive_sweep",)`` keeps the
+    drive_asset rows of the same files, counted in ``FolderSelection.kept``); and
+    ``names=False`` is the ID-ONLY mode -- every log line, refusal message and the
+    reviewed manifest carry folder/file ids and counts, never a Drive name (D-082;
+    the first-40-names log is suppressed). The defaults are today's behaviour."""
+    selected_sources = _normalize_sources(sources)
     if apply and not expect_leaf:
         raise RuntimeError(
             "REFUSED: --apply with --folder-id requires --expect-leaf <folder name> "
@@ -427,7 +532,7 @@ def run_folder_mode(
                 f"entire Drive corpus. Pass the specific excluded folder."
             )
         chain = resolve_folder_chain(service, folder_id)
-        log.info("  FOLDER-MODE %s resolves to: %s", folder_id, format_chain(chain))
+        log.info("  FOLDER-MODE %s resolves to: %s", folder_id, _chain_txt(chain, names))
         if len(chain) < _MIN_CHAIN_DEPTH:
             # I3 (2026-09-08): the ONE admitted shallow shape -- a parentless Drive
             # "Computers" backup root, pinned walk-only, asked for explicitly with
@@ -437,10 +542,10 @@ def run_folder_mode(
             if computers_root and _computers_root_ok(folder_id, chain, my_drive_root_id):
                 log.warning("  FOLDER-MODE %s is a PARENTLESS Drive Computers backup root (%s) -- "
                             "admitted by --computers-root (pinned walk-only; not the My Drive root %s)",
-                            folder_id, format_chain(chain), my_drive_root_id)
+                            folder_id, _chain_txt(chain, names), my_drive_root_id)
             else:
                 raise RuntimeError(
-                    f"REFUSED: {folder_id} resolves to a root/top-level folder ({format_chain(chain)}) "
+                    f"REFUSED: {folder_id} resolves to a root/top-level folder ({_chain_txt(chain, names)}) "
                     f"-- too broad for a purge. Pass the specific excluded folder"
                     + (", or --computers-root for a pinned Computers backup root." if not computers_root
                        else "; --computers-root admits only a pinned, parentless Computers root that is "
@@ -450,22 +555,28 @@ def run_folder_mode(
         if expect_leaf is not None and leaf.strip().casefold() != expect_leaf.strip().casefold():
             raise RuntimeError(
                 f"REFUSED: --expect-leaf {expect_leaf!r} does not match the resolved folder "
-                f"{leaf!r} ({format_chain(chain)})."
+                + (f"{leaf!r} ({format_chain(chain)})." if names else f"({format_chain_ids(chain)}).")
             )
-        names, complete = enumerate_folder_files(service, folder_id)
-        ids, hits = target_folder_descendants(conn, names)
+        file_names, complete = enumerate_folder_files(service, folder_id)
+        ids, hits, kept = target_folder_descendants_ex(conn, file_names, sources=selected_sources)
         n_chunks = sum(n for _, n in hits.values())
         log.info("  FOLDER-MODE descendant files enumerated: %d (complete=%s); "
-                 "with KB chunks: %d files / %d chunks", len(names), complete, len(hits), n_chunks)
+                 "with KB chunks: %d files / %d chunks", len(file_names), complete, len(hits), n_chunks)
+        if sources is not None:
+            log.info("  FOLDER-MODE sources selected: %s; kept (counted, never selected): %s",
+                     ", ".join(selected_sources), json.dumps(kept, sort_keys=True))
         allowlisted = sorted({name for name, _n in hits.values() if _is_kb_allowlisted(name)})
         if allowlisted:
             log.info("  FOLDER-MODE note: %d allowlisted basename(s) selected -- the drive_sweep twin "
                      "only; the static_md copy (path-keyed, allowlist-honoured) stays and keeps "
-                     "refreshing: %s", len(allowlisted), ", ".join(allowlisted))
-        for fid, (name, n) in sorted(hits.items(), key=lambda kv: kv[1][0].lower())[:40]:
-            log.info("      %s  [%s]  x%d", name, fid, n)
-        if len(hits) > 40:
-            log.info("      ... +%d more files (see the folder manifest)", len(hits) - 40)
+                     "refreshing%s", len(allowlisted), (": " + ", ".join(allowlisted)) if names else "")
+        if names:
+            for fid, (name, n) in sorted(hits.items(), key=lambda kv: kv[1][0].lower())[:40]:
+                log.info("      %s  [%s]  x%d", name, fid, n)
+            if len(hits) > 40:
+                log.info("      ... +%d more files (see the folder manifest)", len(hits) - 40)
+        else:
+            log.info("      (ID-ONLY mode: %d file names withheld -- the folder manifest lists file ids)", len(hits))
         if not complete:
             if apply:
                 raise RuntimeError(
@@ -485,9 +596,9 @@ def run_folder_mode(
                     f"dry-run first and eyeball it (D-086)."
                 )
             reviewed = parse_manifest_file_ids(reviewed_manifest)
-            delta = sorted(set(hits) - reviewed, key=lambda k: hits[k][0].lower())
+            delta = sorted(set(hits) - reviewed, key=lambda k: (hits[k][0].lower() if names else "", k))
             if delta and not accept_delta:
-                shown = ", ".join(f"{hits[k][0]} [{k}]" for k in delta[:20])
+                shown = ", ".join((f"{hits[k][0]} [{k}]" if names else f"[{k}]") for k in delta[:20])
                 raise RuntimeError(
                     f"REFUSED: {len(delta)} file(s) under {folder_id} were not in the reviewed "
                     f"manifest (appeared since the eyeball): {shown}"
@@ -499,14 +610,17 @@ def run_folder_mode(
         else:
             try:
                 write_folder_manifest(reviewed_manifest, folder_id=folder_id, chain=chain,
-                                      complete=complete, n_descendants=len(names), hits=hits,
-                                      allowlisted=allowlisted)
+                                      complete=complete, n_descendants=len(file_names), hits=hits,
+                                      allowlisted=allowlisted, names=names,
+                                      sources=selected_sources if sources is not None else None,
+                                      kept=kept if sources is not None else None)
                 log.info("  Folder manifest written -> %s", reviewed_manifest)
             except Exception as exc:  # noqa: BLE001 -- dry-run: nothing is deleted
-                log.warning("  could not write folder manifest: %s", exc)
+                log.warning("  could not write folder manifest: %s", type(exc).__name__ if not names else exc)
         selections.append(FolderSelection(folder_id=folder_id, chain=chain, complete=complete,
-                                          n_descendants=len(names), hits=dict(hits),
-                                          chunk_ids=list(ids), allowlisted=allowlisted))
+                                          n_descendants=len(file_names), hits=dict(hits),
+                                          chunk_ids=list(ids), allowlisted=allowlisted,
+                                          sources=selected_sources, kept=dict(kept)))
     deduped = list(dict.fromkeys(c for sel in selections for c in sel.chunk_ids))
     files_seen = {fid for sel in selections for fid in sel.hits}
     all_complete = all(sel.complete for sel in selections)
@@ -515,19 +629,20 @@ def run_folder_mode(
 
 def write_applied_records(
     selections: Iterable[FolderSelection], totals: Mapping[str, int], logs_dir: Path, stamp: str,
+    *, names: bool = True,
 ) -> list[Path]:
     """AFTER the delete: one ``purge-cora-internal-folder-<id>.applied-<stamp>.txt``
     per folder -- the reviewed-manifest shape plus a DELETED footer carrying the
     per-table totals. Returns the paths written. Raises on failure; the caller
     logs it (the delete has already happened, so nothing can be aborted -- the
-    pre-delete selected-rows JSON remains the record)."""
+    pre-delete selected-rows JSON remains the record). ``names=False`` = ID-ONLY."""
     footer = f"DELETED {datetime.now(timezone.utc).isoformat()} totals={dict(totals)}"
     written: list[Path] = []
     for sel in selections:
         path = logs_dir / f"purge-cora-internal-folder-{sel.folder_id}.applied-{stamp}.txt"
         write_folder_manifest(path, folder_id=sel.folder_id, chain=sel.chain, complete=sel.complete,
                               n_descendants=sel.n_descendants, hits=sel.hits,
-                              allowlisted=sel.allowlisted, footer=footer)
+                              allowlisted=sel.allowlisted, footer=footer, names=names)
         written.append(path)
     return written
 

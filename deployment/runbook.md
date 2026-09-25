@@ -409,6 +409,104 @@ Get-Content logs\cora-instances.jsonl -Tail 1
 
 ---
 
+## Code #15 combined KB purge (S1 + RIDER B) — stop window
+
+ONE dry-run INTENT and ONE apply carry every Code #15 KB change
+(`scripts\purge_kb_code15_2026-09.py`): lane `s1_tokens` (S1, REDACT API-token shapes in
+place) and the RIDER B DELETE lanes `rb2_personal_finances` (the pinned personal store,
+expected 0), `rb3_static_old_paths` (kb-purge-rows.csv old static_md paths, existence-gated),
+`rb3_archived_nonmd` (`_archive\dedup-2026-09`, drive_sweep rows only; drive_asset kept),
+`rb4_desktop_ini` (expected 0) and `rb8_ufl_equity` (three UFL file ids, drive_sweep rows
+only). Every record carries ids and counts only (D-082). The DELETE union is LARGE
+(rb3_archived_nonmd alone is thousands of chunks), so the apply REFUSES unless Cora is
+proven stopped -- it runs inside the stop window below. The ingest-side pins/belts of the
+same bundle are live at their tasks' next fire (static sync 04:00, flat sweep 06:00, tree
+walk 06:30); the bot-side part rides the bundle's ONE restart (4f).
+
+### Before the window -- NORMAL PowerShell, from the PRIMARY checkout AFTER the merge (read-only)
+
+1. The dry-run (opens the KB `mode=ro`; Drive via the direct SA, `files.get` / `files.list`
+   only; writes ONLY `logs\kb-purge-code15-INTENT-<stamp>.json` + `.txt` and the id-only
+   folder manifests under `logs\kb-purge-code15-folders-<stamp>\`):
+   ```powershell
+   .venv\Scripts\python.exe scripts\purge_kb_code15_2026-09.py --csv "C:\Users\Harri\Downloads\hjr-folder-audit\kb-purge-rows.csv"
+   ```
+   Defaults: `--db data\cora_kb.db`, `--out-dir logs`, `--founder-root "G:\My Drive\HJR-Founder-OS"`,
+   `--hash-store data\state\static-md-content-hashes.json` (read, never written).
+2. Harrison reviews the INTENT (`.txt`) -- the intent, not just the totals:
+   - every lane's action / chunks / files / holds / STOPS, the `union` (`is_large`) and the residuals;
+   - `rb3_static_old_paths`: the ARCHIVE row whose old path is still live is HELD (its move is deferred
+     to folder-audit batch 2 -- a follow-up purge after it lands); the applied MOVE rows PURGE;
+   - `rb3_archived_nonmd`: `sources_selected` = drive_sweep, `kept_by_source` = the drive_asset cards,
+     LEX rows HELD, `chain_depth` 3; the whole-`_archive` scope and drive_asset deletion are NOT in it
+     (open rulings);
+   - `rb8_ufl_equity`: 25 / 25 / 10 per id and the `reingest_analysis` (flat sweep: NO; tree walk: LATENT);
+   - `rb2_personal_finances` / `rb4_desktop_ini`: 0 = a recorded, applied no-op;
+   - a lane with a STOP cannot be applied: fix the cause and re-run the dry-run, or deselect it at the
+     apply with `--lanes`. A LEX release (`--release-lex <lane>`) is a ruling: re-run the dry-run with
+     it, and the apply must repeat it.
+
+### The window -- ELEVATED PowerShell (4c -> 4f, as in the allowlist section above)
+
+```powershell
+# 4c. Park the watchdog AND DISABLE the service task, then stop Cora (the amended 4c; Stop alone relaunches).
+Disable-ScheduledTask -TaskName "cora-watchdog"
+Disable-ScheduledTask -TaskName "cowork-cora-service"
+Stop-ScheduledTask -TaskName "cowork-cora-service" -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='cora.exe'" |
+    Where-Object { $_.CommandLine -like "*\Scripts\cora.exe*" -or $_.CommandLine -like "*cora.main*" } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
+    Where-Object { $_.CommandLine -like "*run_hidden.py*" -and ($_.CommandLine -like "*cora.main*" -or $_.CommandLine -like "*\Scripts\cora.exe*") } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Start-Sleep 3
+Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='cora.exe' OR Name='pythonw.exe'" |
+    Where-Object { $_.CommandLine -like "*cora.main*" -or $_.CommandLine -like "*\Scripts\cora.exe*" } |
+    Select-Object ProcessId, Name
+# Must print NOTHING. If a row prints, STOP.
+
+# 4c-wait. Cora is DOWN only when the heartbeat has NOT advanced for >= 300 s.
+$hb0 = (Get-Item data\health\heartbeat.txt).LastWriteTime
+Start-Sleep 310
+(Get-Item data\health\heartbeat.txt).LastWriteTime -eq $hb0
+# Must print True. (The apply checks it again: the heartbeat must EXIST and be > 300 s old by its
+# content stamp AND its mtime -- a missing or unparseable heartbeat REFUSES.)
+
+# Backup. The KB delete is reversible ONLY from this copy (the run-kb-hygiene-apply.ps1 pattern: .db + -wal).
+$bakstamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$bak = "data\cora_kb.db.bak-code15-$bakstamp"
+Copy-Item data\cora_kb.db $bak
+if (Test-Path data\cora_kb.db-wal) { Copy-Item data\cora_kb.db-wal "$bak-wal" }
+Get-Item "$bak*" | Select-Object Name, Length
+
+# Apply the REVIEWED INTENT with the SAME CSV (the apply re-checks its sha256 and re-runs the existence
+# gate, re-runs the positive-leaf gate per folder lane and the UFL gate, and refuses drift -- every
+# refusal happens BEFORE the first write). Add --lanes a,b for a subset; repeat any --release-lex.
+# The folder lanes re-walk their Drive folders read-only first (~1-2 min each on 2026-09-24).
+$env:PYTHONIOENCODING = 'utf-8'
+.venv\Scripts\python.exe scripts\purge_kb_code15_2026-09.py --apply --manifest logs\kb-purge-code15-INTENT-<stamp>.json --csv "C:\Users\Harri\Downloads\hjr-folder-audit\kb-purge-rows.csv"
+# Success writes logs\kb-purge-code15-APPLIED-<stamp>.json: its item_record is the per-lane
+# APPLIED / APPLIED (no-op) / NOT APPLIED with held-why and stopped-why -- the record the folder audit
+# reads before batch 2. outcome._delete_union.remaining_after must be 0.
+
+# 4f. Reclaim (only if the freed space matters; it needs exclusive access), re-enable the service task
+#     BEFORE the restart (a disabled task cannot be started), THE ONE RESTART, then the watchdog.
+.venv\Scripts\python.exe scripts\reclaim_kb_space.py
+Enable-ScheduledTask -TaskName "cowork-cora-service"
+.\deployment\restart-cora.ps1
+Enable-ScheduledTask -TaskName "cora-watchdog"
+Get-Content logs\cora-instances.jsonl -Tail 1
+# Proof of LIVE = a NEW pid in the instances tail (not the pid Cora had before 4c) -- never the script's exit code.
+Get-Content data\state\egress-rails-armed.json
+# first_armed_at must still read 2026-09-10T08:45:06 (the rails' clock survives the restart);
+# last_armed_at and pid move to the new process.
+```
+
+Rollback: stop Cora again (4c + 4c-wait), then restore `data\cora_kb.db` (and `-wal`) from the
+`.bak-code15-<stamp>` copy, and 4f.
+
+---
+
 ## Logs
 
 **Location:** `C:\Users\Harri\code\cora\logs\cora-YYYY-MM-DD.log`

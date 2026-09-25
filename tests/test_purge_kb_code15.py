@@ -54,6 +54,17 @@ def _load():
 
 pk = _load()
 
+
+@pytest.fixture(autouse=True)
+def _s1_registry_only(monkeypatch):
+    """This file tests S1 + the registry mechanics. RIDER B's lanes (tested in
+    tests/test_code15_rider_b_purge.py) need a CSV, a Founder-OS root and a Drive
+    service; without them they STOP by design, which would block every all-lanes
+    apply here -- so they are withdrawn from the registry for these tests."""
+    for name in getattr(pk, "RIDER_B_LANES", ()):
+        monkeypatch.delitem(pk.LANES, name, raising=False)
+
+
 D16A = "1204" + "567890123456"
 D16B = "1205" + "678901234567"
 HEX32 = "0123456789abcdef" * 2
@@ -480,3 +491,10 @@ class TestLargeGate:
         # no heartbeat anywhere near: a REDACT-only apply needs no stop window
         assert pk.main(["--apply", "--manifest", str(intent), "--db", str(db), "--out-dir", str(out),
                         "--heartbeat", str(tmp_path / "absent-heartbeat.txt")]) == 0
+
+
+def test_conftest_disables_the_real_drive_factory():
+    # Code #15 RIDER B conftest block: once this script is loaded, no test can build
+    # the real Drive service (nor run its load_dotenv(<repo>/.env, override=True)).
+    with pytest.raises(RuntimeError, match="disabled in tests"):
+        pk.DRIVE_SERVICE_FACTORY()
