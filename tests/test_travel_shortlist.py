@@ -1025,6 +1025,14 @@ class TestExecuteRoute:
         assert row == {**row, "event": "belt_refused", "reason": "content"}
         assert "Jordan" not in json.dumps(row)
 
+    def test_a_build_crash_is_a_refusal_not_silence(self, monkeypatch):
+        monkeypatch.setattr(ts, "build_request", lambda *a, **k: (_ for _ in ()).throw(KeyError("x")))
+        client = _slack_client()
+        subs = self._exec(ts.Route("search", constraints=_constraints(), budget=4), client)
+        assert subs == []
+        assert client.chat_postMessage.call_args.kwargs["text"] == ts.BELT_REPLY
+        assert [(r["event"], r["reason"]) for r in _rows()] == [("belt_refused", "build_error")]
+
     def test_a_refused_submit_says_so(self):
         client = _slack_client()
         self._exec(ts.Route("search", constraints=_constraints(), budget=4), client,

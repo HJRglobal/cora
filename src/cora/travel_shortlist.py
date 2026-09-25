@@ -1656,8 +1656,12 @@ def execute_route(route: Route, *, channel_id: str, thread_root_ts: str | None, 
     c = route.constraints
     if c is None:  # pragma: no cover -- a search route always carries constraints
         return
-    request = build_request(c, max_uses=route.budget)
-    reason = assert_request_clean(request, c)
+    try:
+        request = build_request(c, max_uses=route.budget)
+        reason = assert_request_clean(request, c)
+    except Exception:  # noqa: BLE001 -- a request that cannot be built is refused, never silent
+        log.warning("travel_shortlist: request build failed -- refusing", exc_info=True)
+        request, reason = {}, "build_error"
     if reason:
         log.warning("travel_shortlist: BELT refused the request (reason=%s) -- nothing searched",
                     reason)

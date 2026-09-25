@@ -1612,9 +1612,18 @@ def _dispatch_qa(
     # B1: the normal-path structural withhold. Recall-biased (any lodging noun, any
     # surface, any user) plus every lane-thread turn; an unreadable lane store
     # withholds too. Read by the web_clean pre-flight and the web gate below.
+    # PRIOR TURNS too (stricter than the amendment's two legs): a lodging ask that
+    # named a guest or a loyalty account sits in the DM / thread history the model
+    # composes search strings from, and a non-custodian's prior turns are NOT
+    # dropped on a web turn -- so a later "google restaurants near there" must not
+    # carry web tools while that ask is in the window.
     try:
-        _travel_web_withhold = (_travel_lane_thread or _travel_store_error
-                                or travel_shortlist.is_lodging_shaped(user_message))
+        _travel_web_withhold = (
+            _travel_lane_thread or _travel_store_error
+            or travel_shortlist.is_lodging_shaped(user_message)
+            or any(travel_shortlist.is_lodging_shaped(m.get("content", ""))
+                   for m in prior_messages if isinstance(m, dict))
+        )
     except Exception:  # noqa: BLE001 -- fail closed: no web
         _travel_web_withhold = True
 

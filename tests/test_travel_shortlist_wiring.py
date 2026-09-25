@@ -320,13 +320,13 @@ class TestMustNotFireThroughRealHandlers:
         assert all(kw.get("web_tools") is False for kw in seen)
 
 
-def _drive_dispatch(text, *, user, channel_id, channel_name, entity="FNDR", root=None):
+def _drive_dispatch(text, *, user, channel_id, channel_name, entity="FNDR", root=None, prior=None):
     seen: list = []
     with _model_path(seen):
         app_module._dispatch_qa(
             channel_id=channel_id, channel_name=channel_name, user_id=user,
             user_message=text, reply_thread_ts=root or ASK_TS, entity=entity,
-            client=_slack_client(), say=_say_no_placeholder(), prior_messages=[],
+            client=_slack_client(), say=_say_no_placeholder(), prior_messages=list(prior or []),
             root_thread_ts=root or ASK_TS)
     return seen
 
@@ -379,6 +379,18 @@ class TestB1WithholdOnTheRealDispatch:
         seen = _drive_dispatch("google the latest Arizona heat advisory news", user=_tessa(),
                                channel_id=TRAVEL_CHANNEL, channel_name=TRAVEL_CHANNEL_NAME)
         assert seen and seen[-1].get("web_tools") is True
+
+    def test_a_lodging_ask_in_the_history_withholds_a_later_web_turn(self, lane):
+        """Tessa's DM history keeps her ask (a guest's name, a loyalty number) and a
+        non-custodian's prior turns are not dropped on a web turn: while it is in the
+        window, a later non-lodging web ask carries no web tools."""
+        prior = [{"role": "user", "content": "find hotels in scottsdale oct 17-21 for Jordan "
+                                             "Riverstone, our Hilton Honors account 123456789"},
+                 {"role": "assistant", "content": ts.ACK_TEXT}]
+        seen = _drive_dispatch("google the latest Arizona heat advisory news", user=_tessa(),
+                               channel_id="D0TESSA", channel_name="dm", entity="HJRG", prior=prior)
+        assert seen and seen[-1].get("web_tools") is False
+        assert any(r.get("reason") == "gate_skipped:travel_lane" for r in _web_rows())
 
     def test_an_unreadable_lane_store_withholds(self, lane, monkeypatch, tmp_path):
         d = tmp_path / "store-is-a-dir"
