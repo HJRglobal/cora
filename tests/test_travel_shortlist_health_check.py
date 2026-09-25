@@ -161,6 +161,23 @@ class TestCheckTravelShortlist:
         assert s["unsettled"] == 1                              # only the rootless ask
         assert s["refused"] == 2 and s["refused_reasons"] == {"daily_cap": 1, "web_off": 1}
 
+    def test_a_catch_up_replay_row_never_warns(self):
+        """D-051 r2 c2-webcall#0: EVAL_MODE is set only by a reconstruction (the
+        missed-message catch-up), which now writes nothing; a legacy 'eval' gate row
+        (the r1 fix range wrote them) is never counted as a lane refusal, so a replay
+        can never make the lane read 'not serving lodging asks'."""
+        for _ in range(3):
+            _ev("refused", 0, root="", hours_ago=1, stage="gate", reason="eval")
+        s = ts.threads_summary(now=NOW)
+        assert s["refused"] == 0 and s["refused_reasons"] == {} and s["eval_replays"] == 3
+        r = hc.check_travel_shortlist(now=NOW)
+        assert r.status == "ok", r.detail
+        assert "the lane refused" not in r.detail and "refusal(s) (" not in r.detail
+        assert "3 catch-up replay row(s) ignored" in r.detail
+        ts.record_gate_refusal(ts.Route("reply", ts.WEB_OFF_REPLY, "web_off"), channel_id=CH, now=NOW)
+        r = hc.check_travel_shortlist(now=NOW)          # a LIVE refusal still warns
+        assert r.status == "warn" and "the lane refused 1 ask(s) and posted no card in 7d (web_off 1)" in r.detail
+
     def test_every_card_unverified_warns(self):
         for i in range(2):
             _ev("asked", 0, root=f"r{i}", hours_ago=2)

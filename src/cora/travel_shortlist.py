@@ -1915,7 +1915,10 @@ def append_event(event: str, *, channel: str, root_ts: str, now: datetime | None
 
 # D-051 r1 c2-webcall#0: the deterministic gate refusals (B2) are ledgered so a lane
 # that refuses every ask reads as such in the monitor, never as "no asks yet".
-GATE_REFUSALS = frozenset({"web_off", "model_unsupported", "daily_cap", "eval"})
+# D-051 r2 c2-webcall#0: LIVE turns only -- 'eval' is not a refusal (EVAL_MODE is set
+# only by a reconstruction: the missed-message catch-up, whose default dry run
+# promises no live-state mutation), and nothing is written under EVAL_MODE at all.
+GATE_REFUSALS = frozenset({"web_off", "model_unsupported", "daily_cap"})
 # Events that settle an 'asked' row (a gate refusal never had one).
 _TERMINAL_EVENTS = frozenset({"posted", "search_failed", "post_failed", "refused"})
 UNSETTLED_AFTER = timedelta(hours=1)
@@ -1923,14 +1926,15 @@ _REASON_TOKEN_RE = re.compile(r"[^a-z_]")
 
 
 def record_gate_refusal(route: Any, *, channel_id: str, now: datetime | None = None) -> None:
-    """Append a shape-only 'refused' row for a gate refusal (web off, unsupported
-    model, daily cap, EVAL_MODE). It carries NO thread key (root_ts "") and
+    """Append a shape-only 'refused' row for a LIVE gate refusal (web off,
+    unsupported model, daily cap). It carries NO thread key (root_ts "") and
     stage "gate": it never registers a lane thread (is_lane_thread needs the root)
     and never settles an ask. Non-refusal replies (clarify, help, lane off) write
-    nothing."""
+    nothing, and under EVAL_MODE (a catch-up reconstruction) NOTHING is written
+    (D-051 r2 c2-webcall#0: a replay is not a lane refusal)."""
+    if eval_mode():
+        return
     reason = str(getattr(route, "reason", "") or "")
-    if eval_mode() and getattr(route, "kind", "") == "search":
-        reason = "eval"            # execute_route answers a search route with EVAL_REPLY
     if reason not in GATE_REFUSALS:
         return
     append_event("refused", channel=channel_id, root_ts="", stage="gate", reason=reason, now=now)
@@ -2033,14 +2037,17 @@ def threads_summary(now: datetime | None = None, days: int = 7) -> dict:
     the same root, and the 1-worker pool settles asks in order. ``unsettled`` =
     asks in the window older than UNSETTLED_AFTER with no terminal event (the job
     died -- a restart mid-search -- or is stuck). ``refused`` counts every
-    'refused' row in the window (gate + job) by shape-only reason;
+    'refused' row in the window (gate + job) by shape-only reason, EXCEPT a legacy
+    gate row with reason 'eval' (a catch-up replay, D-051 r2 c2-webcall#0), which is
+    counted apart in ``eval_replays`` and never feeds a refusal WARN;
     ``posted_unverified`` counts cards that showed only "No listing I could verify"
     (options 0, dropped > 0)."""
     now = now or datetime.now(_AZ)
     path = threads_path()
     out = {"available": True, "exists": path.exists(), "reason": "", "asks": 0, "posted": 0,
            "search_failed": 0, "belt_refused": 0, "post_failed": 0, "bad_lines": 0,
-           "refused": 0, "refused_reasons": {}, "unsettled": 0, "posted_unverified": 0}
+           "refused": 0, "refused_reasons": {}, "unsettled": 0, "posted_unverified": 0,
+           "eval_replays": 0}
     try:
         rows, bad = _read_rows()
     except OSError as exc:
@@ -2073,6 +2080,8 @@ def threads_summary(now: datetime | None = None, days: int = 7) -> dict:
             out[ev] += 1
             if ev == "posted" and not r.get("options") and (r.get("dropped") or 0):
                 out["posted_unverified"] += 1
+        elif ev == "refused" and r.get("stage") == "gate" and r.get("reason") == "eval":
+            out["eval_replays"] += 1   # D-051 r2 c2-webcall#0: a replay, never a refusal
         elif ev == "refused":
             out["refused"] += 1
             reason = _REASON_TOKEN_RE.sub("", str(r.get("reason") or "").lower())[:24] or "unknown"
@@ -2279,16 +2288,16 @@ def execute_route(route: Route, *, channel_id: str, thread_root_ts: str | None, 
     that already is one) -- D-051 r1 integration#0. Under EVAL_MODE
     (missed-message catch-up) only ``say`` is used -- the catch-up's capture
     client overrides chat_update alone, so a raw chat_postMessage would reach real
-    Slack -- and nothing is written to the store but the routing-inert 'refused'
-    row (record_gate_refusal)."""
+    Slack -- and NOTHING is written to the store (D-051 r2 c2-webcall#0: the
+    catch-up's default dry run promises no live-state mutation)."""
     root = str(thread_root_ts or "") or None
     if route.kind == "reply" or eval_mode():
         text = route.reply if route.kind == "reply" else EVAL_REPLY
         log.info("travel_shortlist: reply=%s channel=%s", route.reason, channel_id)
-        record_gate_refusal(route, channel_id=channel_id, now=now)  # D-051 r1 c2-webcall#0
         if eval_mode():
             say(text=text, thread_ts=root, unfurl_links=False, unfurl_media=False)
             return
+        record_gate_refusal(route, channel_id=channel_id, now=now)  # live turns only
         _post(client, channel_id, root, text)
         return
     c = route.constraints

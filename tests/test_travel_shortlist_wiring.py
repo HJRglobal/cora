@@ -445,15 +445,35 @@ class TestMissedMessageCatchup:
                              root_thread_ts=ASK_TS, detection_tier="dm")
         client = MagicMock()
         client.conversations_history.return_value = {"messages": []}
-        draft = mmc._run_dispatch_capture(client, cand, "FNDR", True)
-        assert draft == ts.EVAL_REPLY
+        # D-051 r2 c2-webcall#0 / harness-isolation#0 / integration#0: the catch-up (its
+        # default dry run, then --send-cards) writes NOTHING to the thread store, and
+        # the travel monitor never reads a replay as a lane refusal.
+        import nightly_health_check as hc
+        for _ in range(2):
+            draft = mmc._run_dispatch_capture(client, cand, "FNDR", True)
+            assert draft == ts.EVAL_REPLY
         client.chat_postMessage.assert_not_called()
         assert lane.calls == []
-        # D-051 r1 c2-webcall#0: the refusal is ledgered shape-only and routing-inert
-        # (no thread key -> never a lane thread); nothing else is written
-        assert [(r["event"], r["stage"], r["reason"], r["root_ts"]) for r in _rows()] == [
-            ("refused", "gate", "eval", "")]
-        assert not ts.is_lane_thread("D0HDM", ASK_TS)
+        assert not ts.threads_path().exists()
+        r = hc.check_travel_shortlist()
+        assert r.status == "ok" and r.detail.startswith("INFO: no lodging asks yet")
+
+    def test_a_replayed_lane_thread_turn_leaves_the_store_byte_identical(self, lane):
+        from cora import missed_message_catchup as mmc
+        ts.append_event("asked", channel="D0HDM", root_ts=ASK_TS,
+                        constraints=ts.parse_constraints(ASK).constraints.to_record(),
+                        registered=True)
+        before = ts.threads_path().read_bytes()
+        for text in ("thanks!", "same dates but 6 people"):
+            cand = mmc.Candidate(channel_id="D0HDM", channel_name="dm", is_dm=True,
+                                 user_id=HARRISON, text=text, event_ts="1790000000.000200",
+                                 reply_thread_ts=ASK_TS, root_thread_ts=ASK_TS,
+                                 detection_tier="dm")
+            client = MagicMock()
+            assert mmc._run_dispatch_capture(client, cand, "FNDR", True) == ts.EVAL_REPLY
+            client.chat_postMessage.assert_not_called()
+        assert ts.threads_path().read_bytes() == before
+        assert lane.calls == []
 
 
 # ── wiring pins (AST, never a text grep) + the listener table ────────────────

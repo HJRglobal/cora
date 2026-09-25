@@ -960,8 +960,9 @@ def check_travel_shortlist(now: datetime | None = None) -> CheckResult:
     never reads clean). D-051 r1 c2-webcall#0 -- also WARN on ANY card post
     failure, on any ask older than 1 h that never settled (no card, failure line or
     refusal: the job died or is stuck), when the lane refused asks and posted no
-    card in the window (gate refusals are ledgered, so a lane that refuses
-    everything never reads "no asks yet"), on any model_unsupported refusal (a
+    card in the window (LIVE gate refusals are ledgered, so a lane that refuses
+    everything never reads "no asks yet"; a missed-message catch-up replay writes
+    nothing and a legacy 'eval' row is never a refusal), on any model_unsupported refusal (a
     config regression), and when every card (>= 2) showed only "No listing I could
     verify". An absent store is INFO (no asks yet). Read-only; writes nothing
     (holds under --dry-run by construction). ONE CheckResult.
@@ -989,10 +990,12 @@ def check_travel_shortlist(now: datetime | None = None) -> CheckResult:
     reasons = dict(s.get("refused_reasons") or {})
     why = ", ".join(f"{k} {reasons[k]}" for k in sorted(reasons))
     unverified = int(s.get("posted_unverified") or 0)
+    replays = int(s.get("eval_replays") or 0)     # D-051 r2 c2-webcall#0: never a refusal
     detail = (f"7d: {asks} ask(s), {posted} card(s) posted, {failed} search failure(s), "
               f"{refused} belt refusal(s)" + (f", {post_failed} card post failure(s)" if post_failed else "")
               + (f", {refusals} refusal(s) ({why})" if refusals else "")
-              + (f", {unsettled} unsettled ask(s)" if unsettled else ""))
+              + (f", {unsettled} unsettled ask(s)" if unsettled else "")
+              + (f", {replays} catch-up replay row(s) ignored" if replays else ""))
     problems: list[str] = []
     if refused:
         problems.append(f"{refused} belt refusal(s) -- a lane request carried a token outside the "

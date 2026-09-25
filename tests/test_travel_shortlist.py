@@ -1343,6 +1343,9 @@ class TestExecuteRoute:
         assert _rows() == []
 
     def test_eval_mode_uses_say_only(self, monkeypatch):
+        """D-051 r2 c2-webcall#0: under EVAL_MODE (the missed-message catch-up, its
+        default dry run included) the lane SAYS the fixed line and writes NOTHING --
+        the store is never even created."""
         monkeypatch.setenv("CORA_EVAL_MODE", "1")
         client, say = _slack_client(), MagicMock()
         route = ts.Route("search", constraints=_constraints(), budget=4)
@@ -1350,9 +1353,7 @@ class TestExecuteRoute:
         client.chat_postMessage.assert_not_called()
         assert say.call_args.kwargs["text"] == ts.EVAL_REPLY
         assert subs == []
-        (row,) = _rows()           # the refusal only: shape, no thread key
-        assert (row["event"], row["stage"], row["reason"], row["root_ts"]) == ("refused", "gate", "eval", "")
-        assert not ts.is_lane_thread(TRAVEL_CHANNEL, "1790000000.000500")
+        assert not ts.threads_path().exists()
 
     @pytest.mark.parametrize("reason,reply", [("web_off", ts.WEB_OFF_REPLY),
                                               ("model_unsupported", ts.MODEL_REPLY),
@@ -1373,12 +1374,43 @@ class TestExecuteRoute:
         self._exec(route, _slack_client())
         assert _rows() == []
 
-    def test_route_turns_eval_reply_is_ledgered_as_eval(self, monkeypatch):
+    def test_route_turns_eval_replies_write_nothing_however_often_replayed(self, monkeypatch):
+        """D-051 r2 c2-webcall#0 / harness-isolation#0 / integration#0: a catch-up
+        replay (the dry run, then --send-cards, then a re-run) of a fresh ask AND of a
+        lane-thread 'thanks!' writes no row -- a replay is not a lane refusal."""
         monkeypatch.setenv("CORA_EVAL_MODE", "1")
-        route = _route(MUST_FIRE[1])
-        assert (route.kind, route.reason) == ("reply", "eval")
-        self._exec(route, _slack_client())
-        assert [(r["event"], r["reason"]) for r in _rows()] == [("refused", "eval")]
+        root = "1790000000.000777"
+        for _ in range(3):
+            route = _route(MUST_FIRE[1])
+            assert (route.kind, route.reason) == ("reply", "eval")
+            say = MagicMock()
+            self._exec(route, _slack_client(), say=say)
+            assert say.call_args.kwargs["text"] == ts.EVAL_REPLY
+            lt = ts.route_turn("thanks!", user_id=HARRISON, channel_id=TRAVEL_CHANNEL,
+                               thread_root_ts=root, lane_thread=True, today=TODAY)
+            assert (lt.kind, lt.reason) == ("reply", "eval")
+            self._exec(lt, _slack_client(), root=root)
+        assert not ts.threads_path().exists()
+
+    @pytest.mark.parametrize("reason,reply", [("web_off", ts.WEB_OFF_REPLY),
+                                              ("model_unsupported", ts.MODEL_REPLY),
+                                              ("daily_cap", ts.CAP_REPLY),
+                                              ("eval", ts.EVAL_REPLY)])
+    def test_gate_refusals_are_ledgered_only_on_live_turns(self, monkeypatch, reason, reply):
+        monkeypatch.setenv("CORA_EVAL_MODE", "1")
+        client, say = _slack_client(), MagicMock()
+        self._exec(ts.Route("reply", reply, reason), client, say=say)
+        client.chat_postMessage.assert_not_called()
+        assert say.call_args.kwargs["text"] == reply
+        ts.record_gate_refusal(ts.Route("reply", reply, reason), channel_id=TRAVEL_CHANNEL, now=NOW)
+        assert not ts.threads_path().exists()
+
+    def test_eval_is_not_a_gate_refusal(self):
+        """'eval' is never a lane refusal (EVAL_MODE is set only by a reconstruction)."""
+        assert "eval" not in ts.GATE_REFUSALS
+        ts.record_gate_refusal(ts.Route("reply", ts.EVAL_REPLY, "eval"), channel_id=TRAVEL_CHANNEL,
+                               now=NOW)
+        assert not ts.threads_path().exists()
 
     def test_under_eval_a_non_refusal_reply_is_not_mislabelled_eval(self, monkeypatch):
         monkeypatch.setenv("CORA_EVAL_MODE", "1")
