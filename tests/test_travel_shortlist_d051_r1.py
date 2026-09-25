@@ -584,6 +584,10 @@ class TestDateParserRound1:
          date(2026, 12, 30), date(2027, 1, 2)),
         ("hotels in scottsdale check-in oct 17 – check-out oct 21",
          date(2026, 10, 17), date(2026, 10, 21)),
+        ("hotels in sedona arriving oct 30 and leaving on the 2nd",
+         date(2026, 10, 30), date(2026, 11, 2)),
+        ("hotels in sedona arriving dec 30 and leaving on the 2nd",
+         date(2026, 12, 30), date(2027, 1, 2)),
         # a Feb 29 with no year is the NEXT Feb 29 inside the 2-year window
         ("hotels in sedona feb 29 - mar 2", date(2028, 2, 29), date(2028, 3, 2)),
         ("hotels in sedona feb 29 for 2 nights", date(2028, 2, 29), date(2028, 3, 2)),

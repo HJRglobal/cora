@@ -730,8 +730,9 @@ def _p6_stay(m: "re.Match[str]", today: date) -> tuple[date, date] | None:
         mo2, d2 = _month_num(m.group("m2")), int(m.group("d2"))
     elif m.group("n2"):
         mo2, d2 = int(m.group("n2")), int(m.group("e2"))
-    else:
-        mo2, d2 = mo1, int(m.group("f2"))
+    else:                                   # "leave on the 2nd": the month is inherited,
+        d2 = int(m.group("f2"))             # or the next one when the day is not later
+        mo2 = mo1 if d2 > d1 else mo1 % 12 + 1
     return _resolve_stay(mo1, d1, _year(m.group("y1")), mo2, d2, _year(m.group("y2")), today)
 
 
