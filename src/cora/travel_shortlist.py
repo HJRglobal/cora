@@ -329,20 +329,94 @@ def _norm(text: str) -> str:
 # Predicates
 # ─────────────────────────────────────────────────────────────────────────────
 
-# LOOSE, recall-biased (B1 only): any lodging noun anywhere, any surface. A false
-# positive costs one turn its web tools (a soft KB-only degrade), never an answer.
-# Linear: word-bounded literals with single \s+ runs between literals.
-_LODGING_LOOSE_RE = re.compile(
-    r"\b(?:hotels?|motels?|inns?|hostels?|air\s?bnbs?|vrbos?|lodgings?|accommodations?"
-    r"|(?:vacation|holiday|short[-\s]term)\s+rentals?|(?:places?|somewhere|where)\s+to\s+stay"
-    r"|resorts?|suites?|bnbs?|b\s?&\s?bs?)\b",
-    re.IGNORECASE,
+# LOOSE, recall-biased (B1 only), any surface. TWO TIERS (D-051 r1 c2-egress#0/#1,
+# c2-trigger#0, integration#2/#3) read on text folded exactly like _clean but
+# UNCAPPED (a noun past 1,000 chars still counts) with markdown control characters
+# folded too -- Slack sends "B&amp;B", an en dash in "short–term" and "_hotels_",
+# and the raw-text regex this replaced could match none of them:
+#   STRONG terms always withhold -- lodging nouns, hotel brands, loyalty terms (a
+#     loyalty number travels with a brand or program name, not a generic noun);
+#   WEAK nouns (room, suite, rental, condo, resort, inn, stay ...) withhold only with
+#     a CUE -- a date, an allowlisted area, or a stay verb -- so "full suite green"
+#     or "as a last resort" in Cora's own prose no longer blacks out web.
+# A false positive costs one turn its web tools (a soft KB-only degrade), never an
+# answer. Linear: literal alternations, fixed-width lookarounds, single spaces (the
+# text is whitespace-collapsed first).
+_MD_FOLD = str.maketrans({c: " " for c in "_*~`<>|"})
+_WB, _WE = r"(?<![a-z0-9])", r"(?![a-z0-9])"
+_LOYALTY_HEAD = r"(?:loyalty|rewards?|member(?:ship)?|honors|points)"
+_LODGING_STRONG_RE = re.compile(
+    _WB + r"(?:hotels?|motels?|hostels?|air ?bnbs?|vrbos?|b ?& ?bs?|bnbs?|lodgings?"
+    r"|accommodations?|(?:vacation|holiday|short-? ?term) (?:rentals?|homes?|houses?|condos?)"
+    r"|(?:places?|somewhere|where) to (?:stay|crash|sleep)"
+    r"|hilton|marriott|hyatt|ihg|holiday inn|hampton inn|westin|sheraton|courtyard by marriott"
+    r"|doubletree|embassy suites|four seasons|ritz-? ?carlton|fairmont|kimpton|omni hotels?"
+    r"|bonvoy|world of hyatt|" + _LOYALTY_HEAD + r" (?:numbers?|accounts?|acct|ids?))" + _WE
+    + r"|" + _WB + _LOYALTY_HEAD + r" (?:no\.|#)"
+)
+_LODGING_WEAK_RE = re.compile(
+    _WB + r"(?:rooms?|suites?|rentals?|condos?|villas?|cabins?|lodges?|casitas?|resorts?|inns?"
+    r"|stays?|bedrooms?|(?:houses?|homes?) (?:to|for) (?:rent|stay)"
+    r"|(?:rent|rental|renting) (?:an? |the )?(?:houses?|homes?))" + _WE
+)
+# The CUES. A stay verb ("stay"/"stays" is also a WEAK noun -- one word never both
+# names the lodging and cues it). A date: any month-day or m/d shape (ranges
+# contain one), a night count or a near-term stay phrase.
+_STAY_CUE_RE = re.compile(
+    _WB + r"(?:stay(?:s|ing|ed)?|book(?:s|ing|ed)?|check(?:ing)?[- ](?:in|out)"
+    r"|reserv(?:e|es|ed|ing|ation|ations)|overnight)" + _WE
+)
+_MONTH_WORD = (r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?"
+               r"|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)")
+_DATE_CUE_RE = re.compile(
+    _WB + r"(?:" + _MONTH_WORD + r"\.? \d{1,2}(?:st|nd|rd|th)?"
+    r"|\d{1,2}(?:st|nd|rd|th)? (?:of )?" + _MONTH_WORD
+    + r"|\d{1,2}/\d{1,2}(?![0-9])|(?:\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten) nights?"
+    r"|tonight|this weekend|next weekend|for the weekend)" + _WE
 )
 
 
+def _loose_views(text: Any) -> tuple[str, str]:
+    """(body, token_innards): _clean's folding WITHOUT the cap -- Slack <...> tokens
+    become spaces in the body (their innards, e.g. a pasted listing link's URL and
+    label, are the second view), the three entities are unescaped, typographic
+    dashes/quotes and markdown control characters fold, whitespace collapses."""
+    raw = str(text or "")
+    inner = " ".join(_SLACK_TOKEN_RE.findall(raw))
+    body = _SLACK_TOKEN_RE.sub(" ", raw)
+
+    def fold(t: str) -> str:
+        t = t.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        return " ".join(t.translate(_TRANSLATE).translate(_MD_FOLD).split()).lower()
+
+    return fold(body), fold(inner)
+
+
+def _weak_with_cue(t: str) -> bool:
+    nouns = [m.group(0) for m in _LODGING_WEAK_RE.finditer(t)]
+    if not nouns:
+        return False
+    if _DATE_CUE_RE.search(t) or _parse_areas(t, _load_map()):
+        return True
+    stay_words = sum(1 for n in nouns if n in ("stay", "stays"))
+    other_nouns = len(nouns) - stay_words
+    other_cues = sum(1 for m in _STAY_CUE_RE.finditer(t) if m.group(0) not in ("stay", "stays"))
+    # a noun and a cue that are DIFFERENT words ("stay" can be either, not both)
+    return bool((other_nouns and (other_cues or stay_words)) or (stay_words and other_cues)
+                or stay_words >= 2)
+
+
 def is_lodging_shaped(text: Any) -> bool:
-    """B1's loose predicate: does this turn mention lodging at all?"""
-    return bool(text) and bool(_LODGING_LOOSE_RE.search(str(text)))
+    """B1's loose predicate: does this turn mention lodging at all? STRONG term, or
+    WEAK noun + cue, on either view -- or the STRICT predicate itself, so every ask
+    the lane would take is lodging-shaped by construction (strict is a subset of
+    loose; pinned over the MUST_FIRE asks in Slack wire form)."""
+    if not text:
+        return False
+    for view in _loose_views(text):
+        if view and (_LODGING_STRONG_RE.search(view) or _weak_with_cue(view)):
+            return True
+    return _is_strict_ask(text)
 
 
 # STRICT nouns: suite / resort / rental never trigger the lane alone (B5).

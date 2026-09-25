@@ -288,11 +288,16 @@ class TestPredicates:
                                             channel_type="im", **{flag: True})
 
     def test_loose_lodging_shape_is_recall_biased(self):
-        for t in ("the hotel was great", "renew the Adobe suite", "what's our last resort",
-                  "google hotels in scottsdale", "any places to stay?", "Holiday Inn Express",
-                  "an air bnb", "short-term rentals", "HOTELS"):
+        for t in ("the hotel was great", "google hotels in scottsdale", "any places to stay?",
+                  "Holiday Inn Express", "an air bnb", "short-term rentals", "HOTELS",
+                  "a suite in scottsdale", "the resort for oct 17-21"):
             assert ts.is_lodging_shaped(t), t
-        for t in ("what's our cash position?", "hot take", "suiteness", "", None):
+        # DELIBERATE FLIP (D-051 r1 integration#2 / the two-tier ruling): a WEAK noun
+        # (suite / resort / room / inn ...) withholds only with a cue -- a date, an
+        # allowlisted area or a stay verb -- so "renew the Adobe suite" and "what's our
+        # last resort" no longer black out web. Full tables: test_travel_shortlist_d051_r1.
+        for t in ("what's our cash position?", "hot take", "suiteness", "", None,
+                  "renew the Adobe suite", "what's our last resort"):
             assert not ts.is_lodging_shaped(t), t
 
     @pytest.mark.parametrize("shape", [
@@ -318,7 +323,9 @@ class TestPredicates:
             ts.sanitize_field(shape, 160)
             ts.merge_followup(_constraints(), shape, today=TODAY)
             ts._PASSTHROUGH_RE.search(ts._norm(ts._clean(shape)))
-            ts._LODGING_LOOSE_RE.search(shape)
+            for rx in (ts._LODGING_STRONG_RE, ts._LODGING_WEAK_RE, ts._STAY_CUE_RE,
+                       ts._DATE_CUE_RE):
+                rx.search(shape)
         assert _best_of_3(run) < 0.05
 
 
