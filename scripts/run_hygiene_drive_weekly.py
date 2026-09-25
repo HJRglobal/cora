@@ -448,19 +448,32 @@ def floor_anchor(runs: list[RunInfo], ledger: dict[str, dict], current: str) -> 
                 if isinstance(n, int) and not isinstance(n, bool) and n > 0:
                     out[key] = (n, cutoff)
                     break
-        return out
-    base = next((r for r in runs if r.stamp == BASELINE_STAMP), None)
-    if base is not None:
+    else:
+        base = next((r for r in runs if r.stamp == BASELINE_STAMP), None)
+        if base is not None:
+            for key in ("files_total", "dirs_total"):
+                n = base.summary.get(key) or 0
+                if n:
+                    out[key] = (n, BASELINE_STAMP)
+    # D-051 r4: the anchor FOLLOWS GROWTH. A tree that grew past the anchor could
+    # otherwise shed the growth plus 20% of the anchor with no operator. Raise it to
+    # the largest clean/unverified runner walk at or after the anchor and before
+    # this week (the ledger keeps those totals after rotation deletes the files).
+    lo = cutoff if cutoff is not None else BASELINE_STAMP
+    for st, row in ledger.items():
+        if not (lo <= st < current) or row.get("status") not in ("clean", "unverified"):
+            continue
         for key in ("files_total", "dirs_total"):
-            n = base.summary.get(key) or 0
-            if n:
-                out[key] = (n, BASELINE_STAMP)
+            n = row.get(key)
+            if isinstance(n, int) and not isinstance(n, bool) and n > out.get(key, (0, ""))[0]:
+                out[key] = (n, st)
     return out
 
 
 def sanity(info: RunInfo, full_root: Path, prior: RunInfo | None, *, files_rows: int | None,
            dirs_rows: int | None, high: dict[str, tuple[int, str]] | None = None,
-           anchor: dict[str, tuple[int, str]] | None = None) -> list[str]:
+           anchor: dict[str, tuple[int, str]] | None = None,
+           anchor_cutoff: str | None = None) -> list[str]:
     """Reasons this walk cannot be trusted (empty list = it passed). A row count
     of None = that CSV is missing or unreadable. ``high`` is the high-water mark
     the floor is anchored to (``high_water``); None = the prior alone. ``anchor``
@@ -502,8 +515,12 @@ def sanity(info: RunInfo, full_root: Path, prior: RunInfo | None, *, files_rows:
             continue   # the high-water floor is at least as strict: one reason, not two
         now_n = sm.get(key) or 0
         if now_n < FLOOR_RATIO * an_n:
-            what = ("the 2026-09-21 baseline's" if an_stamp == BASELINE_STAMP
-                    else "the newest re-baselined run's")
+            if an_stamp == BASELINE_STAMP:
+                what = "the 2026-09-21 baseline's"
+            elif anchor_cutoff is not None and an_stamp != anchor_cutoff:
+                what = "the largest clean run's since the anchor"   # the anchor followed growth
+            else:
+                what = "the newest re-baselined run's"
             why.append(f"{label} walked {now_n} < {int(FLOOR_RATIO * 100)}% of {what} {an_n} "
                        f"(stamp {an_stamp}): a cumulative shrink over 20% is accepted only by a re-baseline")
     return why
@@ -771,7 +788,8 @@ def main(argv: list[str] | None = None) -> int:
         prior = runs[0] if runs else None
         rows_n = {"files_rows": None if files is None else len(files), "dirs_rows": None if dirs is None else len(dirs)}
         why = sanity(info, cfg.root, prior, high=high_water(runs),
-                     anchor=floor_anchor(runs, ledger, stamp), **rows_n)
+                     anchor=floor_anchor(runs, ledger, stamp),
+                     anchor_cutoff=rebaseline_cutoff(ledger, stamp) or BASELINE_STAMP, **rows_n)
         prior_rows = load_prior_rows(cfg.outdir, prior)
         if prior is not None and prior_rows is None:
             why.append(f"the prior run's (stamp {prior.stamp}) files or folders CSV is missing or unreadable, "
@@ -797,7 +815,11 @@ def main(argv: list[str] | None = None) -> int:
         if why:
             # the hint only where the re-baseline would be accepted: the walk is
             # sound and the stamp is (now) a runner-recorded full-root NO-HASH walk
-            hint = own_ok and (not a.from_stamp or _is_runner_walk(ledger.get(stamp)))
+            # D-051 r4: never on a week OLDER than the newest re-baseline -- rebaseline()
+            # refuses that stamp, so the printed command would be a dead end.
+            newest_cut = rebaseline_cutoff(ledger)
+            hint = (own_ok and (not a.from_stamp or _is_runner_walk(ledger.get(stamp)))
+                    and (newest_cut is None or stamp >= newest_cut))
             md = hdr.render_incomplete_md(
                 date=date, stamp=stamp, reasons=why, files_total=info.summary.get("files_total"),
                 dirs_total=info.summary.get("dirs_total"), prior_stamp=prior.stamp if prior else None,

@@ -479,10 +479,26 @@ def test_a_subject_is_tier_A_against_its_own_truncated_copies():
         assert cut and full and cut < full                    # a CUT clause: strict subset
         assert gtd.tier_a(subj, copy) and gtd.tier_a(copy, subj)
         assert _tier(subj, copy) == "A"
-    # every cut point of the 191-char subject past its clause keyword, word boundary or not
+    # every CAP-length cut point of the 191-char subject past its clause keyword, word
+    # boundary or not (real copies exist only at the 150 / 240 caps -- D-051 r4)
     kw = _CLAUSE_SUBJ_191.index("currently")
-    for n in range(kw + len("currently b"), len(_CLAUSE_SUBJ_191)):
+    for n in range(max(kw + len("currently b"), gtd._TRUNCATION_MIN_CHARS), len(_CLAUSE_SUBJ_191)):
         assert gtd.tier_a(_CLAUSE_SUBJ_191, _CLAUSE_SUBJ_191[:n]), n
+
+
+@pytest.mark.parametrize("short,longer", [
+    # D-051 r4: a CHARACTER prefix in the dropped region is a different task, not a copy
+    ("Order F3 Pure cans - 12 Lemon", "Order F3 Pure cans - 12 Lemonade"),
+    ("Reprint F3 Pure labels - 4 Mango", "Reprint F3 Pure labels - 4 Mangosteen"),
+    ("Ship the pallet to the depot, currently blocked by Dana",
+     "Ship the pallet to the depot, currently blocked by Danaher"),
+    # a word-boundary extension of a SHORT subject (< 4 content tokens) is not a copy
+    ("Hire currently open roles", "Hire currently open roles for the Phoenix warehouse"),
+    ("Fix currently broken POS", "Fix currently broken POS at the Gilbert store"),
+])
+def test_a_short_or_mid_word_prefix_is_not_a_truncated_copy(short, longer):
+    assert not gtd._is_truncated_copy(short, longer)
+    assert not gtd.tier_a(short, longer) and not gtd.tier_a(longer, short)
 
 
 def test_a_truncated_copy_is_found_by_the_ledger_but_a_different_clause_is_not(tmp_path,

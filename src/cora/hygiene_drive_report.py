@@ -191,13 +191,16 @@ def _lex_entities():
 # Lexington". "Lexicon", "Lexus", "LEXUS", "Alex", "FlexSeal" and "NonLexington"
 # ("Non Lexington": the rule's own exception) split into nothing the rules match.
 _CAMEL_RE = re.compile(
-    r"(?<![A-Za-z])(LEX|LLA|DDD|COPA)(?=[a-z]|[A-Z][a-z])"   # a glued all-caps code
+    r"(?<![A-Z])(LEX|LLA|DDD|COPA)(?=[a-z]|[A-Z][a-z])"      # a glued all-caps code (D-051 r4:
+                                                             # after a lowercase too: TheLEXreport)
     r"|(?<=[a-z])(?=[A-Z])"                                  # camelCase
     r"|(?<=[A-Z])(?=[A-Z][a-z])")                            # ACRONYMWord
 
 
 def _split_camel(seg: str) -> str:
-    return _CAMEL_RE.sub(lambda m: (m.group(1) or "") + " ", seg)
+    # a glued code gets a break on BOTH sides ("TheLEXreport" -> "The LEX report")
+    return _CAMEL_RE.sub(
+        lambda m: ((" " if m.start() else "") + m.group(1) + " ") if m.group(1) else " ", seg)
 
 
 # The named LEX people, as ONE compiled regex: [pattern], or [None] when a source
@@ -274,7 +277,9 @@ def _segment_names_lex(seg: str) -> bool:
         if kb_exclusions.is_copa_meeting_title(seg):
             return True
         leads = _lex_lead_re()
-        if leads is None or leads.search(seg):
+        # D-051 r4: a lead glued to a neighbouring word ("JaneDoeNotes") is found on
+        # the CamelCase-split form too.
+        if leads is None or leads.search(seg) or (camel != seg and leads.search(camel)):
             return True
         spaced = _SEP_RE.sub(" ", seg)
         entities = _lex_entities()

@@ -68,6 +68,10 @@ PASS5_PREFIX = "pass5:drive:"
 
 _MAX_INPUT = 300
 _MAX_SUBJECT_STORED = 240
+# A strict prefix at or past this length reads as a CAPPED copy (the 150-char task
+# name, the 240-char ledger subject); shorter prefixes must end on a word boundary
+# and keep >= 4 content tokens (D-051 r4, _is_truncated_copy).
+_TRUNCATION_MIN_CHARS = 130
 
 # ── normalizer ───────────────────────────────────────────────────────────────
 
@@ -377,10 +381,26 @@ def _is_truncated_copy(a_text: str, b_text: str) -> bool:
     text's dropped words. The drift guard read that as two tasks and refused the
     task its own copy -- after a create that timed out post-commit, the fresh
     project scan (the only net left) no longer recognised the task this executor
-    made. Whitespace runs are collapsed so a copy that only re-spaced still counts."""
+    made. Whitespace runs are collapsed so a copy that only re-spaced still counts.
+
+    D-051 r4: a character prefix alone is not a truncation -- 'Order ... - 12 Lemon'
+    is a character prefix of '... - 12 Lemonade' (a different flavor), and 'Hire
+    currently open roles' of '... for the Phoenix warehouse'. A copy is accepted only
+    when it LOOKS like a cap: the shorter side is at a cap length (>=
+    _TRUNCATION_MIN_CHARS -- the live 150-cap task names measure 138-144 after the
+    prefix strip; the ledger cap is 240), or it ends on a word boundary AND keeps the
+    prefix rule's own content floor (>= 4 content tokens)."""
     sa = " ".join(strip_task_prefix(a_text).split()).casefold()
     sb = " ".join(strip_task_prefix(b_text).split()).casefold()
-    return bool(sa) and bool(sb) and sa != sb and (sa.startswith(sb) or sb.startswith(sa))
+    if not sa or not sb or sa == sb:
+        return False
+    short, long_ = (sa, sb) if len(sa) < len(sb) else (sb, sa)
+    if not long_.startswith(short):
+        return False
+    if len(short) >= _TRUNCATION_MIN_CHARS:
+        return True
+    at_boundary = not long_[len(short)].isalnum() or not short[-1].isalnum()
+    return at_boundary and signature(short).content_n >= 4
 
 
 def tier_a(a_text: str, b_text: str) -> bool:

@@ -1283,6 +1283,8 @@ def test_r3_a_from_stamp_rebuild_before_a_rebaseline_keeps_its_own_floor(world, 
         assert "INCOMPLETE WALK" in md and "UNVERIFIED" not in md and "f000 (1).pdf" not in md
         assert f"files walked {n} < 80% of the prior full run's 100" in md
         assert f"Prior full run: stamp `{rh.BASELINE_STAMP}`" in md
+        # D-051 r4: no dead-end hint -- rebaseline() refuses a week older than W3's
+        assert "--rebaseline" not in md, st
     assert not list(world.outdir.glob("hygiene-findings-full-*")), "no sidecar for a pre-re-baseline week"
     led = rh.ledger_state(rh.read_ledger(world.ledger))
     assert [r.stamp for r in rh.eligible_runs(world.outdir, w1, world.root, led)] == [rh.BASELINE_STAMP]
@@ -1372,3 +1374,46 @@ def test_r2_an_unreadable_prior_csv_is_an_incomplete_walk_not_a_traceback(world,
     fake_ps(monkeypatch, world, stamp="20261003-0240")
     assert rh.main(["--apply"]) == rh.EXIT_OK
     assert "stamp `20260926-0240`" in world.report("2026-10-03").read_text(encoding="utf-8")
+
+
+def test_r4_the_cumulative_anchor_follows_growth(world, monkeypatch):
+    """D-051 r4: the anchor stayed at the 9/21 baseline's counts while the tree
+    GREW, so a tree that grew to 150 could slide 150 -> 121 -> 97 (35%) in CLEAN
+    four-week steps: each step passed the moving window AND 80% of the baseline's
+    100. The anchor now rises to the largest clean walk since it, so the 97 fails."""
+    full = [frow(f"02-F3-Energy\\g\\f{i:03d}.pdf") for i in range(150)]
+    write_stamp(world.outdir, rh.BASELINE_STAMP, full[:100], BASE_DIRS, root=world.root, max_hash=200)
+    s = _weekly(9)
+    for st in s[:4]:                                  # the tree grows to 150
+        fake_ps(monkeypatch, world, stamp=st, files=full[:150])
+        assert rh.main(["--apply"]) == rh.EXIT_OK
+    for st in s[4:8]:                                 # 121 >= 80% of 150: CLEAN
+        fake_ps(monkeypatch, world, stamp=st, files=full[:121])
+        assert rh.main(["--apply"]) == rh.EXIT_OK
+    led = rh.ledger_state(rh.read_ledger(world.ledger))
+    runs = rh.eligible_runs(world.outdir, s[8], world.root, led)
+    assert rh.floor_anchor(runs, led, s[8])["files_total"][0] == 150
+    fake_ps(monkeypatch, world, stamp=s[8], files=full[:97])   # >= 80% of the window's 121
+    assert rh.main(["--apply"]) == rh.EXIT_INCOMPLETE
+    md = world.report(_day(s[8])).read_text(encoding="utf-8")
+    assert "files walked 97 < 80% of the largest clean run's since the anchor 150" in md
+
+
+def test_r4_a_lead_glued_to_a_neighbouring_word_and_a_mid_word_code_are_counts_only():
+    """D-051 r4: a LEX lead glued to another word ("<First><Last>Notes") was matched
+    only on the raw segment, and "TheLEXreport" never split around the code. Both
+    are now counts-only; ordinary words that merely contain the letters stay listed.
+    Failures report indexes only (no names printed)."""
+    from cora import org_roles
+    names = sorted({r.name for r in org_roles.all_roles() if str(r.entity).upper().startswith("LEX")})
+    assert len(names) >= 1
+    missed = []
+    for i, name in enumerate(names):
+        first, last = name.split()[0], name.split()[-1]
+        for j, seg in enumerate((f"{first}{last}Notes", f"Notes{first}{last}", f"{first[0]}{last}Resume")):
+            if not hdr.is_lex_relpath(f"01-HJR-Global\\hr\\{seg} (1).pdf"):
+                missed.append((i, j))
+    assert missed == []
+    assert hdr.is_lex_relpath("01-HJR-Global\\accounting\\TheLEXreport (1).xlsx")
+    for ordinary in ("LEXUS", "Lexicon", "FLEXreport", "LLAMA", "AlexCordova", "LexisNexis"):
+        assert not hdr.is_lex_relpath(f"01-HJR-Global\\misc\\{ordinary} (1).pdf"), ordinary

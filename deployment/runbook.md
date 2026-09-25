@@ -165,7 +165,8 @@ is regenerated. **Weekly Sat 02:40 AZ** -> `scripts/run_hygiene_drive_weekly.py 
   floor; the `20260921-1948` baseline counts only while it is one of those four),
   never of a run older than the newest re-baseline, AND >= 80% of the cumulative
   ANCHOR -- the newest re-baselined stamp's counts (kept in the stamp ledger), or
-  the `20260921-1948` baseline's while nothing was ever re-baselined. It is
+  the `20260921-1948` baseline's while nothing was ever re-baselined -- RAISED to
+  the largest clean walk since that anchor, so the anchor follows growth (D-051 r4). It is
   anchored on those, not on last week, so a partial walk cannot ratchet the floor
   down -- neither at once nor 20% per four weeks (D-051 R3 rb2#r3-0: the four-run
   window alone let 50% of the tree vanish over ~13 CLEAN weeks); a run that fails
