@@ -247,6 +247,8 @@ LEX_NAMED_OUTSIDE_08 = [
     "_shared\\meetings\\Jared Harker check-in (1).gdoc",      # a named LEX lead (attendee signal)
     "_shared\\meetings\\Case Conference notes (1).gdoc",      # a clinical title
     "_shared\\meetings\\HCBS rates (1).pdf",
+    "_shared\\meetings\\Lex Services board (1).gdoc",
+    "01-HJR-Global\\accounting\\Lex-LLC recon (1).xlsx",
     "01-HJR-Global\\accounting\\visibility-binder\\02 Non-Lexington\\Copy of Lex Services P&L (1).xlsx",
     "01-HJR-Global\\accounting\\visibility-binder\\02 Non-Lexington\\Copy of LBHS budget (1).xlsx",
     "01-HJR-Global\\accounting\\DDD contract (1).pdf",
@@ -287,6 +289,8 @@ def test_static_walk_phi_folder_segments_are_counts_only_and_imported_not_copied
 
     assert hdr._static_phi_segments() == frozenset(s.lower() for s in incremental_sync_static.PHI_BLACKLIST_SEGMENTS)
     seg_paths = ["09-One-Stop-Nutrition\\clients\\roster export (1).pdf",
+                 "_shared\\meetings\\clients\\weekly roster (1).gdoc",
+                 "01-HJR-Global\\accounting\\Clients\\billing list (1).xlsx",
                  "02-F3-Energy\\Consumers\\survey (1).pdf",
                  "_shared\\ehr\\x (1).pdf"]
     fine = "02-F3-Energy\\client-decks\\deck (1).pdf"     # a segment CONTAINING 'client' is not the segment
