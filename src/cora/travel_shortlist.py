@@ -789,12 +789,30 @@ _NUM_RX = (r"(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|tw
 _ORDINAL_RE = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)\b")
 _DATE_P1 = re.compile(r"\b" + _MONTH_RX + r" (\d{1,2})" + _YEAR_RX + _SEP_RX + _MONTH_RX
                       + r" (\d{1,2})" + _YEAR_RX + r"\b")
-_DATE_P5 = re.compile(r"\b" + _MONTH_RX + r" (\d{1,2})" + _YEAR_RX + r" for " + _NUM_RX
+_DATE_P5 = re.compile(r"\b" + _MONTH_RX + r" (\d{1,2})" + _YEAR_RX + r"(?:,? for |, )" + _NUM_RX
                       + r" nights?\b")
-_DATE_P2 = re.compile(r"\b" + _MONTH_RX + r" (\d{1,2})" + _SEP_RX + r"(\d{1,2})" + _YEAR_RX + r"\b")
+# P2's check-out day never runs into a '/' (D-051 r2 c2-trigger#5): "oct 17 - 10/21" is
+# Oct 17 -> Oct 21 (P1B), never "Oct 17 -> Oct 10" rolled a year (or a silently WRONG
+# "oct 5 - 10/7" -> Oct 5-10 billed search).
+_DATE_P2 = re.compile(r"\b" + _MONTH_RX + r" (\d{1,2})" + _SEP_RX + r"(\d{1,2})(?![\d/])" + _YEAR_RX
+                      + r"\b")
 _DATE_P3 = re.compile(r"\b(\d{1,2})" + _SEP_RX + r"(\d{1,2}) (?:of )?" + _MONTH_RX + _YEAR_RX + r"\b")
 _DATE_P4 = re.compile(r"(?<![\d/])(\d{1,2})/(\d{1,2})(?:/(20\d\d|\d\d))?" + _SEP_RX
                       + r"(\d{1,2})/(\d{1,2})(?:/(20\d\d|\d\d))?(?![\d/])")
+# D-051 r2 (c2-trigger#5) shorthands: mixed month-word / m-d ranges both ways ("oct 17 -
+# 10/21", "10/17 - oct 21"), a same-month m/d-d ("10/17-21"), an m/d check-in for N
+# nights ("10/17 for 2 nights", "10/17, 2 nights") and nights-first ("3 nights starting
+# oct 17").
+_DATE_P1B = re.compile(r"\b" + _MONTH_RX + r" (\d{1,2})" + _YEAR_RX + _SEP_RX
+                       + r"(\d{1,2})/(\d{1,2})(?:/(20\d\d|\d\d))?(?![\d/])")
+_DATE_P4B = re.compile(r"(?<![\d/])(\d{1,2})/(\d{1,2})(?:/(20\d\d|\d\d))?" + _SEP_RX + _MONTH_RX
+                       + r" (\d{1,2})" + _YEAR_RX + r"\b")
+_DATE_P7 = re.compile(r"(?<![\d/])(\d{1,2})/(\d{1,2})" + _SEP_RX + r"(\d{1,2})(?![\d/])")
+_DATE_P5B = re.compile(r"(?<![\d/])(\d{1,2})/(\d{1,2})(?:/(20\d\d|\d\d))?(?![\d/])(?:,? for |, )"
+                       + _NUM_RX + r" nights?\b")
+_DATE_P5C = re.compile(r"\b" + _NUM_RX + r" nights? (?:starting|from|beginning|arriving"
+                       r"|checking in)(?: on)? (?:" + _MONTH_RX + r" (\d{1,2})" + _YEAR_RX
+                       + r"|(\d{1,2})/(\d{1,2})(?:/(20\d\d|\d\d))?)(?![\d/])")
 
 
 def _month_num(tok: str) -> int:
@@ -888,7 +906,8 @@ def _p6_stay(m: "re.Match[str]", today: date) -> tuple[date, date] | None:
 
 def _date_candidates(text: str, today: date) -> list[tuple[int, int, Any, bool]]:
     """(start, end, stay-or-None, explicit) for every stay phrase, in pattern
-    priority order (P6, P1, P5, P2, P3, P4) with overlapping spans dropped."""
+    priority order (P6, P1, P1B, P4B, P5, P5B, P5C, P2, P3, P4, P7) with overlapping
+    spans dropped."""
     out: list[tuple[int, int, Any, bool]] = []
     taken = bytearray(len(text) + 1)            # linear overlap check (no pairwise scan)
 
@@ -903,10 +922,28 @@ def _date_candidates(text: str, today: date) -> list[tuple[int, int, Any, bool]]
     for m in _DATE_P1.finditer(text):
         add(m, _resolve_stay(_month_num(m.group(1)), int(m.group(2)), _year(m.group(3)),
                              _month_num(m.group(4)), int(m.group(5)), _year(m.group(6)), today))
+    for m in _DATE_P1B.finditer(text):
+        add(m, _resolve_stay(_month_num(m.group(1)), int(m.group(2)), _year(m.group(3)),
+                             int(m.group(4)), int(m.group(5)), _year(m.group(6)), today))
+    for m in _DATE_P4B.finditer(text):
+        add(m, _resolve_stay(int(m.group(1)), int(m.group(2)), _year(m.group(3)),
+                             _month_num(m.group(4)), int(m.group(5)), _year(m.group(6)), today))
+
+    def nights_stay(mo: int, d: int, y: int | None, n_tok: str) -> Any:
+        ci = _resolve_check_in(mo, d, y, today)
+        nights = _num(n_tok)
+        return (ci, ci + timedelta(days=nights)) if ci is not None and 1 <= nights <= 30 else None
+
     for m in _DATE_P5.finditer(text):
-        ci = _resolve_check_in(_month_num(m.group(1)), int(m.group(2)), _year(m.group(3)), today)
-        nights = _num(m.group(4))
-        add(m, (ci, ci + timedelta(days=nights)) if ci is not None and 1 <= nights <= 30 else None)
+        add(m, nights_stay(_month_num(m.group(1)), int(m.group(2)), _year(m.group(3)), m.group(4)))
+    for m in _DATE_P5B.finditer(text):
+        add(m, nights_stay(int(m.group(1)), int(m.group(2)), _year(m.group(3)), m.group(4)))
+    for m in _DATE_P5C.finditer(text):
+        if m.group(2):
+            add(m, nights_stay(_month_num(m.group(2)), int(m.group(3)), _year(m.group(4)),
+                               m.group(1)))
+        else:
+            add(m, nights_stay(int(m.group(5)), int(m.group(6)), _year(m.group(7)), m.group(1)))
     for m in _DATE_P2.finditer(text):
         mo = _month_num(m.group(1))
         add(m, _resolve_stay(mo, int(m.group(2)), _year(m.group(4)), mo, int(m.group(3)),
@@ -918,6 +955,9 @@ def _date_candidates(text: str, today: date) -> list[tuple[int, int, Any, bool]]
     for m in _DATE_P4.finditer(text):
         add(m, _resolve_stay(int(m.group(1)), int(m.group(2)), _year(m.group(3)),
                              int(m.group(4)), int(m.group(5)), _year(m.group(6)), today))
+    for m in _DATE_P7.finditer(text):
+        mo = int(m.group(1))
+        add(m, _resolve_stay(mo, int(m.group(2)), None, mo, int(m.group(3)), None, today))
     return out
 
 

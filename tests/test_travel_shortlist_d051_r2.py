@@ -427,6 +427,61 @@ class TestHeadNounFrame:
         assert _best_of_3(run) < 0.05
 
 
+# ── r2:c2-trigger#5: the date shorthands parse; P2 never reads a check-out month ──
+
+class TestDateShorthandsRound2:
+    @pytest.mark.parametrize("text,ci,co", [
+        ("find hotels in scottsdale 10/17-21", date(2026, 10, 17), date(2026, 10, 21)),
+        ("find hotels in scottsdale 10/17 to 21", date(2026, 10, 17), date(2026, 10, 21)),
+        ("find hotels in scottsdale 10/17 for 2 nights", date(2026, 10, 17), date(2026, 10, 19)),
+        ("find hotels in scottsdale 10/17, 2 nights", date(2026, 10, 17), date(2026, 10, 19)),
+        ("find hotels in scottsdale oct 17, 2 nights", date(2026, 10, 17), date(2026, 10, 19)),
+        ("find hotels in scottsdale 3 nights starting oct 17", date(2026, 10, 17),
+         date(2026, 10, 20)),
+        ("find hotels in scottsdale for 2 nights from 10/17", date(2026, 10, 17),
+         date(2026, 10, 19)),
+        ("find hotels in scottsdale oct 17 - 10/21", date(2026, 10, 17), date(2026, 10, 21)),
+        ("find hotels in scottsdale 10/17 - oct 21", date(2026, 10, 17), date(2026, 10, 21)),
+        # the silently-WRONG stays P2 used to produce (Oct 7-10, Oct 5-10, Oct 3-10)
+        ("find hotels in scottsdale oct 7 - 10/21", date(2026, 10, 7), date(2026, 10, 21)),
+        ("find hotels in scottsdale oct 5 - 10/7", date(2026, 10, 5), date(2026, 10, 7)),
+        ("find hotels in scottsdale oct 3-10/5", date(2026, 10, 3), date(2026, 10, 5)),
+        # unchanged neighbours
+        ("find hotels in scottsdale oct 17-21, 2026", date(2026, 10, 17), date(2026, 10, 21)),
+        ("find hotels in scottsdale 10/17-10/21", date(2026, 10, 17), date(2026, 10, 21)),
+        ("find hotels in scottsdale oct 17 for 4 nights", date(2026, 10, 17), date(2026, 10, 21)),
+    ])
+    def test_formats(self, text, ci, co):
+        c = ts.parse_constraints(text, today=TODAY).constraints
+        assert c is not None, text
+        assert (c.check_in, c.check_out) == (ci, co), text
+        r = ts.route_turn(text, user_id=HARRISON, channel_id="D0HARRISON", channel_name="dm",
+                          today=TODAY)
+        assert r is not None and r.kind == "search", (text, r)
+
+    @pytest.mark.parametrize("text", [
+        "find hotels in scottsdale 10/17-10/5",          # a check-out before check-in, 30+ nights
+        "find hotels in scottsdale 13/40-21",            # no such day
+    ])
+    def test_still_malformed(self, text):
+        pr = ts.parse_constraints(text, today=TODAY)
+        assert pr.constraints is None and pr.malformed is True
+
+    @pytest.mark.parametrize("shape", [
+        " " * 40000, "10/1" * 10000, "1/1-" * 10000, "oct 1 - " * 5000,
+        "3 nights starting " * 2500, "10/17, " * 6000, "10/17 for " * 4000, "oct 1 - 1" * 4000,
+    ], ids=["spaces", "md", "md-dash", "oct-dash", "nights-first", "md-comma", "md-for",
+            "mixed"])
+    def test_the_new_date_patterns_are_linear(self, shape):
+        def run():
+            for rx in (ts._DATE_P1B, ts._DATE_P4B, ts._DATE_P7, ts._DATE_P5B, ts._DATE_P5C,
+                       ts._DATE_P2, ts._DATE_P5):
+                rx.search(shape)
+            ts._parse_dates(ts._norm(shape), TODAY)
+        assert _best_of_3(run) < 0.25
+        assert _best_of_3(lambda: ts.parse_constraints(shape, today=TODAY)) < 0.05
+
+
 # ── r2:c2-trigger#6: "free cancellation" / "cancellable" is a filter, not a bail ──
 
 class TestCancellationIsAFilter:
