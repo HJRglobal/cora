@@ -5296,7 +5296,9 @@ def _channel_archive_dm_intercept(event: dict, client, user_id: str, text: str) 
             # ... nor the answer to a NEWER top-level message of Cora's (a top-level
             # "yes" answers the last thing said; typed in the card's thread it is
             # the card's).
-            if not thread_ts and _ca_bot_spoke_since_card(client, dm, card_ts):
+            # (No Slack read under EVAL_MODE: the intercept below is a no-op there.)
+            if (not thread_ts and os.environ.get("CORA_EVAL_MODE") != "1"
+                    and _ca_bot_spoke_since_card(client, dm, card_ts)):
                 return False
     if thread_ts and _ca_thread_claimed(user_id, dm, thread_ts):
         log.info("channel_archive DM intercept kind=%s yields: a capture owns the thread", kind)

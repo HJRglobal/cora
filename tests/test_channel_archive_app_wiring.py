@@ -488,6 +488,13 @@ class TestNewerBotMessageR1:
         app_module.handle_message_event(_event("yes", thread_ts=card_ts), client)
         assert _texts(client) == [intents.followup_reply()] and not quiet.qa.called
 
+    def test_eval_mode_reads_no_slack_history(self, quiet, monkeypatch):
+        monkeypatch.setenv("CORA_EVAL_MODE", "1")
+        client = MagicMock()
+        app_module.handle_message_event(_event("yes"), client)
+        assert not client.conversations_history.called and not client.chat_postMessage.called
+        assert not quiet.qa.called
+
     def test_an_imperative_follow_up_ignores_newer_messages(self, quiet):
         """Only the bare affirmative is ambiguous; 'archive them' always means the card."""
         client = MagicMock()
