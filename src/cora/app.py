@@ -5202,16 +5202,19 @@ def _channel_archive_dm_intercept(event: dict, client, user_id: str, text: str) 
     thread_ts = event.get("thread_ts")
     kind = ("ask" if cai.looks_like_archive_ask(text)
             else "status" if cai.looks_like_archive_status(text)
-            else "followup" if cai.followup_shape(text) is not None
-            else "attempt" if cai.looks_like_archive_attempt(text)
             else "")
+    shape = None if kind else cai.followup_shape(text)
+    if shape is not None:
+        card_ts = cai.live_card_ts(dm)
+        if card_ts is not None and cai.looks_like_live_followup(text, card_ts=card_ts):
+            kind = "followup"
+    # Every archive-verb opener has a follow-up SHAPE (c1-intents-copy#1), so with no
+    # live card it must still reach the attempt rail rather than end here.
+    if not kind and shape != "affirmative" and cai.looks_like_archive_attempt(text):
+        kind = "attempt"
     if not kind:
         return False
     if kind == "followup":
-        shape = cai.followup_shape(text)
-        card_ts = cai.live_card_ts(dm)
-        if card_ts is None or not cai.looks_like_live_followup(text, card_ts=card_ts):
-            return False
         if shape == "affirmative":
             # A bare "yes" never steals a pending staged write's confirm, a reply typed
             # in some other thread, or the answer to a live gap ask / knowledge-check

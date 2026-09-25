@@ -366,6 +366,66 @@ class TestFounderDM:
 _REAL_DELIVER = deliver.deliver_proposal
 
 
+def _live_card():
+    _stage()
+    st.append_event("delivered", proposal_id=PID, page=1, dm_channel="DHARRISON1",
+                    message_ts=f"{time.time() - 5:.6f}", rendered_cids=[A1], buttons=True)
+
+
+class TestFounderDMGrammarR1:
+    """D-051 round 1 (c1-intents-copy#0/#1/#2/#6, integration#5): every grammar change
+    driven through the REAL handle_message_event."""
+
+    @pytest.mark.parametrize("text", [
+        "how do I archive a channel in slack?", "which archived reports cover the retail channel?",
+        "what did we decide in <#C0B2T18R3FG|hjr-archive-2024>?", "did the hubspot proposal get archived?",
+        "which channels should I archive?", "what is the policy for archiving channels?",
+        "did we ever decide which channels to archive?", "do you have access to the archive channel?",
+        "archive the retail channel deals that closed lost", "archive the email from the channel",
+        "archive the amazon channel report in drive", "archive them",
+    ])
+    def test_must_not_fire_reaches_the_model(self, dm, text):
+        client = MagicMock()
+        app_module.handle_message_event(_event(text), client)
+        assert dm.qa.called, text
+        assert _texts(client) == [] and not dm.scans, text
+
+    @pytest.mark.parametrize("text", [
+        "can we archive the dead channels?", "archive the dead channels, please", "cora! archive the dead channels",
+        "would you mind archiving the dead channels?", "archive the dead channels :pray:",
+        "Cora \u2014 archive the dead channels", "_archive the dead channels_", "yes, archive the dead channels",
+    ])
+    def test_natural_asks_start_the_scan(self, dm, text):
+        client = MagicMock()
+        app_module.handle_message_event(_event(text), client)
+        assert dm.done.wait(5), text
+        assert _texts(client) == [intents.ACK_REPLY] and not dm.qa.called and not dm.capture.called
+
+    @pytest.mark.parametrize("text", ["yes, archive them", "archive them all", "archive the rest",
+                                      "sounds good, archive them", "just archive them", "archive everything",
+                                      "archive all 12", "archive the ones I marked"])
+    def test_typed_followups_to_a_live_card_get_the_code_reply(self, dm, text):
+        _live_card()
+        client = MagicMock()
+        app_module.handle_message_event(_event(text), client)
+        assert _texts(client) == [intents.followup_reply()], text
+        assert not dm.qa.called and not dm.capture.called and not dm.scans
+
+    @pytest.mark.parametrize("text", ["archive the retail channel deals", "archive my emails from tommy",
+                                      "archive the hubspot deal"])
+    def test_an_archive_of_some_other_object_is_not_a_card_followup(self, dm, text):
+        _live_card()
+        client = MagicMock()
+        app_module.handle_message_event(_event(text), client)
+        assert dm.qa.called and _texts(client) == [], text
+
+    def test_an_attempt_with_no_live_card_still_gets_the_attempt_reply(self, dm):
+        """The wider follow-up shape must not swallow the attempt rail when no card is live."""
+        client = MagicMock()
+        app_module.handle_message_event(_event("archive this channel"), client)
+        assert _texts(client) == [intents.ATTEMPT_REPLY] and not dm.qa.called
+
+
 class TestFounderMention:
     def _run(self, text, user=HARRISON):
         say, client = MagicMock(), MagicMock()
@@ -395,6 +455,31 @@ class TestFounderMention:
         _client, dispatch, _capture, start = self._run("archive the dead channels", user=PERSON)
         assert not start.called
 
+    @pytest.mark.parametrize("text", [
+        "how do I archive a channel in slack?", "which archived reports cover the retail channel?",
+        "what did we decide in <#C0B2T18R3FG|hjr-archive-2024>?", "archive the amazon channel report in drive",
+        "which channels are safe to archive?", "is the proposal for walmart archived?",
+    ])
+    def test_r1_must_not_fire_reaches_the_model(self, text):
+        client, dispatch, capture, start = self._run(text)
+        assert dispatch.called and not start.called, text
+        assert not client.chat_postMessage.called, text
+
+    @pytest.mark.parametrize("text", ["archive the dead channels, please", "can we archive the dead channels?",
+                                      "archive the dead channels \U0001f64f"])
+    def test_r1_natural_asks_scan(self, text):
+        client, dispatch, capture, start = self._run(text)
+        assert start.called and not dispatch.called and not capture.called, text
+
+    def test_r1_a_lane_status_question_still_gets_the_ledger_line(self):
+        client, dispatch, _, start = self._run("how many channels have you archived?")
+        assert not dispatch.called and not start.called
+        assert client.chat_postMessage.call_args.kwargs["text"].startswith("Dead-channel lane:")
+
+    def test_r1_a_sales_channel_attempt_is_not_refused(self):
+        client, dispatch, _, start = self._run("archive the dtc channel tasks")
+        assert dispatch.called and not client.chat_postMessage.called
+
 
 def _cand(mmc, text, user):
     return mmc.Candidate(channel_id="DHARRISON1" if user == HARRISON else "DP", channel_name="dm",
@@ -404,7 +489,9 @@ def _cand(mmc, text, user):
 
 class TestCatchup:
     @pytest.mark.parametrize("text", ["archive the dead channels", "archive #old-promo channel",
-                                      "did the dead channels get archived?"])
+                                      "did the dead channels get archived?",
+                                      "<@U0B44MDGC5R>, archive the dead channels",
+                                      "<@U0B44MDGC5R>: can you archive the dead channels?"])
     def test_a_missed_founder_archive_request_drafts_the_fixed_line(self, monkeypatch, text):
         from cora import missed_message_catchup as mmc
         monkeypatch.setattr(mmc, "HARRISON_ID", HARRISON)
@@ -412,6 +499,17 @@ class TestCatchup:
                             lambda *a, **k: pytest.fail("the model must not draft this"))
         out = mmc.generate_draft(MagicMock(), _cand(mmc, text, HARRISON))
         assert out.status == "draft" and out.draft_text == intents.CATCHUP_DRAFT
+
+    @pytest.mark.parametrize("text", ["how do I archive a channel in slack?",
+                                      "archive the retail channel deals that closed lost",
+                                      "what did we decide in <#C0B2T18R3FG|hjr-archive-2024>?"])
+    def test_r1_a_founder_question_that_is_not_a_lane_request_drafts_normally(self, monkeypatch, text):
+        from cora import missed_message_catchup as mmc
+        monkeypatch.setattr(mmc, "HARRISON_ID", HARRISON)
+        monkeypatch.setattr(mmc, "_run_dispatch_capture", lambda *a, **k: "a model draft")
+        monkeypatch.setattr(mmc.user_access, "check_access", lambda *a, **k: None)
+        out = mmc.generate_draft(MagicMock(), _cand(mmc, text, HARRISON))
+        assert out.draft_text == "a model draft", text
 
     def test_a_member_archive_text_still_drafts_normally(self, monkeypatch):
         from cora import missed_message_catchup as mmc

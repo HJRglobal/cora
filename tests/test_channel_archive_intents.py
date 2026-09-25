@@ -51,6 +51,88 @@ STATUS_NOT = ["what's in the archive?", "what is the kb archive status?", "archi
               "did you archive the email?", "status of the deal?", "I archived the channels",
               "where are the archive files?"]
 
+# ── D-051 round 1 (Code #16) ────────────────────────────────────────────────
+#: c1-intents-copy#2 -- natural phrasings of the ask: polite modals, vocatives with
+#: any punctuation, a comma/pls/emoji tail, emphasis wrappers, and the leading
+#: punctuation a stripped mention leaves behind (the catch-up's _strip_mention).
+ASK_FIRE_R1 = [
+    "can we archive the dead channels?", "Cora — archive the dead channels",
+    "hey Cora - archive the dead channels", "cora! archive the dead channels",
+    "can you go ahead and archive the dead channels?", "would you mind archiving the dead channels?",
+    "time to archive the dead channels", "_archive the dead channels_",
+    "archive the dead channels, please", "archive the dead channels pls",
+    "archive the dead channels \U0001f64f", "archive the dead channels :pray:",
+    ", archive the dead channels", ": can you archive the dead channels?",
+    "<@U0B44MDGC5R>, archive the dead channels", "<@U0B44MDGC5R>: can you archive the dead channels?",
+    "yes, archive the dead channels", "ok, archive the dead channels", "~archive the dead channels~",
+    "archive the _dead_ channels", "do you mind archiving the dead channels?",
+]
+ASK_NOT_R1 = [
+    "do you archive the dead channels?", "should we archive the dead channels?",
+    "archiving the dead channels now", "archive the dead channels, then post a summary",
+    "archive the dead channels :pray: and the deals",
+]
+#: c1-intents-copy#0 + integration#5 -- how-to / policy / decision framings, the
+#: noun senses of archive / channel / proposal, and 'archive' inside a channel NAME.
+STATUS_NOT_R1 = [
+    "how did the amazon channel do per the archived excel reports?",
+    "which archived reports cover the retail channel?", "did the hubspot proposal get archived?",
+    "is the proposal for walmart archived?", "how do I archive a channel in slack?",
+    "which channels are safe to archive?", "do you have access to the archive channel?",
+    "what did we decide in <#C0B2T18R3FG|hjr-archive-2024>?", "what is the policy for archiving channels?",
+    "did we ever decide which channels to archive?", "which channels should I archive?",
+    "Did that already -- archived the proposal in August", "Have archived the proposal; closing this out",
+    "how about we archive that proposal until Q1", "any channel quiet for 90 days should be archived",
+    "What we decided: archive channels after 90 days", "did you archive the retail channel report?",
+    "what happens when a channel is archived?", "how does archiving a channel work?",
+    "is <#C0B2T18R3FG|hjr-archive> quiet?", "did the retail channel get archived excel reports?",
+]
+STATUS_FIRE_R1 = [
+    "did you archive the dead channels?", "have you archived any channels?",
+    "has cora archived any channels yet?", "were the dead channels archived?",
+    "how many channels have you archived?", "what channels did cora archive last week?",
+    "is <#C0B2T18R3FG|social> archived?", "were you able to archive the dead channels?",
+    "hey cora, did you archive the channels?", "what's the status of the dead-channel archive card?",
+    "show me the channels you archived", "what's the status on the dead channels archive?",
+    "which channels have you archived so far?", "list the channels cora archived",
+    "any update on the archive card?", "was <#C0B2T18R3FG|hjr-archive> archived?",
+]
+#: c1-intents-copy#6 -- 'channel' in its sales/media sense, and archive requests
+#: whose object is some other thing (channel only inside a prepositional phrase).
+ATTEMPT_NOT_R1 = [
+    "archive the retail channel deals that closed lost", "archive the amazon channel report in drive",
+    "archive my emails from the channel partners", "archive the old channel strategy doc",
+    "archive the tasks for the retail channel project in asana", "archive the channel partner deals in hubspot",
+    "archive the dtc channel tasks", "archive the email about the channel launch",
+    "archive the email from the channel", "Archive policy: channels with no posts for 90 days",
+    "archive the channel's messages", "archive of the #general channel is in drive",
+    "archive the channel history", "archive folder for the channels is full",
+]
+ATTEMPT_FIRE_R1 = [
+    "archive channels after 90 days with no human posts, except leadership",
+    "archive the OSN store channels", "archive this channel", "yes, archive <#C0B2T18R3FG|social>",
+    "archive any channel with no posts in 90 days", "could we archive the old promo channels?",
+    "archive the retail channel",
+]
+#: c1-intents-copy#1 -- a typed follow-up to a LIVE card: any text opening with the
+#: archive verb (after yes / ok / sure / sounds good / just / now / please / go ahead
+#: and), unless its object is plainly some other thing.
+FOLLOWUP_FIRE_R1 = [
+    "archive the rest", "archive the marked ones", "yes, archive them", "yes archive them",
+    "archive them all", "just archive them", "now archive them", "archive all listed",
+    "archive everything", "archive all 12", "archive what i marked", "sounds good, archive them",
+    "archive the dead ones", "ok, archive them", "sure, archive the 3 i marked", "go ahead and archive",
+    "please archive them now", "archive it", "archive them after the meeting next week and tell tommy",
+    "Cora, archive the ones I marked", "yes please archive them", "archive the card",
+]
+FOLLOWUP_NOT_R1 = [
+    "yes, and also send the report", "ok thanks for that", "archive this thread", "archive old emails",
+    "archive the retail channel deals", "archive my emails from tommy", "archive the hubspot deal",
+    "archived them myself", "don't archive them", "did you archive them?",
+    "archive of the old site is in drive", "archive folder is full", "archive: q3 decks",
+    "archive is in drive", "archive the channel history",
+]
+
 
 @pytest.mark.parametrize("text", ASK_FIRE)
 def test_the_ask_grammar_fires(text):
@@ -82,6 +164,43 @@ def test_status_does_not_fire(text):
     assert not it.looks_like_archive_status(text), text
 
 
+@pytest.mark.parametrize("text", ASK_FIRE_R1)
+def test_r1_the_ask_grammar_takes_natural_phrasings(text):
+    assert it.looks_like_archive_ask(text), text
+    assert not it.looks_like_archive_attempt(text), text
+
+
+@pytest.mark.parametrize("text", ASK_NOT_R1)
+def test_r1_the_widened_ask_grammar_still_refuses(text):
+    assert not it.looks_like_archive_ask(text), text
+
+
+@pytest.mark.parametrize("text", STATUS_NOT_R1)
+def test_r1_status_ignores_how_to_policy_noun_senses_and_channel_names(text):
+    assert not it.looks_like_archive_status(text), text
+
+
+@pytest.mark.parametrize("text", STATUS_FIRE_R1)
+def test_r1_lane_status_questions_still_fire(text):
+    assert it.looks_like_archive_status(text), text
+
+
+@pytest.mark.parametrize("text", ATTEMPT_NOT_R1)
+def test_r1_the_attempt_rail_needs_channels_as_the_object(text):
+    assert not it.looks_like_archive_attempt(text), text
+
+
+@pytest.mark.parametrize("text", ATTEMPT_FIRE_R1)
+def test_r1_the_attempt_rail_still_fires_on_a_channel_object(text):
+    assert it.looks_like_archive_attempt(text), text
+
+
+def test_r1_normalize_masks_channel_names_and_strips_leading_punctuation():
+    assert it.normalize("<@U0B44MDGC5R>, archive <#C0B2T18R3FG|hjr-archive-2024>") == "archive #chan"
+    assert it.normalize("_archive the dead channels_") == "archive the dead channels"
+    assert it.normalize("react with :thumbs_up: in snake_case") == "react with :thumbs_up: in snake_case"
+
+
 class TestFollowup:
     def test_imperatives_fire_any_time_the_card_is_live(self):
         for t in ("archive them", "archive all", "archive those please", "can you archive the list?",
@@ -96,18 +215,30 @@ class TestFollowup:
     def test_nothing_fires_without_a_live_card(self):
         assert not it.looks_like_live_followup("archive them", card_ts=None, now=NOW)
 
-    @pytest.mark.parametrize("t", ["yes, and also send the report", "archive it", "ok thanks for that",
-                                   "archive them after the meeting next week and tell tommy"])
+    @pytest.mark.parametrize("t", FOLLOWUP_NOT_R1)
     def test_longer_or_other_replies_do_not(self, t):
         assert not it.looks_like_live_followup(t, card_ts=NOW - 60, now=NOW)
+
+    @pytest.mark.parametrize("t", FOLLOWUP_FIRE_R1)
+    def test_any_archive_verb_opener_is_a_followup_while_the_card_is_live(self, t):
+        """c1-intents-copy#1: 'archive it' and 'archive them after the meeting ...' used
+        to be pinned as must-not-fire; the round-1 adjudication widened the grammar to
+        every archive-verb opener while a card is live (the reply is an honest 'that
+        reply archived nothing'), so both moved here."""
+        assert it.followup_shape(t) == "imperative", t
+        assert it.looks_like_live_followup(t, card_ts=NOW - 5 * DAY, now=NOW), t
 
 
 @pytest.mark.parametrize("fn", [it.looks_like_archive_ask, it.looks_like_archive_attempt,
                                 it.looks_like_archive_status,
                                 lambda s: it.looks_like_live_followup(s, card_ts=NOW, now=NOW)],
                          ids=["ask", "attempt", "status", "followup"])
-@pytest.mark.parametrize("word", ["archive", "cora", "did", "@cora", "<@U0B44MDGC5R>", "<#C0B2T18R3FG|x>"],
-                         ids=["archive", "cora", "did", "at-cora", "mention", "chan-token"])
+@pytest.mark.parametrize("word", ["archive", "cora", "did", "@cora", "<@U0B44MDGC5R>", "<#C0B2T18R3FG|x>",
+                                  "yes,", "_", "~", ",", ":pray:", "\U0001f64f", "did you archive",
+                                  "archive the", "cora \u2014"],
+                         ids=["archive", "cora", "did", "at-cora", "mention", "chan-token", "yes-comma",
+                              "underscore", "tilde", "comma", "shortcode", "emoji", "did-you-archive",
+                              "archive-the", "cora-dash"])
 def test_every_predicate_is_linear_on_the_degenerate_input(fn, word):
     shape = word + " " * 40000 + "x"
     best = float("inf")
@@ -115,6 +246,27 @@ def test_every_predicate_is_linear_on_the_degenerate_input(fn, word):
         t0 = time.perf_counter()
         fn(shape)
         fn(" " * 40000)
+        best = min(best, time.perf_counter() - t0)
+    assert best < 0.05
+
+
+@pytest.mark.parametrize("fn", [it.looks_like_archive_ask, it.looks_like_archive_attempt,
+                                it.looks_like_archive_status, it.followup_shape],
+                         ids=["ask", "attempt", "status", "followup"])
+@pytest.mark.parametrize("shape", ["archive " + "a " * 150, "did you archive " + "the " * 70,
+                                   "archive the dead channels" + "!" * 270, "cora" + "-" * 290,
+                                   "archive the " + ", " * 140, "_" * 299, "archive " + ":a:" * 97,
+                                   "archive the dead channels" + " \U0001f64f" * 90,
+                                   "did you archive " + "old " * 60 + "channels"],
+                         ids=["filler", "det-run", "bangs", "dashes", "commas", "underscores", "codes",
+                              "emoji-run", "long-object"])
+def test_every_predicate_is_fast_on_capped_worst_cases(fn, shape):
+    """The new filler / tail / punctuation patterns, timed on the longest inputs the
+    300-char cap still lets through."""
+    best = float("inf")
+    for _ in range(3):
+        t0 = time.perf_counter()
+        fn(shape)
         best = min(best, time.perf_counter() - t0)
     assert best < 0.05
 
