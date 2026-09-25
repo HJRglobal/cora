@@ -168,6 +168,39 @@ KB_EXCLUDED_FOLDER_IDS: frozenset[str] = frozenset(
         # depth floor, so purges run per child via purge_cora_internal_kb.py
         # --folder-id (Harrison's hand, inside the restart's stop window).
         "1gZVdKz3BIdePV6eeG08kkf7G65yDohaM",  # My Drive / Desktop to Desktop
+        # Code #15 RIDER B item 1 (cq-59c5048d0891, folder-audit A1; pinned
+        # 2026-09-24): the Founder-OS _archive tree -- where the folder-audit batches
+        # move archived duplicates and superseded files. Verified live 2026-09-24
+        # (read-only, the direct SA: files.get chain + a forward files.list under the
+        # root, both agreeing): this id resolves to "_archive" directly under
+        # HJR-Founder-OS (FOUNDERS_OS_ROOT_ID 1TfxuKxzXz0-NipAFYqbK5AxowAy-LIPG); the
+        # SA-view chain is [_archive, HJR-Founder-OS] (length 2), the DWD-as-harrison@
+        # view adds My Drive (length 3). Its child dedup-2026-09
+        # (1TSUGC4hAHjgbHuExFqf_4-lXyXm7opq5, the 9/22 batch-1 landing folder) is
+        # covered WITHOUT its own pin: every Drive door is subtree-inclusive --
+        # _expanded_excluded_folder_ids BFS-expands a non-walk-only pin, the flat
+        # sweep's ancestry walk (always run in production) returns "excluded" for
+        # any pinned id in the chain, and sweep_founders_os passes this set as
+        # skip_folder_ids (never processed, never enqueued). What the pin actually
+        # closes is NON-.md files under _archive on the flat per-user sweep, whose
+        # allowlist is the Founder-OS root and which has no _archive name rule: .md
+        # files were already out (static_md skips any "_archive" path, the flat
+        # sweep leaves Founder-OS markdown to static_md since 9/8 I5, the tree walk
+        # name-skips "_archive", drive_asset blacklists the segment). An ordinary
+        # folder WITH a parent -> expansion set only, NOT walk-only, and NOT a
+        # dashboard store (purge_dashboard_kb.py must not widen).
+        "16q7RfzibKms2rLvBKGIfaTSPBPUGYPaP",  # HJR-Founder-OS/_archive (2026-09-24 parent pin)
+        # Code #15 RIDER B item 2 (cq-59c5048d0891, design O1-A6; pinned 2026-09-24):
+        # a PERSONAL store under 00-Founder. Verified live 2026-09-24 (read-only,
+        # direct SA; a forward exact-name files.list AND a reverse parents walk
+        # agree): personal-finances <- 00-Founder (1P6ArPWh97bojlU5NtUnuRPRKLbXrhw6a)
+        # <- HJR-Founder-OS. 0 KB chunks from it in every source on 2026-09-24
+        # (a complete Drive enumeration of its descendants) -- the pin is forward
+        # protection, incl. for the tree walk, which has never reached 00-Founder;
+        # drive_asset already blacklists the segment and static_md carries the path
+        # belt is_personal_finances_path below. Expansion set only, NOT walk-only,
+        # NOT a dashboard store.
+        "1l7Hms6KwISUelnB-ItLAF9vms6K_Wd9s",  # 00-Founder/personal-finances (PERSONAL; 2026-09-24)
     }
 )
 
@@ -211,6 +244,8 @@ KB_EXCLUDED_FOLDER_LABELS: dict[str, str] = {
     "1cdDb9jvDhoOz1vliE-tmVaks01ey1AJj": "Drive Computers backup: HJR Always-On Desktop (Desktop, Documents, Downloads)",
     "1xmXreU4eKvcpAsj7Ic3fiwJO_ySidZ0F": "Drive Computers backup: Harrison Laptop (Desktop, Documents, Downloads)",
     "1gZVdKz3BIdePV6eeG08kkf7G65yDohaM": "My Drive/Desktop to Desktop (PERSONAL machine-to-machine transfer tree: H-Laptop Downloads/To cleanup, Remote Desktop Download, phone downloads, inbox, media; purged per child folder)",
+    "16q7RfzibKms2rLvBKGIfaTSPBPUGYPaP": "HJR-Founder-OS/_archive (the Founder-OS archive tree; its whole subtree, incl. the dedup-2026-09 batch folder, is pruned)",
+    "1l7Hms6KwISUelnB-ItLAF9vms6K_Wd9s": "00-Founder/personal-finances (PERSONAL store; never ingested)",
 }
 
 
@@ -226,8 +261,10 @@ _DASHBOARD_STORE_SEGMENTS: frozenset[str] = frozenset(
 
 def is_excluded_folder(folder_id: str) -> bool:
     """True if a Drive folder id is KB-excluded: a personal/confidential dashboard
-    store, the LEX copa-bhrf NDA folder, the 13WCF ledger, or the Cora build
-    workspace (D-057). drive_sweep skips the whole subtree of a pinned id."""
+    store, the LEX copa-bhrf NDA folder, the 13WCF ledger, the Cora build
+    workspace (D-057), the PC backup roots and personal transfer tree, the
+    Founder-OS _archive tree or the personal-finances store (Code #15 RIDER B).
+    drive_sweep skips the whole subtree of a pinned id."""
     return bool(folder_id) and folder_id in KB_EXCLUDED_FOLDER_IDS
 
 
@@ -370,6 +407,45 @@ def is_copa_meeting_title(title: str) -> bool:
     'copa', case-insensitive). Excludes Maricopa/copayment/copacker (word boundary)
     and bare 'Voyager' (the fleet minivan). Empty/None -> False."""
     return bool(_COPA_MEETING_TITLE_RE.search(str(title or "")))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Code #15 RIDER B (cq-59c5048d0891), 2026-09-24.
+# ─────────────────────────────────────────────────────────────────────────────
+# Item 2: the PERSONAL store 00-Founder/personal-finances. The Drive door is closed
+# by its folder id in KB_EXCLUDED_FOLDER_IDS; this is the PATH belt for the
+# path-keyed static_md door (scripts/incremental_sync_static.is_static_excluded --
+# script-side only, deliberately not the store Step-0 guard). Folder SEGMENTS
+# only: the subsequence must sit in the DIRECTORY part of the path, so a file
+# merely NAMED like the folder ("00-Founder/personal-finances.md",
+# "projects/x/personal-finances-notes.md") never matches.
+_PERSONAL_FINANCES_SEGMENTS: tuple[str, ...] = ("00-founder", "personal-finances")
+
+
+def is_personal_finances_path(path_or_source_id: str) -> bool:
+    """True if a filesystem path or path-shaped source_id sits INSIDE the
+    ``00-Founder/personal-finances`` folder. Segment subsequence, case-insensitive,
+    either separator; the basename is never part of the match."""
+    parts = _segments(str(path_or_source_id or ""))
+    return _contains_subsequence(parts[:-1], _PERSONAL_FINANCES_SEGMENTS)
+
+
+# Item 4: OS junk files. ``desktop.ini`` is Windows folder-view metadata that Drive
+# for Desktop sees in synced folders (276 of them under personal-finances alone,
+# all local-only on 2026-09-24); it is never knowledge. EXACT basename equality,
+# case-insensitive -- ``desktop.ini.bak`` / ``desktop.initial.md`` /
+# ``my desktop.ini notes.md`` are ordinary files and stay ingestible.
+_OS_JUNK_BASENAMES: frozenset[str] = frozenset({"desktop.ini"})
+
+
+def is_os_junk_filename(name: str) -> bool:
+    """True if a Drive filename / title / path's basename is OS junk
+    (``desktop.ini``). Matches the full value AND its basename, like
+    is_cora_internal_title (a Drive display name may itself contain ``/``)."""
+    raw = str(name or "")
+    if not raw:
+        return False
+    return raw.lower() in _OS_JUNK_BASENAMES or _basename(raw).lower() in _OS_JUNK_BASENAMES
 
 
 def folder_ids_excluded(

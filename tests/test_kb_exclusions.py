@@ -433,6 +433,19 @@ class TestCoraWorkspaceFolderPin:
             # 86 files with KB chunks (1,342 chunks). Ordinary folder WITH a
             # parent -> pinned in the expansion set only, NOT walk-only.
             "1gZVdKz3BIdePV6eeG08kkf7G65yDohaM",  # My Drive / Desktop to Desktop
+            # 2026-09-24 (Code #15 RIDER B item 1, cq-59c5048d0891, folder-audit A1):
+            # the Founder-OS _archive PARENT. Verified live 2026-09-24 (read-only,
+            # direct SA files.get chain + forward files.list): "_archive" directly
+            # under HJR-Founder-OS (1TfxuKxzXz0-NipAFYqbK5AxowAy-LIPG); SA chain
+            # length 2, DWD-as-harrison@ length 3. Its child dedup-2026-09
+            # (1TSUGC4hAHjgbHuExFqf_4-lXyXm7opq5) is covered by the subtree-inclusive
+            # doors and is deliberately NOT pinned separately.
+            "16q7RfzibKms2rLvBKGIfaTSPBPUGYPaP",  # HJR-Founder-OS/_archive
+            # 2026-09-24 (Code #15 RIDER B item 2): the PERSONAL store. Verified
+            # live 2026-09-24 (forward exact-name files.list + reverse parents walk
+            # agree): personal-finances <- 00-Founder (1P6ArPWh97bojlU5NtUnuRPRKLbXrhw6a)
+            # <- HJR-Founder-OS.
+            "1l7Hms6KwISUelnB-ItLAF9vms6K_Wd9s",  # 00-Founder/personal-finances
         )
         for prior in priors:
             assert prior in KB_EXCLUDED_FOLDER_IDS, prior
@@ -471,3 +484,69 @@ class TestCoraWorkspaceFolderPin:
         ):
             assert not is_cora_internal_title(name, broad=True), name
         assert is_excluded_folder(self.CORA_WORKSPACE_FOLDER)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Code #15 RIDER B (cq-59c5048d0891), 2026-09-24: items 1, 2 (pins + the static
+# path belt) and item 4 (the desktop.ini filename belt).
+# ═══════════════════════════════════════════════════════════════════════════════
+class TestArchiveAndPersonalFinancesPins:
+    ARCHIVE = "16q7RfzibKms2rLvBKGIfaTSPBPUGYPaP"         # HJR-Founder-OS/_archive
+    DEDUP_CHILD = "1TSUGC4hAHjgbHuExFqf_4-lXyXm7opq5"     # _archive/dedup-2026-09
+    PERSONAL_FINANCES = "1l7Hms6KwISUelnB-ItLAF9vms6K_Wd9s"
+
+    def test_both_pinned_with_labels(self):
+        from cora.kb_exclusions import KB_EXCLUDED_FOLDER_LABELS
+        for fid in (self.ARCHIVE, self.PERSONAL_FINANCES):
+            assert fid in KB_EXCLUDED_FOLDER_IDS and is_excluded_folder(fid)
+            assert folder_ids_excluded(["x", fid])
+            assert KB_EXCLUDED_FOLDER_LABELS[fid].strip()
+        assert set(KB_EXCLUDED_FOLDER_LABELS) == set(KB_EXCLUDED_FOLDER_IDS)
+
+    def test_parent_design_the_child_is_not_pinned_separately(self):
+        assert self.DEDUP_CHILD not in KB_EXCLUDED_FOLDER_IDS
+
+    def test_neither_is_walk_only_nor_a_dashboard_store(self):
+        # walk-only is the parentless-root class (_computers_root_ok keys on it);
+        # the dashboard set is what purge_dashboard_kb.py may walk -- neither widens.
+        from cora.kb_exclusions import KB_DASHBOARD_FOLDER_IDS, KB_EXCLUDED_WALK_ONLY_IDS
+        for fid in (self.ARCHIVE, self.PERSONAL_FINANCES, self.DEDUP_CHILD):
+            assert fid not in KB_EXCLUDED_WALK_ONLY_IDS
+            assert fid not in KB_DASHBOARD_FOLDER_IDS
+
+    def test_personal_finances_label_names_no_contents(self):
+        from cora.kb_exclusions import KB_EXCLUDED_FOLDER_LABELS
+        label = KB_EXCLUDED_FOLDER_LABELS[self.PERSONAL_FINANCES].lower()
+        for word in ("statement", "tax", "bank", "account", "invest", "brokerage", "1099", "w-2"):
+            assert word not in label, word
+
+
+class TestPersonalFinancesPath:
+    def test_matches_inside_the_folder_either_separator_any_case(self):
+        from cora.kb_exclusions import is_personal_finances_path
+        assert is_personal_finances_path(_DRIVE + r"\00-Founder\personal-finances\2025\x.md")
+        assert is_personal_finances_path("00-Founder/personal-finances/x.pdf")
+        assert is_personal_finances_path(r"00-FOUNDER\Personal-Finances\x.md")
+
+    def test_no_basename_over_match(self):
+        from cora.kb_exclusions import is_personal_finances_path
+        assert not is_personal_finances_path(r"00-Founder\personal-finances.md")
+        assert not is_personal_finances_path(r"00-Founder\projects\y\personal-finances-notes.md")
+        assert not is_personal_finances_path(r"00-Founder\personal-finances")        # the basename itself
+        assert not is_personal_finances_path(r"02-F3-Energy\personal-finances\x.md")  # needs 00-Founder
+        assert not is_personal_finances_path(r"00-Founder\my-personal-finances\x.md")
+        assert not is_personal_finances_path("")
+        assert not is_personal_finances_path(None)
+
+
+class TestOsJunkFilename:
+    def test_positives(self):
+        from cora.kb_exclusions import is_os_junk_filename
+        for name in ("desktop.ini", "Desktop.ini", "DESKTOP.INI", "a/b/desktop.ini", r"a\b\Desktop.ini"):
+            assert is_os_junk_filename(name), name
+
+    def test_negatives(self):
+        from cora.kb_exclusions import is_os_junk_filename
+        for name in ("desktop.ini.bak", "desktop.initial.md", "my desktop.ini notes.md", "desktop.ini/x.md",
+                     "xdesktop.ini", "desktop-ini.md", "", None):
+            assert not is_os_junk_filename(name), name

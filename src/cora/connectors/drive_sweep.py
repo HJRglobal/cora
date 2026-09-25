@@ -53,6 +53,7 @@ from cora.kb_exclusions import (
     KB_EXCLUDED_WALK_ONLY_IDS,
     folder_ids_excluded,
     is_cora_internal_title,
+    is_os_junk_filename,
 )
 from cora.knowledge_base.store import Document
 from cora.phi_guard import _PHI_PATTERNS
@@ -644,6 +645,16 @@ def _is_markdown(mime_type: str | None, filename: str | None) -> bool:
     return (mime_type or "").lower() == "text/markdown" or (filename or "").lower().endswith(".md")
 
 
+#: Code #15 C13-14: the folder name of the Cowork run-marker drop zone.
+_RUNS_FOLDER_NAME = "_runs"
+
+
+def _is_runs_segment(folder_name: str | None) -> bool:
+    """True for a folder NAMED exactly ``_runs`` (case-insensitive) -- never a
+    substring match (``test_runs``, ``_runs-old`` are ordinary folders)."""
+    return (folder_name or "").lower() == _RUNS_FOLDER_NAME
+
+
 def _file_disposition_ex(
     service: Any, parents: list[str] | None, expanded: frozenset[str],
     complete: bool, cache: dict, *, mime_type: str = "", filename: str = "",
@@ -656,7 +667,10 @@ def _file_disposition_ex(
 
     ``"excluded"``        a parent is in the expanded exclusion set (fast path), or
                           an ancestor is any pinned id -- incl. the parentless
-                          Computers backup roots, which only the walk can see;
+                          Computers backup roots, which only the walk can see --
+                          or an ancestor folder is NAMED ``_runs`` (the Cowork
+                          run-marker drop zone; Code #15 C13-14; the name belt
+                          needs the walk, which production always runs);
     ``"unresolved"``      the ancestry could not be resolved this run (fail-closed;
                           the caller HOLDS the watermark so the file is retried);
     ``"outside_allowlist"`` (allowlist mode only) the resolved ancestry does not
@@ -709,6 +723,16 @@ def _file_disposition_ex(
     if not ok:
         return "unresolved", ids
     if ids & KB_EXCLUDED_FOLDER_IDS:
+        return "excluded", ids
+    if any(_is_runs_segment(name) for _fid, name in chain):
+        # Code #15 C13-14: the Cowork run-marker drop zone
+        # (_shared/claude-workspace-mirror/_runs/<task>/...). static_md has
+        # excluded the ``_runs`` segment since Code #13 slice 9c; this is the same
+        # belt on the Drive door -- an EXACT folder-name match (case-insensitive,
+        # like the static sibling), never a substring ("test_runs" stays).
+        # Returned as "excluded" on purpose: every caller already skips it, and a
+        # NEW disposition string would read as ingestable to a caller that does
+        # not know it (_file_under_excluded_folder's membership test).
         return "excluded", ids
     if FOUNDERS_OS_ROOT_ID in ids and _is_markdown(mime_type, filename):
         return "static_md_owned", ids
@@ -956,6 +980,13 @@ def sweep_user(
                 continue
             seen_file_ids.add(file_id)
 
+            # Code #15 RIDER B item 4: OS junk (desktop.ini) is never knowledge.
+            # Checked before the ancestry walk and extraction, so the file is never
+            # downloaded. Counted, never logged by name (D-082).
+            if is_os_junk_filename(filename):
+                stats["os_junk_skipped"] = stats.get("os_junk_skipped", 0) + 1
+                continue
+
             # WS1: never ingest Cora's OWN build/audit/forensic docs or runtime logs.
             # drive_sweep walks the Founder OS Drive tree, so these would otherwise
             # land in the KB under a Drive-file-id source_id no path rule can catch,
@@ -1130,13 +1161,13 @@ def sweep_user(
     log.info(
         "drive_sweep: %s done -- mode=%s enumerated=%d extracted=%d ingested=%d "
         "phi_skipped=%d noise=%d dedup=%d excluded_folder=%d static_md_owned=%d "
-        "ancestry_unresolved=%d skipped_outside_allowlist=%d cora_internal=%d",
+        "ancestry_unresolved=%d skipped_outside_allowlist=%d cora_internal=%d os_junk=%d",
         email, sweep_mode,
         stats["files_enumerated"], stats["files_extracted"], stats["chunks_ingested"],
         stats["phi_skipped"], stats["noise_filtered"], stats["dedup_skipped"],
         stats.get("dashboard_excluded_skipped", 0), stats.get("static_md_owned_skipped", 0),
         stats.get("ancestry_unresolved_skipped", 0), stats.get("skipped_outside_allowlist", 0),
-        stats.get("cora_internal_skipped", 0),
+        stats.get("cora_internal_skipped", 0), stats.get("os_junk_skipped", 0),
     )
     return stats
 
@@ -1367,6 +1398,11 @@ _FOUNDERS_OS_SKIP_FOLDERS = frozenset({
     # UNTAGGED copy (and the .xlsx artifacts carry no in-file banner at all) --
     # re-opening the D-096 self-poisoning class. Skip the whole subtree here.
     "_delegated-work",
+    # Code #15 C13-14: the Cowork run-marker drop zone -- the tree-walk twin of
+    # the flat sweep's _runs ancestry belt (_file_disposition_ex) and of the
+    # static_md segment rule. Exact (lower-cased) folder-name match, like every
+    # entry here.
+    _RUNS_FOLDER_NAME,
 })
 
 _LEX_SCORE_THRESHOLD = 6
@@ -1497,6 +1533,12 @@ def _process_single_folder_files(
                 stats["dedup_skipped"] += 1
                 continue
             seen_file_ids.add(file_id)
+
+            # Code #15 RIDER B item 4: OS junk (desktop.ini) -- the same belt as the
+            # flat sweep, before extraction; counted, never logged by name.
+            if is_os_junk_filename(filename):
+                stats["os_junk_skipped"] = stats.get("os_junk_skipped", 0) + 1
+                continue
 
             # WS1: never ingest Cora's OWN build/audit/forensic docs or runtime logs.
             # broad=True: fail-safe to the WIDER exclusion at ingest -- over-excluding

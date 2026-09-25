@@ -156,7 +156,9 @@ checked against them. Labels are the code comments; no content is described.
 | `1HEHpMWgkJkHmV1wfWIiT5OhBI0p5p2P-` | Downloads/OneAmerica-Handoff dup (PERSONAL) |
 | `112C7ljGRI5VO_ic66fVGQk4kf6IC40HQ` | 08-Lexington-Services/projects/copa-bhrf (LEX NDA; identifier only) |
 | `1aDnmz3oY7QZxsH7mv7_ZDu7cUyDWLhy7` | 01-HJR-Global/accounting/cashflow-ledger (13WCF mirror) |
-| (the remaining pins) | the `_shared/projects/cora` parent pin (D-057) and the Computers-backup roots + personal transfer tree (ingest-integrity I3, cq-a1aaee9f46e0) — read the frozenset in `src/cora/kb_exclusions.py`; the probe row D12 counts them (10 on 2026-09-23) |
+| `16q7RfzibKms2rLvBKGIfaTSPBPUGYPaP` | HJR-Founder-OS/_archive (the archive-tree parent pin; Code #15 RIDER B, 2026-09-24) |
+| `1l7Hms6KwISUelnB-ItLAF9vms6K_Wd9s` | 00-Founder/personal-finances (PERSONAL; Code #15 RIDER B, 2026-09-24; identifier only) |
+| (the remaining pins) | the `_shared/projects/cora` parent pin (D-057) and the Computers-backup roots + personal transfer tree (ingest-integrity I3, cq-a1aaee9f46e0) — read the frozenset in `src/cora/kb_exclusions.py`; the probe row D12 counts them (10 on 2026-09-23; 12 from Code #15 RIDER B -- the generated D12 cell above still reads 10 until the next `dr_manifest_probes.py --update-docs`) |
 
 ## 6. Cowork estate — cross-reference (NOT migrated)
 

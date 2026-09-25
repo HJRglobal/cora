@@ -427,6 +427,21 @@ class TestBuildAndRender:
         founder = si.render_inventory(_inv(detail=True))
         assert "(token: `copa`)" in founder                           # the founder scope names it
 
+    def test_non_founder_scope_never_names_the_code15_rider_b_pins(self):
+        # Code #15 RIDER B items 1-2: the _archive parent and the PERSONAL store are
+        # listed by id + label for the founder only; a channel sees the count.
+        new_ids = ("16q7RfzibKms2rLvBKGIfaTSPBPUGYPaP", "1l7Hms6KwISUelnB-ItLAF9vms6K_Wd9s")
+        for entity in ("F3E", "LEX-LLC", "OSN"):
+            text = si.render_inventory(_inv(detail=False, entity=entity))
+            for fid in new_ids:
+                assert fid not in text, (entity, fid)
+                assert kb_exclusions.KB_EXCLUDED_FOLDER_LABELS[fid] not in text, (entity, fid)
+            assert "personal-finances" not in text.lower(), entity
+            assert "1TSUGC4hAHjgbHuExFqf_4-lXyXm7opq5" not in text and "dedup-2026-09" not in text
+        founder = si.render_inventory(_inv(detail=True))
+        for fid in new_ids:
+            assert fid in founder and kb_exclusions.KB_EXCLUDED_FOLDER_LABELS[fid] in founder
+
     def test_reply_format_and_pointer_live(self):
         for detail in (True, False):
             text = si.render_inventory(_inv(detail))

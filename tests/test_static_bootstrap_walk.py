@@ -92,3 +92,23 @@ def test_full_rebuild_walks_the_same_candidates(tmp_path, monkeypatch):
 def test_exact_filename_list_is_only_bootstrap():
     """Guard against a future 'just add *.txt' -- the design forbids it."""
     assert inc.STATIC_EXACT_FILENAMES == ("bootstrap.txt",)
+
+
+def test_personal_finances_path_belt_code15_rider_b(tmp_path):
+    """Code #15 RIDER B item 2: the static_md door's path belt for the PERSONAL store
+    00-Founder/personal-finances -- directory segments only, case-insensitive, so a
+    file merely NAMED like the folder stays ingestible."""
+    root = tmp_path / "HJR-Founder-OS"
+    assert inc.is_static_excluded(root / "00-Founder" / "personal-finances" / "x.md")
+    assert inc.is_static_excluded(root / "00-Founder" / "Personal-Finances" / "2025" / "notes.md")
+    assert inc.is_static_excluded(root / "00-founder" / "personal-finances" / "bootstrap.txt")
+    assert not inc.is_static_excluded(root / "00-Founder" / "projects" / "y" / "personal-finances-notes.md")
+    assert not inc.is_static_excluded(root / "00-Founder" / "personal-finances.md")
+    assert not inc.is_static_excluded(root / "02-F3-Energy" / "personal-finances" / "x.md")   # needs 00-Founder
+    assert not inc.is_static_excluded(root / "00-Founder" / "projects" / "brief.md")
+    # the full rebuild walks through the same chain
+    (root / "00-Founder" / "personal-finances").mkdir(parents=True)
+    (root / "00-Founder" / "personal-finances" / "statement.md").write_text("x", encoding="utf-8")
+    (root / "00-Founder" / "brief.md").write_text("# Brief", encoding="utf-8")
+    names = {p.name for p in inc.iter_static_candidates(root) if not inc.is_static_excluded(p)}
+    assert "brief.md" in names and "statement.md" not in names

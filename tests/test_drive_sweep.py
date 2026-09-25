@@ -616,6 +616,67 @@ class TestSweepUser:
         kb.upsert_documents.assert_not_called()
         mock_extract.assert_not_called()  # guard fires BEFORE extraction
 
+    # Code #15 RIDER B item 4 (cq-59c5048d0891): desktop.ini is OS junk -- skipped on
+    # BOTH Drive doors before the ancestry walk and extraction, and only COUNTED.
+    def test_desktop_ini_skipped_before_extract(self):
+        user = {"email": "harrison@hjrglobal.com", "name": "Harrison", "entity_default": "FNDR",
+                "enabled": True, "dwd_eligible": True, "drive_sweep": True}
+        kb = self._make_kb()
+        anthropic_client = self._make_anthropic(score=9)
+        with patch("cora.connectors.drive_sweep._build_drive_service") as mock_build:
+            mock_build.return_value = self._make_drive_service([
+                {"id": "dj1", "name": "desktop.ini", "mimeType": "text/plain",
+                 "modifiedTime": "2026-09-01T00:00:00Z", "size": "9000"},
+                {"id": "dj2", "name": "Desktop.INI", "mimeType": "text/plain",
+                 "modifiedTime": "2026-09-01T00:00:00Z", "size": "9000"},
+            ])
+            with patch("cora.connectors.drive_sweep._extract_content") as mock_extract, \
+                 patch("cora.connectors.drive_sweep._file_disposition") as mock_disp:
+                stats = sweep_user(user, "/fake/sa.json", kb, anthropic_client,
+                                   freshness_days=30, dry_run=False)
+        assert stats["os_junk_skipped"] == 2
+        kb.upsert_documents.assert_not_called()
+        mock_extract.assert_not_called()   # before extraction
+        mock_disp.assert_not_called()      # before the ancestry walk
+
+    def test_desktop_ini_lookalike_is_still_ingested(self):
+        # Negative control: an ordinary file whose name merely CONTAINS desktop.ini.
+        user = {"email": "harrison@hjrglobal.com", "name": "Harrison", "entity_default": "FNDR",
+                "enabled": True, "dwd_eligible": True, "drive_sweep": True}
+        kb = self._make_kb()
+        anthropic_client = self._make_anthropic(score=9)
+        with patch("cora.connectors.drive_sweep._build_drive_service") as mock_build:
+            mock_build.return_value = self._make_drive_service([
+                {"id": "dj3", "name": "desktop.initial-rollout-notes.txt", "mimeType": "text/plain",
+                 "modifiedTime": "2026-09-01T00:00:00Z", "size": "9000"},
+            ])
+            with patch("cora.connectors.drive_sweep._extract_content") as mock_extract:
+                mock_extract.return_value = "Rollout notes for the desktop initiative " * 10
+                stats = sweep_user(user, "/fake/sa.json", kb, anthropic_client,
+                                   freshness_days=30, dry_run=False)
+        assert stats.get("os_junk_skipped", 0) == 0
+        kb.upsert_documents.assert_called()
+
+    def test_founders_os_loop_skips_desktop_ini(self):
+        from cora.connectors.drive_sweep import _process_single_folder_files
+        kb = self._make_kb()
+        anthropic_client = self._make_anthropic(score=9)
+        service = self._make_drive_service([
+            {"id": "dj4", "name": "desktop.ini", "mimeType": "text/plain",
+             "modifiedTime": "2026-09-01T00:00:00Z", "size": "9000"}
+        ])
+        stats = {"files_enumerated": 0, "files_extracted": 0, "chunks_ingested": 0,
+                 "phi_skipped": 0, "noise_filtered": 0, "dedup_skipped": 0}
+        with patch("cora.connectors.drive_sweep._extract_content") as mock_extract:
+            _process_single_folder_files(
+                service=service, folder_id="F", label="FNDR", effective_entity="FNDR",
+                kb=kb, anthropic_client=anthropic_client, cutoff_str="2020-01-01T00:00:00Z",
+                dry_run=False, is_lex=False, score_threshold=4, seen_file_ids=set(), stats=stats,
+            )
+        assert stats["os_junk_skipped"] == 1
+        kb.upsert_documents.assert_not_called()
+        mock_extract.assert_not_called()
+
 
 # ── run_sweep ─────────────────────────────────────────────────────────────────
 
@@ -890,6 +951,71 @@ class TestPinnedParentPrunesSubtree:
         assert set(kb.checkpoints["ck"]["completed_folder_ids"]) == {"root", self.SIB}
         assert not ({cora_ws, "mirror", "quarantine"} & set(svc.parents_queried))
         assert stats["files_enumerated"] == 0
+
+    def test_the_real_excluded_set_prunes_the_real_archive_id(self):
+        # Code #15 RIDER B item 1: the REAL _archive parent id prunes its child
+        # dedup-2026-09 (REAL id, not separately pinned) and a grandchild. The
+        # pinned node is given a NON-skip name on purpose so the proof is the ID
+        # pin, not the pre-existing "_archive" folder-NAME skip.
+        from cora.kb_exclusions import KB_EXCLUDED_FOLDER_IDS
+        archive, dedup = "16q7RfzibKms2rLvBKGIfaTSPBPUGYPaP", "1TSUGC4hAHjgbHuExFqf_4-lXyXm7opq5"
+        assert archive in KB_EXCLUDED_FOLDER_IDS and dedup not in KB_EXCLUDED_FOLDER_IDS
+        f = lambda i: [{"id": i, "name": f"{i}.pdf", "mimeType": "application/pdf",  # noqa: E731
+                        "modifiedTime": "2026-09-01T00:00:00Z", "size": "999", "parents": []}]
+        svc = _RecordingTreeService(
+            subfolders={
+                "root": [{"id": archive, "name": "archive-tree-renamed"}, {"id": self.SIB, "name": "02-F3-Energy"}],
+                archive: [{"id": dedup, "name": "dedup-2026-09"}],
+                dedup: [{"id": "grand", "name": "01-HJR-Global"}],
+                "grand": [], self.SIB: [],
+            },
+            files={archive: f("loose-archived"), dedup: f("dup-copy"), "grand": f("deep-dup")},
+        )
+        done, kb, stats = self._walk(svc, KB_EXCLUDED_FOLDER_IDS)
+        assert done is True
+        assert set(kb.checkpoints["ck"]["completed_folder_ids"]) == {"root", self.SIB}
+        assert not ({archive, dedup, "grand"} & set(svc.parents_queried))
+        assert stats["files_enumerated"] == 0
+
+    def test_the_real_excluded_set_prunes_the_real_personal_finances_id(self):
+        # Code #15 RIDER B item 2: 00-Founder is walked, personal-finances and its
+        # subtree are never listed.
+        from cora.kb_exclusions import KB_EXCLUDED_FOLDER_IDS
+        pf = "1l7Hms6KwISUelnB-ItLAF9vms6K_Wd9s"
+        assert pf in KB_EXCLUDED_FOLDER_IDS
+        f = lambda i: [{"id": i, "name": f"{i}.pdf", "mimeType": "application/pdf",  # noqa: E731
+                        "modifiedTime": "2026-09-01T00:00:00Z", "size": "999", "parents": []}]
+        svc = _RecordingTreeService(
+            subfolders={
+                "root": [{"id": "FNDR", "name": "00-Founder"}],
+                "FNDR": [{"id": pf, "name": "personal-finances"}, {"id": self.SIB, "name": "projects"}],
+                pf: [{"id": "pf-2025", "name": "2025"}],
+                "pf-2025": [], self.SIB: [],
+            },
+            files={pf: f("statement"), "pf-2025": f("return")},
+        )
+        done, kb, stats = self._walk(svc, KB_EXCLUDED_FOLDER_IDS)
+        assert done is True
+        assert set(kb.checkpoints["ck"]["completed_folder_ids"]) == {"root", "FNDR", self.SIB}
+        assert not ({pf, "pf-2025"} & set(svc.parents_queried))
+
+    def test_a_folder_named_runs_is_name_skipped_in_the_tree_walk(self):
+        # Code #15 C13-14: the Cowork run-marker drop zone is pruned by NAME (exact,
+        # case-insensitive -- the entries are lower-cased at compare); a lookalike
+        # "test_runs" is walked.
+        assert "_runs" in _ds._FOUNDERS_OS_SKIP_FOLDERS
+        svc = _RecordingTreeService(
+            subfolders={
+                "root": [{"id": "MIRROR", "name": "claude-workspace-mirror"}],
+                "MIRROR": [{"id": "RUNS", "name": "_Runs"}, {"id": "TR", "name": "test_runs"}],
+                "RUNS": [], "TR": [],
+            },
+            files={},
+        )
+        done, kb, _ = self._walk(svc, frozenset())
+        assert done is True
+        assert "RUNS" not in set(svc.parents_queried)
+        assert "TR" in set(kb.checkpoints["ck"]["completed_folder_ids"])
 
     def test_without_the_pin_the_same_tree_is_walked(self):
         # Control: the pruning above is the pin's doing, not an artifact of the fixture.

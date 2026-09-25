@@ -34,6 +34,7 @@ from cora.knowledge_base.store import Document  # noqa: E402
 from cora.kb_exclusions import (  # noqa: E402
     is_copa_bhrf_path,
     is_cora_internal_path,
+    is_personal_finances_path,
     is_swept_path,
 )
 
@@ -83,7 +84,8 @@ def iter_static_candidates(root: Path) -> Iterator[Path]:
 def is_static_excluded(path: Path) -> bool:
     """The single exclusion chain for the static walk -- PHI path segments,
     ``_brain/swept`` materialization output, Cora's own workspace (D-057), the
-    copa-bhrf NDA folder, dot-dirs, and ``_archive`` trees. Returns True when the
+    copa-bhrf NDA folder, dot-dirs, ``_archive`` trees, the ``_runs`` marker zone
+    and the ``00-Founder/personal-finances`` store. Returns True when the
     path must NOT be ingested. Shared by ``main`` and ``file_to_document``'s
     callers so a new candidate class (bootstrap.txt) inherits every rule."""
     if is_phi_path(path):
@@ -104,6 +106,12 @@ def is_static_excluded(path: Path) -> bool:
     # task drops there by mistake WOULD ingest. Belt: exclude the segment outright.
     # Segment match, not substring ("test_runs.md" stays ingestible).
     if any(part.lower() == "_runs" for part in path.parts):
+        return True
+    # Code #15 RIDER B item 2: the PERSONAL store 00-Founder/personal-finances. Its
+    # Drive door is closed by the folder-id pin; this is the static_md door's path
+    # belt (no .md lives there today -- forward protection). Directory segments
+    # only, so a file merely named "personal-finances*.md" stays ingestible.
+    if is_personal_finances_path(str(path)):
         return True
     return False
 
