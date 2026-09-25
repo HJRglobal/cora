@@ -49,6 +49,7 @@ import re
 import sys
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -1439,9 +1440,13 @@ def extract_json_options(text: str) -> list | None:
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _SPECIAL_MENTION_RE = re.compile(r"<[!@#][^<>]{0,200}>")
 _AT_SPECIAL_RE = re.compile(r"@(?:here|channel|everyone)\b", re.IGNORECASE)
-_DOMAIN_TOKEN_RE = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,24}(?:[/:?#]\S*)?", re.IGNORECASE)
+# Domain-SHAPED: a label character, a dot, two letters -- every host with a 2+ letter
+# TLD contains one. SEARCHED inside each token (fixed width, so linear), never a
+# fullmatch of a trimmed core: no wrapper, prefix or trailing character hides it.
+_DOMAIN_SHAPE_RE = re.compile(r"[a-z0-9-]\.[a-z]{2}", re.IGNORECASE)
 _BOOKING_WORD_RE = re.compile(
-    r"\b(?:book(?:ed|ing|s)?|reserv\w*|hold(?:s|ing)?|held|confirm\w*|done)\b", re.IGNORECASE)
+    r"\b(?:(?:re|pre|over|un)?book(?:ed|ings?|s)?|reserv\w*|hold(?:s|ing)?|held|confirm\w*|done)\b",
+    re.IGNORECASE)
 _MD_CHARS = str.maketrans({"*": " ", "_": " ", "~": " ", "`": " ", "|": "/"})
 _FIELD_CAPS = {"property": 80, "nightly_rate": 40, "fit_note": 160}
 
@@ -1450,27 +1455,30 @@ def _esc(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _domain_shaped(tok: str) -> bool:
+    return "://" in tok or "www." in tok.lower() or bool(_DOMAIN_SHAPE_RE.search(tok))
+
+
 def sanitize_field(value: Any, cap: int) -> str:
     """A model/web string -> a card-safe PLAIN string (unescaped; escaping happens
-    at render). Whitespace+control collapsed (no forged lines), Slack special
-    tokens and @here/@channel removed, URL/domain-shaped tokens removed (Slack would
-    auto-link them past the record check), booking words neutralized, markdown
-    control characters removed, then capped."""
-    s = str(value or "")[:2000]
+    at render). ORDER MATTERS (D-051 r1 c2-injection-card#0/#1): NFKC-fold, then
+    Unicode format characters (category Cf: zero-width, bidi, soft hyphen) and
+    control characters become spaces, then the markdown characters -- FIRST, so
+    no wrapper ('**x.com**', '_Booked_', '_@here_') survives into the passes below
+    and no translate re-exposes a word they skipped. Then Slack special tokens and
+    @here/@channel/@everyone are removed, every token that CONTAINS a URL/domain
+    shape is dropped (Slack would auto-link it past the record check), booking
+    words (compounds included: rebooked, bookings, reserved, confirmed, held,
+    Done) are neutralized, and the result is capped."""
+    s = unicodedata.normalize("NFKC", str(value or "")[:2000])
+    s = "".join(" " if unicodedata.category(ch) == "Cf" else ch for ch in s)
     s = _CTRL_RE.sub(" ", s)
+    s = s.translate(_MD_CHARS)
     s = " ".join(s.split())
     s = _SPECIAL_MENTION_RE.sub(" ", s)
     s = _AT_SPECIAL_RE.sub(" ", s)
-    kept = []
-    for tok in s.split(" "):
-        core = tok.strip(".,;:!?()[]{}'\"")
-        low = core.lower()
-        if "://" in low or low.startswith("www.") or (core and _DOMAIN_TOKEN_RE.fullmatch(core)):
-            continue
-        kept.append(tok)
-    s = " ".join(kept)
+    s = " ".join(tok for tok in s.split() if not _domain_shaped(tok))
     s = _BOOKING_WORD_RE.sub("…", s)
-    s = s.translate(_MD_CHARS)
     s = " ".join(s.split())
     if len(s) > cap:
         s = s[: cap - 1].rstrip() + "…"
@@ -1559,6 +1567,13 @@ def card_text(c: TravelConstraints, n_options: int) -> str:
             "Open the card; nothing is booked.")
 
 
+def _mrkdwn(text: str) -> dict:
+    """Every card text object is VERBATIM (D-051 r1 c2-injection-card#0): Slack then
+    never auto-links a domain or auto-parses an @here a field still carries; the
+    explicit <url|label> links (record URLs only) keep working."""
+    return {"type": "mrkdwn", "text": text, "verbatim": True}
+
+
 def render_card(c: TravelConstraints, options: list[dict], *, dropped: int = 0,
                 now: datetime | None = None) -> tuple[str, list[dict]]:
     now = now or datetime.now(_AZ)
@@ -1567,22 +1582,22 @@ def render_card(c: TravelConstraints, options: list[dict], *, dropped: int = 0,
     header = (f"*Lodging shortlist* — {names} · {_short_span(c.check_in, c.check_out)} "
               f"({n} night{'s' if n != 1 else ''})"
               + (f" · {c.party_size} guests" if c.party_size else ""))
-    blocks: list[dict] = [{"type": "section", "text": {"type": "mrkdwn", "text": _esc(header)}}]
+    blocks: list[dict] = [{"type": "section", "text": _mrkdwn(_esc(header))}]
     for opt in options[:MAX_OPTIONS]:
         label = web_guard._clean_label(opt["property"])
         kind = "hotel" if opt["kind"] == "hotel" else "vacation rental"
         body = f"*<{opt['url']}|{label}>* — {_esc(opt['nightly_rate'])} · {kind}"
         if opt.get("fit_note"):
             body += f"\n_{_esc(opt['fit_note'])}_"
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": body}})
+        blocks.append({"type": "section", "text": _mrkdwn(body)})
     if not options:
-        blocks.append({"type": "section", "text": {
-            "type": "mrkdwn", "text": NO_VERIFIED_FIT_TEXT if dropped else NO_FIT_TEXT}})
+        blocks.append({"type": "section",
+                       "text": _mrkdwn(NO_VERIFIED_FIT_TEXT if dropped else NO_FIT_TEXT)})
     context = (f"As of {_stamp(now)} AZ · rates as the search results showed them — "
                "confirm on the site; taxes/fees may apply · searched with "
                f"{searched_fields_clause(c)} only — no names, no loyalty accounts · "
                "nothing is booked; booking stays with a person")
-    blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": _esc(context)}]})
+    blocks.append({"type": "context", "elements": [_mrkdwn(_esc(context))]})
     return card_text(c, len(options)), blocks
 
 

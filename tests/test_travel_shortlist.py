@@ -736,6 +736,85 @@ class TestFieldSanitizer:
         assert len(ts.sanitize_field("x" * 500, 80)) == 80
         assert len(ts.sanitize_field("y " * 500, 40)) <= 40
 
+    # D-051 r1 c2-injection-card#0: a domain wrapped in markdown / a format character /
+    # a prefix or trailing character used to survive (the strip ran BEFORE the
+    # markdown pass, on a fullmatch of a lightly trimmed core) and Slack auto-linked
+    # the bare host the translate left behind -- a link the record check never saw.
+    @pytest.mark.parametrize("raw", [
+        "$329 on **scottsdale-deals.example**", "_evil.com_", "`evil.com`", "~evil.com~",
+        "evil.com|login", "evil.com​", "evil.com…", "see:evil.com", "*evil.com/login*",
+        "(**www.evil.example**)", "evil​.com", "‮moc.live", "ｅｖｉｌ．ｃｏｍ",
+        "evil.com⁠now", "e­vil.com",
+    ])
+    def test_a_wrapped_or_decorated_domain_is_stripped(self, raw):
+        import re
+        import unicodedata
+        out = ts.sanitize_field(raw, 160)
+        folded = unicodedata.normalize("NFKC", out)     # a fullwidth host folds to ASCII
+        assert not re.search(r"[a-z0-9-]\.[a-z]{2}", folded, re.IGNORECASE), (raw, out)
+        assert "evil.com" not in folded.lower() and "scottsdale-deals" not in folded
+        assert not [ch for ch in out if unicodedata.category(ch) == "Cf"], (raw, out)
+
+    # D-051 r1 c2-injection-card#1: '_' is a word character, so the \b anchors never
+    # matched inside Slack italics and the markdown pass then exposed the bare word.
+    @pytest.mark.parametrize("raw", [
+        "_Booked_ for 4 guests", "Room _reserved_ under your name", "_Confirmed_: king suite",
+        "_Done_", "__Booked__", "booked_for_4", "Rebooked for your dates", "Prebooked king suite",
+        "Your bookings are set", "Overbooked but we got you in", "*BOOKED*", "~held~ for you",
+        "re-booked", "Un​booked", "Book​ed for you",
+    ])
+    def test_booking_words_are_neutralized_through_markdown_and_compounds(self, raw):
+        low = ts.sanitize_field(raw, 160).lower()
+        for bad in ("book", "reserv", "confirm", "done", "held"):
+            assert bad not in low, (raw, low)
+
+    @pytest.mark.parametrize("raw", ["_@here_ great pool", "heads up @channel_", "*@everyone*",
+                                     "@​here", "＠here now"])
+    def test_at_specials_are_stripped_through_markdown(self, raw):
+        import re
+        out = ts.sanitize_field(raw, 160)
+        # a format character becomes a SPACE ("@ here" pings no one; a removed one would
+        # have glued "Booked​for" into an un-neutralized "Bookedfor")
+        assert not re.search(r"@(?:here|channel|everyone)", out, re.IGNORECASE), (raw, out)
+
+    def test_the_sanitizer_is_linear_on_degenerate_input(self):
+        for shape in (" " * 40000, "a." * 20000, "_" * 40000, "​" * 40000, "book" * 10000,
+                      "*a.bc*" * 6000, "@" * 40000):
+            assert _best_of_3(lambda: ts.sanitize_field(shape, 160)) < 0.05, shape[:10]
+
+    def test_a_decorated_domain_never_reaches_the_rendered_card(self):
+        """End to end through validate_options + render_card (the finding's own repro)."""
+        m = _msg(_fx())
+        urls, _e = ts.collect_record_urls([m])
+        raw = [{"property": "**Hotel Valley Ho**", "nightly_rate": "$329 on **scottsdale-deals.example**",
+                "url": "https://hotelvalleyho.com/", "kind": "hotel",
+                "fit_note": "_Booked_ for 4 -- now at `scottsdale-deals.example/login` _@here_"}]
+        opts, dropped = ts.validate_options(raw, urls)
+        assert dropped == 0 and len(opts) == 1
+        _t, blocks = ts.render_card(_constraints(), opts, now=NOW)
+        body = blocks[1]["text"]["text"].lower()
+        for bad in ("scottsdale-deals", "booked", "@here"):
+            assert bad not in body, bad
+
+    def test_every_mrkdwn_text_object_on_the_card_is_verbatim(self):
+        """Structural backstop: verbatim stops Slack auto-linking/auto-parsing whatever a
+        field still carries; the explicit <url|label> links keep working."""
+        def walk(node):
+            if isinstance(node, dict):
+                if node.get("type") == "mrkdwn":
+                    yield node
+                for v in node.values():
+                    yield from walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    yield from walk(v)
+        for opts, dropped in ((TestCard()._options(), 0), ([], 0), ([], 2)):
+            _t, blocks = ts.render_card(_constraints(), opts, dropped=dropped, now=NOW)
+            objs = list(walk(blocks))
+            assert objs and all(o.get("verbatim") is True for o in objs), objs
+        _t, blocks = ts.render_card(_constraints(), TestCard()._options(), now=NOW)
+        assert blocks[1]["text"]["text"].startswith("*<https://")
+
 
 # ── the card (B4/B9) ─────────────────────────────────────────────────────────
 
