@@ -641,6 +641,11 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
         ("cora.connectors.photoroom_client", "_SPEND_LOG_PATH", "photoroom-spend.jsonl"),
         ("cora.revops.sender", "_AUDIT_PATH", "cora-send-audit.jsonl"),
         ("cora.main", "_HEARTBEAT_FILE", "heartbeat.txt"),
+        # Code #16 D-051 r1 (harness-isolation#1): the travel intercept registers
+        # every lane turn in the active-thread SQLite store, and the lane's wiring
+        # tests drive the real handlers -- without this every suite run wrote rows
+        # into the LIVE bot's data/active_threads.db (working tree is live).
+        ("cora.active_thread_store", "_DB_PATH", "active_threads.db"),
     ]
     for _mod_name, _attr, _fname in _LEDGER_CONSTS:
         try:
@@ -966,6 +971,9 @@ _GUARDED_LEDGERS = (
     # Code #16 C2: the travel shortlist lane's thread store (writer:
     # travel_shortlist.append_event; redirected via CORA_TRAVEL_SHORTLIST_THREADS_PATH).
     "data/state/travel-shortlist-threads.jsonl",
+    # Code #16 D-051 r1: the active-thread routing store (writer:
+    # active_thread_store.register; redirected via the _LEDGER_CONSTS row above).
+    "data/active_threads.db",
 )
 
 
