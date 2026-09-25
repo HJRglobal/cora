@@ -238,12 +238,12 @@ decision recorded in `deployment/DR-MANIFEST.md`, not something this phase sets.
 ### Scheduled estate (generated -- do not hand-edit)
 
 <!-- BEGIN GENERATED: scheduled-estate -->
-_Generated 2026-09-24 by `scripts/generate_task_estate_manifest.py --update-docs` from the live registry: **99 tasks** (80 enabled). Source of truth: `deployment/manifest/task-estate.json`. Do not hand-list tasks here -- regenerate._
+_Generated 2026-09-25 by `scripts/generate_task_estate_manifest.py --update-docs` from the live registry: **100 tasks** (81 enabled). Source of truth: `deployment/manifest/task-estate.json`. Do not hand-list tasks here -- regenerate._
 
 **Register the estate FROM THE MANIFEST** (from an ELEVATED PowerShell at the repo root; host time zone must be `US Mountain Standard Time` first -- `Set-TimeZone`):
 1. `.\deployment\register-estate-from-manifest.ps1` (dry-run plan) then `.\deployment\register-estate-from-manifest.ps1 -Apply` -- registers every task below from `deployment/manifest/tasks/<slug>.xml` (full-fidelity Task Scheduler exports: triggers, windowless action, settings, run level, and `Enabled=false` for the 19 intent-disabled tasks). The `setup-*.ps1` scripts are NOT run on a rebuild: several carry drifted clocks or would re-enable disabled tasks; they create NEW tasks only.
 2. Restore `.env` (Phase 4) BEFORE starting anything; then `Start-ScheduledTask -TaskName cowork-cora-service` (the service otherwise starts at the next logon).
-3. Verify: `Get-ScheduledTask | Where-Object { $_.TaskName -like 'cowork-cora-*' -or $_.TaskName -like 'Cora - *' -or $_.TaskName -eq 'cora-watchdog' } | Measure-Object` -> expect **99**, then `.venv\Scripts\python.exe scripts\generate_task_estate_manifest.py --diff-only` -> expect ZERO `task-estate-drift` lines (cron / enabled / action / principal / settings / time zone are all compared).
+3. Verify: `Get-ScheduledTask | Where-Object { $_.TaskName -like 'cowork-cora-*' -or $_.TaskName -like 'Cora - *' -or $_.TaskName -eq 'cora-watchdog' } | Measure-Object` -> expect **100**, then `.venv\Scripts\python.exe scripts\generate_task_estate_manifest.py --diff-only` -> expect ZERO `task-estate-drift` lines (cron / enabled / action / principal / settings / time zone are all compared).
 4. The Cowork estate (Claude desktop scheduled tasks) is NOT registered by any of this: it stays on the office machine (charter D4); its weekly pin task is `cowork-model-pin-weekly`.
 
 | Task | Trigger | XML (restore form) | Created by (setup script, informational) | Run level / logon | SWA | Intent |
@@ -319,6 +319,7 @@ _Generated 2026-09-24 by `scripts/generate_task_estate_manifest.py --update-docs
 | `cowork-cora-gap-digest` | weekly Mon 08:00 | `tasks/cowork-cora-gap-digest.xml` | (none -- manifest XML only) | Limited / Interactive | **no** | disabled |
 | `cowork-cora-health-check` | daily 08:45 | `tasks/cowork-cora-health-check.xml` | (none -- manifest XML only) | Limited / Interactive | **no** | UNROWED |
 | `cowork-cora-hubspot-email-sync` | every PT1H (from 2026-05-31T23:23) | `tasks/cowork-cora-hubspot-email-sync.xml` | (none -- manifest XML only) | Limited / Interactive | **no** | disabled |
+| `cowork-cora-hygiene-drive-weekly` | weekly Sat 02:40 | `tasks/cowork-cora-hygiene-drive-weekly.xml` | `setup-hygiene-drive-weekly-task.ps1` | Limited / Interactive | yes | UNROWED |
 | `cowork-cora-influencer-digest` | weekly Mon 08:20 | `tasks/cowork-cora-influencer-digest.xml` | `setup-influencer-digest-task.ps1` | Limited / Interactive | yes | disabled |
 | `cowork-cora-influencer-overdue-alerts` | daily 09:10 | `tasks/cowork-cora-influencer-overdue-alerts.xml` | `setup-influencer-overdue-alerts-task.ps1` | Limited / Interactive | yes | disabled |
 | `cowork-cora-influencer-scan` | every PT2H (from 2026-05-27T22:00) | `tasks/cowork-cora-influencer-scan.xml` | `setup-influencer-scan-task.ps1` | Limited / Interactive | yes | disabled |

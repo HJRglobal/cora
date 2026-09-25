@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "generated_at_utc": "2026-09-24T23:10:52Z",
-  "generated_at_az": "2026-09-24 16:10 AZ",
+  "generated_at_utc": "2026-09-25T14:30:22Z",
+  "generated_at_az": "2026-09-25 07:30 AZ",
   "generator": "scripts/generate_task_estate_manifest.py",
   "host": "H-REMOTE",
   "host_time_zone": "US Mountain Standard Time",
@@ -16,8 +16,8 @@
       "cora-watchdog"
     ]
   },
-  "count": 99,
-  "enabled_count": 80,
+  "count": 100,
+  "enabled_count": 81,
   "disabled": [
     "Cora - Cash Flow Pulse",
     "Cora - Deal Aging Alerts",
@@ -39,7 +39,7 @@
     "cowork-cora-proactive-gaps",
     "cowork-cora-project-channel-sync"
   ],
-  "interactive_logon_count": 98,
+  "interactive_logon_count": 99,
   "start_when_available_false": [
     "Cora - Expected Invoice Check",
     "Cora - F3E Blog Pipeline",
@@ -90,19 +90,19 @@
     "cowork-cora-drive-extractor": "host DISABLED, not in the disabled list"
   },
   "enumeration_agreement": {
-    "cim_count": 99,
+    "cim_count": 100,
     "agree": true,
     "methods": {
       "schtasks_csv": {
         "available": true,
-        "count": 99,
+        "count": 100,
         "agree": true,
         "only_in_cim": [],
         "only_in_method": []
       },
       "cora_health_view": {
         "available": true,
-        "count": 99,
+        "count": 100,
         "agree": true,
         "only_in_cim": [],
         "only_in_method": []
@@ -110,7 +110,7 @@
     }
   },
   "run_marker_coverage": {
-    "tasks_total": 99,
+    "tasks_total": 100,
     "tasks_with_marker": 5,
     "with_marker": [
       "Cora - F3E Blog Pipeline",
@@ -119,7 +119,7 @@
       "cowork-cora-meeting-capture-audit",
       "cowork-cora-session-capture"
     ],
-    "per_task_log_prefixes": 77,
+    "per_task_log_prefixes": 78,
     "log_prefixes_not_matching_a_task": [
       "bigcode",
       "proc-exit"
@@ -177,8 +177,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T06:40:01",
-      "next_run_time": "2026-09-25T06:40:00",
+      "last_run_time": "2026-09-25T06:40:01",
+      "next_run_time": "2026-09-26T06:40:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -188,9 +188,9 @@
       "log_slug": "Cora-Asana-Hygiene-Nudges",
       "log": {
         "pattern": "logs/tasks/Cora-Asana-Hygiene-Nudges-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/Cora-Asana-Hygiene-Nudges-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T13:40:53Z",
-        "count": 22
+        "newest": "logs/tasks/Cora-Asana-Hygiene-Nudges-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T13:40:52Z",
+        "count": 23
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -301,8 +301,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T06:45:01",
-      "next_run_time": "2026-09-25T06:45:00",
+      "last_run_time": "2026-09-25T06:45:01",
+      "next_run_time": "2026-09-26T06:45:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -312,9 +312,9 @@
       "log_slug": "Cora-Cash-Snapshot",
       "log": {
         "pattern": "logs/tasks/Cora-Cash-Snapshot-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/Cora-Cash-Snapshot-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T13:46:17Z",
-        "count": 22
+        "newest": "logs/tasks/Cora-Cash-Snapshot-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T13:45:09Z",
+        "count": 23
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -389,7 +389,7 @@
     {
       "name": "Cora - Daily Briefing",
       "path": "\\",
-      "state": "Ready",
+      "state": "Running",
       "enabled": true,
       "trigger_text": "weekly Mon,Tue,Wed,Thu,Fri 07:30",
       "triggers": [
@@ -424,9 +424,9 @@
       "restart_interval": "",
       "wake_to_run": false,
       "run_only_if_network_available": false,
-      "last_task_result": 0,
-      "last_run_time": "2026-09-24T07:30:00",
-      "next_run_time": "2026-09-25T07:30:00",
+      "last_task_result": 267009,
+      "last_run_time": "2026-09-25T07:30:00",
+      "next_run_time": "2026-09-28T07:30:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -436,9 +436,9 @@
       "log_slug": "Cora-Daily-Briefing",
       "log": {
         "pattern": "logs/tasks/Cora-Daily-Briefing-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/Cora-Daily-Briefing-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T14:33:40Z",
-        "count": 16
+        "newest": "logs/tasks/Cora-Daily-Briefing-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T14:30:08Z",
+        "count": 17
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -487,8 +487,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T06:52:01",
-      "next_run_time": "2026-09-25T06:52:00",
+      "last_run_time": "2026-09-25T06:52:01",
+      "next_run_time": "2026-09-26T06:52:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -498,9 +498,9 @@
       "log_slug": "Cora-Daily-Synthesis-BDM",
       "log": {
         "pattern": "logs/tasks/Cora-Daily-Synthesis-BDM-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/Cora-Daily-Synthesis-BDM-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T14:01:04Z",
-        "count": 22
+        "newest": "logs/tasks/Cora-Daily-Synthesis-BDM-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T13:53:42Z",
+        "count": 23
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -549,8 +549,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T06:58:01",
-      "next_run_time": "2026-09-25T06:58:00",
+      "last_run_time": "2026-09-25T06:58:01",
+      "next_run_time": "2026-09-26T06:58:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -560,9 +560,9 @@
       "log_slug": "Cora-Daily-Synthesis-F3C",
       "log": {
         "pattern": "logs/tasks/Cora-Daily-Synthesis-F3C-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/Cora-Daily-Synthesis-F3C-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T14:05:56Z",
-        "count": 22
+        "newest": "logs/tasks/Cora-Daily-Synthesis-F3C-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T14:00:02Z",
+        "count": 23
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -611,8 +611,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T06:33:01",
-      "next_run_time": "2026-09-25T06:33:00",
+      "last_run_time": "2026-09-25T06:33:01",
+      "next_run_time": "2026-09-26T06:33:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -622,9 +622,9 @@
       "log_slug": "Cora-Daily-Synthesis-F3E",
       "log": {
         "pattern": "logs/tasks/Cora-Daily-Synthesis-F3E-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/Cora-Daily-Synthesis-F3E-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T13:36:08Z",
-        "count": 22
+        "newest": "logs/tasks/Cora-Daily-Synthesis-F3E-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T13:36:54Z",
+        "count": 23
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -673,8 +673,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T06:35:01",
-      "next_run_time": "2026-09-25T06:35:00",
+      "last_run_time": "2026-09-25T06:35:01",
+      "next_run_time": "2026-09-26T06:35:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -684,9 +684,9 @@
       "log_slug": "Cora-Daily-Synthesis-HJRP",
       "log": {
         "pattern": "logs/tasks/Cora-Daily-Synthesis-HJRP-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/Cora-Daily-Synthesis-HJRP-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T13:37:21Z",
-        "count": 22
+        "newest": "logs/tasks/Cora-Daily-Synthesis-HJRP-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T13:37:05Z",
+        "count": 23
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -735,8 +735,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T06:56:01",
-      "next_run_time": "2026-09-25T06:56:00",
+      "last_run_time": "2026-09-25T06:56:01",
+      "next_run_time": "2026-09-26T06:56:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -746,9 +746,9 @@
       "log_slug": "Cora-Daily-Synthesis-HJRPROD",
       "log": {
         "pattern": "logs/tasks/Cora-Daily-Synthesis-HJRPROD-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/Cora-Daily-Synthesis-HJRPROD-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T14:04:43Z",
-        "count": 22
+        "newest": "logs/tasks/Cora-Daily-Synthesis-HJRPROD-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T13:59:07Z",
+        "count": 23
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -797,8 +797,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T06:39:01",
-      "next_run_time": "2026-09-25T06:39:00",
+      "last_run_time": "2026-09-25T06:39:01",
+      "next_run_time": "2026-09-26T06:39:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -808,9 +808,9 @@
       "log_slug": "Cora-Daily-Synthesis-LEX",
       "log": {
         "pattern": "logs/tasks/Cora-Daily-Synthesis-LEX-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/Cora-Daily-Synthesis-LEX-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T13:39:19Z",
-        "count": 22
+        "newest": "logs/tasks/Cora-Daily-Synthesis-LEX-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T13:39:22Z",
+        "count": 23
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -859,8 +859,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T06:37:01",
-      "next_run_time": "2026-09-25T06:37:00",
+      "last_run_time": "2026-09-25T06:37:01",
+      "next_run_time": "2026-09-26T06:37:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -870,9 +870,9 @@
       "log_slug": "Cora-Daily-Synthesis-OSN",
       "log": {
         "pattern": "logs/tasks/Cora-Daily-Synthesis-OSN-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/Cora-Daily-Synthesis-OSN-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T13:39:22Z",
-        "count": 22
+        "newest": "logs/tasks/Cora-Daily-Synthesis-OSN-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T13:39:25Z",
+        "count": 23
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -921,8 +921,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T06:31:01",
-      "next_run_time": "2026-09-25T06:31:00",
+      "last_run_time": "2026-09-25T06:31:01",
+      "next_run_time": "2026-09-26T06:31:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -932,9 +932,9 @@
       "log_slug": "Cora-Daily-Synthesis-Portfolio",
       "log": {
         "pattern": "logs/tasks/Cora-Daily-Synthesis-Portfolio-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/Cora-Daily-Synthesis-Portfolio-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T13:35:06Z",
-        "count": 22
+        "newest": "logs/tasks/Cora-Daily-Synthesis-Portfolio-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T13:34:45Z",
+        "count": 23
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -983,8 +983,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T06:54:01",
-      "next_run_time": "2026-09-25T06:54:00",
+      "last_run_time": "2026-09-25T06:54:01",
+      "next_run_time": "2026-09-26T06:54:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -994,9 +994,9 @@
       "log_slug": "Cora-Daily-Synthesis-UFL",
       "log": {
         "pattern": "logs/tasks/Cora-Daily-Synthesis-UFL-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/Cora-Daily-Synthesis-UFL-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T14:03:16Z",
-        "count": 22
+        "newest": "logs/tasks/Cora-Daily-Synthesis-UFL-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T13:57:38Z",
+        "count": 23
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -1107,8 +1107,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T05:45:01",
-      "next_run_time": "2026-09-25T05:45:00",
+      "last_run_time": "2026-09-25T05:45:01",
+      "next_run_time": "2026-09-26T05:45:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -1118,9 +1118,9 @@
       "log_slug": "Cora-Drive-Materialization",
       "log": {
         "pattern": "logs/tasks/Cora-Drive-Materialization-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/Cora-Drive-Materialization-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T12:47:08Z",
-        "count": 21
+        "newest": "logs/tasks/Cora-Drive-Materialization-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T12:47:06Z",
+        "count": 22
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -1168,9 +1168,9 @@
       "restart_interval": "",
       "wake_to_run": false,
       "run_only_if_network_available": false,
-      "last_task_result": 0,
-      "last_run_time": "2026-09-24T06:00:01",
-      "next_run_time": "2026-09-25T06:00:00",
+      "last_task_result": 1073807364,
+      "last_run_time": "2026-09-25T06:00:01",
+      "next_run_time": "2026-09-26T06:00:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -1180,9 +1180,9 @@
       "log_slug": "Cora-Drive-Sweep",
       "log": {
         "pattern": "logs/tasks/Cora-Drive-Sweep-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/Cora-Drive-Sweep-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T13:14:12Z",
-        "count": 21
+        "newest": "logs/tasks/Cora-Drive-Sweep-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T13:14:31Z",
+        "count": 22
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -1293,8 +1293,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T14:00:01",
-      "next_run_time": "2026-09-24T18:00:00",
+      "last_run_time": "2026-09-25T06:00:01",
+      "next_run_time": "2026-09-25T10:00:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -1304,9 +1304,9 @@
       "log_slug": "Cora-Email-Attachment-Filer",
       "log": {
         "pattern": "logs/tasks/Cora-Email-Attachment-Filer-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/Cora-Email-Attachment-Filer-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T21:13:13Z",
-        "count": 22
+        "newest": "logs/tasks/Cora-Email-Attachment-Filer-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T13:00:35Z",
+        "count": 23
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -1496,8 +1496,8 @@
       "run_only_if_network_available": false,
       "last_task_result": 0,
       "last_run_time": "2026-07-07T07:10:01",
-      "next_run_time": "2026-09-25T07:10:00",
-      "number_of_missed_runs": 79,
+      "next_run_time": "2026-09-26T07:10:00",
+      "number_of_missed_runs": 80,
       "run_marker": {
         "registered": false,
         "present": false,
@@ -1682,8 +1682,8 @@
       "run_only_if_network_available": false,
       "last_task_result": 0,
       "last_run_time": "2026-06-04T17:00:01",
-      "next_run_time": "2026-09-24T17:00:00",
-      "number_of_missed_runs": 2687,
+      "next_run_time": "2026-09-25T08:00:00",
+      "number_of_missed_runs": 2702,
       "run_marker": {
         "registered": false,
         "present": false,
@@ -2007,8 +2007,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T04:45:01",
-      "next_run_time": "2026-09-25T04:45:00",
+      "last_run_time": "2026-09-25T04:45:01",
+      "next_run_time": "2026-09-26T04:45:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -2018,9 +2018,9 @@
       "log_slug": "Cora-LEX-Dump-Folder-Sync",
       "log": {
         "pattern": "logs/tasks/Cora-LEX-Dump-Folder-Sync-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/Cora-LEX-Dump-Folder-Sync-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T11:45:04Z",
-        "count": 21
+        "newest": "logs/tasks/Cora-LEX-Dump-Folder-Sync-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T11:45:04Z",
+        "count": 22
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -2069,8 +2069,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T07:06:01",
-      "next_run_time": "2026-09-25T07:06:00",
+      "last_run_time": "2026-09-25T07:06:01",
+      "next_run_time": "2026-09-26T07:06:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -2080,9 +2080,9 @@
       "log_slug": "Cora-LEX-Swept-PHI-Check",
       "log": {
         "pattern": "logs/tasks/Cora-LEX-Swept-PHI-Check-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/Cora-LEX-Swept-PHI-Check-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T14:06:04Z",
-        "count": 22
+        "newest": "logs/tasks/Cora-LEX-Swept-PHI-Check-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T14:06:04Z",
+        "count": 23
       },
       "intent": "enabled",
       "intent_drift": "",
@@ -2210,8 +2210,8 @@
       "run_only_if_network_available": false,
       "last_task_result": 0,
       "last_run_time": "2026-06-18T11:00:01",
-      "next_run_time": "2026-09-24T17:00:00",
-      "number_of_missed_runs": 2357,
+      "next_run_time": "2026-09-25T08:00:00",
+      "number_of_missed_runs": 2372,
       "run_marker": {
         "registered": false,
         "present": false,
@@ -2271,20 +2271,20 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T16:08:02",
-      "next_run_time": "2026-09-24T16:23:00",
+      "last_run_time": "2026-09-25T07:23:02",
+      "next_run_time": "2026-09-25T07:38:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": true,
         "present": true,
-        "last_ts": "2026-09-24T23:08:05.408673+00:00"
+        "last_ts": "2026-09-25T14:23:04.602285+00:00"
       },
       "log_slug": "Cora-Meeting-Ask-Capture",
       "log": {
         "pattern": "logs/tasks/Cora-Meeting-Ask-Capture-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/Cora-Meeting-Ask-Capture-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T23:08:05Z",
-        "count": 22
+        "newest": "logs/tasks/Cora-Meeting-Ask-Capture-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T14:23:04Z",
+        "count": 23
       },
       "intent": "enabled",
       "intent_drift": "",
@@ -2304,7 +2304,7 @@
         {
           "type": "MSFT_TaskDailyTrigger",
           "enabled": true,
-          "start_boundary": "2026-09-19T08:30:00-07:00",
+          "start_boundary": "2026-09-25T08:30:00-07:00",
           "days_interval": 1,
           "days_of_week": null,
           "weeks_interval": null,
@@ -2315,9 +2315,9 @@
           "user_id": ""
         }
       ],
-      "action_text": "C:\\Users\\Harri\\code\\cora\\.venv\\Scripts\\pythonw.exe C:\\Users\\Harri\\code\\cora\\deployment\\run_hidden.py --name Cora-Missed-Nightly-Catch-Up -- C:\\Users\\Harri\\code\\cora\\.venv\\Scripts\\python.exe \"C:\\Users\\Harri\\code\\cora\\scripts\\check_missed_nightly.py\"",
+      "action_text": "C:\\Users\\Harri\\code\\cora\\.venv\\Scripts\\pythonw.exe C:\\Users\\Harri\\code\\cora\\deployment\\run_hidden.py --name Cora-Missed-Nightly-Catch-Up -- C:\\Users\\Harri\\code\\cora\\.venv\\Scripts\\python.exe \"C:\\Users\\Harri\\code\\cora\\scripts\\check_missed_nightly.py\" --record",
       "working_directory": "C:\\Users\\Harri\\code\\cora",
-      "child_command": "C:\\Users\\Harri\\code\\cora\\.venv\\Scripts\\python.exe \"C:\\Users\\Harri\\code\\cora\\scripts\\check_missed_nightly.py\"",
+      "child_command": "C:\\Users\\Harri\\code\\cora\\.venv\\Scripts\\python.exe \"C:\\Users\\Harri\\code\\cora\\scripts\\check_missed_nightly.py\" --record",
       "script": "scripts/check_missed_nightly.py",
       "windowless": true,
       "run_as": {
@@ -2332,8 +2332,8 @@
       "restart_interval": "",
       "wake_to_run": false,
       "run_only_if_network_available": false,
-      "last_task_result": 0,
-      "last_run_time": "2026-09-24T08:30:01",
+      "last_task_result": 267011,
+      "last_run_time": "",
       "next_run_time": "2026-09-25T08:30:00",
       "number_of_missed_runs": 0,
       "run_marker": {
@@ -2535,8 +2535,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T06:50:01",
-      "next_run_time": "2026-09-25T06:50:00",
+      "last_run_time": "2026-09-25T06:50:01",
+      "next_run_time": "2026-09-26T06:50:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -2546,9 +2546,9 @@
       "log_slug": "Cora-QBO-Token-Monitor",
       "log": {
         "pattern": "logs/tasks/Cora-QBO-Token-Monitor-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/Cora-QBO-Token-Monitor-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T13:50:02Z",
-        "count": 22
+        "newest": "logs/tasks/Cora-QBO-Token-Monitor-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T13:50:02Z",
+        "count": 23
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -2907,8 +2907,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T16:07:01",
-      "next_run_time": "2026-09-24T16:12:00",
+      "last_run_time": "2026-09-25T07:27:01",
+      "next_run_time": "2026-09-25T07:32:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -2918,9 +2918,9 @@
       "log_slug": "cora-watchdog",
       "log": {
         "pattern": "logs/tasks/cora-watchdog-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cora-watchdog-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T23:07:01Z",
-        "count": 22
+        "newest": "logs/tasks/cora-watchdog-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T14:27:02Z",
+        "count": 23
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -3032,8 +3032,8 @@
       "run_only_if_network_available": false,
       "last_task_result": 0,
       "last_run_time": "2026-06-01T15:10:01",
-      "next_run_time": "2026-09-24T17:10:00",
-      "number_of_missed_runs": 2761,
+      "next_run_time": "2026-09-25T08:10:00",
+      "number_of_missed_runs": 2776,
       "run_marker": {
         "registered": false,
         "present": false,
@@ -3153,8 +3153,8 @@
       "wake_to_run": true,
       "run_only_if_network_available": true,
       "last_task_result": 0,
-      "last_run_time": "2026-09-23T20:30:01",
-      "next_run_time": "2026-09-24T20:30:00",
+      "last_run_time": "2026-09-24T20:30:01",
+      "next_run_time": "2026-09-25T20:30:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -3164,9 +3164,9 @@
       "log_slug": "cowork-cora-backup",
       "log": {
         "pattern": "logs/tasks/cowork-cora-backup-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cowork-cora-backup-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T03:30:05Z",
-        "count": 22
+        "newest": "logs/tasks/cowork-cora-backup-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T03:30:06Z",
+        "count": 23
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -3215,8 +3215,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T07:05:01",
-      "next_run_time": "2026-09-25T07:05:00",
+      "last_run_time": "2026-09-25T07:05:01",
+      "next_run_time": "2026-09-26T07:05:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -3226,9 +3226,9 @@
       "log_slug": "cowork-cora-bank-snapshot",
       "log": {
         "pattern": "logs/tasks/cowork-cora-bank-snapshot-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cowork-cora-bank-snapshot-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T14:06:11Z",
-        "count": 22
+        "newest": "logs/tasks/cowork-cora-bank-snapshot-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T14:06:10Z",
+        "count": 23
       },
       "intent": "enabled",
       "intent_drift": "",
@@ -3476,8 +3476,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T12:15:01",
-      "next_run_time": "2026-09-25T03:45:00",
+      "last_run_time": "2026-09-25T03:45:01",
+      "next_run_time": "2026-09-25T12:15:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -3487,9 +3487,9 @@
       "log_slug": "cowork-cora-claude-mirror",
       "log": {
         "pattern": "logs/tasks/cowork-cora-claude-mirror-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cowork-cora-claude-mirror-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T19:15:06Z",
-        "count": 21
+        "newest": "logs/tasks/cowork-cora-claude-mirror-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T10:45:07Z",
+        "count": 22
       },
       "intent": "enabled",
       "intent_drift": "",
@@ -3598,8 +3598,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T07:15:01",
-      "next_run_time": "2026-09-25T07:15:00",
+      "last_run_time": "2026-09-25T07:15:01",
+      "next_run_time": "2026-09-26T07:15:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -3609,9 +3609,9 @@
       "log_slug": "cowork-cora-decision-capture",
       "log": {
         "pattern": "logs/tasks/cowork-cora-decision-capture-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cowork-cora-decision-capture-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T14:15:04Z",
-        "count": 22
+        "newest": "logs/tasks/cowork-cora-decision-capture-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T14:15:05Z",
+        "count": 23
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -3658,8 +3658,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T16:00:01",
-      "next_run_time": "2026-09-24T16:15:00",
+      "last_run_time": "2026-09-25T07:30:01",
+      "next_run_time": "2026-09-25T07:45:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -3669,9 +3669,9 @@
       "log_slug": "cowork-cora-delegated-work",
       "log": {
         "pattern": "logs/tasks/cowork-cora-delegated-work-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cowork-cora-delegated-work-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T23:00:02Z",
-        "count": 22
+        "newest": "logs/tasks/cowork-cora-delegated-work-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T14:30:02Z",
+        "count": 23
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -3719,9 +3719,9 @@
       "restart_interval": "",
       "wake_to_run": false,
       "run_only_if_network_available": false,
-      "last_task_result": 267011,
-      "last_run_time": "",
-      "next_run_time": "2026-09-25T06:22:00",
+      "last_task_result": 0,
+      "last_run_time": "2026-09-25T06:22:01",
+      "next_run_time": "2026-09-26T06:22:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -3731,9 +3731,9 @@
       "log_slug": "cowork-cora-deposco-inventory-sync",
       "log": {
         "pattern": "logs/tasks/cowork-cora-deposco-inventory-sync-<YYYY-MM-DD>.log",
-        "newest": "",
-        "newest_mtime_utc": "",
-        "count": 0
+        "newest": "logs/tasks/cowork-cora-deposco-inventory-sync-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T13:22:06Z",
+        "count": 1
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -3845,8 +3845,8 @@
       "run_only_if_network_available": true,
       "last_task_result": 0,
       "last_run_time": "2026-06-21T05:20:01",
-      "next_run_time": "2026-09-25T05:20:00",
-      "number_of_missed_runs": 95,
+      "next_run_time": "2026-09-26T05:20:00",
+      "number_of_missed_runs": 96,
       "run_marker": {
         "registered": false,
         "present": false,
@@ -3920,8 +3920,8 @@
       "run_only_if_network_available": false,
       "last_task_result": 0,
       "last_run_time": "2026-07-23T04:05:01",
-      "next_run_time": "2026-09-25T04:05:00",
-      "number_of_missed_runs": 63,
+      "next_run_time": "2026-09-26T04:05:00",
+      "number_of_missed_runs": 64,
       "run_marker": {
         "registered": false,
         "present": false,
@@ -4315,7 +4315,7 @@
     {
       "name": "cowork-cora-founders-os-sweep",
       "path": "\\",
-      "state": "Ready",
+      "state": "Running",
       "enabled": true,
       "trigger_text": "daily 06:30",
       "triggers": [
@@ -4350,9 +4350,9 @@
       "restart_interval": "",
       "wake_to_run": false,
       "run_only_if_network_available": true,
-      "last_task_result": 0,
-      "last_run_time": "2026-09-24T06:30:01",
-      "next_run_time": "2026-09-25T06:30:00",
+      "last_task_result": 267009,
+      "last_run_time": "2026-09-25T06:30:01",
+      "next_run_time": "2026-09-26T06:30:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -4362,9 +4362,9 @@
       "log_slug": "cowork-cora-founders-os-sweep",
       "log": {
         "pattern": "logs/tasks/cowork-cora-founders-os-sweep-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cowork-cora-founders-os-sweep-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T15:17:28Z",
-        "count": 22
+        "newest": "logs/tasks/cowork-cora-founders-os-sweep-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T14:30:15Z",
+        "count": 23
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -4413,8 +4413,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T06:10:01",
-      "next_run_time": "2026-09-25T06:10:00",
+      "last_run_time": "2026-09-25T06:10:01",
+      "next_run_time": "2026-09-26T06:10:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -4424,9 +4424,9 @@
       "log_slug": "cowork-cora-gap-autofill",
       "log": {
         "pattern": "logs/tasks/cowork-cora-gap-autofill-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cowork-cora-gap-autofill-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T13:10:11Z",
-        "count": 21
+        "newest": "logs/tasks/cowork-cora-gap-autofill-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T13:10:13Z",
+        "count": 22
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -4596,8 +4596,8 @@
       "run_only_if_network_available": false,
       "last_task_result": 0,
       "last_run_time": "2026-06-02T11:23:02",
-      "next_run_time": "2026-09-24T16:23:00",
-      "number_of_missed_runs": 2740,
+      "next_run_time": "2026-09-25T08:23:00",
+      "number_of_missed_runs": 2756,
       "run_marker": {
         "registered": false,
         "present": false,
@@ -4615,6 +4615,68 @@
       "ladder_lane": "UNROWED",
       "setup_scripts": [],
       "description": ""
+    },
+    {
+      "name": "cowork-cora-hygiene-drive-weekly",
+      "path": "\\",
+      "state": "Ready",
+      "enabled": true,
+      "trigger_text": "weekly Sat 02:40",
+      "triggers": [
+        {
+          "type": "MSFT_TaskWeeklyTrigger",
+          "enabled": true,
+          "start_boundary": "2026-09-25T02:40:00-07:00",
+          "days_interval": null,
+          "days_of_week": 64,
+          "weeks_interval": 1,
+          "rep_interval": "",
+          "rep_duration": "",
+          "rep_stop_at_end": false,
+          "exec_limit": "",
+          "user_id": ""
+        }
+      ],
+      "action_text": "C:\\Users\\Harri\\code\\cora\\.venv\\Scripts\\pythonw.exe C:\\Users\\Harri\\code\\cora\\deployment\\run_hidden.py --name cowork-cora-hygiene-drive-weekly -- C:\\Users\\Harri\\code\\cora\\.venv\\Scripts\\python.exe \"C:\\Users\\Harri\\code\\cora\\scripts\\run_hygiene_drive_weekly.py\" --apply",
+      "working_directory": "C:\\Users\\Harri\\code\\cora",
+      "child_command": "C:\\Users\\Harri\\code\\cora\\.venv\\Scripts\\python.exe \"C:\\Users\\Harri\\code\\cora\\scripts\\run_hygiene_drive_weekly.py\" --apply",
+      "script": "scripts/run_hygiene_drive_weekly.py",
+      "windowless": true,
+      "run_as": {
+        "user_id": "Harri",
+        "logon_type": "Interactive",
+        "run_level": "Limited"
+      },
+      "start_when_available": true,
+      "execution_time_limit": "PT1H",
+      "multiple_instances": "IgnoreNew",
+      "restart_count": 0,
+      "restart_interval": "",
+      "wake_to_run": false,
+      "run_only_if_network_available": false,
+      "last_task_result": 267011,
+      "last_run_time": "",
+      "next_run_time": "2026-09-26T02:40:00",
+      "number_of_missed_runs": 0,
+      "run_marker": {
+        "registered": false,
+        "present": false,
+        "last_ts": ""
+      },
+      "log_slug": "cowork-cora-hygiene-drive-weekly",
+      "log": {
+        "pattern": "logs/tasks/cowork-cora-hygiene-drive-weekly-<YYYY-MM-DD>.log",
+        "newest": "",
+        "newest_mtime_utc": "",
+        "count": 0
+      },
+      "intent": "UNROWED",
+      "intent_drift": "",
+      "ladder_lane": "UNROWED",
+      "setup_scripts": [
+        "setup-hygiene-drive-weekly-task.ps1"
+      ],
+      "description": "Weekly Founder-OS Drive hygiene: NO-HASH read-only inventory (vendored folder-audit PS1) + week-over-week report into _shared\\hygiene-pending-moves. Deterministic, no LLM, no egress. T0 instrument."
     },
     {
       "name": "cowork-cora-influencer-digest",
@@ -4780,8 +4842,8 @@
       "run_only_if_network_available": true,
       "last_task_result": 0,
       "last_run_time": "2026-08-03T10:00:01",
-      "next_run_time": "2026-09-24T18:00:00",
-      "number_of_missed_runs": 627,
+      "next_run_time": "2026-09-25T08:00:00",
+      "number_of_missed_runs": 634,
       "run_marker": {
         "registered": false,
         "present": false,
@@ -4841,8 +4903,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T06:05:01",
-      "next_run_time": "2026-09-25T06:05:00",
+      "last_run_time": "2026-09-25T06:05:01",
+      "next_run_time": "2026-09-26T06:05:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -4852,9 +4914,9 @@
       "log_slug": "cowork-cora-info-for-cora-sweep",
       "log": {
         "pattern": "logs/tasks/cowork-cora-info-for-cora-sweep-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cowork-cora-info-for-cora-sweep-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T13:05:02Z",
-        "count": 21
+        "newest": "logs/tasks/cowork-cora-info-for-cora-sweep-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T13:05:02Z",
+        "count": 22
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -4903,8 +4965,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T06:20:01",
-      "next_run_time": "2026-09-25T06:20:00",
+      "last_run_time": "2026-09-25T06:20:01",
+      "next_run_time": "2026-09-26T06:20:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -4914,9 +4976,9 @@
       "log_slug": "cowork-cora-inventory-state-sync",
       "log": {
         "pattern": "logs/tasks/cowork-cora-inventory-state-sync-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cowork-cora-inventory-state-sync-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T13:20:06Z",
-        "count": 22
+        "newest": "logs/tasks/cowork-cora-inventory-state-sync-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T13:20:05Z",
+        "count": 23
       },
       "intent": "enabled",
       "intent_drift": "",
@@ -5043,8 +5105,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T03:00:01",
-      "next_run_time": "2026-09-25T03:00:00",
+      "last_run_time": "2026-09-25T03:00:01",
+      "next_run_time": "2026-09-26T03:00:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -5054,9 +5116,9 @@
       "log_slug": "cowork-cora-kb-sync-asana",
       "log": {
         "pattern": "logs/tasks/cowork-cora-kb-sync-asana-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cowork-cora-kb-sync-asana-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T10:01:36Z",
-        "count": 21
+        "newest": "logs/tasks/cowork-cora-kb-sync-asana-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T10:01:57Z",
+        "count": 22
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -5105,8 +5167,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T04:30:01",
-      "next_run_time": "2026-09-25T04:30:00",
+      "last_run_time": "2026-09-25T04:30:01",
+      "next_run_time": "2026-09-26T04:30:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -5116,9 +5178,9 @@
       "log_slug": "cowork-cora-kb-sync-drive",
       "log": {
         "pattern": "logs/tasks/cowork-cora-kb-sync-drive-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cowork-cora-kb-sync-drive-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T11:54:56Z",
-        "count": 21
+        "newest": "logs/tasks/cowork-cora-kb-sync-drive-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T11:54:37Z",
+        "count": 22
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -5167,8 +5229,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T03:30:01",
-      "next_run_time": "2026-09-25T03:30:00",
+      "last_run_time": "2026-09-25T03:30:01",
+      "next_run_time": "2026-09-26T03:30:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -5178,9 +5240,9 @@
       "log_slug": "cowork-cora-kb-sync-fireflies",
       "log": {
         "pattern": "logs/tasks/cowork-cora-kb-sync-fireflies-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cowork-cora-kb-sync-fireflies-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T10:30:08Z",
-        "count": 21
+        "newest": "logs/tasks/cowork-cora-kb-sync-fireflies-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T10:30:16Z",
+        "count": 22
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -5229,8 +5291,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T02:30:01",
-      "next_run_time": "2026-09-25T02:30:00",
+      "last_run_time": "2026-09-25T02:30:01",
+      "next_run_time": "2026-09-26T02:30:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -5240,9 +5302,9 @@
       "log_slug": "cowork-cora-kb-sync-gmail",
       "log": {
         "pattern": "logs/tasks/cowork-cora-kb-sync-gmail-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cowork-cora-kb-sync-gmail-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T09:42:48Z",
-        "count": 21
+        "newest": "logs/tasks/cowork-cora-kb-sync-gmail-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T09:47:33Z",
+        "count": 22
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -5291,8 +5353,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T05:00:01",
-      "next_run_time": "2026-09-25T05:00:00",
+      "last_run_time": "2026-09-25T05:00:01",
+      "next_run_time": "2026-09-26T05:00:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -5302,9 +5364,9 @@
       "log_slug": "cowork-cora-kb-sync-notion",
       "log": {
         "pattern": "logs/tasks/cowork-cora-kb-sync-notion-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cowork-cora-kb-sync-notion-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T12:00:05Z",
-        "count": 21
+        "newest": "logs/tasks/cowork-cora-kb-sync-notion-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T12:00:04Z",
+        "count": 22
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -5353,8 +5415,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T02:00:01",
-      "next_run_time": "2026-09-25T02:00:00",
+      "last_run_time": "2026-09-25T02:00:01",
+      "next_run_time": "2026-09-26T02:00:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -5364,9 +5426,9 @@
       "log_slug": "cowork-cora-kb-sync-slack",
       "log": {
         "pattern": "logs/tasks/cowork-cora-kb-sync-slack-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cowork-cora-kb-sync-slack-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T09:03:17Z",
-        "count": 21
+        "newest": "logs/tasks/cowork-cora-kb-sync-slack-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T09:03:15Z",
+        "count": 22
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -5428,8 +5490,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T12:20:01",
-      "next_run_time": "2026-09-25T04:00:00",
+      "last_run_time": "2026-09-25T04:00:01",
+      "next_run_time": "2026-09-25T12:20:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -5439,9 +5501,9 @@
       "log_slug": "cowork-cora-kb-sync-static",
       "log": {
         "pattern": "logs/tasks/cowork-cora-kb-sync-static-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cowork-cora-kb-sync-static-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T19:22:04Z",
-        "count": 22
+        "newest": "logs/tasks/cowork-cora-kb-sync-static-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T11:02:03Z",
+        "count": 23
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -5552,8 +5614,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T07:00:00",
-      "next_run_time": "2026-09-25T07:00:00",
+      "last_run_time": "2026-09-25T07:00:00",
+      "next_run_time": "2026-09-28T07:00:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -5563,9 +5625,9 @@
       "log_slug": "cowork-cora-knowledge-review",
       "log": {
         "pattern": "logs/tasks/cowork-cora-knowledge-review-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cowork-cora-knowledge-review-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T14:00:06Z",
-        "count": 16
+        "newest": "logs/tasks/cowork-cora-knowledge-review-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T14:00:17Z",
+        "count": 17
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -5676,20 +5738,20 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T07:22:01",
-      "next_run_time": "2026-09-25T07:22:00",
+      "last_run_time": "2026-09-25T07:22:01",
+      "next_run_time": "2026-09-26T07:22:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": true,
         "present": true,
-        "last_ts": "2026-09-24T14:22:17.907013+00:00"
+        "last_ts": "2026-09-25T14:22:18.147570+00:00"
       },
       "log_slug": "cowork-cora-meeting-capture-audit",
       "log": {
         "pattern": "logs/tasks/cowork-cora-meeting-capture-audit-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cowork-cora-meeting-capture-audit-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T14:22:18Z",
-        "count": 22
+        "newest": "logs/tasks/cowork-cora-meeting-capture-audit-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T14:22:18Z",
+        "count": 23
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -5738,8 +5800,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T16:07:02",
-      "next_run_time": "2026-09-24T16:22:00",
+      "last_run_time": "2026-09-25T07:22:00",
+      "next_run_time": "2026-09-25T07:37:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -5749,9 +5811,9 @@
       "log_slug": "cowork-cora-meeting-capture-ensure",
       "log": {
         "pattern": "logs/tasks/cowork-cora-meeting-capture-ensure-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cowork-cora-meeting-capture-ensure-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T23:07:24Z",
-        "count": 22
+        "newest": "logs/tasks/cowork-cora-meeting-capture-ensure-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T14:22:23Z",
+        "count": 23
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -6001,8 +6063,8 @@
       "run_only_if_network_available": false,
       "last_task_result": 0,
       "last_run_time": "2026-06-03T06:00:01",
-      "next_run_time": "2026-09-25T06:00:00",
-      "number_of_missed_runs": 113,
+      "next_run_time": "2026-09-26T06:00:00",
+      "number_of_missed_runs": 114,
       "run_marker": {
         "registered": false,
         "present": false,
@@ -6122,8 +6184,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T02:00:01",
-      "next_run_time": "2026-09-25T02:00:00",
+      "last_run_time": "2026-09-25T02:00:01",
+      "next_run_time": "2026-09-26T02:00:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -6133,9 +6195,9 @@
       "log_slug": "cowork-cora-qbo-token-refresh",
       "log": {
         "pattern": "logs/tasks/cowork-cora-qbo-token-refresh-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cowork-cora-qbo-token-refresh-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T09:00:10Z",
-        "count": 21
+        "newest": "logs/tasks/cowork-cora-qbo-token-refresh-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T09:00:10Z",
+        "count": 22
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -6184,8 +6246,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T05:30:01",
-      "next_run_time": "2026-09-25T05:30:00",
+      "last_run_time": "2026-09-25T05:30:01",
+      "next_run_time": "2026-09-26T05:30:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -6195,9 +6257,9 @@
       "log_slug": "cowork-cora-reconciliation",
       "log": {
         "pattern": "logs/tasks/cowork-cora-reconciliation-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cowork-cora-reconciliation-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T12:33:40Z",
-        "count": 21
+        "newest": "logs/tasks/cowork-cora-reconciliation-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T12:35:44Z",
+        "count": 22
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -6246,8 +6308,8 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T16:03:41",
-      "next_run_time": "2026-09-24T16:18:40",
+      "last_run_time": "2026-09-25T07:18:41",
+      "next_run_time": "2026-09-25T07:33:40",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": false,
@@ -6257,9 +6319,9 @@
       "log_slug": "cowork-cora-security-monitor",
       "log": {
         "pattern": "logs/tasks/cowork-cora-security-monitor-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cowork-cora-security-monitor-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T23:03:41Z",
-        "count": 22
+        "newest": "logs/tasks/cowork-cora-security-monitor-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T14:18:42Z",
+        "count": 23
       },
       "intent": "UNROWED",
       "intent_drift": "",
@@ -6308,7 +6370,7 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 267009,
-      "last_run_time": "2026-09-24T14:42:20",
+      "last_run_time": "2026-09-25T07:06:25",
       "next_run_time": "",
       "number_of_missed_runs": 0,
       "run_marker": {
@@ -6319,9 +6381,9 @@
       "log_slug": "cowork-cora-service",
       "log": {
         "pattern": "logs/tasks/cowork-cora-service-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cowork-cora-service-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T23:10:23Z",
-        "count": 7
+        "newest": "logs/tasks/cowork-cora-service-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T14:29:27Z",
+        "count": 8
       },
       "intent": "running",
       "intent_drift": "",
@@ -6383,20 +6445,20 @@
       "wake_to_run": false,
       "run_only_if_network_available": false,
       "last_task_result": 0,
-      "last_run_time": "2026-09-24T12:30:01",
-      "next_run_time": "2026-09-25T05:15:00",
+      "last_run_time": "2026-09-25T05:15:01",
+      "next_run_time": "2026-09-25T12:30:00",
       "number_of_missed_runs": 0,
       "run_marker": {
         "registered": true,
         "present": true,
-        "last_ts": "2026-09-24T19:30:18.191074+00:00"
+        "last_ts": "2026-09-25T12:15:25.833357+00:00"
       },
       "log_slug": "cowork-cora-session-capture",
       "log": {
         "pattern": "logs/tasks/cowork-cora-session-capture-<YYYY-MM-DD>.log",
-        "newest": "logs/tasks/cowork-cora-session-capture-2026-09-24.log",
-        "newest_mtime_utc": "2026-09-24T19:30:18Z",
-        "count": 22
+        "newest": "logs/tasks/cowork-cora-session-capture-2026-09-25.log",
+        "newest_mtime_utc": "2026-09-25T12:15:25Z",
+        "count": 23
       },
       "intent": "UNROWED",
       "intent_drift": "",

@@ -1,13 +1,13 @@
 {
   "schema_version": 1,
-  "generated_at_utc": "2026-09-23T18:01:38Z",
-  "generated_at_az": "2026-09-23 11:01 AZ",
+  "generated_at_utc": "2026-09-25T14:30:22Z",
+  "generated_at_az": "2026-09-25 07:30 AZ",
   "host": "H-REMOTE",
   "live_root": "C:\\Users\\Harri\\code\\cora",
   "summary": {
-    "PASS": 19,
+    "PASS": 20,
     "FAIL": 0,
-    "MANUAL": 3,
+    "MANUAL": 2,
     "UNMEASURED": 1,
     "INFO": 1
   },
@@ -24,8 +24,8 @@
       "restore_step": "`git clone <origin> C:\\Users\\Harri\\code\\cora`; checkout `main` at the recorded hash",
       "owner": "Harrison",
       "rto": "~5 min",
-      "status": "MANUAL",
-      "detail": "restore hash: origin/main f65b7fc; live checkout HEAD 6f65b37 on claude/deposco-push-write-path-2026-09-22; origin set -- the live checkout is NOT on main (a Code session holds it); the restore target is origin/main, not this HEAD"
+      "status": "PASS",
+      "detail": "restore hash: origin/main a8e9263e; live checkout HEAD 9425730b on main; origin set"
     },
     {
       "id": "D02",
@@ -65,7 +65,7 @@
       "owner": "Harrison",
       "rto": "~10 min (after the passphrase)",
       "status": "PASS",
-      "detail": "newest 2026-09-22/secrets-2026-09-22.enc (27420 B, 14.5 h old); restore_secrets.py present; passphrase env var visible to this process"
+      "detail": "newest 2026-09-24/secrets-2026-09-24.enc (27420 B, 11.0 h old); restore_secrets.py present; passphrase env var visible to this process"
     },
     {
       "id": "D06",
@@ -95,7 +95,7 @@
       "owner": "Cora-script",
       "rto": "~2 min",
       "status": "PASS",
-      "detail": "heartbeat -4 s old; pid 5384 started 2026-09-20T05:44:15Z"
+      "detail": "heartbeat 54 s old; pid 3844 started 2026-09-25T14:06:26Z"
     },
     {
       "id": "D09",
@@ -125,7 +125,7 @@
       "owner": "Harrison",
       "rto": "~30 min + initial sync UNMEASURED",
       "status": "PASS",
-      "detail": "G:\\My Drive\\HJR-Founder-OS mounted; GoogleDriveFS pid 12012"
+      "detail": "G:\\My Drive\\HJR-Founder-OS mounted; GoogleDriveFS pid 1128"
     },
     {
       "id": "D12",
@@ -135,17 +135,17 @@
       "owner": "Cora-script",
       "rto": "n/a",
       "status": "PASS",
-      "detail": "10 pinned Drive folder ids in cora.kb_exclusions.KB_EXCLUDED_FOLDER_IDS (identifiers only; the doc lists them)"
+      "detail": "12 pinned Drive folder ids in cora.kb_exclusions.KB_EXCLUDED_FOLDER_IDS (identifiers only; the doc lists them)"
     },
     {
       "id": "D13",
-      "item": "Scheduled estate (96 tasks) = `deployment/manifest/task-estate.json` + `deployment/manifest/tasks/*.xml`",
+      "item": "Scheduled estate (100 tasks) = `deployment/manifest/task-estate.json` + `deployment/manifest/tasks/*.xml`",
       "source_of_truth": "the live Task Scheduler registry, derived by `scripts/generate_task_estate_manifest.py` (M1): the JSON is the diff view, the per-task XML is the restore form",
       "restore_step": "bootstrap Phase 5: `Set-TimeZone` to the manifest's host_time_zone, then `deployment\\register-estate-from-manifest.ps1 -Apply` (elevated; registers every task from its XML, keeps the intent-disabled ones disabled); NOT the setup-*.ps1 scripts (drifted clocks / re-enable disabled tasks); `--diff-only` must print zero drift",
       "owner": "Harrison (elevated) + Cora-script",
       "rto": "~15-30 min",
       "status": "PASS",
-      "detail": "96 live / 96 manifest; 0 task-estate-drift line(s)"
+      "detail": "100 live / 100 manifest; 0 task-estate-drift line(s)"
     },
     {
       "id": "D14",
@@ -155,7 +155,7 @@
       "owner": "Harrison",
       "rto": "MANUAL",
       "status": "MANUAL",
-      "detail": "96 of 96 tasks run LogonType=Interactive -> nothing fires until a user signs in (the 2026-09-09 dark box, 00:34-06:18 AZ); 21 tasks have StartWhenAvailable=false. Decision owner Harrison: auto-logon on the host / VM, or re-register with a stored-credential logon type. Drill item: cold boot with NO user logged on -> does the estate come up?"
+      "detail": "99 of 100 tasks run LogonType=Interactive -> nothing fires until a user signs in (the 2026-09-09 dark box, 00:34-06:18 AZ); 21 tasks have StartWhenAvailable=false. Decision owner Harrison: auto-logon on the host / VM, or re-register with a stored-credential logon type. Drill item: cold boot with NO user logged on -> does the estate come up?"
     },
     {
       "id": "D15",
@@ -165,7 +165,7 @@
       "owner": "Cora-script",
       "rto": "n/a",
       "status": "PASS",
-      "detail": "dated folders present: ['2026-09-22']; last backup log offsite verify: PASS (cowork-cora-backup-2026-09-23.log)"
+      "detail": "dated folders present: ['2026-09-24']; last backup log offsite verify: PASS (cowork-cora-backup-2026-09-25.log)"
     },
     {
       "id": "D16",
@@ -175,7 +175,7 @@
       "owner": "Harrison",
       "rto": "UNMEASURED (copy ~7.9 GB + catch-up)",
       "status": "PASS",
-      "detail": "G:\\My Drive\\HJR-Founder-OS\\_shared\\projects\\cora\\backups\\2026-09-08\\cora_kb.db = 7,874,965,504 B (7.87 GB), taken 2026-09-09 00:59Z, 14 days stale; RTO(a) UNMEASURED (copy 7.87 GB from Drive + open + run the nightly syncs to catch up 14 days)"
+      "detail": "G:\\My Drive\\HJR-Founder-OS\\_shared\\projects\\cora\\backups\\2026-09-08\\cora_kb.db = 7,874,965,504 B (7.87 GB), taken 2026-09-09 00:59Z, 16 days stale; RTO(a) UNMEASURED (copy 7.87 GB from Drive + open + run the nightly syncs to catch up 16 days)"
     },
     {
       "id": "D17",
@@ -185,7 +185,7 @@
       "owner": "Harrison + Cora-script",
       "rto": "UNMEASURED",
       "status": "PASS",
-      "detail": "kb-rebuild.md present; 14/14 doors registered; RTO(b) UNMEASURED -- only bound: ~20 calendar days via nightly windows (full re-ingest 2026-05-28..06-17, TOM 2026-06-17); no single-window measurement exists. Doors: cowork-cora-kb-sync-static: Ready last 2026-09-23T04:00:01 rc 0 | cowork-cora-kb-sync-slack: Ready last 2026-09-23T02:00:01 rc 0 | cowork-cora-kb-sync-gmail: Ready last 2026-09-23T02:30:01 rc 0 | cowork-cora-kb-sync-asana: Ready last 2026-09-23T03:00:01 rc 0 | cowork-cora-kb-sync-fireflies: Ready last 2026-09-23T03:30:01 rc 0 | cowork-cora-kb-sync-notion: Ready last 2026-09-23T05:00:01 rc 0 | cowork-cora-kb-sync-drive: Ready last 2026-09-23T04:30:01 rc 0 | Cora - Drive Sweep: Ready last 2026-09-23T06:00:01 rc 0 | Cora - Drive Materialization: Ready last 2026-09-23T05:45:01 rc 0 | Cora - LEX Dump Folder Sync: Ready last 2026-09-23T04:45:01 rc 0 | cowork-cora-founders-os-sweep: Ready last 2026-09-23T06:30:01 rc 0 | cowork-cora-channel-sweep: Ready last 2026-09-23T08:40:01 rc 0 | cowork-cora-session-capture: Ready last 2026-09-23T05:15:01 rc 0 | cowork-cora-claude-mirror: Ready last 2026-09-23T03:45:01 rc 0"
+      "detail": "kb-rebuild.md present; 14/14 doors registered; RTO(b) UNMEASURED -- only bound: ~20 calendar days via nightly windows (full re-ingest 2026-05-28..06-17, TOM 2026-06-17); no single-window measurement exists. Doors: cowork-cora-kb-sync-static: Ready last 2026-09-25T04:00:01 rc 0 | cowork-cora-kb-sync-slack: Ready last 2026-09-25T02:00:01 rc 0 | cowork-cora-kb-sync-gmail: Ready last 2026-09-25T02:30:01 rc 0 | cowork-cora-kb-sync-asana: Ready last 2026-09-25T03:00:01 rc 0 | cowork-cora-kb-sync-fireflies: Ready last 2026-09-25T03:30:01 rc 0 | cowork-cora-kb-sync-notion: Ready last 2026-09-25T05:00:01 rc 0 | cowork-cora-kb-sync-drive: Ready last 2026-09-25T04:30:01 rc 0 | Cora - Drive Sweep: Ready last 2026-09-25T06:00:01 rc 1073807364 | Cora - Drive Materialization: Ready last 2026-09-25T05:45:01 rc 0 | Cora - LEX Dump Folder Sync: Ready last 2026-09-25T04:45:01 rc 0 | cowork-cora-founders-os-sweep: Running last 2026-09-25T06:30:01 rc 267009 | cowork-cora-channel-sweep: Ready last 2026-09-24T08:40:01 rc 0 | cowork-cora-session-capture: Ready last 2026-09-25T05:15:01 rc 0 | cowork-cora-claude-mirror: Ready last 2026-09-25T03:45:01 rc 0"
     },
     {
       "id": "D18",
@@ -195,7 +195,7 @@
       "owner": "Cora-script",
       "rto": "n/a",
       "status": "PASS",
-      "detail": "8.15 GB on disk; 685,109 knowledge_chunks (read-only open)"
+      "detail": "8.22 GB on disk; 685,827 knowledge_chunks (read-only open)"
     },
     {
       "id": "D19",
@@ -215,7 +215,7 @@
       "owner": "Cora-script",
       "rto": "~2 min",
       "status": "PASS",
-      "detail": "run_hidden.py present; 78/96 tasks wrapped windowless"
+      "detail": "run_hidden.py present; 81/100 tasks wrapped windowless"
     },
     {
       "id": "D21",
@@ -225,7 +225,7 @@
       "owner": "Harrison",
       "rto": "n/a",
       "status": "INFO",
-      "detail": "111 Cowork task folders under C:\\Users\\Harri\\OneDrive\\Documents\\Claude\\Scheduled; pin task cowork-model-pin-weekly Ready; NOT migrated (charter D4)"
+      "detail": "118 Cowork task folders under C:\\Users\\Harri\\OneDrive\\Documents\\Claude\\Scheduled; pin task cowork-model-pin-weekly Ready; NOT migrated (charter D4)"
     },
     {
       "id": "D22",
@@ -235,7 +235,7 @@
       "owner": "Cora-script",
       "rto": "n/a",
       "status": "PASS",
-      "detail": "96 committed task XML files under deployment/manifest/tasks; covers every live task; local dated exports (gitignored convenience): ['2026-09-02', '2026-09-03']"
+      "detail": "100 committed task XML files under deployment/manifest/tasks; covers every live task; local dated exports (gitignored convenience): ['2026-09-02', '2026-09-03']"
     },
     {
       "id": "D23",

@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>Missed-start catch-up for the nightly ingest set: replays any nightly task with no fire evidence for today's window, once, in trigger order, via run_hidden. Deterministic, no LLM. Ledger logs/nightly-catchup.jsonl; the 08:45 health check reads it. T1 (dry-run plan, recorded) by default per the 2026-09-19 ruling 9.2; -Apply registers T2 act-with-audit.</Description>
-    <URI>\Cora - Missed Nightly Catch-Up</URI>
+    <Description>Weekly Founder-OS Drive hygiene: NO-HASH read-only inventory (vendored folder-audit PS1) + week-over-week report into _shared\hygiene-pending-moves. Deterministic, no LLM, no egress. T0 instrument.</Description>
+    <URI>\cowork-cora-hygiene-drive-weekly</URI>
   </RegistrationInfo>
   <Principals>
     <Principal id="Author">
@@ -13,7 +13,7 @@
   <Settings>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <ExecutionTimeLimit>PT4H</ExecutionTimeLimit>
+    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
     <StartWhenAvailable>true</StartWhenAvailable>
     <IdleSettings>
@@ -26,16 +26,19 @@
   </Settings>
   <Triggers>
     <CalendarTrigger>
-      <StartBoundary>2026-09-25T08:30:00-07:00</StartBoundary>
-      <ScheduleByDay>
-        <DaysInterval>1</DaysInterval>
-      </ScheduleByDay>
+      <StartBoundary>2026-09-25T02:40:00-07:00</StartBoundary>
+      <ScheduleByWeek>
+        <WeeksInterval>1</WeeksInterval>
+        <DaysOfWeek>
+          <Saturday />
+        </DaysOfWeek>
+      </ScheduleByWeek>
     </CalendarTrigger>
   </Triggers>
   <Actions Context="Author">
     <Exec>
       <Command>C:\Users\Harri\code\cora\.venv\Scripts\pythonw.exe</Command>
-      <Arguments>C:\Users\Harri\code\cora\deployment\run_hidden.py --name Cora-Missed-Nightly-Catch-Up -- C:\Users\Harri\code\cora\.venv\Scripts\python.exe "C:\Users\Harri\code\cora\scripts\check_missed_nightly.py" --record</Arguments>
+      <Arguments>C:\Users\Harri\code\cora\deployment\run_hidden.py --name cowork-cora-hygiene-drive-weekly -- C:\Users\Harri\code\cora\.venv\Scripts\python.exe "C:\Users\Harri\code\cora\scripts\run_hygiene_drive_weekly.py" --apply</Arguments>
       <WorkingDirectory>C:\Users\Harri\code\cora</WorkingDirectory>
     </Exec>
   </Actions>

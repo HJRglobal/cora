@@ -11,7 +11,7 @@ are in `deployment/manifest/task-estate.md`. The Monday digest
 manifest and prints `task-estate-drift:` lines. Do not hand-edit inside the markers.
 
 <!-- BEGIN GENERATED: task-registry -->
-_Generated 2026-09-24 by `scripts/generate_task_estate_manifest.py --update-docs` from the live registry (99 tasks, 80 enabled). Full columns: `deployment/manifest/task-estate.md`. Do not hand-edit._
+_Generated 2026-09-25 by `scripts/generate_task_estate_manifest.py --update-docs` from the live registry (100 tasks, 81 enabled). Full columns: `deployment/manifest/task-estate.md`. Do not hand-edit._
 
 | Task Name | Schedule | Script | State | Run level | Notes |
 |---|---|---|---|---|---|
@@ -19,7 +19,7 @@ _Generated 2026-09-24 by `scripts/generate_task_estate_manifest.py --update-docs
 | `Cora - Cash Flow Pulse` | daily 15:30 | `scripts/run_cashflow_pulse.py` | Disabled | Highest | intent: disabled; console action (not run_hidden-wrapped) |
 | `Cora - Cash Snapshot` | daily 06:45 | `scripts/write_cashflow_snapshot.py` | Ready | Limited |  |
 | `Cora - Channel Health Monitor` | weekly Sun 04:15 | `scripts/run_channel_health_monitor.py` | Ready | Highest |  |
-| `Cora - Daily Briefing` | weekly Mon,Tue,Wed,Thu,Fri 07:30 | `scripts/run_daily_briefing.py` | Ready | Limited |  |
+| `Cora - Daily Briefing` | weekly Mon,Tue,Wed,Thu,Fri 07:30 | `scripts/run_daily_briefing.py` | Running | Limited |  |
 | `Cora - Daily Synthesis (BDM)` | daily 06:52 | `scripts/run_entity_synthesis.py` | Ready | Limited |  |
 | `Cora - Daily Synthesis (F3C)` | daily 06:58 | `scripts/run_entity_synthesis.py` | Ready | Limited |  |
 | `Cora - Daily Synthesis (F3E)` | daily 06:33 | `scripts/run_entity_synthesis.py` | Ready | Limited |  |
@@ -81,11 +81,12 @@ _Generated 2026-09-24 by `scripts/generate_task_estate_manifest.py --update-docs
 | `cowork-cora-finance-receipt-digest` | weekly Mon 10:30 | `scripts/run_finance_receipt_digest.py` | Ready | Limited | SWA=false |
 | `cowork-cora-finance-weekly` | weekly Mon 14:30 | `scripts/run_finance_weekly_recap.py` | Ready | Limited |  |
 | `cowork-cora-fireflies-coverage` | weekly Mon 08:10 | `scripts/run_fireflies_coverage.py` | Ready | Limited |  |
-| `cowork-cora-founders-os-sweep` | daily 06:30 | `scripts/ingest_founders_os.py` | Ready | Highest |  |
+| `cowork-cora-founders-os-sweep` | daily 06:30 | `scripts/ingest_founders_os.py` | Running | Highest |  |
 | `cowork-cora-gap-autofill` | daily 06:10 | `scripts/run_gap_autofill.py` | Ready | Limited |  |
 | `cowork-cora-gap-digest` | weekly Mon 08:00 | `scripts/post_gap_digest_slack.py` | Disabled | Limited | intent: disabled; SWA=false; console action (not run_hidden-wrapped) |
 | `cowork-cora-health-check` | daily 08:45 | `scripts/nightly_health_check.py` | Ready | Limited | SWA=false |
 | `cowork-cora-hubspot-email-sync` | every PT1H (from 2026-05-31T23:23) | `scripts/run_hubspot_email_sync.py` | Disabled | Limited | intent: disabled; SWA=false; console action (not run_hidden-wrapped) |
+| `cowork-cora-hygiene-drive-weekly` | weekly Sat 02:40 | `scripts/run_hygiene_drive_weekly.py` | Ready | Limited |  |
 | `cowork-cora-influencer-digest` | weekly Mon 08:20 | `scripts/run_influencer_digest.py` | Disabled | Limited | intent: disabled; console action (not run_hidden-wrapped) |
 | `cowork-cora-influencer-overdue-alerts` | daily 09:10 | `scripts/run_influencer_overdue_alerts.py` | Disabled | Limited | intent: disabled; console action (not run_hidden-wrapped) |
 | `cowork-cora-influencer-scan` | every PT2H (from 2026-05-27T22:00) | `scripts/run_influencer_scan.py` | Disabled | Limited | intent: disabled; console action (not run_hidden-wrapped) |
