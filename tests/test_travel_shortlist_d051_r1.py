@@ -55,17 +55,39 @@ def _best_of_3(fn) -> float:
 
 class TestActiveThreadStoreIsRedirected:
     def test_a_lane_turn_registers_in_the_tmp_store_never_the_repo_db(self, lane, tmp_path):
-        repo_db = _REPO_ROOT / "data" / "active_threads.db"
-        before = repo_db.stat().st_mtime_ns if repo_db.exists() else None
+        """Proven POSITIVELY on the redirect (D-051 r2 harness-isolation#2): the module
+        constant points into THIS test's tmp dir and the row the travel intercept
+        registered is in that tmp SQLite file. The live repo data/active_threads.db is
+        never stat'ed or opened -- the always-on bot legitimately writes it (the
+        session guard downgrades such a change to a warning), so its mtime is not
+        this test's to assert."""
+        import sqlite3
+        db = Path(active_thread_store._DB_PATH).resolve()
         # the conftest belt points the module constant at THIS test's tmp dir
-        assert Path(active_thread_store._DB_PATH).resolve().parent == tmp_path.resolve()
+        assert db.parent == tmp_path.resolve()
         _mention(_slack_client(), MagicMock(), ASK, user=_tessa())
         _drain()
-        # the row the travel intercept registered landed in the redirected store...
         assert active_thread_store.is_active(TRAVEL_CHANNEL, ASK_TS)
-        # ...and the repo's live SQLite store was never touched
-        after = repo_db.stat().st_mtime_ns if repo_db.exists() else None
-        assert after == before
+        # the row the travel intercept registered landed in the redirected file
+        con = sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True)
+        try:
+            rows = con.execute("SELECT channel_id, thread_ts FROM active_threads "
+                               "WHERE channel_id = ? AND thread_ts = ?",
+                               (TRAVEL_CHANNEL, ASK_TS)).fetchall()
+        finally:
+            con.close()
+        assert rows == [(TRAVEL_CHANNEL, ASK_TS)]
+
+    def test_the_pin_never_reads_a_live_repo_file(self):
+        """AST pin: the redirect pin above derives no repo path and reads no mtime."""
+        import ast
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                  and n.name == "test_a_lane_turn_registers_in_the_tmp_store_never_the_repo_db")
+        names = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}
+        attrs = {n.attr for n in ast.walk(fn) if isinstance(n, ast.Attribute)}
+        assert "_REPO_ROOT" not in names and "__file__" not in attrs
+        assert not ({"stat", "st_mtime", "st_mtime_ns", "lstat"} & attrs), attrs
 
 
 # ── c2-egress#0/#1, c2-trigger#0, integration#3: the two-tier loose predicate ───
