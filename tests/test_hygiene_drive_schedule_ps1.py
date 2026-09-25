@@ -77,10 +77,16 @@ def test_the_fire_minute_is_unclaimed_by_every_other_script_and_the_live_estate(
             claimed[p.name] = found
     assert not claimed, f"{FIRE_AT} is claimed by {sorted(claimed)}"
     estate = (REPO / "deployment" / "manifest" / "task-estate.md").read_text(encoding="utf-8")
-    triggers = re.findall(r"^\| `[^`]+` \| ([^|]+) \|", estate, flags=re.M)
-    assert triggers, "the committed live-registry manifest must parse, or this belt is vacuous"
-    assert not any(FIRE_AT in t for t in triggers), "a live task already fires at 02:40"
-    assert "cowork-cora-hygiene-drive-weekly" not in estate, "never hand-edit the generated manifest"
+    rows = re.findall(r"^\| `([^`]+)` \| ([^|]+) \|", estate, flags=re.M)
+    assert rows, "the committed live-registry manifest must parse, or this belt is vacuous"
+    # DELIBERATE FLIP (Code #16, inherited red on main 86a45ffc): the task is now
+    # REGISTERED -- 86a45ffc regenerated the manifest from the live registry with it
+    # in. The belt still holds: no OTHER live task may fire at 02:40, and the
+    # registered row itself must carry the scripted minute.
+    others = [(name, trig) for name, trig in rows if name != "cowork-cora-hygiene-drive-weekly"]
+    assert not any(FIRE_AT in trig for _, trig in others), "another live task already fires at 02:40"
+    own = [trig for name, trig in rows if name == "cowork-cora-hygiene-drive-weekly"]
+    assert all(FIRE_AT in trig for trig in own), own
 
 
 def test_the_vendored_inventory_is_the_pinned_reviewed_bytes():
@@ -120,5 +126,10 @@ def test_verify_ps1_refuses_a_tampered_copy(tmp_path):
 def test_runbook_carries_the_task_entry():
     rb = (REPO / "deployment" / "runbook.md").read_text(encoding="utf-8")
     assert "cowork-cora-hygiene-drive-weekly" in rb and "setup-hygiene-drive-weekly-task.ps1" in rb
-    gen = rb.split("<!-- BEGIN GENERATED: task-registry -->", 1)[1].split("<!-- END GENERATED: task-registry -->", 1)[0]
-    assert "hygiene-drive-weekly" not in gen, "the generated block is regenerated from the registry, never hand-edited"
+    head, rest = rb.split("<!-- BEGIN GENERATED: task-registry -->", 1)
+    gen, tail = rest.split("<!-- END GENERATED: task-registry -->", 1)
+    # DELIBERATE FLIP (Code #16, inherited red on main 86a45ffc): the generated block
+    # is regenerated from the LIVE registry, and the task is registered now, so it
+    # carries the row. The hand-written entry must still live OUTSIDE the block.
+    assert "setup-hygiene-drive-weekly-task.ps1" in head + tail, "the hand-written entry is outside the generated block"
+    assert "cowork-cora-hygiene-drive-weekly" in gen and FIRE_AT in gen
