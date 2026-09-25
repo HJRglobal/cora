@@ -228,14 +228,34 @@ def test_the_EARLIER_of_two_pending_duplicates_still_creates(env):
 
 
 def test_two_sibling_approvals_in_one_run_create_ONE_task(env):
-    a = _row("g0000001", "HJRP", CASH, days_ago=1)
-    b = _row("g0000002", "HJRP", CASH_VARIANT, days_ago=1)
+    # ONE pinned instant for both rows (Code #15 D-051 r3 flake): two _iso(1) calls
+    # land on different clock ticks about half the time, and a strictly EARLIER
+    # sibling proposal is itself a tier-A hit (the next test) -- a different, equally
+    # correct refusal reason. Pinning makes this test the created-row path only.
+    ts = _iso(1)
+    a = _row("g0000001", "HJRP", CASH, proposed_at=ts)
+    b = _row("g0000002", "HJRP", CASH_VARIANT, proposed_at=ts)
     _write_rows(env, a, b)
     state = rkr._new_gap_run_state()
     assert _exec(a, state) is True
     assert _exec(b, state) is False
     assert len(env["created"]) == 1
     assert _state(env, "g0000002")[1].startswith("duplicate_of:12190000000")
+
+
+def test_a_strictly_earlier_sibling_proposal_also_refuses_and_creates_ONE_task(env):
+    # The tick-dependent half of the old test, made deterministic: when the sibling's
+    # proposal is strictly earlier, the refusal may name that proposal instead of the
+    # created gid -- either way it is a duplicate refusal and exactly one task exists.
+    a = _row("g0000005", "HJRP", CASH, days_ago=2)
+    b = _row("g0000006", "HJRP", CASH_VARIANT, days_ago=1)
+    _write_rows(env, a, b)
+    state = rkr._new_gap_run_state()
+    assert _exec(a, state) is True
+    assert _exec(b, state) is False
+    assert len(env["created"]) == 1
+    status, reason = _state(env, "g0000006")
+    assert status == "DISMISSED" and reason.startswith("duplicate_of:")
 
 
 def test_in_run_set_holds_even_when_the_ledger_write_fails(env, monkeypatch):
