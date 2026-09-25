@@ -53,7 +53,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import urlsplit
 
 from . import web_guard
@@ -1387,12 +1387,22 @@ def normalize_url(url: str) -> str:
     return out + (f"?{parts.query}" if parts.query else "")
 
 
-def collect_record_urls(responses: Iterable[Any]) -> tuple[frozenset[str], tuple[str, ...]]:
+def collect_record_urls(responses: Iterable[Any]) -> tuple[dict[str, str], tuple[str, ...]]:
     """Every URL the API itself returned, across ALL iterations: web_search_tool_result
     list items, and text-block citations; an error-object result contributes its
-    error_code instead (B8)."""
-    urls: set[str] = set()
+    error_code instead (B8). Returns {normalized URL: the FIRST raw URL string the API
+    returned for it} -- the card renders that record string, never the model's
+    (D-051 r1 c2-injection-card#2: normalization drops a fragment, so the model's
+    string could carry one the search never returned)."""
+    urls: dict[str, str] = {}
     errors: list[str] = []
+
+    def _add(raw: Any) -> None:
+        raw_s = str(raw or "").strip()
+        u = normalize_url(raw_s)
+        if u and u not in urls:
+            urls[u] = raw_s
+
     for resp in responses:
         for block in _attr(resp, "content", None) or []:
             btype = _attr(block, "type")
@@ -1400,18 +1410,14 @@ def collect_record_urls(responses: Iterable[Any]) -> tuple[frozenset[str], tuple
                 content = _attr(block, "content")
                 if isinstance(content, list):
                     for item in content:
-                        u = normalize_url(_attr(item, "url", "") or "")
-                        if u:
-                            urls.add(u)
+                        _add(_attr(item, "url", ""))
                 else:
                     code = str(_attr(content, "error_code", "") or "unknown")
                     errors.append(re.sub(r"[^a-z0-9_]", "", code.lower())[:40] or "unknown")
             elif btype == "text":
                 for cit in _attr(block, "citations", None) or []:
-                    u = normalize_url(_attr(cit, "url", "") or "")
-                    if u:
-                        urls.add(u)
-    return frozenset(urls), tuple(errors)
+                    _add(_attr(cit, "url", ""))
+    return urls, tuple(errors)
 
 
 def final_text(resp: Any) -> str:
@@ -1485,7 +1491,7 @@ def sanitize_field(value: Any, cap: int) -> str:
     return s
 
 
-def _url_ok(url: str, records: frozenset[str]) -> bool:
+def _url_ok(url: str, records: Mapping[str, str]) -> bool:
     if not url.lower().startswith(("http://", "https://")):
         return False
     if any(ch in url for ch in "<>|") or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in url):
@@ -1506,9 +1512,10 @@ def _url_ok(url: str, records: frozenset[str]) -> bool:
     return True
 
 
-def validate_options(raw: list, records: frozenset[str]) -> tuple[list[dict], int]:
+def validate_options(raw: list, records: Mapping[str, str]) -> tuple[list[dict], int]:
     """<= 5 options whose URL the API itself returned; kind in {hotel, rental};
-    every text field sanitized. Returns (options, dropped)."""
+    every text field sanitized. The option carries the API's OWN record string for
+    that URL (checked again as the string that is rendered). Returns (options, dropped)."""
     out: list[dict] = []
     dropped = 0
     for item in raw:
@@ -1520,14 +1527,15 @@ def validate_options(raw: list, records: frozenset[str]) -> tuple[list[dict], in
         url = str(item.get("url") or "").strip()
         kind = str(item.get("kind") or "").strip().lower()
         prop = sanitize_field(item.get("property"), _FIELD_CAPS["property"])
-        if kind not in ("hotel", "rental") or not prop or not _url_ok(url, records):
+        record = records.get(normalize_url(url), "") if _url_ok(url, records) else ""
+        if kind not in ("hotel", "rental") or not prop or not record or not _url_ok(record, records):
             dropped += 1
             continue
         out.append({
             "property": prop,
             "nightly_rate": sanitize_field(item.get("nightly_rate"), _FIELD_CAPS["nightly_rate"])
             or "not shown",
-            "url": url,
+            "url": record,
             "fit_note": sanitize_field(item.get("fit_note"), _FIELD_CAPS["fit_note"]),
             "kind": kind,
         })

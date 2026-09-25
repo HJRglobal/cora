@@ -696,6 +696,43 @@ class TestRunSearch:
                             client_factory=lambda: FakeAnthropic([_msg(d)]))
         assert len(out.options) == 5
 
+    def test_the_card_renders_the_apis_own_record_url_never_the_models_string(self):
+        """D-051 r1 c2-injection-card#2: normalize_url drops the fragment (and folds host
+        case / one trailing '/'), so a model-invented '#/redirect?to=...' on a record URL
+        matched -- and the MODEL's string went into the href. The card now renders the
+        first raw URL the API returned for that record."""
+        def mut(o):
+            o[0] = dict(o[0], url="https://HotelValleyHo.com/#/redirect?to=evil")
+            return o
+        d = _mutate_options(_fx(), mut)
+        out = ts.run_search(ts.build_request(_constraints(), model=MODEL), budget=4,
+                            client_factory=lambda: FakeAnthropic([_msg(d)]))
+        assert out.status == "ok" and out.dropped == 0
+        assert out.options[0]["url"] == "https://hotelvalleyho.com/"
+        _t, blocks = ts.render_card(_constraints(), out.options, now=NOW)
+        body = blocks[1]["text"]["text"]
+        assert body.startswith("*<https://hotelvalleyho.com/|") and "redirect" not in body
+
+    def test_a_record_whose_raw_string_is_unsafe_to_render_is_dropped(self):
+        """The RENDERED string is checked too: a record carrying '|' or '<' in a fragment
+        (dropped by normalization) would break the <url|label> token."""
+        rec_url = "https://www.hotelvalleyho.com/rooms#a|b"
+        records, _e = ts.collect_record_urls([{"content": [{"type": "web_search_tool_result",
+                                                            "content": [{"url": rec_url}]}]}])
+        assert records == {"https://www.hotelvalleyho.com/rooms": rec_url}
+        opts, dropped = ts.validate_options(
+            [{"property": "Hotel Valley Ho", "url": "https://www.hotelvalleyho.com/rooms",
+              "kind": "hotel", "nightly_rate": "$300", "fit_note": "quiet"}], records)
+        assert opts == [] and dropped == 1
+
+    def test_the_first_raw_record_string_wins_across_iterations(self):
+        first = {"content": [{"type": "web_search_tool_result",
+                              "content": [{"url": "https://www.Example-Hotel.com/rooms/"}]}]}
+        second = {"content": [{"type": "text", "text": "x",
+                               "citations": [{"url": "https://www.example-hotel.com/rooms"}]}]}
+        records, _e = ts.collect_record_urls([first, second])
+        assert records == {"https://www.example-hotel.com/rooms": "https://www.Example-Hotel.com/rooms/"}
+
     def test_a_bad_kind_or_internal_url_is_dropped(self):
         def mut(o):
             o[0] = dict(o[0], kind="spa")
