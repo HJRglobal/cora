@@ -317,15 +317,28 @@ def _decide_or_archive(p: st.Proposal, row: dict, actor: str, *, now: float,
 
 # ── the archive path ─────────────────────────────────────────────────────────
 def _reverify(p: st.Proposal, row: dict, read: Any, *, now: float,
-              sleep: Callable[[float], None] | None) -> tuple[str, str, cl.Verdict | None]:
-    """("ok"|"stale"|"retry", reason, fresh verdict) -- the ONE classifier on a FRESH
-    context (A5). The fresh verdict's age is what the notice and the ledger carry."""
+              sleep: Callable[[float], None] | None
+              ) -> tuple[str, str, cl.Verdict | None, tuple[str, str]]:
+    """("ok"|"stale"|"retry", reason, fresh verdict, (bot_uid, bot_id)) -- the ONE
+    classifier on a FRESH context (A5). The fresh verdict's age is what the notice and
+    the ledger carry; the identity is the one this context CONFIRMED (a blind context
+    never reaches "ok"), so the archive path never asks auth.test a second time
+    (r2:c1-authority-tier#0/#1)."""
     from . import deliver  # noqa: PLC0415 -- lazy: deliver imports this module's peers
     cid = row["cid"]
     ctx = deliver.load_context(read, now=now)
     blind = ctx.blind_cause()
     if blind:
-        return "retry", f"reverify_{blind}", None
+        return "retry", f"reverify_{blind}", None, ("", "")
+    ident = (str(ctx.bot_uid or ""), str(ctx.bot_id or ""))
+    status, reason, v = _reverify_verdict(row, read, ctx, now=now, sleep=sleep)
+    return status, reason, v, ident
+
+
+def _reverify_verdict(row: dict, read: Any, ctx: reg.Context, *, now: float,
+                      sleep: Callable[[float], None] | None
+                      ) -> tuple[str, str, cl.Verdict | None]:
+    cid = row["cid"]
     try:
         info = read.conversations_info(channel=cid, include_num_members=True)
         meta = scan_mod.project_channel(info.get("channel") or {})
@@ -464,56 +477,80 @@ PRIOR_ATTEMPT_WINDOW_S = st.EXPIRY_DAYS * st.DAY_S
 
 
 def _prior_attempt_ts(cid: str, now_wall: float) -> float | None:
-    """The intent ts of this lane's latest attempt on *cid* inside the card window
-    that did NOT end archived -- its notice may still be the channel's last word. A
-    ledger we cannot read counts as a prior attempt 14 days back (check, never guess)."""
+    """The intent ts of this lane's OLDEST attempt on *cid* inside the card window that
+    came after the channel's last archive by this lane and did NOT end archived -- the
+    notice of ANY of those attempts may still be the channel's last lane line
+    (r2:c1-authority-tier#0 (c): a later attempt refused before its notice must never
+    hide an earlier standing one). A ledger we cannot read counts as a prior attempt 14
+    days back (check, never guess)."""
     ledger = st.read_ledger()
     if ledger is None:
         return now_wall - PRIOR_ATTEMPT_WINDOW_S
-    last_intent: dict | None = None
+    last_end = 0.0
+    for r in ledger:
+        if (r.get("event") == "outcome" and str(r.get("channel_id") or "") == cid
+                and str(r.get("outcome") or "").startswith(("archived", "already_archived"))):
+            last_end = max(last_end, float(r.get("ts") or 0))
+    floor: float | None = None
     for r in ledger:
         if str(r.get("channel_id") or "") != cid or r.get("event") != "intent":
             continue
-        if last_intent is None or float(r.get("ts") or 0) >= float(last_intent.get("ts") or 0):
-            last_intent = r
-    if last_intent is None:
-        return None
-    its = float(last_intent.get("ts") or 0)
-    if now_wall - its > PRIOR_ATTEMPT_WINDOW_S:
-        return None
-    for r in ledger:
-        if (r.get("event") == "outcome" and str(r.get("channel_id") or "") == cid
-                and float(r.get("ts") or 0) >= its
-                and str(r.get("outcome") or "").startswith(("archived", "already_archived"))):
-            return None
-    return its
+        its = float(r.get("ts") or 0)
+        if its <= last_end or now_wall - its > PRIOR_ATTEMPT_WINDOW_S:
+            continue
+        floor = its if floor is None else min(floor, its)
+    return floor
 
 
-def _notice_still_standing(read: Any, cid: str, bot_uid: str, bot_id: str,
-                           since: float) -> bool | None:
+#: The notice read-back covers the whole window since the prior attempt (A8: exhausted
+#: ONLY when has_more is False) within this many paced pages; past it -> unreadable.
+NOTICE_CHECK_MAX_PAGES = 10
+
+
+def _notice_still_standing(read: Any, cid: str, bot_uid: str, bot_id: str, since: float, *,
+                           sleep: Callable[[float], None] | None = None) -> bool | None:
     """After an earlier attempt: True when Cora's newest lane line in the channel since
     that attempt is the NOTICE (it stands -- never post it twice), False when it is the
-    correction or there is none (a fresh notice is due), None when the channel cannot
-    be read (the caller refuses, retryably). Reads only Cora's own two lane lines."""
+    correction or there is none in the WHOLE window (a fresh notice is due), None when
+    the window could not be read to its end or no line could count as Cora's (the
+    caller refuses, retryably -- r2:c1-authority-tier#0 / r2:c1-state-machine#2).
+    Reads only Cora's own two lane lines."""
+    if not bot_uid and not bot_id:
+        return None                    # an unknown identity sees no line as Cora's
+    sleep = time.sleep if sleep is None else sleep
+    cursor = ""
     try:
-        resp = read.conversations_history(channel=cid, oldest=f"{max(0.0, since - 60):.6f}",
-                                          limit=20)
-        msgs = resp.get("messages")
-        if not isinstance(msgs, list):
-            return None
-        for m in msgs:                                     # newest first
-            if not isinstance(m, dict):
-                continue
-            mine = (bool(bot_uid) and m.get("user") == bot_uid) or \
-                   (bool(bot_id) and m.get("bot_id") == bot_id)
-            text = m.get("text")
-            if not mine or not isinstance(text, str):
-                continue
-            if text.startswith(cards.CORRECTION_TEXT):
+        for _page in range(NOTICE_CHECK_MAX_PAGES):
+            sleep(cl.PACE_S)
+            kwargs: dict[str, Any] = {"channel": cid, "oldest": f"{max(0.0, since - 60):.6f}",
+                                      "limit": cl.PAGE_LIMIT}
+            if cursor:
+                kwargs["cursor"] = cursor
+            resp = read.conversations_history(**kwargs)
+            msgs = resp.get("messages")
+            if not isinstance(msgs, list):
+                return None
+            for m in msgs:                                 # newest first
+                if not isinstance(m, dict):
+                    continue
+                mine = (bool(bot_uid) and m.get("user") == bot_uid) or \
+                       (bool(bot_id) and m.get("bot_id") == bot_id)
+                text = m.get("text")
+                if not mine or not isinstance(text, str):
+                    continue
+                if text.startswith(cards.CORRECTION_TEXT):
+                    return False
+                if text.startswith(cards.NOTICE_PREFIX):
+                    return True
+            md = resp.get("response_metadata")
+            nxt = md.get("next_cursor") if isinstance(md, dict) else None
+            step = cl._pagination(resp.get("has_more"), nxt)
+            if step == "done":
                 return False
-            if text.startswith(cards.NOTICE_PREFIX):
-                return True
-        return False
+            if step == "unknown":
+                return None
+            cursor = nxt
+        return None                    # page cap: the window was not covered
     except Exception:  # noqa: BLE001
         return None
 
@@ -528,7 +565,7 @@ def _archive_one(p: st.Proposal, row: dict, actor: str, *, now: float,
     ok, why, _f = st.claim_row(pid, cid, "archive", actor=actor, now=now)
     if not ok:
         return _refusal(why, pid), None
-    status, reason, fresh = _reverify(p, row, read, now=now, sleep=sleep)
+    status, reason, fresh, ident = _reverify(p, row, read, now=now, sleep=sleep)
     if status == "stale":
         st.append_event(st.STALE, proposal_id=pid, cid=cid, by=actor, code=reason, ts=time.time())
         return TapResult("stale_refused", f"Not archived: {_label(row)} — {reason}.", pid), None
@@ -591,14 +628,16 @@ def _archive_one(p: st.Proposal, row: dict, actor: str, *, now: float,
                 release=True)
         return TapResult("failed", f"Nothing was archived — no Slack write client ({type(exc).__name__}).",
                          pid), None
-    bot_uid, bot_id = _identity(read)
+    # the identity the re-verify's fresh context confirmed -- never a second auth.test
+    # (a transient failure there once read as "no notice here", r2:c1-authority-tier#0)
+    bot_uid, bot_id = ident
     # (1) the notice goes FIRST (kickoff section 3) -- but NEVER twice: after an earlier
     # attempt on this channel (an indeterminate notice may have landed), read the
     # channel's newest lane lines first (clients.py: an indeterminate write is read
     # back, never re-sent)
     reused = False
     if prior is not None:
-        standing = _notice_still_standing(read, cid, bot_uid, bot_id, prior)
+        standing = _notice_still_standing(read, cid, bot_uid, bot_id, prior, sleep=sleep)
         if standing is None:
             _finish(p, row, actor, now, "not_attempted:notice_check_unreadable",
                     store_event="released", release=True)
@@ -686,11 +725,6 @@ def _archive_one(p: st.Proposal, row: dict, actor: str, *, now: float,
     return TapResult("unknown", (f"Outcome unknown for {_label(row)}: Slack did not confirm the "
                                  "archive. I won't retry — the nightly monitor reconciles "
                                  "against Slack."), pid), None
-
-
-def _identity(read: Any) -> tuple[str, str]:
-    from . import deliver  # noqa: PLC0415
-    return deliver.bot_identity(read)
 
 
 def _archive_all(f: st.Fold, p: st.Proposal, page: int, actor: str, *, now: float,

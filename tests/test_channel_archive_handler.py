@@ -586,7 +586,7 @@ class TestIndeterminateWrites:
         real = fake.conversations_history
 
         def _hist(channel, oldest=None, latest=None, limit=100, cursor=None, inclusive=False, **kw):
-            if limit == 20 and oldest is not None:          # the dedupe read
+            if oldest is not None and latest is None:       # the dedupe read (no latest)
                 raise api_error("ratelimited")
             return real(channel, oldest=oldest, latest=latest, limit=limit, cursor=cursor,
                         inclusive=inclusive)
