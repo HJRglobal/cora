@@ -957,8 +957,14 @@ def check_travel_shortlist(now: datetime | None = None) -> CheckResult:
     lane's own egress regression, caught before anything was searched), on a
     search_failed share above 50% of >= 4 asks, on unreadable store lines (counts
     may be incomplete), and when the store exists but cannot be read (a blind read
-    never reads clean). An absent store is INFO (no asks yet). Read-only; writes
-    nothing (holds under --dry-run by construction). ONE CheckResult.
+    never reads clean). D-051 r1 c2-webcall#0 -- also WARN on ANY card post
+    failure, on any ask older than 1 h that never settled (no card, failure line or
+    refusal: the job died or is stuck), when the lane refused asks and posted no
+    card in the window (gate refusals are ledgered, so a lane that refuses
+    everything never reads "no asks yet"), on any model_unsupported refusal (a
+    config regression), and when every card (>= 2) showed only "No listing I could
+    verify". An absent store is INFO (no asks yet). Read-only; writes nothing
+    (holds under --dry-run by construction). ONE CheckResult.
     """
     name = "Travel shortlist lane"
     try:
@@ -979,8 +985,14 @@ def check_travel_shortlist(now: datetime | None = None) -> CheckResult:
     asks, posted = int(s.get("asks") or 0), int(s.get("posted") or 0)
     failed, refused = int(s.get("search_failed") or 0), int(s.get("belt_refused") or 0)
     post_failed, bad = int(s.get("post_failed") or 0), int(s.get("bad_lines") or 0)
+    unsettled, refusals = int(s.get("unsettled") or 0), int(s.get("refused") or 0)
+    reasons = dict(s.get("refused_reasons") or {})
+    why = ", ".join(f"{k} {reasons[k]}" for k in sorted(reasons))
+    unverified = int(s.get("posted_unverified") or 0)
     detail = (f"7d: {asks} ask(s), {posted} card(s) posted, {failed} search failure(s), "
-              f"{refused} belt refusal(s)" + (f", {post_failed} card post failure(s)" if post_failed else ""))
+              f"{refused} belt refusal(s)" + (f", {post_failed} card post failure(s)" if post_failed else "")
+              + (f", {refusals} refusal(s) ({why})" if refusals else "")
+              + (f", {unsettled} unsettled ask(s)" if unsettled else ""))
     problems: list[str] = []
     if refused:
         problems.append(f"{refused} belt refusal(s) -- a lane request carried a token outside the "
@@ -990,6 +1002,23 @@ def check_travel_shortlist(now: datetime | None = None) -> CheckResult:
         problems.append(f"search failures {failed}/{asks} (> 50%) -- the lane is mostly failing")
     if bad:
         problems.append(f"{bad} unreadable store line(s) -- counts may be incomplete")
+    # D-051 r1 c2-webcall#0: the delivery failures B6's two rules could not see
+    if post_failed:
+        problems.append(f"{post_failed} card post failure(s) -- a finished search's card was "
+                        "rejected by Slack and the asker got only the failure line")
+    if unsettled:
+        problems.append(f"{unsettled} ask(s) never settled (asked over 1 h ago; no card, failure "
+                        "line or refusal) -- the search job died (a restart mid-search?) or is stuck "
+                        "on the lane's one worker")
+    if refusals and not posted:
+        problems.append(f"the lane refused {refusals} ask(s) and posted no card in 7d ({why}) -- it "
+                        "is not serving lodging asks")
+    elif reasons.get("model_unsupported"):
+        problems.append(f"{reasons['model_unsupported']} model_unsupported refusal(s) -- the lane's "
+                        "model cannot carry web search (a config regression)")
+    if posted >= 2 and unverified == posted:
+        problems.append(f"every card in 7d ({posted}) showed only 'No listing I could verify' -- the "
+                        "record-URL check is dropping every option (a parse regression?)")
     if problems:
         return CheckResult(name, "warn", detail + " | " + "; ".join(problems))
     return CheckResult(name, "ok", detail)

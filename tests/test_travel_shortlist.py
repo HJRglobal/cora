@@ -1349,7 +1349,29 @@ class TestExecuteRoute:
         subs = self._exec(route, client, say=say)
         client.chat_postMessage.assert_not_called()
         assert say.call_args.kwargs["text"] == ts.EVAL_REPLY
-        assert subs == [] and _rows() == []
+        assert subs == []
+        (row,) = _rows()           # the refusal only: shape, no thread key
+        assert (row["event"], row["stage"], row["reason"], row["root_ts"]) == ("refused", "gate", "eval", "")
+        assert not ts.is_lane_thread(TRAVEL_CHANNEL, "1790000000.000500")
+
+    @pytest.mark.parametrize("reason,reply", [("web_off", ts.WEB_OFF_REPLY),
+                                              ("model_unsupported", ts.MODEL_REPLY),
+                                              ("daily_cap", ts.CAP_REPLY)])
+    def test_a_gate_refusal_is_ledgered_shape_only_and_routing_inert(self, reason, reply):
+        client = _slack_client()
+        self._exec(ts.Route("reply", reply, reason), client)
+        assert client.chat_postMessage.call_args.kwargs["text"] == reply
+        (row,) = _rows()
+        assert row == {"ts": row["ts"], "event": "refused", "channel": TRAVEL_CHANNEL, "root_ts": "",
+                       "stage": "gate", "reason": reason}
+        assert not ts.is_lane_thread(TRAVEL_CHANNEL, "1790000000.000500")
+
+    @pytest.mark.parametrize("route", [ts.Route("reply", ts.CLARIFY_DATES_REPLY, "clarify_dates"),
+                                       ts.Route("reply", ts.FOLLOWUP_HELP_REPLY, "followup_help"),
+                                       ts.Route("reply", ts.OFF_REPLY, "lane_off")])
+    def test_a_non_refusal_reply_writes_nothing(self, route):
+        self._exec(route, _slack_client())
+        assert _rows() == []
 
     def test_a_search_acks_registers_and_submits(self):
         client = _slack_client()

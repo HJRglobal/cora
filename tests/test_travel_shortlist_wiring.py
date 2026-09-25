@@ -448,7 +448,12 @@ class TestMissedMessageCatchup:
         draft = mmc._run_dispatch_capture(client, cand, "FNDR", True)
         assert draft == ts.EVAL_REPLY
         client.chat_postMessage.assert_not_called()
-        assert lane.calls == [] and _rows() == []
+        assert lane.calls == []
+        # D-051 r1 c2-webcall#0: the refusal is ledgered shape-only and routing-inert
+        # (no thread key -> never a lane thread); nothing else is written
+        assert [(r["event"], r["stage"], r["reason"], r["root_ts"]) for r in _rows()] == [
+            ("refused", "gate", "eval", "")]
+        assert not ts.is_lane_thread("D0HDM", ASK_TS)
 
 
 # ── wiring pins (AST, never a text grep) + the listener table ────────────────
