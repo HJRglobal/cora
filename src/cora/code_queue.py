@@ -903,6 +903,16 @@ def _lex_safe_view(it: dict[str, Any]) -> dict[str, Any]:
         for k in ("park_reason", "park_event", "dismiss_reason"):
             if it.get(k):
                 it[k] = "[LEX -- withheld]"
+        # D-051 Code #15 s6#1: representative + evidence notes too -- the write side
+        # blanks them for LEX (_capture / seed_item / append_evidence), but 3 legacy
+        # rows (7/28, pre-parity-raise) still carry raw text, and _evidence_block
+        # rendered both into the Sonnet message and the kickoff file. Pointers only
+        # (channel_id + ts), one per entry so every count over the view is unchanged.
+        it["representative"] = ""
+        it["evidence"] = [
+            {"channel_id": str(e.get("channel_id") or ""), "ts": str(e.get("ts") or "")}
+            if isinstance(e, dict) else {"channel_id": "", "ts": ""}
+            for e in (it.get("evidence") or [])]
     return it
 
 
@@ -1679,9 +1689,14 @@ _KICKOFF_MAX_TOKENS = 4096   # was 2000: 14 of 96 logged kickoff calls hit it (a
 _KICKOFF_FIRE_WEEKDAY = 4    # Friday (the Cowork unfired-work sweep's day)
 _KICKOFF_FIRE_HOUR = 16      # 16:00 AZ
 _KICKOFF_TRUNCATED_TRAILER = (
-    "> TRUNCATED: the model reply was cut off (it hit max_tokens, or never closed its "
-    "wrapper fence); anything after this point is missing -- regenerate or complete "
-    "by hand before firing.")
+    "> TRUNCATED: the model reply did not finish cleanly (it hit max_tokens, stopped "
+    "early for another reason such as a refusal, or never closed its wrapper fence); "
+    "anything after this point is missing -- regenerate or complete by hand before firing.")
+# D-051 Code #15 s6#2: the ONLY stop reasons that mean "the model finished". Any
+# other (max_tokens, refusal, pause_turn, a missing value ...) marks the file -- fail
+# closed: the new _PROMPT_SYS forbids the wrapper, so for a compliant reply the
+# unclosed-wrapper belt no longer exists and stop_reason is the only signal left.
+_KICKOFF_CLEAN_STOPS = frozenset({"end_turn", "stop_sequence"})
 # A fence LINE at ANY indent (looser than CommonMark's 0-3 spaces on purpose: a
 # fence nested in a list item is commonly indented, and the balance check must see
 # it). Group 1 = the fence run, group 2 = the rest of the line (the info string).
@@ -1690,9 +1705,26 @@ _FENCE_LINE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
 _WRAPPER_OPEN_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})[ \t]*(?:markdown|md)?[ \t]*$", re.IGNORECASE)
 # An ATX H1 (0-3 spaces of indent, then '#' and whitespace or end of line).
 _H1_RE = re.compile(r"^ {0,3}#(?:[ \t]|$)")
+# D-051 Code #15 s6#4: the other two ways a body renders an H1 -- a Setext underline
+# (a line of only '=' under a paragraph line) and a raw HTML <h1>.
+_SETEXT_H1_RE = re.compile(r"^ {0,3}=+[ \t]*$")
+_HTML_H1_RE = re.compile(r"^ {0,3}<h1(?:[\s>/]|$)", re.IGNORECASE)
+# A line a Setext underline cannot turn into a heading: an ATX heading, a list item or
+# a blockquote (the '===' is a lazy paragraph continuation there), or indented code.
+_NOT_SETEXT_TEXT_RE = re.compile(r"^(?: {4,}|\t| {0,3}(?:#{1,6}|[-*+>]|\d{1,9}[.)])(?:[ \t]|$))")
 # A model line the Friday sweep could read as a STATUS line ("STATUS: FIRED",
-# "**Status**: ..."): optional quote/emphasis/list/heading marks, the word, a colon.
-_STATUS_LIKE_RE = re.compile(r"^[\s>*_`#~-]*status\b[\s*_`]*:[*_`]*", re.IGNORECASE)
+# "**Status**: ..."): optional quote / emphasis / list / heading / table / link /
+# HTML-comment marks (s6#4: '+ ', '| ', '[', '<!-- ' were missed), an optional
+# ordered-list number ('1. ', '2) '), the word (not followed by a letter or digit --
+# '\b' failed before '_', so '_STATUS_:' slipped), then a colon. The number atom
+# needs a digit the prefix class cannot hold, so the two runs never overlap
+# (linear on a pathological line -- the AD-3 ReDoS lesson).
+_STATUS_LIKE_RE = re.compile(
+    r"^[\s>*_`#~+|\-\[<!]*(?:\d{1,3}[.)][\s>*_`\[]*)?status(?![a-z0-9])[\s*_`\]]*:[*_`]*",
+    re.IGNORECASE)
+# Inside a fenced code block only the sweep's own UPPER-case key is neutralized
+# (s6#4): a yaml `status: open` or a python `status: int = 0` is code, not a claim.
+_STATUS_KEY_UPPER_RE = re.compile(r"STATUS")
 _STATUS_NEUTRALIZED_PREFIX = "> (model text, not a queue status) Status --"
 
 
@@ -1717,10 +1749,12 @@ def _fence_scan(lines: list[str]) -> tuple[tuple[str, int] | None, list[str]]:
     fence of the SAME char at least as long as its opener; a backtick run whose
     info string holds a backtick is an inline code span, not a fence). Returns
     ``(open_fence, h1_lines)``: the still-open fence as ``(char, length)`` (None
-    = balanced) and the ATX H1 lines OUTSIDE any fence (a ``# comment`` inside a
-    bash block is not a heading)."""
+    = balanced) and the H1 lines OUTSIDE any fence (a ``# comment`` inside a
+    bash block is not a heading) -- ATX, raw ``<h1>``, and a Setext ``===``
+    underline (recorded as the text line above it)."""
     open_: tuple[str, int] | None = None
     h1: list[str] = []
+    prev = ""   # the previous line OUTSIDE a fence ("" after a blank / fence line)
     for ln in lines:
         m = _FENCE_LINE_RE.match(ln)
         if m:
@@ -1730,10 +1764,39 @@ def _fence_scan(lines: list[str]) -> tuple[tuple[str, int] | None, list[str]]:
                     open_ = (run[0], len(run))
             elif run[0] == open_[0] and len(run) >= open_[1] and not rest.strip():
                 open_ = None
+            prev = ""
             continue
-        if open_ is None and _H1_RE.match(ln):
+        if open_ is not None:
+            continue
+        if _H1_RE.match(ln) or _HTML_H1_RE.match(ln):
             h1.append(ln)
+        elif (_SETEXT_H1_RE.match(ln) and prev.strip()
+              and not _NOT_SETEXT_TEXT_RE.match(prev)):
+            # s6#4: 'Title' + '=====' renders an H1 exactly like '# Title'
+            h1.append(prev)
+        prev = ln
     return open_, h1
+
+
+def _fence_flags(lines: list[str]) -> list[bool]:
+    """Per line: True when it is a fence line or inside a fenced code block, by the
+    SAME rules as _fence_scan (s6#4: STATUS neutralization used to rewrite code)."""
+    open_: tuple[str, int] | None = None
+    out: list[bool] = []
+    for ln in lines:
+        m = _FENCE_LINE_RE.match(ln)
+        if open_ is not None:
+            out.append(True)
+            if (m and m.group(1)[0] == open_[0] and len(m.group(1)) >= open_[1]
+                    and not m.group(2).strip()):
+                open_ = None
+            continue
+        if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+            open_ = (m.group(1)[0], len(m.group(1)))
+            out.append(True)
+            continue
+        out.append(False)
+    return out
 
 
 def _strip_model_fences(text: str) -> tuple[str, bool]:
@@ -1743,7 +1806,8 @@ def _strip_model_fences(text: str) -> tuple[str, bool]:
     fence alone on its line. With an opener, it is dropped, and the last non-blank
     line is dropped too when it is a bare fence of the same char that CLOSES the
     wrapper (the body without it is balanced -- a final fence that instead closes
-    an INNER block leaves the wrapper open). An opener with no closer sets
+    an INNER block leaves the wrapper open), or a bare fence of another char /
+    length on a body that is balanced without it (s6#5). An opener with no closer sets
     ``unclosed_wrapper`` -- the truncation belt (every unclosed 9/21 file was a
     max_tokens cut). With NO leading opener nothing is touched: a trailing fence
     then closes a real inner code block."""
@@ -1763,11 +1827,19 @@ def _strip_model_fences(text: str) -> tuple[str, bool]:
         j -= 1
     if j >= 0:
         cm = _FENCE_LINE_RE.match(rest[j])
-        if (cm and cm.group(1)[0] == char and len(cm.group(1)) >= n
-                and not cm.group(2).strip()):
-            if _fence_scan(rest[:j])[0] is None or _fence_scan(rest[:j + 1])[0] is not None:
+        if cm and not cm.group(2).strip():
+            if cm.group(1)[0] == char and len(cm.group(1)) >= n:
+                if _fence_scan(rest[:j])[0] is None or _fence_scan(rest[:j + 1])[0] is not None:
+                    return "\n".join(rest[:j]), False
+                # the final fence closes an inner block -> the wrapper itself never closed
+            elif _fence_scan(rest[:j])[0] is None:
+                # D-051 Code #15 s6#5: a bare closer of ANOTHER char / length (a ````
+                # or ~~~ wrapper closed with ```) on a body that is balanced without
+                # it IS the wrapper closer the model mismatched -- flagging it
+                # unclosed stamped a TRUNCATED trailer (and a stray empty code block)
+                # on a complete reply. A final fence that closes an INNER block
+                # leaves the body unbalanced without it, so it still reads unclosed.
                 return "\n".join(rest[:j]), False
-            # the final fence closes an inner block -> the wrapper itself never closed
     return "\n".join(rest), True
 
 
@@ -1847,9 +1919,11 @@ def _normalize_model_body(text: str) -> tuple[str, dict[str, Any]]:
         info["preamble_dropped"] = first
         lines = lines[first:]
     out: list[str] = []
-    for ln in lines:
+    for ln, in_fence in zip(lines, _fence_flags(lines)):
         m = _STATUS_LIKE_RE.match(ln)
-        if m:
+        # s6#4: inside a code block only the sweep's own upper-case key is a claim;
+        # `status: open` in a yaml / python sample is code and stays byte-identical.
+        if m and (not in_fence or _STATUS_KEY_UPPER_RE.search(m.group(0))):
             info["status_neutralized"] += 1
             ln = f"{_STATUS_NEUTRALIZED_PREFIX} {ln[m.end():].strip()}".rstrip()
         out.append(ln)
@@ -2196,8 +2270,9 @@ def generate_kickoff_prompt(items: list[dict[str, Any]], *, slug: str | None = N
     naming ``via`` -- the door this stage came through, 'button' | 'approve_auto' |
     'typed_verb' | 'bundle_button' | 'seed' | 'script' -- the H1 = the LEX-safe item
     title, the banner, the queue line); the model writes only the body. A truncated
-    reply (stop_reason == 'max_tokens', or a wrapper that never closed) is written
-    WITH a TRUNCATED trailer, never silently. Every file passes _kickoff_shape_errors
+    reply (any stop_reason other than 'end_turn' / 'stop_sequence' -- max_tokens, a
+    refusal, ... -- or a wrapper that never closed) is written WITH a TRUNCATED
+    trailer, never silently. Every file passes _kickoff_shape_errors
     before it is written and a line-1 read-back after; a failure of either returns
     None (log.error; ``meta_out["error"]`` says why) -- never a raise, so every
     caller's existing "nothing staged" ack surfaces it.
@@ -2205,10 +2280,14 @@ def generate_kickoff_prompt(items: list[dict[str, Any]], *, slug: str | None = N
     ``meta_out`` (optional): ``mis_homed`` (bool; G: was unavailable -> repo
     ``_notes``), ``truncated`` (True when the written file carries the TRUNCATED
     trailer), ``shape_fallback`` (the reasons, when an off-shape model body was
-    replaced by the skeleton), ``error`` (why None was returned)."""
+    replaced by the skeleton), ``cut_discarded`` (True when that discarded body was
+    also a cut), ``error`` (why None was returned). The callers copy shape_fallback /
+    cut_discarded onto the `staged` event (s6#3)."""
     if not items:
         return None
-    items = [_lex_safe_view(it) for it in items]  # belt: the H1 + evidence read the safe view only
+    # belt: the H1 + evidence read the safe view only (for LEX that now includes the
+    # representative + evidence notes -- s6#1)
+    items = [_lex_safe_view(it) for it in items]
     slug = slug or _slug(str(items[0].get("title", "")))
     now = _now()
     # The filename date stays the UTC date (unchanged; S6 residual: an AZ-evening stage
@@ -2245,7 +2324,9 @@ def generate_kickoff_prompt(items: list[dict[str, Any]], *, slug: str | None = N
             log_usage(resp, caller="code_queue.kickoff")
             raw = resp.content[0].text
             model_body, info = _normalize_model_body(raw)
-            cut = (getattr(resp, "stop_reason", None) == "max_tokens"
+            # s6#2: fail closed -- any stop other than a natural end is a cut (a
+            # 'refusal' can carry a partial body and used to be staged unmarked).
+            cut = (getattr(resp, "stop_reason", None) not in _KICKOFF_CLEAN_STOPS
                    or bool(info.get("unclosed_wrapper")))
             if model_body.strip():
                 blines = model_body.splitlines()
@@ -2264,6 +2345,11 @@ def generate_kickoff_prompt(items: list[dict[str, Any]], *, slug: str | None = N
                                 "writing the deterministic skeleton instead", "; ".join(errs))
                     if meta_out is not None:
                         meta_out["shape_fallback"] = errs
+                        if cut:
+                            # s6#3: the discarded body was ALSO a cut -- the file on
+                            # disk is the (complete) skeleton, so `truncated` stays
+                            # unset, but the ledger must still be able to count it.
+                            meta_out["cut_discarded"] = True
                 else:
                     body = candidate
                     truncated = cut
@@ -2536,9 +2622,11 @@ def process_queue_action(action_id: str, cq_id: str, actor_id: str, *,
         # ensure_kickoff_staged so EVERY approval path shares one implementation and
         # one loud-failure contract.
         if is_priority_severity(rec.get("severity")):
-            outcome, detail = ensure_kickoff_staged(cq_id, via="approve_auto")
+            kmeta: dict[str, Any] = {}
+            outcome, detail = ensure_kickoff_staged(cq_id, via="approve_auto", meta_out=kmeta)
             if outcome == "staged":
-                msg = f"✅ Queued + prompt staged: `{detail}`"
+                msg = (f"✅ Queued + prompt staged: `{detail}`"
+                       + (_KICKOFF_SKELETON_NOTE if kmeta.get("shape_fallback") else ""))
             elif outcome == "inflight":
                 # A benign concurrent stage (e.g. a Monday-menu bundle holding the
                 # reservation) is NOT a failure -- reporting one would send Harrison
@@ -2584,9 +2672,11 @@ def process_queue_action(action_id: str, cq_id: str, actor_id: str, *,
         # guard is what keeps a re-tap from a second Sonnet call / second `staged`
         # event (defect #3 TOCTOU class), and its terminal guard is what keeps a
         # stale Slack button from resurrecting a SHIPPED row (lens-4 HIGH).
-        outcome, detail = ensure_kickoff_staged(cq_id, via="button")
+        smeta: dict[str, Any] = {}
+        outcome, detail = ensure_kickoff_staged(cq_id, via="button", meta_out=smeta)
         if outcome == "staged":
-            return "staged", f"📝 Prompt staged: `{detail}`"
+            return "staged", (f"📝 Prompt staged: `{detail}`"
+                              + (_KICKOFF_SKELETON_NOTE if smeta.get("shape_fallback") else ""))
         if outcome == "noop":
             return "noop", (f"Already staged: `{detail}`" if detail.startswith(("/", "G:", "C:", "\\"))
                             else detail)
@@ -2711,8 +2801,28 @@ def process_queue_action(action_id: str, cq_id: str, actor_id: str, *,
 _TERMINAL_STATUSES = frozenset({"SHIPPED", "DISMISSED", "SUPERSEDED"})
 
 
+def _kickoff_event_flags(ev: dict[str, Any], meta: dict[str, Any]) -> None:
+    """Copy the generator's file facts onto a `staged` event (both callers): the
+    ledger must say which file was written (D-314). s6#3: shape_fallback /
+    cut_discarded used to live only in meta_out + one WARNING, so a skeleton
+    stage was indistinguishable from a model stage on the ledger."""
+    if meta.get("mis_homed"):
+        ev["mis_homed"] = True
+    if meta.get("truncated"):
+        ev["truncated"] = True       # the file carries the TRUNCATED trailer (S6)
+    if meta.get("shape_fallback"):
+        ev["shape_fallback"] = True  # the model body was off-shape -> the skeleton was written
+    if meta.get("cut_discarded"):
+        ev["cut_discarded"] = True   # ... and that discarded body was a cut
+
+
+# The ack suffix when the written file is the skeleton, not the model's draft (s6#3).
+_KICKOFF_SKELETON_NOTE = (" -- note: the model draft was off-shape, so the generic skeleton "
+                          "was written; fill it in before firing")
+
+
 def ensure_kickoff_staged(cq_id: str, *, override_evidence_floor: bool = False,
-                          via: str = "") -> tuple[str, str]:
+                          via: str = "", meta_out: dict[str, Any] | None = None) -> tuple[str, str]:
     """Generate + ledger-record a kickoff prompt for one item. The single
     implementation every approval path shares.
 
@@ -2733,6 +2843,10 @@ def ensure_kickoff_staged(cq_id: str, *, override_evidence_floor: bool = False,
     ONLY by stage_by_id (the founder's typed `stage cq-<id>` verb, Code #12 S1').
     Every other caller (approve auto-stage, the Stage button, seed stage_now,
     scripts) is subject to the floor once C1 lands.
+
+    meta_out (optional, s6#3): on "staged", receives the generator's file facts
+    (mis_homed / truncated / shape_fallback / cut_discarded) so an ack can say
+    when the file is the skeleton rather than the model's draft.
 
     Reservation-guarded (defect #3 TOCTOU class) so a concurrent approve/stage can
     never double-generate. The race is its OWN outcome rather than an error string
@@ -2792,13 +2906,13 @@ def ensure_kickoff_staged(cq_id: str, *, override_evidence_floor: bool = False,
               "bundle_id": solo_bundle_id(cq_id), "via": _kickoff_via(via)}
         if override_evidence_floor:
             ev["override"] = True   # the founder's typed verb bypassed the C1 floor
-        if meta.get("mis_homed"):
-            ev["mis_homed"] = True
-        if meta.get("truncated"):
-            ev["truncated"] = True  # the file carries the TRUNCATED trailer (S6)
+        _kickoff_event_flags(ev, meta)
         _append_event(ev)
         _render_backlog_safe()
         _dm_prompt_path(path)
+        if meta_out is not None:
+            meta_out.update({k: meta[k] for k in ("mis_homed", "truncated", "shape_fallback",
+                                                  "cut_discarded") if meta.get(k)})
         return "staged", path
     finally:
         _end_staging([cq_id])
@@ -3483,6 +3597,9 @@ def queue_explicit(user: str, entity: str, channel_id: str, request: str,
     """Backend for the explicit tool's confirmed call. Returns (cq_id, outcome).
 
     outcome is one of:
+      "staged"  -- the request NAMED an existing item and the founder's stage ran
+      "resolved:<outcome>[:<why>]" -- it named one and did not stage (why = the
+                   generator's reason on an error; never a path)
       "ok"      -- captured (APPROVED for founder, PROPOSED for a teammate) + carded
       "held"    -- captured PROPOSED but over the daily cap: no immediate card, rides
                    the overflow flush (a confirmed ask MUST NOT vanish -- 1g)
@@ -3504,8 +3621,16 @@ def queue_explicit(user: str, entity: str, channel_id: str, request: str,
     named = find_stage_request(request)
     if named:
         if is_founder:
-            outcome, _detail = stage_by_id(named, user)
-            return named, ("staged" if outcome == "staged" else f"resolved:{outcome}")
+            outcome, detail = stage_by_id(named, user)
+            if outcome == "staged":
+                return named, "staged"
+            # D-051 Code #15 s6#6: the generator's reason (read-back / shape gate /
+            # write / crash) rides back as "resolved:<outcome>:<why>" -- it was
+            # discarded here, so this door's reply read only "(error)". A noop's
+            # detail is the existing prompt PATH (a title-derived slug, D-082): never
+            # carried.
+            why = _one_line(detail) if outcome not in ("noop", "not_authorized") else ""
+            return named, f"resolved:{outcome}" + (f":{why}" if why else "")
         return named, "resolved:not_authorized"
     held = (not is_founder) and _explicit_count_today(user) >= EXPLICIT_THROTTLE_PER_DAY
     rec = {
@@ -4038,14 +4163,12 @@ def stage_bundle(value: str, actor_id: str) -> tuple[str, str]:
         for r in still:
             ev = {"event": "staged", "ts": _now_iso(), "id": r["id"],
                   "prompt_path": path, "bundle_id": bundle_id, "via": "bundle_button"}
-            if meta.get("mis_homed"):
-                ev["mis_homed"] = True
-            if meta.get("truncated"):
-                ev["truncated"] = True
+            _kickoff_event_flags(ev, meta)
             _append_event(ev)
         _render_backlog_safe()
         _dm_prompt_path(path)
         return "staged", (f"📝 Bundle prompt staged ({len(still)} items): `{path}`"
+                          + (_KICKOFF_SKELETON_NOTE if meta.get("shape_fallback") else "")
                           + (f" -- {len(floored)} refused by the evidence floor (no permalink, "
                              f"no seed body): {floored_ids}" if floored else ""))
     finally:
@@ -4597,17 +4720,25 @@ _QS_CAPTURE_CARD_DAYS = 7
 _QS_TITLE_CHARS = 80
 # Code #15 S5 (cq-2d26f131091e): rewritten to what the code now does -- the old text
 # stated the non-refreshing card as permanent fact. Pinned by test_queue_status_force.
+# D-051 Code #15 s5#2: the S5 text said "only the pressed row changes ... every other
+# row keeps its buttons" -- but rerender_card_blocks resolves EVERY row decided since
+# the card ts (the pinned week-old-menu test resolves 5 rows on one press), and a
+# refusal / floor hold / error press on the menu only threads (never re-renders).
+# Each clause below is measured in test_code_queue_card_rerender.py::TestFooterClaims.
 QUEUE_STATUS_FOOTER = (
-    "A press re-renders the card it was made on (cq-2d26f131091e): on the Monday menu "
-    "only the pressed row changes -- its buttons become a one-line outcome once this "
-    "ledger records a decision after the menu went out, every other row keeps its "
-    "buttons, and the outcome is also threaded under the menu; a capture card's buttons "
-    "are replaced by the outcome (a refusal or an evidence-floor hold keeps them and "
-    "threads the reason). A card decided from another surface (a typed verb, a "
-    "different card), or a menu posted before this change, refreshes only on its next "
-    "press -- this ledger is the source of truth. A repeat press is safe: Approve / "
-    "Stage / Dismiss / Ship are no-ops once recorded and a repeat Keep on the same card "
-    "is a no-op; a repeat Park or Later records one more park / snooze.")
+    "A press re-renders the card it was made on (cq-2d26f131091e), except a refusal, an "
+    "evidence-floor hold or an error: those only thread the reason and every button "
+    "stays. On the Monday menu a re-render resolves EVERY row this ledger shows decided "
+    "since the menu went out -- including rows decided from another surface (a typed "
+    "verb, a different card, a script) -- turning its buttons into a one-line outcome; "
+    "rows with no decision since then keep their buttons (a row since closed or gone "
+    "from the ledger resolves too), and the outcome is also threaded under the menu. A "
+    "capture card's buttons are replaced by the outcome. A "
+    "card decided only from another surface, or a menu posted before this change, "
+    "refreshes on its next re-rendering press -- this ledger is the source of truth. A "
+    "repeat press is safe: Approve / Stage / Dismiss / Ship are no-ops once recorded and "
+    "a repeat Keep on the same card is a no-op; a repeat Park or Later records one more "
+    "park / snooze.")
 # D-051 forcing-seams-2: the read states its own scope, so a turn forced onto it by
 # a question about some OTHER card surface cannot relay the Monday-menu tally as
 # that surface's truth.

@@ -12495,7 +12495,10 @@ def _execute_claimed_code_queue(pending: dict, slack_user_id: str, entity: str) 
         return _write_confirmed_contract(
             f"Staged the kickoff for `{cq_id}` -- nothing new was queued.")
     if outcome.startswith("resolved:"):
-        detail = outcome.split(":", 1)[1]
+        # D-051 Code #15 s6#6: "resolved:<outcome>[:<why>]" -- the generator's own
+        # reason now rides back (queue_explicit used to discard it, so a read-back
+        # or shape-gate failure read only "(error)").
+        detail, _, why = outcome.split(":", 1)[1].partition(":")
         if detail == "not_authorized":
             return _write_confirmed_contract(
                 f"`{cq_id}` already exists in the queue. Only Harrison can stage "
@@ -12504,7 +12507,8 @@ def _execute_claimed_code_queue(pending: dict, slack_user_id: str, entity: str) 
             return _write_confirmed_contract(
                 f"`{cq_id}` already has a staged kickoff -- nothing to do.")
         return _write_confirmed_contract(
-            f"I found `{cq_id}` but couldn't stage it ({detail}). Tap "
+            f"I found `{cq_id}` but couldn't stage it ({detail}"
+            + (f" -- {why.strip()}" if why.strip() else "") + "). Tap "
             f"\"Stage prompt\" on its card instead.")
     if is_founder:
         return _write_confirmed_contract(
@@ -13990,7 +13994,15 @@ _TOOL_TIMEOUTS: dict[str, int] = {
     # and 2 synchronous Slack DM calls INLINE -- an 8s budget was smaller than a
     # single slow Drive write, yielding "Tool timed out" while the abandoned
     # worker usually still filed the item (filed-but-reported-failed).
-    "cora_queue_code_session": 20,
+    # D-051 Code #15 s6#6: RAISED 20 -> 60 (the cora_person_dossier tier). A founder's
+    # natural-language "stage cq-..." + typed yes runs the WHOLE kickoff inside this
+    # budget (queue_explicit -> stage_by_id -> generate_kickoff_prompt): Sonnet at up
+    # to _KICKOFF_MAX_TOKENS=4096 output tokens (~35s at the measured 113-122 tok/s;
+    # 8 of 18 kickoffs since 9/20 hit the old 2000 cap) + the G: write, the S6
+    # read-back, the backlog render and the DM. At 20s any kickoff past ~2,300
+    # tokens answered "Tool timed out" while the abandoned worker staged it anyway.
+    # Pinned against the token cap in tests/test_kickoff_shape.py.
+    "cora_queue_code_session": 60,
     # Delegated-work intake: ledger fold + (on HELD) a synchronous DM card send.
     "cora_delegate_work": 20,
     # Dashboard read layer: Drive/Airtable network reads.

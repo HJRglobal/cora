@@ -542,6 +542,14 @@ class TestRenderer:
         assert "repeat Park or Later records one more park / snooze" in f
         assert "this ledger is the source of truth" in f
         assert cq.KEEP_CAP >= 1
+        # D-051 Code #15 s5#2: the S5 wording claimed "only the pressed row changes ...
+        # every other row keeps its buttons" -- false whenever a row was decided on
+        # another surface (TestStaleCard resolves 5 rows on one press), and "a press
+        # re-renders" was false for a refusal / floor-hold / error press on the menu.
+        assert "only the pressed row changes" not in f and "every other row keeps" not in f
+        assert "resolves EVERY row this ledger shows decided since the menu went out" in f
+        assert "including rows decided from another surface" in f
+        assert "except a refusal, an evidence-floor hold or an error" in f
 
     def test_the_read_writes_nothing(self, qledger, monkeypatch):
         _seed_menu(qledger)

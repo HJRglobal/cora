@@ -581,3 +581,281 @@ def test_record_staged_and_rehome_record_via_script(qenv, tmp_path, monkeypatch)
     done = cq.apply_prompt_rehome(cq.plan_prompt_rehome())
     assert done and all(d["ok"] for d in done)
     assert _staged_events(cid2)[-1]["via"] == "script" and _staged_events(cid2)[-1]["rehomed"] is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# D-051 Code #15 review round 1 (s6#1..#6, lens-integration#3)
+# ─────────────────────────────────────────────────────────────────────────────
+# Distinctive tokens: a raw-text leak would show (never real LEX text).
+LEX_RAW_REP = "Quillfeather Marlowe redline for the harbour intake"
+LEX_RAW_NOTE = "Quillfeather note: Marlowe asked for the harbour intake form"
+LEX_PTR = {"channel_id": "C0LEX", "ts": "1753700000.000100"}
+
+
+def _legacy_lex_row(cid="cq-00000000fd59"):
+    """A pre-parity-raise (7/28) LEX row: raw title / summary / representative and an
+    evidence NOTE persisted at rest -- the shape of the 3 live legacy rows."""
+    cq._append_event({"event": "captured", "id": cid, "ts": "2026-07-28T15:00:00+00:00",
+                      "status": "APPROVED", "kind": "feature", "severity": "P3",
+                      "title": LEX_RAW_REP, "summary": "Quillfeather summary",
+                      "entity": "LEX-LLC", "signal": "friction", "count": 1,
+                      "representative": LEX_RAW_REP,
+                      "evidence": [dict(LEX_PTR, note=LEX_RAW_NOTE)]})
+    return cid
+
+
+def _no_raw_lex(blob):
+    return "Quillfeather" not in blob and "Marlowe" not in blob
+
+
+class TestLexLegacyEvidence:
+    """s6#1: _lex_safe_view blanked title/summary/fix_sketch but NOT representative or
+    evidence notes, and _evidence_block renders both ("seed text:", "note:") into the
+    Sonnet message and the skeleton's Section 0 -- the S6 belt comment claimed the
+    evidence read the safe view only."""
+
+    def test_the_view_keeps_pointers_only(self, qenv):  # noqa: F811
+        cid = _legacy_lex_row()
+        assert cq._fold_items()[cid]["representative"] == LEX_RAW_REP   # else proves nothing
+        view = cq.get_item(cid)
+        assert view["representative"] == "" and view["evidence"] == [LEX_PTR]
+        assert cq.has_evidence(view)                  # the pointer still satisfies the floor
+        assert _no_raw_lex(json.dumps(cq.load_items()))
+
+    def test_the_model_message_and_the_file_carry_no_raw_lex_text(self, qenv, monkeypatch):  # noqa: F811
+        _pin_now(monkeypatch)
+        calls: list[dict] = []
+        _fake_anthropic(monkeypatch, _wrapped(), calls=calls)
+        cid = _legacy_lex_row()
+        path = cq.generate_kickoff_prompt([cq.get_item(cid)], via="typed_verb", override=True)
+        sent = calls[0]["messages"][0]["content"]
+        assert _no_raw_lex(sent) and _no_raw_lex(Path(path).read_text(encoding="utf-8"))
+        assert cq.slack_permalink(LEX_PTR["channel_id"], LEX_PTR["ts"]) in sent   # the pointer stays
+
+    def test_the_skeleton_carries_none_either_even_from_a_raw_record(self, qenv, monkeypatch):  # noqa: F811
+        _pin_now(monkeypatch)
+        _fake_anthropic(monkeypatch, "", boom=RuntimeError("sonnet down"))
+        cid = _legacy_lex_row()
+        raw = cq._fold_items()[cid]                   # the belt: a caller passing the RAW fold
+        path = cq.generate_kickoff_prompt([raw], via="typed_verb", override=True)
+        text = Path(path).read_text(encoding="utf-8")
+        assert _no_raw_lex(text) and "## 0. Evidence" in text
+        assert cq.slack_permalink(LEX_PTR["channel_id"], LEX_PTR["ts"]) in text
+
+
+PARTIAL_BODY = "## 0. Evidence\n- copied evidence\n\n## 1. Deliverables\n- Slice 1: half a sen"
+
+
+class TestUncleanStopsAreMarked:
+    """s6#2: the cut predicate keyed only on stop_reason == 'max_tokens'; S6's prompt
+    forbids the wrapper, so for a compliant reply that was the ONLY signal, and a
+    'refusal' (which can carry a partial body) was staged as a normal kickoff."""
+
+    @pytest.mark.parametrize("stop", ["refusal", "pause_turn", None])
+    def test_any_stop_but_a_natural_end_is_truncated(self, qenv, monkeypatch, stop):  # noqa: F811
+        _pin_now(monkeypatch)
+        _fake_anthropic(monkeypatch, PARTIAL_BODY, stop_reason=stop)
+        cid = _seed(title="Stopped midway")
+        outcome, path = cq.ensure_kickoff_staged(cid, via="button")
+        assert outcome == "staged"
+        text = Path(path).read_text(encoding="utf-8")
+        assert text.rstrip().splitlines()[-1] == cq._KICKOFF_TRUNCATED_TRAILER
+        assert _staged_events(cid)[-1]["truncated"] is True
+
+    @pytest.mark.parametrize("stop", ["end_turn", "stop_sequence"])
+    def test_a_natural_end_is_not(self, qenv, monkeypatch, stop):  # noqa: F811
+        _pin_now(monkeypatch)
+        _fake_anthropic(monkeypatch, MODEL_BODY, stop_reason=stop)
+        meta: dict = {}
+        path = cq.generate_kickoff_prompt([cq.get_item(_seed(title="Finished"))], meta_out=meta,
+                                          via="button")
+        assert "truncated" not in meta
+        assert cq._KICKOFF_TRUNCATED_TRAILER not in Path(path).read_text(encoding="utf-8")
+
+
+class TestSkeletonFallbackIsOnTheLedger:
+    """s6#3: an off-shape model body fell back to the skeleton with the fact recorded
+    only in meta_out + one WARNING -- both `staged` builders copied mis_homed /
+    truncated but never shape_fallback, and the acks read the same as a model stage."""
+
+    STRAY = _wrapped(MODEL_BODY + "\n# A stray second title")
+
+    def test_an_off_shape_cut_body_is_flagged_on_the_event_and_in_the_ack(self, qenv, monkeypatch):  # noqa: F811
+        _pin_now(monkeypatch)
+        _fake_anthropic(monkeypatch, self.STRAY, stop_reason="max_tokens")
+        cid = _seed(title="Off shape and cut")
+        outcome, msg = cq.process_queue_action(cq.ACTION_STAGE, cid, HARRISON)
+        assert outcome == "staged" and "generic skeleton was written" in msg
+        ev = _staged_events(cid)[-1]
+        assert ev["shape_fallback"] is True and ev["cut_discarded"] is True
+        assert "truncated" not in ev        # the file on disk is the complete skeleton
+
+    def test_a_model_stage_carries_no_fallback_flag(self, qenv, monkeypatch):  # noqa: F811
+        _pin_now(monkeypatch)
+        _fake_anthropic(monkeypatch, _wrapped())
+        cid = _seed(title="Clean model stage")
+        outcome, msg = cq.process_queue_action(cq.ACTION_STAGE, cid, HARRISON)
+        assert outcome == "staged" and "skeleton" not in msg
+        ev = _staged_events(cid)[-1]
+        assert "shape_fallback" not in ev and "cut_discarded" not in ev
+
+    def test_the_approve_auto_and_bundle_doors_record_it_too(self, qenv, monkeypatch):  # noqa: F811
+        _pin_now(monkeypatch)
+        _fake_anthropic(monkeypatch, self.STRAY)
+        p1 = cq.seed_item(kind="bug", severity="P1", title="Priority off shape", summary="body",
+                          entity="F3E", signal="explicit", status="PROPOSED")
+        outcome, msg = cq.process_queue_action(cq.ACTION_APPROVE, p1, HARRISON)
+        assert outcome == "approved" and "generic skeleton was written" in msg
+        assert _staged_events(p1)[-1]["shape_fallback"] is True
+        ids = [_seed(title=f"bundle off shape {i}") for i in range(2)]
+        outcome, msg = cq.stage_bundle("bundle:" + ",".join(ids), HARRISON)
+        assert outcome == "staged" and "generic skeleton was written" in msg
+        assert all(_staged_events(i)[-1]["shape_fallback"] is True for i in ids)
+        assert all("cut_discarded" not in _staged_events(i)[-1] for i in ids)   # end_turn: no cut
+
+
+class TestStatusAndH1Coverage:
+    """s6#4: the STATUS neutralizer missed '+ ', ordered lists, '_STATUS_', table cells,
+    '[STATUS]' and the HTML-comment form Cowork already uses; the one-H1 gate counted
+    only ATX headings; and neutralization rewrote `status:` lines inside code."""
+
+    @pytest.mark.parametrize("line", [
+        "+ STATUS: FIRED", "1. STATUS: FIRED 2026-09-22", "1) STATUS: FIRED",
+        "<!-- STATUS: FIRED 2026-09-22 -->", "| STATUS: FIRED |", "_STATUS_: FIRED",
+        "__STATUS__: FIRED", "[STATUS]: FIRED", "1. **STATUS:** FIRED",
+        # still caught (the pre-fix forms)
+        "STATUS: FIRED", "**Status**: parked", "> status : FIRED", "- STATUS: FIRED"])
+    def test_every_markdown_form_is_neutralized(self, line):
+        body, info = cq._normalize_model_body("## 0. Evidence\n" + line)
+        assert info["status_neutralized"] == 1, line
+        assert not any(cq._STATUS_LIKE_RE.match(ln) for ln in body.splitlines()), body
+
+    @pytest.mark.parametrize("line", ["statuses: three", "The status: fine", "status_code: 200",
+                                      "Status -- FIRED", "substatus: x"])
+    def test_non_status_lines_are_untouched(self, line):
+        body, info = cq._normalize_model_body("## 0. Evidence\n" + line)
+        assert info["status_neutralized"] == 0 and body.splitlines()[1] == line
+
+    def test_code_samples_inside_a_fence_stay_byte_identical(self):
+        sample = [FENCE + "yaml", "  status: STAGED  # yaml in code", "status: open", FENCE,
+                  FENCE + "python", "status: int = 0", FENCE]
+        body, info = cq._normalize_model_body("\n".join(["## 0. Evidence"] + sample))
+        assert info["status_neutralized"] == 0 and body.splitlines()[1:] == sample
+
+    def test_the_sweeps_own_upper_case_key_inside_a_fence_is_still_neutralized(self):
+        body, info = cq._normalize_model_body(
+            "## 0. Evidence\n" + FENCE + "\nSTATUS: FIRED 2026-09-22\n" + FENCE)
+        assert info["status_neutralized"] == 1 and "STATUS: FIRED" not in body
+
+    @pytest.mark.parametrize("extra", [["Injected Title", "====="], ["<h1>Injected</h1>"],
+                                       ["<H1 class='x'>Injected</H1>"]])
+    def test_setext_and_html_h1s_count(self, extra):
+        errs = cq._kickoff_shape_errors(_valid(MODEL_BODY.splitlines() + extra), "Widget")
+        assert any("2 H1" in e for e in errs), errs
+
+    @pytest.mark.parametrize("extra", [["", "====="], [FENCE, "Title", "=====", FENCE],
+                                       ["## Sub", "====="], ["Title", "-----"],
+                                       # a lazy continuation, not a heading (CommonMark)
+                                       ["- a list item", "====="], ["> a quote", "====="],
+                                       ["1. step", "====="], ["    indented code", "====="]])
+    def test_what_is_not_an_h1(self, extra):
+        assert cq._kickoff_shape_errors(_valid(MODEL_BODY.splitlines() + extra), "Widget") == []
+
+    def test_a_pathological_line_matches_in_linear_time(self):
+        import time as _time
+        t0 = _time.perf_counter()
+        for line in (" " * 50000 + "x", "1." + " " * 50000 + "x", "<!-" * 20000 + "x"):
+            assert cq._STATUS_LIKE_RE.match(line) is None
+        assert _time.perf_counter() - t0 < 1.0
+
+    def test_end_to_end_only_line_1_reads_as_a_status_line(self, qenv, monkeypatch):  # noqa: F811
+        _pin_now(monkeypatch)
+        _fake_anthropic(monkeypatch, "## 0. Evidence\n1. STATUS: FIRED 2026-09-22\n"
+                                     "<!-- STATUS: FIRED 2026-09-22 -->\n+ STATUS: FIRED\n" + MODEL_BODY)
+        path = cq.generate_kickoff_prompt([cq.get_item(_seed(title="Status forms"))], via="button")
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+        # an INDEPENDENT check (not the regex under test): no body line still carries
+        # the sweep's key + a state, in any decoration
+        assert lines[0].startswith("STATUS: STAGED ")
+        assert not [ln for ln in lines[1:] if "STATUS: FIRED" in ln], lines
+        assert [ln for ln in lines if cq._STATUS_LIKE_RE.match(ln)] == [lines[0]]
+
+
+class TestMismatchedWrapperCloser:
+    """s6#5: a ```` or ~~~ wrapper closed with ``` read as UNCLOSED, so a complete
+    end_turn reply got a stray empty code block + the TRUNCATED trailer and
+    truncated:true on the ledger."""
+
+    def test_four_backtick_wrapper_closed_with_three(self):
+        four = "`" * 4
+        text = f"{four}markdown\n## 0\n{FENCE}bash\nls\n{FENCE}\n{FENCE}"
+        assert cq._strip_model_fences(text) == (f"## 0\n{FENCE}bash\nls\n{FENCE}", False)
+
+    def test_tilde_wrapper_closed_with_backticks(self):
+        assert cq._strip_model_fences(f"~~~markdown\n## 0\nx\n{FENCE}") == ("## 0\nx", False)
+
+    def test_a_final_fence_closing_an_inner_block_still_reads_unclosed(self):
+        body, unclosed = cq._strip_model_fences(f"~~~markdown\n## 0\n{FENCE}python\nx = 1\n{FENCE}")
+        assert unclosed is True and body.endswith(FENCE)
+
+    def test_end_to_end_a_complete_reply_is_not_marked_truncated(self, qenv, monkeypatch):  # noqa: F811
+        _pin_now(monkeypatch)
+        four = "`" * 4
+        raw = f"{four}markdown\n{MODEL_BODY}\n{FENCE}bash\nls\n{FENCE}\n{FENCE}"
+        _fake_anthropic(monkeypatch, raw, stop_reason="end_turn")
+        meta: dict = {}
+        path = cq.generate_kickoff_prompt([cq.get_item(_seed(title="Mismatched closer"))],
+                                          meta_out=meta, via="button")
+        text = Path(path).read_text(encoding="utf-8")
+        assert "truncated" not in meta and cq._KICKOFF_TRUNCATED_TRAILER not in text
+        assert text.rstrip().splitlines()[-2:] == ["ls", FENCE]     # no stray empty block
+        assert cq._kickoff_shape_errors(text, "Mismatched closer") == []
+
+
+class TestModelToolDoor:
+    """s6#6: a founder's natural-language 'stage cq-...' confirmed by a typed yes runs
+    the whole kickoff inside dispatch()'s cora_queue_code_session budget -- 20s, below
+    a 4096-token generation -- and queue_explicit discarded the generator's reason."""
+
+    def test_the_tool_budget_covers_a_full_cap_generation(self):
+        from cora import drive_io
+        from cora.tools import tool_dispatch as td
+        floor_tok_per_s = 110   # the S6 build measured 113-122 output tok/s; 110 = its floor
+        need = cq._KICKOFF_MAX_TOKENS / floor_tok_per_s + drive_io.TIMEOUT_SECONDS
+        assert td._TOOL_TIMEOUTS["cora_queue_code_session"] >= need
+
+    def test_the_generator_reason_reaches_the_tool_reply(self, qenv, monkeypatch):  # noqa: F811
+        from cora.tools import tool_dispatch as td
+
+        def _slow(*a, **k):
+            raise TimeoutError("G: read timed out")
+        monkeypatch.setattr(cq.drive_io, "read_text", _slow)
+        cid = _seed(title="Door with a reason")
+        out = td._execute_claimed_code_queue(
+            {"request": f"stage a code-session prompt for {cid}", "channel_id": "D1"},
+            HARRISON, "FNDR")
+        assert "couldn't stage it (error -- " in out and "read-back failed (TimeoutError)" in out
+        assert _staged_events(cid) == []
+
+    def test_a_noop_never_carries_the_prompt_path(self, qenv):  # noqa: F811
+        cid = _seed(title="Already staged once")
+        assert cq.ensure_kickoff_staged(cid, via="button")[0] == "staged"
+        got, outcome = cq.queue_explicit(HARRISON, "FNDR", "D1",
+                                         f"stage a code-session prompt for {cid}", True)
+        assert (got, outcome) == (cid, "resolved:noop")    # the path's slug is title-derived
+
+
+def test_read_back_body_mismatch_is_an_error_with_no_staged_event(qenv, monkeypatch):  # noqa: F811
+    """lens-integration#3: only the line-1 leg of the read-back was pinned; the
+    full-content leg (the partial-write case it exists for) survived deletion."""
+    def _partial(path, *a, **k):
+        # line 1 survived the write, the body did not
+        return Path(path).read_text(encoding="utf-8").splitlines()[0] + "\n## 0. Evidence\n"
+    monkeypatch.setattr(cq.drive_io, "read_text", _partial)
+    cid = _seed(title="Partial write")
+    meta: dict = {}
+    assert cq.generate_kickoff_prompt([cq.get_item(cid)], meta_out=meta, via="button") is None
+    assert meta["error"] == "read-back content differs from what was written"
+    outcome, detail = cq.ensure_kickoff_staged(cid, via="button")
+    assert outcome == "error" and "content differs" in detail
+    assert _staged_events(cid) == [] and cid not in cq._STAGING_INFLIGHT

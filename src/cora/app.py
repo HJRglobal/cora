@@ -6,6 +6,7 @@ import os
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 from slack_bolt import App
@@ -5648,6 +5649,13 @@ def handle_revops_edit_submit(ack, body, client, view) -> None:
 # code_queue._LEDGER_LOCK (brief, inside the read); code_queue never takes this one.
 _CQ_CARD_RENDER_LOCK = threading.Lock()
 _CQ_CARD_FALLBACK_TEXT = "Cora code-session queue"
+# D-051 Code #15 s5#0: the lock is held across a chat_update network call, so a hung
+# Slack edit (WebClient timeout 30s + one retry) used to queue EVERY later press
+# behind it with no bound -- N presses waited N x the stall, on listener workers.
+# The wait is now bounded: past it the press skips its re-render (the threaded
+# outcome is already posted) and the next press converges, because every render
+# re-derives the whole card from the ledger.
+_CQ_CARD_RENDER_LOCK_WAIT_S = 5.0
 
 
 def _cq_rerender_rows(client, channel_id: str, message_ts: str, blocks: list,
@@ -5655,13 +5663,21 @@ def _cq_rerender_rows(client, channel_id: str, message_ts: str, blocks: list,
     """Row-level re-render of a multi-row code-queue card. Returns True when a
     chat_update was sent. The fallback ``text`` is the card's OWN (never one
     press's outcome -- it is the notification / accessibility text of the whole
-    menu). Raises on a chat_update failure; the caller logs it."""
-    with _CQ_CARD_RENDER_LOCK:
+    menu). Raises on a chat_update failure; the caller logs it. Waits at most
+    _CQ_CARD_RENDER_LOCK_WAIT_S for the render lock, then skips (False + WARNING)."""
+    if not _CQ_CARD_RENDER_LOCK.acquire(timeout=_CQ_CARD_RENDER_LOCK_WAIT_S):
+        log.warning("code-queue card re-render skipped: render lock busy for %.1fs "
+                    "channel=%s ts=%s -- the next press re-renders from the ledger",
+                    _CQ_CARD_RENDER_LOCK_WAIT_S, channel_id, message_ts)
+        return False
+    try:
         new_blocks, summary = code_queue.rerender_card_blocks(blocks, message_ts)
         if not summary.get("changed"):
             return False
         client.chat_update(channel=channel_id, ts=message_ts,
                            text=fallback_text or _CQ_CARD_FALLBACK_TEXT, blocks=new_blocks)
+    finally:
+        _CQ_CARD_RENDER_LOCK.release()
     # ids + counts only (D-082)
     log.info("code-queue card re-render channel=%s ts=%s rows=%d resolved=%d open=%d new=%s",
              channel_id, message_ts, summary.get("rows", 0), summary.get("resolved", 0),
@@ -5682,8 +5698,9 @@ def _cq_ack_in_message(client, body: dict, msg: str, *, keep_card: bool = False)
 
       * the Monday menu (several actions blocks, or any menu-row block_id -- a menu
         down to its last open row has ONE actions block left) re-renders ONLY its
-        decided rows (Code #15 S5) and STILL threads the outcome, so the approve
-        path's "kickoff did NOT generate" text is never lost;
+        decided rows (Code #15 S5) and STILL threads the outcome -- threaded first,
+        never behind the render lock (s5#0) -- so the approve path's "kickoff did
+        NOT generate" text is never lost or delayed;
       * a single-item card is consumed: buttons replaced by the outcome."""
     channel_id = (body.get("channel") or {}).get("id", "")
     message = body.get("message") or {}
@@ -5695,15 +5712,18 @@ def _cq_ack_in_message(client, body: dict, msg: str, *, keep_card: bool = False)
     blocks = message.get("blocks") or []
     actions_blocks = [b for b in blocks if b.get("type") == "actions"]
     if not keep_card and (len(actions_blocks) > 1 or code_queue.is_menu_card(blocks)):
+        # s5#0: the outcome is threaded FIRST, independent of the re-render -- it
+        # used to wait behind every earlier press's render (the lock), so a hung
+        # chat_update delayed even "kickoff did NOT generate".
+        try:
+            _cq_thread_reply(client, channel_id, message_ts, msg)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("code-queue ack update failed: %s", exc)
         try:
             _cq_rerender_rows(client, channel_id, message_ts, blocks,
                               str(message.get("text") or ""))
         except Exception as exc:  # noqa: BLE001
             log.warning("code-queue card re-render failed: %s", exc)
-        try:
-            _cq_thread_reply(client, channel_id, message_ts, msg)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("code-queue ack update failed: %s", exc)
         return
     try:
         if keep_card:
@@ -5755,6 +5775,34 @@ def _handle_code_queue_button(body: dict, client, action_id: str) -> None:
         log.warning("code-queue button handler error (non-fatal)", exc_info=True)
 
 
+# D-051 Code #15 s6#0: the presses that can GENERATE a kickoff (Stage, a Stage-bundle
+# row, Queue/Approve on a P0/P1 row) run their body here, OFF Bolt's shared listener
+# pool. App() takes no listener_executor, so Bolt's default ThreadPoolExecutor(5)
+# serves every button, @mention and DM; each generation held one of those five
+# workers for the whole Sonnet call (+ the G: write + read-back), up to ~35s at the
+# 4096-token cap, and a burst of presses left the next press's ack() queued past
+# Slack's 3s window ("didn't call ack()" -> the app-did-not-respond warning; live
+# 8/17 07:29 x5 and 8/24 07:02, with all five workers inside code_queue.kickoff).
+# The listener now acks, submits and returns; the outcome still threads / re-renders
+# when the body finishes (the bundle ack already said "I'll post the prompt path
+# when it's ready"). Two workers keep concurrent Sonnet kickoffs bounded; every
+# per-row guard (the _STAGING_INFLIGHT reservation, idempotency, the render lock)
+# lives in the body and is unchanged. Quick presses (Keep / Dismiss / Later /
+# Mark shipped) stay inline -- they must not queue behind a generation.
+_CQ_KICKOFF_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="cq-kickoff")
+
+
+def _submit_code_queue_button(body: dict, client, action_id: str) -> None:
+    """Run _handle_code_queue_button on the cq-kickoff pool. Never raises; a pool
+    that refuses work (interpreter shutdown) falls back to running it inline."""
+    try:
+        _CQ_KICKOFF_POOL.submit(_handle_code_queue_button, body, client, action_id)
+    except Exception:  # noqa: BLE001 -- RuntimeError after shutdown: never drop the press
+        log.warning("code-queue kickoff pool refused action=%s -- running inline",
+                    action_id, exc_info=True)
+        _handle_code_queue_button(body, client, action_id)
+
+
 # ── Delegated work HELD-card one-tap (Release / Dismiss) ────────────────────
 # Same contract as the code-queue buttons: ack() first, delegate; ALL
 # correctness (Harrison gate, idempotency) lives in delegated_work.
@@ -5793,7 +5841,8 @@ def handle_dw_dismiss(ack, body, client) -> None:
 @app.action(code_queue.ACTION_APPROVE)
 def handle_cq_approve(ack, body, client) -> None:
     ack()
-    _handle_code_queue_button(body, client, code_queue.ACTION_APPROVE)
+    # s6#0: a P0/P1 Queue auto-stages a kickoff -> off the shared listener pool
+    _submit_code_queue_button(body, client, code_queue.ACTION_APPROVE)
 
 
 @app.action(code_queue.ACTION_DISMISS)
@@ -5811,7 +5860,8 @@ def handle_cq_later(ack, body, client) -> None:
 @app.action(code_queue.ACTION_STAGE)
 def handle_cq_stage(ack, body, client) -> None:
     ack()
-    _handle_code_queue_button(body, client, code_queue.ACTION_STAGE)
+    # s6#0: Stage (single or bundle) generates a kickoff -> off the shared listener pool
+    _submit_code_queue_button(body, client, code_queue.ACTION_STAGE)
 
 
 @app.action(code_queue.ACTION_MARK_SHIPPED)
@@ -5935,6 +5985,11 @@ def _cq_ack_view_submit(client, meta: dict, msg: str, *, rerender: bool = False)
         log.warning("code-queue modal ack: no card pointer in private_metadata -- "
                     "outcome not surfaced: %s", msg[:120])
         return
+    # s5#0: threaded first, independent of the fetch + locked re-render.
+    try:
+        _cq_thread_reply(client, ch, ts, msg)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("code-queue modal ack failed: %s", exc)
     if rerender:
         try:
             card = _cq_fetch_card(client, ch, ts)
@@ -5943,10 +5998,6 @@ def _cq_ack_view_submit(client, meta: dict, msg: str, *, rerender: bool = False)
                                   str(card.get("text") or ""))
         except Exception as exc:  # noqa: BLE001
             log.warning("code-queue modal re-render failed: %s", exc)
-    try:
-        _cq_thread_reply(client, ch, ts, msg)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("code-queue modal ack failed: %s", exc)
 
 
 def _cq_submit_rerenders(outcome: str) -> bool:

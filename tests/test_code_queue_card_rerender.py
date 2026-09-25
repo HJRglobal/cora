@@ -1,4 +1,5 @@
-"""Code #15 S5 (cq-2d26f131091e) -- a press re-renders ONLY the pressed row.
+"""Code #15 S5 (cq-2d26f131091e) -- a press re-renders the rows the ledger shows decided
+(the pressed row, plus any row decided elsewhere since the card went out -- s5#2).
 
 9/21: the Monday menu went out as ONE DM message with 21 actions rows (6 APPROVED
 Stage rows, 7 PROPOSED Queue rows, 8 stale STAGED Keep rows). Harrison pressed 29
@@ -13,8 +14,9 @@ Contract under test:
     actions block becomes ONE context block (cq_done_...) with a static label + AZ
     time and no title / prompt path / reason; every other block is untouched;
   * app._cq_ack_in_message re-renders under _CQ_CARD_RENDER_LOCK (held across the
-    ledger read + chat_update only) and STILL threads the outcome; the menu's own
-    fallback text is preserved; a single capture card is consumed as before;
+    ledger read + chat_update only; the wait for it is bounded -- s5#0) and STILL
+    threads the outcome, FIRST; the menu's own fallback text is preserved; a single
+    capture card is consumed as before;
   * Park / Dismiss-w/-note modal submits fetch the card by its EXACT ts first;
   * a repeat Keep on the same card is a no-op (per-card idempotency).
 The menus here are built by the REAL build_weekly_menu and posted by the REAL
@@ -28,6 +30,7 @@ import copy
 import hashlib
 import json
 import logging
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -158,16 +161,26 @@ def _write(rows):
             fh.write(json.dumps(r) + "\n")
 
 
-def _seed_921():
+def _seed_921(anchor: datetime | None = None):
     """The live 9/21 shape: 6 APPROVED singles (one floor-held), 7 PROPOSED (5 HIGH +
-    2 aged), 8 stale STAGED -- exactly the 21 action rows the allocator carded."""
+    2 aged), 8 stale STAGED -- exactly the 21 action rows the allocator carded.
+
+    ``anchor`` (D-051 Code #15 lens-integration#1): the instant the aged / stale
+    history is measured back FROM. Default = now (every test that posts its menu at
+    a now-relative ts). The replay posts at the FIXED 9/21 card ts, so it passes that
+    card's instant: seeded relative to the real clock, the stale rows' `staged`
+    events (now-20d) crossed the fixed card ts on 2026-10-11 and every one counted as
+    a decision made AFTER the card -- the replay went red with no product change."""
+    def ago(days: float) -> str:
+        return ((anchor - timedelta(days=days)).isoformat() if anchor is not None
+                else _iso(days))
     rows = [_cap(c, status="APPROVED") for c in APPROVED_921]
     rows.append(_cap(FLOOR_HELD, status="APPROVED", signal="passive", summary=""))
     rows += [_cap(c, severity="HIGH") for c in HIGH_921]
-    rows += [_cap(c, severity="P3", ts=_iso(20)) for c in AGED_921]
+    rows += [_cap(c, severity="P3", ts=ago(20)) for c in AGED_921]
     for c in STALE_921:
-        rows.append(_cap(c, status="APPROVED", ts=_iso(30)))
-        rows.append({"event": "staged", "id": c, "ts": _iso(20), "prompt_path": f"/p/{c}.md",
+        rows.append(_cap(c, status="APPROVED", ts=ago(30)))
+        rows.append({"event": "staged", "id": c, "ts": ago(20), "prompt_path": f"/p/{c}.md",
                      "bundle_id": ""})
     _write(rows)
 
@@ -343,7 +356,13 @@ class TestReplay921:
 
     @pytest.mark.parametrize("stale_client", [False, True], ids=["fresh_client", "stale_client"])
     def test_29_presses_resolve_20_rows_and_leave_the_floor_held_row_buttoned(self, qenv, stale_client):
-        _seed_921()
+        card_dt = cq.card_ts_to_dt(MENU_921_TS)
+        _seed_921(anchor=card_dt)   # the history is measured back from THIS card (lens-integration#1)
+        # the fixture's own precondition, by name: nothing seeded is a decision made
+        # after the card (a seed that drifts past the fixed ts fails HERE, not as 13 != 20)
+        seeded = [e for e in cq._read_jsonl(cq._EVENT_LEDGER) if e.get("event") in cq._QS_DECISION_EVENTS]
+        assert seeded and all(cq._parse_ts(e["ts"]) < card_dt for e in seeded), \
+            "a seeded decision postdates the fixed 9/21 card ts -- the replay fixture has rotted"
         client = FakeClient(menu_ts=MENU_921_TS)
         blocks, text, ts = _post_menu(client)
         assert ts == MENU_921_TS
@@ -369,6 +388,20 @@ class TestReplay921:
         assert decided == set(_resolved_ids(final))
         if not stale_client:
             assert len(client.updates) == 20              # one update per newly decided row
+
+    def test_the_replay_does_not_rot_with_the_clock(self, qenv, monkeypatch):
+        """D-051 Code #15 lens-integration#1: the replay posts at a FIXED card ts but
+        seeded its stale rows' `staged` events relative to the real clock, so from
+        2026-10-11T14:00:54Z (card + 20d) they counted as decisions after the card and
+        the fresh-client run failed 13 != 20 with no product change. Every clock the
+        test and the product read is pushed 60 days ahead here; the replay must hold."""
+        shift = timedelta(days=60)
+        real_now = cq._now
+        monkeypatch.setattr(cq, "_now", lambda: real_now() + shift)
+        monkeypatch.setattr(sys.modules[__name__], "_iso", lambda days_ago=0.0: (
+            datetime.now(timezone.utc) + shift - timedelta(days=days_ago)).isoformat())
+        self.test_29_presses_resolve_20_rows_and_leave_the_floor_held_row_buttoned(
+            qenv, stale_client=False)
 
 
 # ── 4. a stale / expired card ────────────────────────────────────────────────
@@ -526,14 +559,29 @@ class TestInFlight:
 
 class _SpyLock:
     """Wraps the render lock: signals when press-B reaches it (then blocks on the
-    real lock, or passes straight through a no-op one)."""
+    real lock, or passes straight through a no-op one). s5#0: the render now takes
+    the lock with ``acquire(timeout=...)`` / ``release()`` (a bounded wait), so the
+    spy speaks that protocol too; a no-op inner (nullcontext) always "acquires"."""
 
     def __init__(self, inner, b_at_lock):
         self.inner, self.b_at_lock = inner, b_at_lock
 
-    def __enter__(self):
+    def _signal(self):
         if threading.current_thread().name == "press-B":
             self.b_at_lock.set()
+
+    def acquire(self, blocking=True, timeout=-1):
+        self._signal()
+        if hasattr(self.inner, "acquire"):
+            return self.inner.acquire(blocking, timeout)
+        return True
+
+    def release(self):
+        if hasattr(self.inner, "release"):
+            self.inner.release()
+
+    def __enter__(self):
+        self._signal()
         return self.inner.__enter__()
 
     def __exit__(self, *exc):
@@ -584,6 +632,59 @@ class TestRenderLock:
     def test_without_the_lock_the_same_interleaving_loses_a_row(self, qenv, monkeypatch):
         """The control: proves the race is real and that the lock is what closes it."""
         assert self._race(qenv, monkeypatch, contextlib.nullcontext()) == {AGED_921[0]}
+
+    def test_a_hung_render_never_holds_a_press_past_the_bound(self, qenv, monkeypatch, caplog):
+        """D-051 Code #15 s5#0: the lock is held across chat_update, so one hung Slack
+        edit used to queue EVERY later press behind it with no bound (a convoy on the
+        shared listener workers). A press now waits at most the bound, skips its
+        re-render, and still threads its outcome; the next press converges."""
+        _seed_921()
+        monkeypatch.setattr(app_module, "_CQ_CARD_RENDER_LOCK_WAIT_S", 0.3)
+        caplog.set_level(logging.WARNING, logger=app_module.log.name)
+        client = FakeClient()
+        blocks, text, ts = _post_menu(client)
+        lock = app_module._CQ_CARD_RENDER_LOCK
+        assert lock.acquire(timeout=5)          # an earlier press's render, hung in chat_update
+        try:
+            t = threading.Thread(target=_press,
+                                 args=(client, blocks, text, ts, cq.ACTION_APPROVE, AGED_921[0]))
+            t.start()
+            t.join(3)
+            assert not t.is_alive(), "the press is still queued behind the held render lock"
+            assert cq.get_item(AGED_921[0])["status"] == "APPROVED"      # the write landed
+            assert client.updates == []                                  # the render was skipped
+            assert client.threads and client.threads[-1]["thread_ts"] == ts   # the outcome was not
+            assert any("render lock busy" in r.getMessage() for r in caplog.records)
+        finally:
+            lock.release()
+        # the next press re-derives the whole card from the ledger: both rows resolve
+        _press(client, blocks, text, ts, cq.ACTION_KEEP, STALE_921[0])
+        assert set(_resolved_ids(client.updates[-1]["blocks"])) == {AGED_921[0], STALE_921[0]}
+
+    def test_the_outcome_is_threaded_before_the_render_waits_on_the_lock(self, qenv, monkeypatch):
+        """s5#0 (c): each press's threaded reply -- including 'kickoff did NOT generate'
+        -- was posted only AFTER its render returned, i.e. behind every earlier press's
+        render. It is now posted first, independent of the lock."""
+        _seed_921()
+        monkeypatch.setattr(app_module, "_CQ_CARD_RENDER_LOCK_WAIT_S", 10.0)
+        client = FakeClient()
+        blocks, text, ts = _post_menu(client)
+        lock = app_module._CQ_CARD_RENDER_LOCK
+        assert lock.acquire(timeout=5)
+        t = threading.Thread(target=_press,
+                             args=(client, blocks, text, ts, cq.ACTION_APPROVE, AGED_921[0]))
+        try:
+            t.start()
+            deadline = time.monotonic() + 3
+            while not client.threads and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert client.threads, "the outcome waited behind the render lock"
+            assert client.updates == []            # the render is still waiting its turn
+        finally:
+            lock.release()
+            t.join(5)
+        assert not t.is_alive()
+        assert _resolved_ids(client.updates[-1]["blocks"]) == [AGED_921[0]]
 
 
 # ── 8. LEX ───────────────────────────────────────────────────────────────────
@@ -740,14 +841,21 @@ class TestFooterClaims:
                                        card_ts=card_1)[0] == "kept"
         o, msg = cq.process_queue_action(cq.ACTION_KEEP, "cq-00000000dddd", HARRISON, card_ts=card_1)
         assert (o, msg) == ("noop", "Already kept on this card (x1).")
-        time.sleep(0.01)
-        card_2 = f"{time.time():.6f}"                           # next week's menu: a NEW card
+
+        def _card_after_last_kept() -> str:
+            # D-051 Code #15 s5#1: the next card's ts is built from the LEDGER (the last
+            # `kept` stamp + 1ms), never from time.time() after a 10ms sleep -- under
+            # Windows' default 15.625ms clock tick the two reads can land in one tick,
+            # the new card then equals the kept stamp, and the per-card dedup fires.
+            kept = [cq._parse_ts(e["ts"]) for e in cq._events_by_id()["cq-00000000dddd"]
+                    if e.get("event") == "kept"]
+            return f"{(max(kept) + timedelta(milliseconds=1)).timestamp():.6f}"
+        card_2 = _card_after_last_kept()                        # next week's menu: a NEW card
         assert cq.process_queue_action(cq.ACTION_KEEP, "cq-00000000dddd", HARRISON,
                                        card_ts=card_2)[0] == "kept"
         # the cap still holds, on any card
-        time.sleep(0.01)
         o3, msg3 = cq.process_queue_action(cq.ACTION_KEEP, "cq-00000000dddd", HARRISON,
-                                           card_ts=f"{time.time():.6f}")
+                                           card_ts=_card_after_last_kept())
         assert o3 == "noop" and "capped" in msg3
         assert cq.get_item("cq-00000000dddd")["keep_count"] == 2
         # a typed / scripted Keep (no card) keeps the pre-S5 behaviour: the cap alone
@@ -767,3 +875,33 @@ class TestFooterClaims:
     def test_the_footer_rides_the_status_read(self, qenv):
         assert cq.QUEUE_STATUS_FOOTER in cq.render_card_status()
         assert "cq-2d26f131091e" in cq.QUEUE_STATUS_FOOTER
+
+    def test_one_press_resolves_every_row_decided_elsewhere_as_the_footer_says(self, qenv):
+        """D-051 Code #15 s5#2: the S5 footer said 'only the pressed row changes ...
+        every other row keeps its buttons'. Measured: a Keep on row Y also resolves row
+        X that a typed verb staged; the footer now says exactly that."""
+        f = cq.QUEUE_STATUS_FOOTER
+        assert "only the pressed row changes" not in f and "every other row keeps" not in f
+        assert "resolves EVERY row this ledger shows decided since the menu went out" in f
+        assert "including rows decided from another surface" in f
+        _seed_921()
+        client = FakeClient()
+        blocks, text, ts = _post_menu(client)
+        assert cq.process_queue_action(cq.ACTION_STAGE, APPROVED_921[0], HARRISON)[0] == "staged"
+        _press(client, blocks, text, ts, cq.ACTION_KEEP, STALE_921[0])
+        assert set(_resolved_ids(client.updates[-1]["blocks"])) == {APPROVED_921[0], STALE_921[0]}
+        # "rows with no decision since then keep their buttons"
+        assert _row(client.updates[-1]["blocks"], APPROVED_921[1])["type"] == "actions"
+
+    def test_a_refusal_press_only_threads_as_the_footer_says(self, qenv):
+        """s5#2: 'A press re-renders the card' was false for a refusal / floor hold /
+        error press on the menu -- it threads only, even with rows decided elsewhere
+        pending. The footer names that exception now."""
+        assert ("except a refusal, an evidence-floor hold or an error: those only thread "
+                "the reason and every button stays") in cq.QUEUE_STATUS_FOOTER
+        _seed_921()
+        client = FakeClient()
+        blocks, text, ts = _post_menu(client)
+        assert cq.process_queue_action(cq.ACTION_STAGE, APPROVED_921[0], HARRISON)[0] == "staged"
+        _press(client, blocks, text, ts, cq.ACTION_STAGE, FLOOR_HELD)   # no_evidence
+        assert client.updates == [] and "NOT staged" in client.threads[-1]["text"]

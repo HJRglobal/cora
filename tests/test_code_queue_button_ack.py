@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import inspect
 import logging
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import cora.app as app_module
@@ -100,6 +102,131 @@ class TestCardKeptOnNoChange:
             app_module._handle_code_queue_button(_body(value="bundle:cq-a,cq-b", n_actions=2), client, cq.ACTION_STAGE)
         client.chat_update.assert_not_called()
         assert "NOT staged" in client.chat_postMessage.call_args.kwargs["text"]
+
+
+class TestKickoffOffTheListenerPool:
+    """D-051 Code #15 s6#0: a press that can GENERATE a kickoff (Stage, a Stage-bundle
+    row, Queue on a P0/P1 row) used to run the whole Sonnet call on Bolt's shared
+    5-worker listener pool after ack(); a burst of presses left the next press's ack
+    queued past Slack's 3s window (live 8/17 07:29 x5, 8/24 07:02). The listener now
+    acks, hands the body to the cq-kickoff pool and returns; the outcome still posts."""
+
+    def _blocking_pqa(self, gate, seen):
+        def _pqa(action_id, value, actor_id, **kw):
+            seen.append(threading.current_thread().name)
+            assert gate.wait(10)
+            return "approved", "Queued (APPROVED)."
+        return _pqa
+
+    def test_stage_and_queue_listeners_return_before_generation_finishes(self):
+        for handler, action in ((app_module.handle_cq_stage, cq.ACTION_STAGE),
+                                (app_module.handle_cq_approve, cq.ACTION_APPROVE)):
+            gate, seen = threading.Event(), []
+            client, ack = MagicMock(), MagicMock()
+            with patch.object(cq, "process_queue_action", self._blocking_pqa(gate, seen)):
+                t = threading.Thread(target=handler, args=(ack, _body(), client))
+                t.start()
+                t.join(2)
+                try:
+                    assert not t.is_alive(), f"{action}: the listener waited for the generation"
+                    ack.assert_called_once_with()
+                    client.chat_update.assert_not_called()      # the outcome is not in yet
+                finally:
+                    gate.set()
+                    t.join(5)
+                deadline = time.monotonic() + 5
+                while not client.chat_update.called and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            # the outcome still lands (a single card: consumed), from the cq-kickoff pool
+            kw = client.chat_update.call_args.kwargs
+            assert kw["ts"] == "9.9" and "Queued" in kw["text"], action
+            assert seen and seen[0].startswith("cq-kickoff"), seen
+
+    def test_quick_presses_stay_inline(self):
+        """Keep / Dismiss / Later / Mark shipped generate nothing and must not queue
+        behind a generation on the two-worker pool."""
+        for handler, action in ((app_module.handle_cq_keep, cq.ACTION_KEEP),
+                                (app_module.handle_cq_dismiss, cq.ACTION_DISMISS),
+                                (app_module.handle_cq_later, cq.ACTION_LATER),
+                                (app_module.handle_cq_shipped, cq.ACTION_MARK_SHIPPED)):
+            seen: list[str] = []
+            with patch.object(cq, "process_queue_action",
+                              lambda *a, **k: (seen.append(threading.current_thread().name),
+                                               ("noop", "ok"))[1]):
+                handler(MagicMock(), _body(), MagicMock())
+            assert seen == [threading.current_thread().name], action
+
+    def test_a_burst_of_presses_through_bolt_acks_every_one_in_time(self, monkeypatch):
+        """The incident path, through the REAL Bolt dispatch on Cora's own App (default
+        5-worker listener pool): six Stage presses 50ms apart while each generation
+        holds for longer than the ack window. Before: presses 0-4 took every worker and
+        press 5 was never acked (404 -> Slack's 'app did not respond'). ack_timeout is
+        lowered from 3s (and the stand-in generation to 1s) so the test runs in about
+        three seconds."""
+        from slack_bolt import BoltRequest
+        from slack_bolt.middleware.authorization.single_team_authorization import (
+            SingleTeamAuthorization)
+        from slack_sdk.web.client import WebClient
+        from slack_sdk.web.slack_response import SlackResponse
+
+        data = {"ok": True, "url": "https://test.slack.com/", "user_id": "U_CORA_TEST",
+                "team": "T", "user": "bot", "team_id": "T_TEST", "bot_id": "B_TEST"}
+
+        def _auth(self, **kw):
+            return SlackResponse(client=self, http_verb="POST", api_url="auth.test", req_args={},
+                                 data=data, headers={"x-oauth-scopes": "chat:write"},
+                                 status_code=200)
+        monkeypatch.setattr(WebClient, "auth_test", _auth)
+        bolt = app_module.app
+        for m in bolt._middleware_list:
+            if isinstance(m, SingleTeamAuthorization):
+                monkeypatch.setattr(m, "auth_test_result", _auth(bolt.client))
+        listener = next(li for li in bolt._listeners
+                        if getattr(li, "ack_function", None) is app_module.handle_cq_stage)
+        monkeypatch.setattr(listener, "ack_timeout", 0.5)
+        assert bolt._listener_runner.listener_executor._max_workers == 5   # the shared pool
+
+        done: list[str] = []
+        done_lock = threading.Lock()
+
+        def _pqa(action_id, value, actor_id, **kw):
+            time.sleep(1.0)              # a generation: twice the ack window
+            return "staged", "Prompt staged"
+
+        def _ack_in_message(client, body, msg, **kw):
+            with done_lock:
+                done.append(body["actions"][0]["value"])
+        monkeypatch.setattr(cq, "process_queue_action", _pqa)
+        monkeypatch.setattr(app_module, "_cq_ack_in_message", _ack_in_message)
+
+        def _payload(i):
+            return {"type": "block_actions", "user": {"id": HARRISON}, "team": {"id": "T_TEST"},
+                    "api_app_id": "A1", "token": "t", "trigger_id": f"trig{i}",
+                    "container": {"type": "message", "message_ts": f"1.{i}", "channel_id": "D1"},
+                    "channel": {"id": "D1"}, "message": {"ts": f"1.{i}", "blocks": []},
+                    "actions": [{"type": "button", "action_id": cq.ACTION_STAGE,
+                                 "block_id": f"b{i}", "value": f"cq-00000000000{i}",
+                                 "action_ts": "1"}]}
+        results: list = [None] * 6
+
+        def _one(i):
+            t0 = time.monotonic()
+            r = bolt.dispatch(BoltRequest(mode="socket_mode", body=_payload(i)))
+            results[i] = (r.status, time.monotonic() - t0)
+        threads = []
+        for i in range(6):
+            th = threading.Thread(target=_one, args=(i,))
+            th.start()
+            threads.append(th)
+            time.sleep(0.05)
+        for th in threads:
+            th.join(10)
+        # drain every press BEFORE asserting, so no body outlives this test's patches
+        deadline = time.monotonic() + 10
+        while len(done) < 6 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert [s for s, _t in results] == [200] * 6, results
+        assert sorted(done) == sorted(f"cq-00000000000{i}" for i in range(6))   # every outcome posts
 
 
 class TestAckPointers:
