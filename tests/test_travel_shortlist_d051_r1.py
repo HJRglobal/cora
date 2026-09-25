@@ -496,3 +496,58 @@ class TestLaneThreadRefinementGate:
         (call,) = client2.chat_postMessage.call_args_list
         assert call.kwargs["text"] == ts.FOLLOWUP_HELP_REPLY
         assert len(lane.calls) == 1                     # no second (billed) web call
+
+
+# ── c2-trigger#5: the scheduler's "availability" keyword never takes a lane-thread turn ─
+
+DM_CHANNEL = "D0TRAVELDM"
+FOLLOW_UP = "check availability for oct 20-22 instead"
+
+
+class TestShiftSchedulerEscapeInALaneThread:
+    def _seed(self):
+        ts.append_event("asked", channel=DM_CHANNEL, root_ts=ASK_TS,
+                        constraints=_constraints().to_record(), registered=True)
+
+    def test_an_idle_users_lane_thread_follow_up_reaches_the_lane(self, lane, monkeypatch):
+        handled = []
+        monkeypatch.setattr(app_module.osn_shift_handler, "handle_dm",
+                            lambda **k: handled.append(k))
+        self._seed()
+        client = _slack_client()
+        _dm(client, FOLLOW_UP, user=HARRISON, ts_="1790000000.000300", thread_ts=ASK_TS)
+        _drain()
+        assert handled == []
+        card = _card_call(client)
+        assert card["thread_ts"] == ASK_TS
+        assert "October 20" in lane.calls[-1]["messages"][0]["content"]
+
+    def test_a_mid_flow_user_stays_with_the_scheduler(self, lane, monkeypatch):
+        handled = []
+        monkeypatch.setattr(app_module.osn_shift_handler, "handle_dm",
+                            lambda **k: handled.append(k))
+        monkeypatch.setattr(app_module.osn_shift_handler, "get_dm_state",
+                            lambda uid: {"step": "collecting_days"})
+        self._seed()
+        _dm(_slack_client(), FOLLOW_UP, user=HARRISON, ts_="1790000000.000300", thread_ts=ASK_TS)
+        assert len(handled) == 1
+
+    def test_outside_a_lane_thread_the_keyword_still_routes_to_the_scheduler(self, lane,
+                                                                              monkeypatch):
+        handled = []
+        monkeypatch.setattr(app_module.osn_shift_handler, "handle_dm",
+                            lambda **k: handled.append(k))
+        _dm(_slack_client(), FOLLOW_UP, user=HARRISON, ts_="1790000000.000300",
+            thread_ts="1790000000.000222")                     # not a lane thread
+        assert len(handled) == 1
+
+    def test_an_unreadable_store_leaves_the_scheduler_its_turn(self, lane, monkeypatch,
+                                                               tmp_path):
+        handled = []
+        monkeypatch.setattr(app_module.osn_shift_handler, "handle_dm",
+                            lambda **k: handled.append(k))
+        d = tmp_path / "store-is-a-dir"
+        d.mkdir()
+        monkeypatch.setenv("CORA_TRAVEL_SHORTLIST_THREADS_PATH", str(d))
+        _dm(_slack_client(), FOLLOW_UP, user=HARRISON, ts_="1790000000.000300", thread_ts=ASK_TS)
+        assert len(handled) == 1

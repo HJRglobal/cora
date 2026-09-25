@@ -1158,11 +1158,31 @@ def _travel_dm_ask_intent(user_id: str, text: str, event: dict, pending_write: b
         return False
 
 
-def _travel_ask_escapes_shift_keywords(user_id: str, travel_dm_ask: bool) -> bool:
-    """True only for a strict travel ask from a user who is NOT mid-flow in the OSN
-    shift scheduler (mid-flow users always stay with the scheduler)."""
-    if not travel_dm_ask:
+def _travel_dm_lane_thread(event: dict) -> bool:
+    """Is this DM a reply inside a registered travel-lane thread? An unreadable
+    store reads as NO (the scheduler keeps its turn -- fail closed to today)."""
+    thread_ts = event.get("thread_ts")
+    if not thread_ts:
         return False
+    try:
+        return bool(travel_shortlist.is_lane_thread(str(event.get("channel", "") or ""),
+                                                    str(thread_ts)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _travel_ask_escapes_shift_keywords(user_id: str, travel_dm_ask: bool,
+                                       lane_thread_probe=None) -> bool:
+    """True only for a strict travel ask -- or a turn in a registered lane thread
+    (D-051 r1 c2-trigger#5: "check availability for oct 20-22 instead" is the lane's
+    follow-up, B3) -- from a user who is NOT mid-flow in the OSN shift scheduler
+    (mid-flow users always stay with the scheduler)."""
+    if not travel_dm_ask:
+        try:
+            if lane_thread_probe is None or not lane_thread_probe():
+                return False
+        except Exception:  # noqa: BLE001 -- unknown: leave the scheduler its turn
+            return False
     try:
         return osn_shift_handler.get_dm_state(user_id).get("step", "idle") == "idle"
     except Exception:  # noqa: BLE001 -- unknown state: leave the scheduler its turn
@@ -3911,11 +3931,15 @@ def handle_message_event(event: dict, client) -> None:
             # Code #16 C2: the scheduler's KEYWORD leg ("availability" is one) must not
             # take a travel-lane ask ("hotels with availability Oct 17-21"); a user
             # mid-flow in the scheduler stays there regardless.
-            _shift_may_claim = not _travel_ask_escapes_shift_keywords(user_id, _travel_dm_ask)
-            if _shift_may_claim and _dm_is_shift_message(user_id, text):
-                log.info("osn_shift_handler: DM from user=%s text=%r", user_id, text[:80])
-                osn_shift_handler.handle_dm(text=text, slack_user_id=user_id, client=client)
-                return
+            # A reply in a lane thread escapes too (D-051 r1 c2-trigger#5); probed only
+            # when the keyword leg would claim the turn (the store read is lazy).
+            if _dm_is_shift_message(user_id, text):
+                if not _travel_ask_escapes_shift_keywords(
+                        user_id, _travel_dm_ask,
+                        lane_thread_probe=lambda: _travel_dm_lane_thread(event)):
+                    log.info("osn_shift_handler: DM from user=%s text=%r", user_id, text[:80])
+                    osn_shift_handler.handle_dm(text=text, slack_user_id=user_id, client=client)
+                    return
             _handle_dm_qa(event, client, user_id, text)
         return
 

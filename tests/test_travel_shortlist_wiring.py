@@ -521,7 +521,7 @@ class TestWiringPins:
         assert {"handle_mention", "handle_message_event"} <= names
         for helper in ("_travel_forced_tool_turn", "_travel_lane_thread_state",
                        "_travel_dm_ask_intent", "_travel_ask_escapes_shift_keywords",
-                       "_submit_travel_shortlist"):
+                       "_travel_dm_lane_thread", "_submit_travel_shortlist"):
             assert helper not in names, f"a decorator was orphaned onto {helper}"
 
 
