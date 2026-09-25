@@ -347,6 +347,18 @@ def _reverify(p: st.Proposal, row: dict, read: Any, *, now: float,
         return "stale", f"it is no longer a clean candidate ({v.reason})", v
     if row.get("section") == cl.SECTION_B and (v.kind != cl.SECTION_B or v.reason != row.get("reason")):
         return "stale", "its class changed since the card", v
+    if row.get("section") == cl.SECTION_B:
+        # c1-false-inactive#0: the card disclosed these flags; archive only on the same
+        fresh = {**row, "history_complete": v.history_complete,
+                 "is_private": bool(meta.get("is_private")), "harrison_member": v.harrison_member}
+        if cards.threads_unchecked(fresh) != cards.threads_unchecked(row):
+            now_capped = cards.threads_unchecked(fresh)
+            return "stale", ("its older-thread check changed since the card ("
+                             + ("its history is now longer than 2,000 messages, so older threads "
+                                "go unchecked" if now_capped else "every thread is checked now")
+                             + ")"), v
+        if cards.private_not_member(fresh) != cards.private_not_member(row):
+            return "stale", "your membership of it changed since the card", v
     return "ok", "", v
 
 

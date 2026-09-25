@@ -350,3 +350,79 @@ def test_a_registry_row_that_cora_still_posts_to_says_so():
     body2 = "\n".join(texts(cards.render_page(f2, "chanarch-dddddddddddd", 1, now=NOW)[0]))
     assert body2.count("Cora/app posts in the last 90 days: 2") == 1
     assert "still posts here" not in body2
+
+
+class TestSecondaryDisclosuresOnEveryBRow:
+    """c1-false-inactive#0 (A4 / A1): a higher-ranked B reason must never hide that the
+    thread check was capped (threads_unchecked) or that Harrison is not a member of a
+    private channel (the d275085f always-disclose pattern), and a capped row never
+    claims 'no person posted' / 'N days since a person posted' as certain."""
+
+    def _capped_bot_traffic_row(self):
+        """The finding's exact channel, classified by the REAL classifier."""
+        from _chanarch_fakes import FakeSlack, chan, context, msg, no_sleep
+        from cora.channel_archive import scan as sc
+        cid = "C0CAPPED001"
+        meta = chan(cid, "fx-busy-cora-room")
+        hist = [msg(1 + i * 2, user="UCORABOT1") for i in range(30)]           # bot posts, days 1-59
+        hist += [msg(91 + i * 0.1) for i in range(2300)]                        # people, day 91 on
+        hist.append(msg(320, reply_count=4, latest_reply=f"{NOW - 10 * DAY:.6f}"))  # live old thread
+        fake = FakeSlack(channels=[meta], history={cid: hist})
+        v = cl.classify_channel(fake, meta, context(), now=NOW, sleep=no_sleep)
+        assert (v.kind, v.reason, v.history_complete) == (cl.SECTION_B, cl.B_BOT_TRAFFIC, False)
+        r = sc.row_from_verdict(meta, v)
+        r["tier"] = "T0"
+        return r
+
+    def test_a_capped_bot_traffic_row_discloses_unchecked_threads_and_drops_the_certainty(self):
+        r = self._capped_bot_traffic_row()
+        f = staged([r])
+        body = "\n".join(texts(cards.render_page(f, PID, 1, now=NOW)[0]))
+        assert "Older threads not checked" in body, body
+        assert "no person posted" not in body
+        assert "days since a person posted" not in body
+
+    @pytest.mark.parametrize("reason", [cl.B_REGISTRY, cl.B_KEEP_LIST, cl.B_UNARCHIVED_BEFORE,
+                                        cl.B_PRIVATE_NOT_MEMBER])
+    def test_every_b_reason_row_discloses_a_capped_thread_check(self, reason):
+        f = staged([row("C0BBBBBBB1", section="B", reason=reason, history_complete=False,
+                        unarchived_by="UPERSON01", unarchived_at=NOW - 100 * DAY)])
+        body = "\n".join(texts(cards.render_page(f, PID, 1, now=NOW)[0]))
+        assert body.count("Older threads not checked") == 1, body
+        assert "143 days since a person posted" not in body
+
+    def test_the_threads_unchecked_row_itself_says_it_once(self):
+        f = staged([row("C0BBBBBBB1", section="B", reason=cl.B_THREADS_UNCHECKED,
+                        history_complete=False)])
+        body = "\n".join(texts(cards.render_page(f, PID, 1, now=NOW)[0]))
+        assert body.count("Older threads not checked") == 1
+
+    @pytest.mark.parametrize("reason", [cl.B_REGISTRY, cl.B_LEX, cl.B_KEEP_LIST,
+                                        cl.B_UNARCHIVED_BEFORE, cl.B_BOT_TRAFFIC])
+    def test_private_not_member_is_disclosed_under_any_reason(self, reason):
+        f = staged([row("C0BBBBBBB1", section="B", reason=reason, is_private=True,
+                        harrison_member=False, lex=reason == cl.B_LEX, bot_posts=2,
+                        unarchived_by="UPERSON01", unarchived_at=NOW - 100 * DAY)])
+        body = "\n".join(texts(cards.render_page(f, PID, 1, now=NOW)[0]))
+        assert body.count("you are not a member") == 1, body
+
+    def test_a_member_or_public_or_complete_row_adds_nothing(self):
+        f = staged([row("C0BBBBBBB1", section="B", reason=cl.B_REGISTRY, is_private=True,
+                        harrison_member=True),
+                    row("C0BBBBBBB2", section="B", reason=cl.B_REGISTRY)])
+        body = "\n".join(texts(cards.render_page(f, PID, 1, now=NOW)[0]))
+        assert "Older threads not checked" not in body and "not a member" not in body
+        assert "143 days since a person posted" in body
+
+    def test_the_disclosures_pass_both_rails(self, monkeypatch, caplog):
+        caplog.set_level(logging.WARNING, logger=se.__name__)
+        r = self._capped_bot_traffic_row()
+        f = staged([r, row("C0BBBBBBB1", section="B", reason=cl.B_LEX, lex=True, is_private=True,
+                           harrison_member=None, history_complete=False)])
+        strings = texts(cards.render_page(f, PID, 1, now=NOW)[0])
+        for s in strings:
+            assert se.screen_phantom_write_claims(s, tool_use_count=0) == s, s
+            assert se.sanitize_text(s) == s, s
+        monkeypatch.setenv("CORA_SENTINEL_ENFORCE", "enforce")
+        for s in strings:
+            assert se.screen_phantom_write_claims(s, tool_use_count=0) == s, s

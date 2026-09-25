@@ -141,10 +141,30 @@ def _name_part(row: dict) -> str:
     return f"<#{cid}>  ({_esc(row.get('name') or '?')})"
 
 
+def threads_unchecked(row: dict) -> bool:
+    """A4 as a FLAG, not only a reason: phase 2 hit its 2,000-message cap, so a reply
+    under an older parent was never examined. Every section-A row read its history to
+    the end by construction; a B row carries ``history_complete`` from the scan."""
+    return row.get("section") == cl.SECTION_B and not row.get("history_complete")
+
+
+def private_not_member(row: dict) -> bool:
+    """A1: a private channel Harrison is not a member of (or membership unreadable)."""
+    return bool(row.get("is_private")) and row.get("harrison_member") is not True
+
+
+THREADS_UNCHECKED_LINE = ("Older threads not checked — history longer than 2,000 messages, so a "
+                          "reply there could be newer than the age shown.")
+PRIVATE_NOT_MEMBER_LINE = "Private, and you are not a member — its name may not show for you."
+
+
 def _fields_line(row: dict) -> str:
     bits: list[str] = []
     lp = row.get("last_person_days")
-    if lp is not None:
+    if lp is not None and threads_unchecked(row):
+        # a capped read found this post; an unchecked older thread could hold a newer reply
+        bits.append(f"last person post found {lp} days ago")
+    elif lp is not None:
         bits.append(f"{lp} days since a person posted")
     elif row.get("history_complete"):
         bits.append("no person has posted in its history")
@@ -172,11 +192,15 @@ def _fields_line(row: dict) -> str:
 
 def _b_line(row: dict) -> str:
     r = row.get("reason") or ""
+    capped = threads_unchecked(row)
     if r == cl.B_BOT_TRAFFIC:
         latest = row.get("bot_latest_days")
         tail = f", latest {latest} days ago" if latest is not None else ""
-        return (f"Cora/app posts in the last 90 days: {row.get('bot_posts') or 0}{tail} — no "
-                "person posted. Per-row only.")
+        # "no person posted" is backed only when every thread was checked (A4)
+        certainty = "" if capped else " — no person posted"
+        line = (f"Cora/app posts in the last 90 days: {row.get('bot_posts') or 0}{tail}"
+                f"{certainty}. Per-row only.")
+        return line + _secondary_lines(row, r)
     if r == cl.B_UNARCHIVED_BEFORE:
         by = row.get("unarchived_by") or ""
         who = f"<@{by}>" if by else "someone"
@@ -194,7 +218,19 @@ def _b_line(row: dict) -> str:
         tail = f", latest {latest} days ago" if latest is not None else ""
         line += (f"\nCora/app still posts here: {posts} in the last 90 days{tail} — archiving "
                  "would stop those posts landing.")
-    return line
+    return line + _secondary_lines(row, r)
+
+
+def _secondary_lines(row: dict, reason: str) -> str:
+    """c1-false-inactive#0: a higher-ranked reason never hides the A4 thread cap or a
+    private channel Harrison is not in -- every B row says both when they hold (the
+    d275085f always-disclose pattern). The primary reason's own line is not repeated."""
+    out = ""
+    if threads_unchecked(row) and reason != cl.B_THREADS_UNCHECKED:
+        out += "\n" + THREADS_UNCHECKED_LINE
+    if private_not_member(row) and reason != cl.B_PRIVATE_NOT_MEMBER:
+        out += "\n" + PRIVATE_NOT_MEMBER_LINE
+    return out
 
 
 def _decided_line(row: dict, state: dict, tier: str) -> str:

@@ -493,6 +493,63 @@ class TestDemotionHistoryA12:
             assert handler.button_tier(cards.ACTION_ROW, value) == "T0"
 
 
+BUSY = "C0BUSYBOT01"
+
+
+def _busy_history(older: int):
+    """30 Cora posts in the last 60 days, then *older* person messages from day 91 on."""
+    hist = [msg(1 + i * 2, user=BOT_UID) for i in range(30)]
+    return hist + [msg(91 + i * 0.1) for i in range(older)]
+
+
+class TestReverifySecondaryFlags:
+    """c1-false-inactive#0: the T1 re-verify of a B row requires the SAME thread-cap and
+    private-not-member flags the card disclosed -- a changed flag is stale_refused with
+    an honest reason, never an archive on a card that showed something else."""
+
+    def _stage_busy(self, *, capped: bool):
+        row = _row(BUSY, "fx-busy-room", section="B", reason="bot_traffic", tier="T1",
+                   bot_posts=30, bot_latest_days=1)
+        row["history_complete"] = not capped
+        row["last_person_days"] = 91
+        stage(tier="T1", rows=[row])
+
+    def test_matching_capped_flags_proceed(self, fake, armed):
+        fake.channels.append(chan(BUSY, "fx-busy-room"))
+        fake.history[BUSY] = _busy_history(2300)
+        self._stage_busy(capped=True)
+        r = tap(cards.ACTION_OVERRIDE, f"{PID}:{BUSY}:T1")
+        assert r.outcome == "archived", r.msg
+
+    def test_a_card_that_said_capped_but_now_reads_complete_is_stale(self, fake, armed):
+        fake.channels.append(chan(BUSY, "fx-busy-room"))
+        fake.history[BUSY] = _busy_history(100)
+        self._stage_busy(capped=True)
+        r = tap(cards.ACTION_OVERRIDE, f"{PID}:{BUSY}:T1")
+        assert r.outcome == "stale_refused" and "older-thread check changed" in r.msg, r.msg
+        assert "conversations_archive" not in fake.method_names() and not fake.posts
+
+    def test_a_card_that_said_complete_but_now_reads_capped_is_stale(self, fake, armed):
+        fake.channels.append(chan(BUSY, "fx-busy-room"))
+        fake.history[BUSY] = _busy_history(2300)
+        self._stage_busy(capped=False)
+        r = tap(cards.ACTION_OVERRIDE, f"{PID}:{BUSY}:T1")
+        assert r.outcome == "stale_refused" and "older-thread check changed" in r.msg, r.msg
+        assert "conversations_archive" not in fake.method_names() and not fake.posts
+
+    def test_a_membership_change_on_a_private_row_is_stale(self, fake, armed):
+        row = _row(B1, "fx-registry-quiet", section="B", reason="registry", tier="T1",
+                   is_private=True)
+        row["harrison_member"] = False                    # the card said: not a member
+        fake.channels[:] = [c for c in fake.channels if c["id"] != B1]
+        fake.channels.append(chan(B1, "fx-registry-quiet", private=True))
+        fake.members[B1] = [HARRISON, PERSON]             # ...he is one now
+        stage(tier="T1", rows=[row])
+        r = tap(cards.ACTION_OVERRIDE, f"{PID}:{B1}:T1")
+        assert r.outcome == "stale_refused" and "membership" in r.msg, r.msg
+        assert "conversations_archive" not in fake.method_names()
+
+
 class TestFreshAge:
     def test_the_notice_and_intent_carry_the_age_at_tap_time_not_the_cards(self, fake, armed):
         row = _row(A1, "fx-dead-one", tier="T1")
@@ -618,4 +675,20 @@ class TestRoundOneRepliesPassTheRails:
         out += [tap(cards.ACTION_ROW, f"chanarch-000000000011:{A1}:T1", now=NOW + 3).msg,
                 tap(cards.ACTION_ALL, "chanarch-000000000011:p1:T1", now=NOW + 3).msg]
         assert not fake.posts
+        _assert_rails(out, monkeypatch, caplog)
+
+    def test_secondary_flag_stale_replies(self, fake, armed, monkeypatch, caplog):
+        out = []
+        for older, capped in ((100, True), (2300, False)):
+            st.store_path().unlink(missing_ok=True)
+            fake.channels[:] = [c for c in fake.channels if c["id"] != BUSY]
+            fake.channels.append(chan(BUSY, "fx-busy-room"))
+            fake.history[BUSY] = _busy_history(older)
+            TestReverifySecondaryFlags()._stage_busy(capped=capped)
+            r = tap(cards.ACTION_OVERRIDE, f"{PID}:{BUSY}:T1")
+            assert r.outcome == "stale_refused"
+            out.append(r.msg)
+            blocks, text = cards.render_page(st.fold(now=NOW + 20), PID, 1, now=NOW + 20)
+            out += [e["text"] for b in blocks if b.get("type") == "section"
+                    for e in [b["text"]]] + [text]
         _assert_rails(out, monkeypatch, caplog)
