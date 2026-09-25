@@ -335,8 +335,8 @@ def _norm(text: str) -> str:
 # UNCAPPED (a noun past 1,000 chars still counts) with markdown control characters
 # folded too -- Slack sends "B&amp;B", an en dash in "short–term" and "_hotels_",
 # and the raw-text regex this replaced could match none of them:
-#   STRONG terms always withhold -- lodging nouns, hotel brands, loyalty terms (a
-#     loyalty number travels with a brand or program name, not a generic noun);
+#   STRONG terms always withhold -- lodging nouns, hotel brands, loyalty terms, a
+#     loyalty/account NUMBER (digit-anchored, D-051 r2) and a NAMED property;
 #   WEAK nouns (room, suite, rental, condo, resort, inn, stay ...) withhold only with
 #     a CUE -- a date, an allowlisted area, or a stay verb -- so "full suite green"
 #     or "as a last resort" in Cora's own prose no longer blacks out web.
@@ -346,20 +346,77 @@ def _norm(text: str) -> str:
 _MD_FOLD = str.maketrans({c: " " for c in "_*~`<>|"})
 _WB, _WE = r"(?<![a-z0-9])", r"(?![a-z0-9])"
 _LOYALTY_HEAD = r"(?:loyalty|rewards?|member(?:ship)?|honors|points)"
+# D-051 r2 (c2-egress#1): a loyalty/account NUMBER is anchored on its digits, not on a
+# connector word -- "Honors 482915736", "honors: 482915736", "honors#482915736", "member
+# no 482915736", "Membership No: 482915736". A program word, <= 3 closed connectors,
+# then a 5+ digit run; a bare account/acct needs 6+ digits (a QBO chart-of-accounts
+# code is 4-5 -- "account 10100" is not an identifier). Linear: every connector
+# iteration consumes a closed word, the separator runs are bounded.
+_ID_CONNECTOR = r"(?:[ :#.-]{0,3}(?:no|nos|num|number|numbers|id|ids|is|acct|account|accounts)(?![a-z]))"
 _LODGING_STRONG_RE = re.compile(
     _WB + r"(?:hotels?|motels?|hostels?|air ?bnbs?|vrbos?|b ?& ?bs?|bnbs?|lodgings?"
     r"|accommodations?|(?:vacation|holiday|short-? ?term) (?:rentals?|homes?|houses?|condos?)"
     r"|(?:places?|somewhere|where) to (?:stay|crash|sleep)"
     r"|hilton|marriott|hyatt|ihg|holiday inn|hampton inn|westin|sheraton|courtyard by marriott"
     r"|doubletree|embassy suites|four seasons|ritz-? ?carlton|fairmont|kimpton|omni hotels?"
-    r"|bonvoy|world of hyatt|" + _LOYALTY_HEAD + r" (?:numbers?|accounts?|acct|ids?))" + _WE
+    r"|bonvoy|world of hyatt|" + _LOYALTY_HEAD + r" (?:numbers?|accounts?|acct|ids?)"
+    # D-051 r2 (c2-egress#1 / c2-trigger#7): the brands a Phoenix-based team books
+    # (Best Western is headquartered here), their programs, the sites and the lodging
+    # words the first cut missed. "omni" never in "omni-channel".
+    r"|best western|la quinta|wyndham|radisson|choice privileges|omni(?![- ]?channel)|andaz"
+    r"|sonesta|accor|residence inn|springhill suites|fairfield inn|homewood suites|home2 suites"
+    r"|towneplace suites|candlewood suites|staybridge suites|w scottsdale|loews|le meridien"
+    r"|st\.? regis|guest ?houses?|timeshares?|glamping|furnished (?:apartments?|rentals?|homes?"
+    r"|condos?)|booking\.com|expedia|priceline|trivago|kayak\.com"
+    r"|where (?:[a-z']{1,30} ){1,3}(?:can|could|will|would|should|might) (?:sleep|crash))" + _WE
     + r"|" + _WB + _LOYALTY_HEAD + r" (?:no\.|#)"
+    + r"|" + _WB + r"(?:" + _LOYALTY_HEAD + r"|bonvoy)" + _ID_CONNECTOR + r"{0,3}[ :#.-]{0,3}\d{5}"
+    + r"|" + _WB + r"(?:accounts?|acct)" + _ID_CONNECTOR + r"{0,3}[ :#.-]{0,3}\d{6}"
 )
 _LODGING_WEAK_RE = re.compile(
     _WB + r"(?:rooms?|suites?|rentals?|condos?|villas?|cabins?|lodges?|casitas?|resorts?|inns?"
     r"|stays?|bedrooms?|(?:houses?|homes?) (?:to|for) (?:rent|stay)"
-    r"|(?:rent|rental|renting) (?:an? |the )?(?:houses?|homes?))" + _WE
+    r"|(?:rent|rental|renting) (?:an? |the )?(?:houses?|homes?)"
+    # D-051 r2 (c2-egress#1 / c2-trigger#7): cue-gated like condo -- and never the
+    # real-estate compounds HJRP asks about ("the apartment complex in Mesa").
+    r"|(?:apartments?|town ?houses?|town ?homes?)(?![a-z0-9])(?! (?:complex|complexes|buildings?"
+    r"|units?|portfolios?|deals?|communit(?:y|ies)|developments?|projects?|owners?|market|leasing"
+    r"|rent roll|builders?)(?![a-z0-9])))" + _WE
 )
+# D-051 r2 (c2-egress#0, ruled SPLIT -> fix): resort / inn / suites are STRONG when they
+# HEAD A NAMED PROPERTY ("the Phoenician resort", "Hermosa Inn", "Canyon Suites") or sit
+# in a LODGING FRAME ("a suite at the Sanctuary", "staying at the Boulders"); the
+# idioms and software/office senses stay weak ("last resort", "G Suite", "Adobe
+# Creative Suite", "office suite", "suite of tools", "resort to"). resort/inn read
+# case-insensitively (neither has a common non-lodging sense once the idioms are out);
+# plural "Suites" needs a Title-case name (software/test/office suites are common
+# nouns); singular "suite" counts only in the frame. Read on the CASED fold.
+_NOT_A_NAME = frozenset((
+    "a an the this that these those our my your their his her its some any no every each "
+    "which what whose both all many few several most other another such at in on of for to "
+    "from by with near into onto and or but nor as is was be been are were it we i you they "
+    "he she them us me not never would will can could should might must may shall do did "
+    "does had has have one two three four five six seven eight nine ten last first only "
+    "final lone sole").split())
+_NOT_A_SUITES_NAME = _NOT_A_NAME | frozenset((
+    "test tests unit integration regression product products software office offices tool "
+    "tools app apps security business sales marketing analytics full entire whole creative "
+    "adobe microsoft google g cloud productivity executive medical dental retail commercial "
+    "vacant leasing lease").split())
+_PROPERTY_RE = re.compile(r"(?<![A-Za-z0-9'&])(?=([A-Za-z][A-Za-z0-9'&]{0,30}) "
+                          r"(resorts?|inns?|suites)(?![A-Za-z0-9]))", re.IGNORECASE)
+_TO_AFTER_RE = re.compile(r" to(?![A-Za-z0-9])", re.IGNORECASE)
+# The frame: stay/suite/night "at (the) <Name>"; room/book "at THE <Name>" and never a
+# meeting-space room ("the board room at HQ", "conference rooms at the Biltmore" in
+# Cora's own calendar prose) or a bare system ("the booking at Deposco").
+_LODGING_AT_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:(?i:stay|stays|staying|stayed|suites?|nights?) (?i:at) (?:(?i:the) )?"
+    r"|(?<!(?i:board) )(?<!(?i:conference) )(?<!(?i:meeting) )(?<!(?i:break) )(?<!(?i:war) )"
+    r"(?<!(?i:server) )(?<!(?i:living) )(?<!(?i:dining) )(?<!(?i:green) )(?<!(?i:press) )"
+    r"(?<!(?i:locker) )(?<!(?i:waiting) )(?<!(?i:mail) )(?<!(?i:reading) )(?<!(?i:media) )"
+    r"(?<!(?i:common) )(?<!(?i:storage) )(?<!(?i:supply) )(?<!(?i:team) )"
+    r"(?i:rooms?|book|booked|booking) (?i:at) (?i:the) )"
+    r"(?!(?:HQ|Home|Work|Office|Zoom|Slack|Google)(?![A-Za-z0-9]))[A-Z][A-Za-z0-9'&]{1,30}")
 # The CUES. A stay verb ("stay"/"stays" is also a WEAK noun -- one word never both
 # names the lodging and cues it). A date: any month-day or m/d shape (ranges
 # contain one), a night count or a near-term stay phrase.
@@ -377,20 +434,59 @@ _DATE_CUE_RE = re.compile(
 )
 
 
-def _loose_views(text: Any) -> tuple[str, str]:
+def _loose_views_cased(text: Any) -> tuple[str, str]:
     """(body, token_innards): _clean's folding WITHOUT the cap -- Slack <...> tokens
     become spaces in the body (their innards, e.g. a pasted listing link's URL and
     label, are the second view), the three entities are unescaped, typographic
-    dashes/quotes and markdown control characters fold, whitespace collapses."""
+    dashes/quotes and markdown control characters fold, whitespace collapses. CASE IS
+    KEPT (the named-property rule reads a Title-case name); _loose_views lowercases."""
     raw = str(text or "")
     inner = " ".join(_SLACK_TOKEN_RE.findall(raw))
     body = _SLACK_TOKEN_RE.sub(" ", raw)
 
     def fold(t: str) -> str:
         t = t.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-        return " ".join(t.translate(_TRANSLATE).translate(_MD_FOLD).split()).lower()
+        return " ".join(t.translate(_TRANSLATE).translate(_MD_FOLD).split())
 
     return fold(body), fold(inner)
+
+
+def _loose_views(text: Any) -> tuple[str, str]:
+    body, inner = _loose_views_cased(text)
+    return body.lower(), inner.lower()
+
+
+def _named_property(cased: str) -> bool:
+    """resort / inn / suites heading a named property, or a lodging frame "<stay|
+    room|suite|night|book> at (the) <Name>" (D-051 r2 c2-egress#0). *cased* is one
+    _loose_views_cased view."""
+    if _LODGING_AT_RE.search(cased):
+        return True
+    for m in _PROPERTY_RE.finditer(cased):
+        word, head = m.group(1), m.group(2).lower()
+        w = word.lower()
+        if head == "suites":
+            if word[0].isupper() and w not in _NOT_A_SUITES_NAME:
+                return True
+        elif w not in _NOT_A_NAME:
+            if head.startswith("resort") and _TO_AFTER_RE.match(cased, m.end(2)):
+                continue                        # the verb: "managers resort to spreadsheets"
+            return True
+    return False
+
+
+def _strong_view(cased: str) -> bool:
+    return bool(_LODGING_STRONG_RE.search(cased.lower()) or _named_property(cased))
+
+
+def is_lodging_strong(text: Any) -> bool:
+    """The STRONG tier alone -- lodging nouns, brands, loyalty numbers, a named
+    property. B1's prior-turn leg reads CORA's own turns with this (D-051 r2
+    c2-egress#2): her relay of "the hotel for Jordan" or "Hilton Honors 482915736"
+    withholds; her "Full suite green ... Sep 24" (a weak noun + a date) does not."""
+    if not text:
+        return False
+    return any(v and _strong_view(v) for v in _loose_views_cased(text))
 
 
 def _weak_with_cue(t: str) -> bool:
@@ -414,8 +510,8 @@ def is_lodging_shaped(text: Any) -> bool:
     loose; pinned over the MUST_FIRE asks in Slack wire form)."""
     if not text:
         return False
-    for view in _loose_views(text):
-        if view and (_LODGING_STRONG_RE.search(view) or _weak_with_cue(view)):
+    for view in _loose_views_cased(text):
+        if view and (_strong_view(view) or _weak_with_cue(view.lower())):
             return True
     return _is_strict_ask(text)
 
