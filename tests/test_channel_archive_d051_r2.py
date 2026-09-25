@@ -211,3 +211,97 @@ class TestNoticeReadBackNeverMissesAStandingNotice:
         _prior_attempt(cid, NOW - 1 * DAY, "archived (reconciled)")
         assert handler._prior_attempt_ts(cid, NOW) is None
         assert handler._prior_attempt_ts("C0OTHER0001", NOW) is None
+
+
+# ── r2:c1-authority-tier#1 ─────────────────────────────────────────────────────────
+def _mark_recheck(fake, monkeypatch):
+    """Wrap (never replace) the REAL A12 re-check so its position among the Slack calls
+    is visible in fake.calls."""
+    real = gates.pre_notice_check
+
+    def _marked():
+        fake.calls.append(("pre_notice_check", {}))
+        return real()
+    monkeypatch.setattr(gates, "pre_notice_check", _marked)
+
+
+def _during_notice_read(fake, side_effect):
+    real = fake.conversations_history
+
+    def _hist(channel, oldest=None, latest=None, limit=100, cursor=None, inclusive=False, **kw):
+        if _is_notice_read(oldest, latest):
+            side_effect()
+        return real(channel, oldest=oldest, latest=latest, limit=limit, cursor=cursor,
+                    inclusive=inclusive)
+    fake.conversations_history = _hist
+
+
+def _notice_index(fake):
+    return next(n for n, c in enumerate(fake.calls)
+                if c[0] == "chat_postMessage" and c[1]["text"].startswith(cards.NOTICE_PREFIX))
+
+
+class TestTheA12RecheckIsImmediatelyBeforeTheWrite:
+
+    def test_first_attempt_nothing_sits_between_the_recheck_and_the_notice(self, fake, armed,
+                                                                           monkeypatch):
+        stage([_row(A1, "fx-dead-one")])
+        _mark_recheck(fake, monkeypatch)
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
+        assert r.outcome == "archived", r.msg
+        i = _notice_index(fake)
+        assert fake.calls[i - 1][0] == "pre_notice_check", fake.method_names()[:i + 1]
+
+    def test_a_retry_rechecks_after_the_notice_read_back(self, fake, armed, monkeypatch):
+        stage([_row(A1, "fx-dead-one")])
+        _prior_attempt(A1, NOW + 5, "failed:restricted_action")
+        _mark_recheck(fake, monkeypatch)
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1", now=NOW + 100)
+        assert r.outcome == "archived" and len(_notices_to(fake, A1)) == 1, r.msg
+        i = _notice_index(fake)
+        assert fake.calls[i - 1][0] == "pre_notice_check", fake.method_names()[:i + 1]
+
+    def test_a_reused_notice_rechecks_immediately_before_the_archive(self, fake, armed, monkeypatch):
+        stage([_row(A1, "fx-dead-one")])
+        _prior_attempt(A1, NOW + 5, "notice_indeterminate:timeout")
+        fake.history[A1].insert(0, _notice_msg(NOW + 5.5))
+        _mark_recheck(fake, monkeypatch)
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1", now=NOW + 100)
+        assert r.outcome == "archived" and "not posted twice" in r.msg, r.msg
+        i = fake.method_names().index("conversations_archive")
+        assert fake.calls[i - 1][0] == "pre_notice_check", fake.method_names()[:i + 1]
+
+    def test_a_demotion_written_during_the_read_back_stops_the_notice(self, fake, armed):
+        from datetime import datetime, timedelta, timezone
+        stage([_row(A1, "fx-dead-one")])
+        _prior_attempt(A1, NOW + 5, "failed:restricted_action")
+        since = datetime.fromtimestamp(NOW + 50, timezone(timedelta(hours=-7))).isoformat()
+        _during_notice_read(fake, lambda: st.write_demotion(
+            {"since": since, "channel_id": "C0ROGUE0001", "archive_ts": "1790.1",
+             "reason": "an archive by Cora with no tap-attributed ledger intent"}, dry_run=False))
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1", now=NOW + 100)
+        assert r.outcome == "refused_transient" and "demoted" in r.msg, r.msg
+        assert _notices_to(fake, A1) == [] and "conversations_archive" not in fake.method_names()
+        assert st.read_ledger()[-1]["outcome"].startswith("not_attempted:")
+        assert state(A1, now=NOW + 200)["state"] == st.OPEN
+
+    def test_a_card_demoted_during_the_read_back_stops_the_notice(self, fake, armed):
+        """A demotion seen (and perhaps already cleared) while this attempt read Slack:
+        the card's own history makes it T0 for good -- no notice, no archive."""
+        stage([_row(A1, "fx-dead-one")])
+        _prior_attempt(A1, NOW + 5, "failed:restricted_action")
+        _during_notice_read(fake, lambda: st.append_event(st.DEMOTED_SEEN, proposal_id=PID,
+                                                          ts=NOW + 101))
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1", now=NOW + 100)
+        assert r.outcome == "refused_transient" and "demoted after this card" in r.msg, r.msg
+        assert _notices_to(fake, A1) == [] and "conversations_archive" not in fake.method_names()
+
+    def test_a_registry_rollback_during_the_read_back_stops_a_reused_archive(self, fake, armed):
+        stage([_row(A1, "fx-dead-one")])
+        _prior_attempt(A1, NOW + 5, "notice_indeterminate:timeout")
+        fake.history[A1].insert(0, _notice_msg(NOW + 5.5))
+        _during_notice_read(fake, lambda: armed.write_text(
+            "lanes:\n  - lane: slack-channel-archive\n    tier: T0\n", encoding="utf-8"))
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1", now=NOW + 100)
+        assert r.outcome == "refused_transient" and "ladder registry" in r.msg, r.msg
+        assert "conversations_archive" not in fake.method_names() and _notices_to(fake, A1) == []

@@ -14,10 +14,11 @@ re-render the page from the store); every correctness promise lives HERE:
      writes nothing and the buttons stay.
   5. THE ARCHIVE PATH (a T1 row whose gate says ARCHIVE):
        claim -> live re-verify with the ONE classifier on a fresh context (A5) ->
-       tier re-check -> ledger INTENT (fsynced; a failed write refuses) -> no-network
-       pre-notice re-check -> the one-line NOTICE in the channel -> conversations.archive
-       on a no-retry client -> a conversations.info READ-BACK -> ledger outcome +
-       store event.
+       tier re-check -> ledger INTENT (fsynced; a failed write refuses) -> (a retry
+       only) the read-back of the channel's newest lane line -> the no-network A12
+       re-check, after every read -> the one-line NOTICE in the channel ->
+       conversations.archive on a no-retry client -> a conversations.info READ-BACK ->
+       ledger outcome + store event.
      "Archived" is said ONLY after archive returned ok, the read-back showed the
      channel archived, and the intent row had landed. A timeout gets ONE read-back
      (A16); an indeterminate result is UNKNOWN (locked; the nightly monitor
@@ -555,6 +556,24 @@ def _notice_still_standing(read: Any, cid: str, bot_uid: str, bot_id: str, since
         return None
 
 
+def _pre_write_recheck(pid: str, now: float) -> tuple[bool, str]:
+    """A12's re-check IMMEDIATELY before the first channel write: gates.pre_notice_check
+    (live registry tier + acting tier + the demotion file) AND the card's demotion
+    history (a demotion written AND cleared while this attempt was reading Slack still
+    makes the card T0 for good). No network: the registry, the flag and the store are
+    all local reads."""
+    ok, why = gates.pre_notice_check()
+    if not ok:
+        return ok, why
+    f = st.fold(now=now)
+    p = f.proposals.get(pid)
+    if not f.ok or p is None:
+        return False, "I couldn't re-read my proposal store a moment ago"
+    if p.demoted:
+        return False, gates.DEMOTED_AFTER_CARD
+    return True, ""
+
+
 def _archive_one(p: st.Proposal, row: dict, actor: str, *, now: float,
                  sleep: Callable[[float], None] | None, override: bool,
                  read: Any, write: Any = None) -> tuple[TapResult, str | None]:
@@ -617,10 +636,6 @@ def _archive_one(p: st.Proposal, row: dict, actor: str, *, now: float,
         return TapResult("failed", ("Nothing was done: the archive ledger write failed, and an "
                                     "archive the ledger can't show never happens. The buttons "
                                     "stay."), pid), None
-    ok2, why2 = gates.pre_notice_check()
-    if not ok2:
-        _finish(p, row, actor, now, f"not_attempted:{why2}", store_event="released", release=True)
-        return TapResult("refused_transient", f"Nothing was archived — {why2}.", pid), None
     try:
         write = write if write is not None else clients.write_client()
     except Exception as exc:  # noqa: BLE001
@@ -646,6 +661,14 @@ def _archive_one(p: st.Proposal, row: dict, actor: str, *, now: float,
                                         "check, so I posted nothing. The buttons stay; tap "
                                         "again."), pid), None
         reused = standing
+    # A12: the registry / acting-tier / demotion re-check -- and the card's own demotion
+    # history -- IMMEDIATELY before the first channel write (the notice, or the archive
+    # when an earlier notice stands), after EVERY network read of this attempt
+    # (r2:c1-authority-tier#1). Local reads only; nothing sits between it and the write.
+    ok2, why2 = _pre_write_recheck(pid, clock)
+    if not ok2:
+        _finish(p, row, actor, now, f"not_attempted:{why2}", store_event="released", release=True)
+        return TapResult("refused_transient", f"Nothing was archived — {why2}.", pid), None
     if not reused:
         try:
             write.chat_postMessage(channel=cid, text=cards.notice_text(age, actor),

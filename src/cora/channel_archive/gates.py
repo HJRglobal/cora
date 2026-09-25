@@ -119,7 +119,9 @@ def tap_gate(row: dict, client: Any, *, scopes: frozenset | None = None,
 
 
 def pre_notice_check() -> tuple[bool, str]:
-    """The no-network re-check IMMEDIATELY before the in-channel notice (A12)."""
+    """The no-network re-check IMMEDIATELY before the first in-channel write -- the
+    notice, or the archive when an earlier notice still stands (A12). The handler runs
+    it after every network read of the attempt (r2:c1-authority-tier#1)."""
     if policy.is_demoted():
         return False, "the lane was demoted a moment ago"
     if policy.mode() != "act":
