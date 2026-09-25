@@ -704,7 +704,8 @@ def _find_write_claim(text: str, user_texts: Any = ()) -> tuple[str, str] | None
 #
 # THE SNIPPET: the FULL reply is scrubbed first (mojibake repair, a SILENT sentinel
 # delete -- never scrub_write_sentinels, which logs a sentinel-egress-leak line and
-# would double-count that rail -- bare-URL/GID/long-id redaction, banking-identifier
+# would double-count that rail -- API-token-shape redaction (Code #15 S1, BEFORE the
+# id pass), bare-URL/GID/long-id redaction, banking-identifier
 # redaction), then the hit is re-located and windowed, because the banking redactor
 # keys on a cue up to 40 chars from the value and a window cut first could strand a
 # bare routing number. WITHHELD entirely ("[LEX — withheld]") in LEX scope, on a
@@ -769,6 +770,12 @@ def _append_rail_row(row: dict) -> bool:
 def _scrub_for_snippet(text: str) -> str:
     t = repair_mojibake(text)
     t = _SENTINEL_ANY_RE.sub("", t)                 # SILENT: never log a sentinel line here
+    # Code #15 S1 (cq-d9d0c92cc797): API-token shapes FIRST -- before the long-id
+    # redaction below, which strips a token's digit segments and would leave a
+    # shape the token regex no longer matches (the secret tail surviving), the
+    # same ordering rule as tokens-before-banking.
+    from .secret_tokens import redact_secret_tokens  # lazy
+    t, _n = redact_secret_tokens(t)
     t = redact_links_and_ids(t)
     from .banking_identifiers import redact_banking_identifiers  # lazy
     t, _n = redact_banking_identifiers(t)

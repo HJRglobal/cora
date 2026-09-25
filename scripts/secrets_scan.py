@@ -8,7 +8,7 @@ the Founder-OS packet + report before they are filed (kickoff smoke #5).
 WHAT IT FLAGS
   1. Known token SHAPES (Slack xox*/xapp, Google API keys + OAuth refresh/access tokens,
      Anthropic/OpenAI sk-, AWS AKIA, GitHub ghp_, Shopify shpat_, Airtable pat..., Asana
-     PATs `<n>/<16 digits>:<32 alnum>`, healthchecks ping URLs, Slack/Make webhook URLs,
+     PATs v1 `<n>/<gid>:<32 alnum>` + v2 `<n>/<gid>/<gid>:<32 alnum>`, healthchecks ping URLs, Slack/Make webhook URLs,
      PEM private keys) -- minus obvious PLACEHOLDERS (your/paste/example/xxx/dummy/test/
      redacted/here/changeme/placeholder).
   2. A `KEY=value` line whose KEY is documented in .env.example and whose value is not a
@@ -61,7 +61,11 @@ SHAPES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("github-token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}")),
     ("shopify-token", re.compile(r"\bshp(?:at|ca|pa|ss)_[a-f0-9]{32}\b")),
     ("airtable-pat", re.compile(r"\bpat[A-Za-z0-9]{14}\.[a-f0-9]{64}\b")),
-    ("asana-pat", re.compile(r"\b\d/\d{16}:[A-Za-z0-9]{32}\b")),
+    # Asana PAT v1 `<n>/<gid>:<32>` AND v2 `<n>/<gid>/<gid>:<32>` (Code #15 S1: the pre-S1
+    # `\b\d/\d{16}:...` shape missed v2 -- the exact 9/11 paste). Left edge "not a digit" (a
+    # letter / JSON escape may precede), gid 10-20 digits: a superset of
+    # cora.secret_tokens' asana leg (tests/test_secret_tokens.py drift test binds the two).
+    ("asana-pat", re.compile(r"(?<![0-9])\d/\d{10,20}(?:/\d{10,20})?:[A-Za-z0-9]{32}(?![A-Za-z0-9])")),
     ("healthchecks-ping", re.compile(r"hc-ping\.com/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")),
     ("pem-private-key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
     ("hubspot-private-app", re.compile(r"\bpat-(?:na|eu)\d-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")),

@@ -14,7 +14,9 @@ import time
 from pathlib import Path
 
 from cora import historical_access, user_notes, phi_guard, org_roles, drive_io
-from cora import banking_identifiers  # I1 (cq-c89cfab00b1f): chunk-egress redaction
+# I1 (cq-c89cfab00b1f) banking-identifier belt + Code #15 S1 (cq-d9d0c92cc797) API-token
+# shapes: ONE composed chunk-egress helper (tokens FIRST, then banking_identifiers).
+from cora import secret_tokens
 from cora.dynamic_answers import available_dynamic_entities, load_dynamic_answers
 from . import email_citation  # S1: shared email citation
 
@@ -1027,7 +1029,8 @@ def _format_kb_chunks(chunks: list) -> str:
         # I1 / D-051 lens F: the title is an email subject or a file name and can
         # carry the same identifiers as the body -- it rides in the header, the
         # link label and the WARN line, so it goes through the same redactor.
-        title, n_title = banking_identifiers.redact_banking_identifiers(r.title or r.source_id)
+        # Code #15 S1: the composed belt -- API-token shapes FIRST, then banking.
+        title, n_title, n_title_tok = secret_tokens.redact_chunk_egress(r.title or r.source_id)
 
         # Wrap deep_link as Slack mrkdwn if it's a bare URL (computer:// or https://)
         if r.deep_link:
@@ -1087,12 +1090,20 @@ def _format_kb_chunks(chunks: list) -> str:
         # the ONE renderer every retrieval consumer goes through (main path,
         # cross-entity fallback, MCP text), so the belt cannot be bypassed by a
         # new caller. n == 0 is a byte-identical pass-through.
-        body, n_body = banking_identifiers.redact_banking_identifiers(r.content.strip())
+        body, n_body, n_body_tok = secret_tokens.redact_chunk_egress(r.content.strip())
         n_redacted = n_body + n_title
         if n_redacted:
             log.warning(
                 "banking-identifier redaction: %d identifier(s) redacted from chunk %s | %s",
                 n_redacted, r.source, title,   # `title` is already redacted
+            )
+        # Code #15 S1: a SEPARATE trace for token shapes, keyed on the chunk id --
+        # never the title (D-082: the one live at-rest target is a LEX row).
+        n_tok = n_body_tok + n_title_tok
+        if n_tok:
+            log.warning(
+                "api-token redaction: %d token(s) redacted from chunk %s | %s",
+                n_tok, r.source, getattr(r, "chunk_id", "") or "?",
             )
         lines.append(body)
         lines.append("")

@@ -55,6 +55,24 @@ class TestShapes:
         ])
         assert ss.scan_text(fake, "x.md", env_keys=_KEYS) == []
 
+    def test_asana_pat_v1_and_v2_are_hits(self):
+        """Code #15 S1: the pre-S1 `\\b\\d/\\d{16}:...` shape missed the REAL v2 format
+        `2/<gid>/<gid>:<32>` -- the exact 9/11 paste -- so the DR/VM secrets gate had a
+        false negative on the incident shape. Assembled (the hook greps staged files)."""
+        d16a, d16b = "1204" + "567890123456", "1205" + "678901234567"
+        hex32 = "0123456789abcdef" * 2
+        for tok in ("2/" + d16a + "/" + d16b + ":" + hex32,      # v2 (the 9/11 shape)
+                    "1/" + d16a + ":" + hex32,                    # v1
+                    "PAT" + "2/" + d16a + "/" + d16b + ":" + hex32,   # a letter glued in front
+                    "\\n" + "2/" + d16a + "/" + d16b + ":" + hex32):  # a JSON-escaped newline
+            hits = ss.scan_text("pat: " + tok, "x.md", env_keys=set())
+            assert [h.key for h in hits] == ["asana-pat"], tok[:6]
+        # an Asana task URL (the gid ends in 2, followed by /<gid>/) is not a PAT;
+        # assembled so this file does not trip the hook's own prefix screen
+        url = "https://app.asana.com/0/1204525841563032" + "/" + "1218516997344812/f"
+        assert ss.scan_text(url, "x.md", env_keys=set()) == []
+        assert ss.scan_text("2/" + d16a + "/" + d16b + ":abc", "x.md", env_keys=set()) == []
+
     def test_env_assignment_rule(self):
         text = "\n".join([
             "OPENAI_API_KEY=<value>",                  # placeholder

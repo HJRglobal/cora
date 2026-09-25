@@ -72,7 +72,11 @@ def _i1_present() -> str | None:
     except Exception as exc:  # noqa: BLE001
         return f"I1 module missing on this tree ({exc})"
     src = (_REPO_ROOT / "src" / "cora" / "context_loader.py").read_text(encoding="utf-8")
-    if "banking_identifiers.redact_banking_identifiers" not in src:
+    # Code #15 S1 (cq-d9d0c92cc797): the renderer now reaches banking_identifiers through
+    # the composed chunk-egress helper (API-token shapes first, then banking) -- either
+    # wiring is the I1 belt.
+    if ("banking_identifiers.redact_banking_identifiers" not in src
+            and "secret_tokens.redact_chunk_egress" not in src):
         return "I1 renderer wiring missing in context_loader.py"
     return None
 

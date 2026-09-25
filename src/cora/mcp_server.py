@@ -68,7 +68,7 @@ from pathlib import Path
 from typing import Any
 
 from cora import context_loader as cl
-from cora import banking_identifiers, drive_io, historical_access
+from cora import drive_io, historical_access, secret_tokens
 from cora.knowledge_base import embeddings
 from cora.knowledge_base.store import KnowledgeBase
 
@@ -206,13 +206,17 @@ def _result_dict(r: Any) -> dict[str, Any]:
     # 9/4 probe leaked through -- redact here too (the `text` rendering goes
     # through context_loader._format_kb_chunks, which redacts on its own). The
     # deep link is untouched so the consumer can open the source document.
-    content, n_body = banking_identifiers.redact_banking_identifiers(
+    # Code #15 S1 (cq-d9d0c92cc797): the composed belt -- API-token shapes FIRST,
+    # then banking. `banking_redactions` still counts banking identifiers ONLY;
+    # tokens are the additive `token_redactions` field.
+    content, n_body, n_body_tok = secret_tokens.redact_chunk_egress(
         (getattr(r, "content", "") or "").strip()
     )
-    title, n_title = banking_identifiers.redact_banking_identifiers(
+    title, n_title, n_title_tok = secret_tokens.redact_chunk_egress(
         getattr(r, "title", "") or getattr(r, "source_id", "")
     )
     n_redacted = n_body + n_title
+    n_tok = n_body_tok + n_title_tok
     if n_redacted:
         # INFO, not WARN: the `text` rendering of the same rows goes through
         # context_loader._format_kb_chunks, which already WARNs once per chunk
@@ -220,6 +224,12 @@ def _result_dict(r: Any) -> dict[str, Any]:
         log.info(
             "MCP banking-identifier redaction: %d identifier(s) redacted from chunk %s | %s",
             n_redacted, getattr(r, "source", ""), title,
+        )
+    if n_tok:
+        # Same INFO-not-WARN rule; keyed on the chunk id, never the title (D-082).
+        log.info(
+            "MCP api-token redaction: %d token(s) redacted from chunk %s | %s",
+            n_tok, getattr(r, "source", ""), getattr(r, "chunk_id", "") or "?",
         )
     return {
         "source": getattr(r, "source", ""),
@@ -230,6 +240,7 @@ def _result_dict(r: Any) -> dict[str, Any]:
         "deep_link": getattr(r, "deep_link", "") or "",
         "content": content,
         "banking_redactions": n_redacted,
+        "token_redactions": n_tok,
     }
 
 
@@ -308,6 +319,8 @@ def kb_search(query: str, entity: str | None = None, limit: int | None = None) -
         "results": rows,
         # I1: total identifiers redacted across the returned chunks (0 = untouched).
         "banking_redactions": sum(int(row.get("banking_redactions", 0)) for row in rows),
+        # Code #15 S1: total API tokens redacted across the returned chunks (additive).
+        "token_redactions": sum(int(row.get("token_redactions", 0)) for row in rows),
         "text": _render_kb_text(relevant, _KB_PROVENANCE),
     }
 

@@ -53,7 +53,9 @@ import yaml
 
 from .phi_guard import is_phi_risk
 from . import email_citation  # S1: shared email citation
-from . import banking_identifiers  # I1 / D-051 lens C: chunk-egress redaction
+# I1 / D-051 lens C banking belt + Code #15 S1 (cq-d9d0c92cc797) API-token shapes:
+# ONE composed chunk-egress helper (tokens FIRST, then banking_identifiers).
+from . import secret_tokens
 
 log = logging.getLogger(__name__)
 
@@ -577,7 +579,7 @@ def format_owned_chunks(results: list, target_label: str, recency_first: bool = 
         # chunk-egress surface (own-mailbox pulls + the Harrison override over
         # ANY mailbox). Same belt as the shared renderer: the value is replaced,
         # the label and the deep link survive so the owner opens the source.
-        title_txt = banking_identifiers.redact_title(r.title or r.source_id)
+        title_txt, _n_bt, n_title_tok = secret_tokens.redact_chunk_egress(r.title or r.source_id)
         head = f"## [{i}] {title_txt} | {date_str} | mailbox: {owner}"
         if getattr(r, "author", ""):
             head += f" | from: {r.author}"
@@ -598,10 +600,15 @@ def format_owned_chunks(results: list, target_label: str, recency_first: bool = 
             pass
         if r.deep_link:
             head += f" | {r.deep_link}"
-        body, n_redacted = banking_identifiers.redact_banking_identifiers((r.content or "").strip())
+        body, n_redacted, n_body_tok = secret_tokens.redact_chunk_egress((r.content or "").strip())
         if n_redacted:
             log.warning("banking-identifier redaction (owned-chunk renderer): %d identifier(s) "
                         "redacted from chunk %s | %s", n_redacted, r.source, title_txt)
+        if n_body_tok + n_title_tok:
+            # Code #15 S1: keyed on the chunk id, never the title (D-082).
+            log.warning("api-token redaction (owned-chunk renderer): %d token(s) redacted from "
+                        "chunk %s | %s", n_body_tok + n_title_tok, r.source,
+                        getattr(r, "chunk_id", "") or "?")
         lines.extend([head, "", body, ""])
     return "\n".join(lines)
 

@@ -35,7 +35,9 @@ from pathlib import Path
 from typing import Any
 
 from . import drive_io, phi_guard, org_roles
-from . import banking_identifiers  # I1 / D-051 lens C: chunk-egress redaction
+# I1 / D-051 lens C banking belt + Code #15 S1 (cq-d9d0c92cc797) API-token shapes:
+# ONE composed chunk-egress helper (tokens FIRST, then banking_identifiers).
+from . import secret_tokens
 
 log = logging.getLogger(__name__)
 
@@ -217,8 +219,9 @@ def _build_source_block(chunks: list[dict[str, Any]]) -> str:
         # I1 / D-051 lens C: the nightly digest distills raw swept chunks into a
         # Drive note that static_md re-ingests -- an unredacted wire footer here
         # would be laundered into a NEW chunk under a fresh title. Redact first.
-        title = banking_identifiers.redact_title((c.get("title") or "").strip())
-        body, _n = banking_identifiers.redact_banking_identifiers((c.get("content") or "").strip())
+        # Code #15 S1: the composed belt (API-token shapes FIRST, then banking).
+        title = secret_tokens.redact_chunk_egress((c.get("title") or "").strip())[0]
+        body = secret_tokens.redact_chunk_egress((c.get("content") or "").strip())[0]
         seg = (f"{title}\n{body}" if title else body).strip()
         if not seg:
             continue
