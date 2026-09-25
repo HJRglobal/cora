@@ -285,7 +285,7 @@ class TestTheA12RecheckIsImmediatelyBeforeTheWrite:
         assert st.read_ledger()[-1]["outcome"].startswith("not_attempted:")
         assert state(A1, now=NOW + 200)["state"] == st.OPEN
 
-    def test_a_card_demoted_during_the_read_back_stops_the_notice(self, fake, armed):
+    def test_a_card_demoted_during_the_read_back_stops_the_notice(self, fake, armed, monkeypatch):
         """A demotion seen (and perhaps already cleared) while this attempt read Slack:
         the card's own history makes it T0 for good -- no notice, no archive."""
         stage([_row(A1, "fx-dead-one")])
@@ -295,6 +295,20 @@ class TestTheA12RecheckIsImmediatelyBeforeTheWrite:
         r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1", now=NOW + 100)
         assert r.outcome == "refused_transient" and "demoted after this card" in r.msg, r.msg
         assert _notices_to(fake, A1) == [] and "conversations_archive" not in fake.method_names()
+        _assert_rails([r.msg], monkeypatch)
+
+    def test_a_store_unreadable_at_the_recheck_posts_nothing(self, fake, armed, monkeypatch,
+                                                              tmp_path):
+        stage([_row(A1, "fx-dead-one")])
+        _prior_attempt(A1, NOW + 5, "failed:restricted_action")
+        d = tmp_path / "ledger-now-a-dir"
+        d.mkdir()
+        _during_notice_read(fake, lambda: monkeypatch.setenv(
+            "CORA_CHANNEL_ARCHIVE_LEDGER_PATH", str(d)))
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1", now=NOW + 100)
+        assert r.outcome == "refused_transient" and "proposal store" in r.msg, r.msg
+        assert _notices_to(fake, A1) == [] and "conversations_archive" not in fake.method_names()
+        _assert_rails([r.msg], monkeypatch)
 
     def test_a_registry_rollback_during_the_read_back_stops_a_reused_archive(self, fake, armed):
         stage([_row(A1, "fx-dead-one")])
@@ -456,7 +470,8 @@ class TestAMembershipReadFailureIsNeverNotAMember:
         body = _card_body([r])
         assert "you are not a member" not in body and "could not be read" in body, body
 
-    def test_a_tap_after_the_read_recovers_is_stale_with_an_honest_reason(self, fake, armed):
+    def test_a_tap_after_the_read_recovers_is_stale_with_an_honest_reason(self, fake, armed,
+                                                                          monkeypatch):
         lexp = "C0LEXPRIV01"
         meta = chan(lexp, "lex-quiet-room", private=True)
         fake.channels.append(meta)
@@ -470,6 +485,7 @@ class TestAMembershipReadFailureIsNeverNotAMember:
         assert res.outcome == "stale_refused", res.msg
         assert "membership of it changed" not in res.msg and "could not be read" in res.msg
         assert "conversations_archive" not in fake.method_names() and not fake.posts
+        _assert_rails([res.msg], monkeypatch)
 
     def test_the_new_lines_pass_both_rails(self, monkeypatch):
         r = _row(PRIV, "fx-quiet-private", section="B", reason=cl.B_PRIVATE_NOT_MEMBER, tier="T0",
@@ -531,7 +547,8 @@ class TestAnUnarchiveIsDisclosedOnEveryBRow:
         _v, r = _scan_row(fake, meta, context(unarchive_state=unarchive_state or {}), tier="T1")
         stage([r])
 
-    def test_a_t1_override_refuses_when_an_unarchive_appeared_since_the_card(self, fake, armed):
+    def test_a_t1_override_refuses_when_an_unarchive_appeared_since_the_card(self, fake, armed,
+                                                                              monkeypatch):
         self._stage_registry_t1(fake)                        # the card showed no unarchive
         # since the card: another card's archive of it, and it is open again (fail-closed form)
         st.append_ledger("outcome", proposal_id="chanarch-000000000077", channel_id=REGQ,
@@ -539,6 +556,7 @@ class TestAnUnarchiveIsDisclosedOnEveryBRow:
         res = tap(cards.ACTION_OVERRIDE, f"{PID}:{REGQ}:T1")
         assert res.outcome == "stale_refused" and "archive history changed" in res.msg, res.msg
         assert "conversations_archive" not in fake.method_names() and not fake.posts
+        _assert_rails([res.msg], monkeypatch)
 
     def test_a_t1_override_with_the_same_disclosed_unarchive_proceeds(self, fake, armed):
         st.append_ledger("outcome", proposal_id="chanarch-000000000077", channel_id=REGQ,
