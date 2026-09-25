@@ -554,3 +554,52 @@ lanes:
         tier: T0
         by: code-14
         evidence: "ruling 9.6 (2026-09-19 ask batch: YES, as a LOCKED LANE) + D-324; ships dark behind the DWD scope's presence; the row text is session-authored, so it awaits Harrison's confirm"
+
+  # Code #16 C1 (cq-be90cea867c3). Born T0 per R-A / D-326. NO capability_terms and
+  # NO ask_hint, deliberately: cora.capability_set merges row terms for every entity
+  # and every user, so "archive channels" would make an honest T0 "I can't archive
+  # channels" read as a phantom denial in every channel (and reset the enforce clock).
+  - lane: slack-channel-archive
+    title: "Slack inactive-channel archive (cora.channel_archive): a metadata-only scan of the channels Cora belongs to -> a proposal card in Harrison's DM (on ask, and monthly via run_channel_archive_proposal.py); T1 = tap -> one-line notice in the channel -> conversations.archive -> ledger row"
+    tier: T0
+    status: live
+    promotion_criteria: "T0 -> T1 = Harrison's tap after the FIRST proposal card matches his own read of the dead channels (N=1 supervised; ruled 2026-09-21 kickoff section 9.1: inactive = no message from a person for >= 90 days AND no exemption class; the first output is the T0 card only). His taps on a T0 card are RECORDED as the promotion evidence (data/state/channel-archive-proposals.jsonl `agreed` events); the promotion itself = a `promoted` event on this row (a Code/Cowork commit -- the bot never writes this file) + CORA_CHANNEL_ARCHIVE=act + ONE restart. Acting at T1 before that event reads as acting drift (probe channel_archive_mode)."
+    demotion_triggers: "AUTOMATIC: a channel the monitor finds archived BY CORA'S BOT USER with no tap-attributed intent row in the ledger -> data/state/channel-archive-demotion.json is written, the lane acts at T0 whatever the flag says, and the health check WARNs daily until Harrison clears it (only Harrison clears it); a ledger `archived` row that Slack does not show archived (no later unarchive) -> WARN"
+    evidence_monitor:
+      description: "check_channel_archive in the 08:45 health check (cora.channel_archive.monitor.reconcile): diffs logs/channel-archive-ledger.jsonl against Slack's own conversations.list is_archived flag and each archived channel's channel_archive system message (the archiver id). FAILS on an archive the ledger lacks (archiver = Cora, no tap row) and on a ledger row Slack does not show archived; a blind read (Slack unreadable) never reads clean; unresolved intents WARN. The Cowork weekly Slack-clarity check is NOT this monitor (a prompt task with no run marker)."
+      failing_capable: true
+    audit_surface: "logs/channel-archive-ledger.jsonl (an intent row written and fsynced BEFORE any Slack write + an outcome row per archive: channel id, name (never for LEX), age in days, tapped_by, ts) + data/state/channel-archive-proposals.jsonl (cards, agreements, keeps) + the one-line notice in each archived channel"
+    authority: Harrison
+    confirmed_by: pending-Harrison
+    acting_probe: channel_archive_mode
+    events:
+      - ts: 2026-09-25
+        event: seeded
+        tier: T0
+        by: code-16
+        evidence: "kickoff 2026-09-21 C1 + rulings 9.1 (threshold >= 90 days no HUMAN message, exemptions as written, T0 first, Harrison's tap = T1) and 9.3 (the two browser mechanisms supersede when C1 ships via the API); live scopes probed 2026-09-25 (auth.test: channels:manage + groups:write + pins:read + bookmarks:read present); the row text is session-authored, so it awaits Harrison's confirm"
+
+  # Code #16 C2 (cq-e9ef3f581d60). The T0 RUNG of the fuller travel lane Harrison
+  # chose 2026-09-21 (9.2 "Build the fuller version"): `cap: none` = uncapped, the
+  # lane is meant to climb; every rung above this one is designed by the Fable
+  # SCOPING session and promoted by his tap. NO capability_terms / ask_hint (same
+  # reason as above: portfolio-wide terms would flag honest out-of-scope denials).
+  - lane: travel-shortlist
+    title: "Travel shortlist (cora.travel_shortlist): a dated lodging ask (@Cora in the travel channel, or Harrison's / Tessa's DM) -> ONE in-thread card of <= 5 options from a web-tools-only turn built from parsed area / dates / party size / budget fields; NO booking, NO loyalty account, NO guest identity in any web request"
+    tier: T0
+    cap: none
+    status: live
+    promotion_criteria: "none sought in this rung -- RULED 2026-09-21 (kickoff section 9.2, 'Build the fuller version'): the provider / loyalty-credential / hold / book rungs are designed by the Fable SCOPING session (_notes/2026-09-21_fndr_cora-travel-booking-lane-SCOPING-KICKOFF.md) and built only after that design + the C5 spend-lane T1 definition + D-308 credential provisioning; each rung is promoted by Harrison's tap on a measured output, never by a session. cap: none = the lane climbs from here."
+    demotion_triggers: "any outbound request found carrying a name, email, phone number or loyalty identifier, or any card copy that claims a booking or reservation -> CORA_TRAVEL_SHORTLIST=off (the ask falls through to ordinary Q&A) until a Code session closes the path and re-proves the builder assertion"
+    evidence_monitor:
+      description: "per-call runtime belt travel_shortlist.assert_request_clean refuses the web call when the serialized request carries any source-message token outside the parsed fields or any loyalty / identity term; tests/test_travel_shortlist.py drives the real request builder with a named, loyalty-bearing ask and asserts the create kwargs of every iteration hold none of it; web usage rows tagged channel_name travel-shortlist in data/state/web-search-usage.jsonl (counts only, never query text)"
+      failing_capable: true
+    audit_surface: "data/state/web-search-usage.jsonl rows tagged travel-shortlist + the llm usage line (caller=travel_shortlist) + the in-thread card itself (as-of stamp, the fields searched, 'nothing is booked')"
+    authority: Harrison
+    confirmed_by: pending-Harrison
+    events:
+      - ts: 2026-09-25
+        event: seeded
+        tier: T0
+        by: code-16
+        evidence: "kickoff 2026-09-21 C2 + ruling 9.2 (the shortlist card ships as the fuller lane's T0 rung, cap none; no booking, no loyalty linkage, no guest identity in any web request -- structurally, not by policy); the 9/15 Oct 17-21 stay is a human task; the row text is session-authored, so it awaits Harrison's confirm"

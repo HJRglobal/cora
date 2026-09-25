@@ -352,6 +352,16 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "CORA_DEPOSCO_DEMOTION_STATE_PATH", str(tmp_path / "deposco-standing-demotion.json")
     )
+    # Code #16 C1 (dead-channel archive lane): the automatic-demotion state file is
+    # read by the ladder probe and the tap path, and written by the monitor -- per-call
+    # env path, so a suite run never reads or writes data/state/channel-archive-demotion.json.
+    # The mode flag is pinned to the CODE default (propose = T0): the live .env may one
+    # day carry CORA_CHANNEL_ARCHIVE=act, and every "nothing is archived at T0" test
+    # asserts the default.
+    monkeypatch.setenv(
+        "CORA_CHANNEL_ARCHIVE_DEMOTION_PATH", str(tmp_path / "channel-archive-demotion.json")
+    )
+    monkeypatch.delenv("CORA_CHANNEL_ARCHIVE", raising=False)
     # WS-4 drive-extractor pause: .env carries DRIVE_EXTRACTOR_PROPOSALS_ENABLED=0
     # (the D-066 production pause) and config.py's import-time load_dotenv() pulls
     # it into the test process, short-circuiting run_proposal_loop and reddening
@@ -823,6 +833,8 @@ _GUARDED_LEDGERS = (
     "data/cache/finance-notify-throttle.json",
     "data/state/info-for-cora-runstate.json",
     "data/state/info-for-cora-watermark.json",
+    # Code #16 C1: the dead-channel archive lane's automatic-demotion state.
+    "data/state/channel-archive-demotion.json",
 )
 
 

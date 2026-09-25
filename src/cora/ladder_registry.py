@@ -30,6 +30,10 @@ THE FILE. ``data/ladder-registry.yaml`` -- one row per lane:
     capability_terms     (optional) natural-language names of what the lane lets
                          Cora DO -- read by cora.capability_set for the honesty rail
     ask_hint             (optional) the `Try:` hint the honesty rail prints
+    cap                  (optional; Code #16 C3) the highest tier the lane may ever
+                         hold: none (uncapped -- the lane is meant to climb) | T1 |
+                         T2 | T3. A row may not sit above its cap, and a CAP-T1 row
+                         may carry only `cap: T1`. Validated, not rendered.
     events[]             {ts, event: seeded|promoted|demoted|confirmed|note, by,
                          evidence, tier?} -- append-only history; `tier` = the tier
                          the lane holds AFTER the event (required on promoted /
@@ -102,7 +106,13 @@ KNOWN_LANES: tuple[str, ...] = (
     "expected-invoice-owner-nudge",
     "cowork-run-marker-contract",
     "meet-join-audit",
+    # Code #16 C3: both lanes born T0 with their rows (R-A, D-326).
+    "slack-channel-archive",
+    "travel-shortlist",
 )
+
+#: Allowed values of the optional `cap` key (Code #16 C3). "none" = uncapped.
+CAPS: tuple[str, ...] = ("none", "T1", "T2", "T3")
 
 
 def registry_path() -> Path:
@@ -220,6 +230,19 @@ def _tier_history_problems(lane: str, tier: str, events: list[Any]) -> list[str]
     return problems
 
 
+def _cap_problems(lane: str, tier: str, cap: Any) -> list[str]:
+    """The optional `cap` key (Code #16 C3). An unknown key would be silently inert,
+    so a present `cap` is checked: a known value, a tier at or below the cap, and a
+    CAP-T1 row (already capped by its tier) may say only `cap: T1`."""
+    if not isinstance(cap, str) or cap not in CAPS:
+        return [f"{lane}: cap {cap!r} not in {list(CAPS)}"]
+    if tier == "CAP-T1" and cap != "T1":
+        return [f"{lane}: tier CAP-T1 is capped at T1 by definition; cap {cap!r} contradicts it"]
+    if cap != "none" and TIER_RANK.get(tier, 0) > TIER_RANK[cap]:
+        return [f"{lane}: tier {tier} sits above its cap {cap}"]
+    return []
+
+
 def validate(reg: dict[str, Any]) -> list[str]:
     """Schema problems as human sentences (empty = clean). Never raises."""
     problems: list[str] = []
@@ -269,6 +292,8 @@ def validate(reg: dict[str, Any]) -> list[str]:
         probe = row.get("acting_probe")
         if probe is not None and str(probe) not in PROBES:
             problems.append(f"{lane}: acting_probe {probe!r} is not a known probe {sorted(PROBES)}")
+        if "cap" in row:
+            problems.extend(_cap_problems(lane, tier, row.get("cap")))
     for lane in KNOWN_LANES:
         if lane not in seen:
             problems.append(f"{lane}: KNOWN lane has no registry row")
@@ -306,11 +331,18 @@ def _probe_ensure() -> str | None:
     return "T2" if m == "live" else "T0"
 
 
+def _probe_channel_archive() -> str | None:
+    # Code #16 C1: T1 only when CORA_CHANNEL_ARCHIVE=act AND the lane is not demoted
+    from cora.channel_archive import policy  # script-safe, stdlib-only module
+    return policy.acting_tier()
+
+
 PROBES: dict[str, Callable[[], str | None]] = {
     "sentinel_mode": _probe_sentinel,
     "send_live_mode": _probe_revops,
     "delegated_level": _probe_delegated,
     "ensure_mode": _probe_ensure,
+    "channel_archive_mode": _probe_channel_archive,
 }
 
 

@@ -30,6 +30,8 @@ from cora import ladder_registry as lr
 
 _REPO = Path(__file__).resolve().parents[1]
 _REAL = _REPO / "data" / "ladder-registry.yaml"
+#: Code #16 C3: the two lanes born T0 (in file order), pending Harrison's confirm.
+_CODE16_LANES = ("slack-channel-archive", "travel-shortlist")
 
 
 def _row(**over):
@@ -99,11 +101,16 @@ class TestShippedRegistry:
         DELIBERATE FLIP (Code #14 R14-8): the lane was RULED (ask 9.6) but its ROW
         text is session-authored, so the new meet-join-audit row is seeded
         `pending-Harrison` -- the ONE pending row. Every other row keeps the
-        9/19 confirm."""
+        9/19 confirm.
+
+        DELIBERATE FLIP (Code #16 C3): the two new lanes (slack-channel-archive,
+        travel-shortlist) are seeded `pending-Harrison` in file order after
+        meet-join-audit, which is still pending -- so the pending list GROWS by
+        exactly the two new rows (the kickoff's "exactly the two new rows")."""
         reg = lr.load(_REAL)
-        assert lr.pending_confirmation(reg) == ["meet-join-audit"]
+        assert lr.pending_confirmation(reg) == ["meet-join-audit", *_CODE16_LANES]
         for row in reg["lanes"]:
-            if row["lane"] == "meet-join-audit":
+            if row["lane"] == "meet-join-audit" or row["lane"] in _CODE16_LANES:
                 continue
             assert str(row["confirmed_by"]).startswith("Harrison 2026-09-19"), row["lane"]
             assert any(ev.get("event") == "confirmed" for ev in row["events"]), row["lane"]
@@ -162,6 +169,46 @@ class TestShippedRegistry:
         assert "recap card" in terms and "meeting recap" in terms
         assert "send recap" in terms["recap card"]
 
+    def test_code16_lanes_are_born_t0_pending_with_no_capability_terms(self, monkeypatch):
+        """Code #16 C3 (R-A / D-326): both lanes are born T0 -- registering above T0
+        before a ruling is a T2 act. No capability_terms / ask_hint: the honesty rail
+        merges row terms for every entity and user, so a term would make an honest
+        T0 "I can't archive channels" read as a phantom denial."""
+        reg = lr.load(_REAL)
+        for lane in _CODE16_LANES:
+            row = lr.row_for(lane, reg)
+            assert row is not None, lane
+            assert row["tier"] == "T0" and row["status"] == "live", lane
+            assert row["confirmed_by"] == "pending-Harrison", lane
+            assert [ev["event"] for ev in row["events"]] == ["seeded"], lane
+            assert row["events"][0]["tier"] == "T0" and row["events"][0]["by"] == "code-16", lane
+            assert "capability_terms" not in row and "ask_hint" not in row, lane
+            assert row["evidence_monitor"]["failing_capable"] is True, lane
+        monkeypatch.setattr(cs, "LADDER_REGISTRY_PATH", _REAL)
+        terms = cs.capability_terms("FNDR", cross_entity=True, founder=True)
+        assert not any("archive" in t or "shortlist" in t or "lodging" in t for t in terms)
+
+    def test_archive_row_names_its_probe_and_its_own_task_script_only(self):
+        """The acting probe makes 'flag act while registered T0' a nightly drift WARN.
+        The task-estate manifest labels a task with the FIRST row whose text contains
+        its script basename, so the row names its own monthly script and never
+        another task's script file."""
+        reg = lr.load(_REAL)
+        row = lr.row_for("slack-channel-archive", reg)
+        assert row["acting_probe"] == "channel_archive_mode"
+        text = " ".join(str(row.get(k) or "") for k in ("title", "audit_surface", "promotion_criteria"))
+        text += " " + row["evidence_monitor"]["description"]
+        assert "run_channel_archive_proposal.py" in text
+        for other in ("nightly_health_check.py", "cora_health_report.py", "run_channel_health_monitor.py",
+                      "archive_sprawl_channels.py", "run_knowledge_review.py"):
+            assert other not in text, other
+
+    def test_travel_row_is_uncapped_and_names_the_scoping_session(self):
+        row = lr.row_for("travel-shortlist", lr.load(_REAL))
+        assert row["cap"] == "none"
+        assert "SCOPING" in row["promotion_criteria"]
+        assert "acting_probe" not in row
+
 
 # ── validate() on tmp registries ──────────────────────────────────────────────
 
@@ -213,6 +260,32 @@ class TestValidate:
         assert any("no seeded/promoted/confirmed event carrying evidence" in p for p in probs)
         assert any("`events` must be a non-empty list" in p for p in probs)
         assert any("malformed event" in p for p in probs)
+
+    def test_cap_key_is_validated_not_silently_inert(self, tmp_path):
+        """Code #16 C3: `cap` is optional; when present it must be a known value, the
+        tier may not sit above it, and a CAP-T1 row may only say `cap: T1`."""
+        rows = self._all_rows()
+        rows[0]["cap"] = "none"
+        rows[1]["cap"] = "T1"
+        assert lr.validate(lr.load(_write(tmp_path, rows))) == []
+        rows = self._all_rows()
+        rows[0]["cap"] = "uncapped"
+        rows[1]["cap"] = 2
+        rows[2]["tier"] = "T2"
+        rows[2]["cap"] = "T1"
+        rows[2]["events"] = [
+            {"ts": "2026-09-19", "event": "seeded", "tier": "T0", "by": "x", "evidence": "e"},
+            {"ts": "2026-09-20", "event": "promoted", "tier": "T1", "by": "x", "evidence": "e"},
+            {"ts": "2026-09-21", "event": "promoted", "tier": "T2", "by": "x", "evidence": "e"}]
+        rows[3]["tier"] = "CAP-T1"
+        rows[3]["cap"] = "none"
+        rows[3]["events"] = [{"ts": "2026-09-19", "event": "seeded", "tier": "CAP-T1", "by": "x",
+                              "evidence": "e"}]
+        probs = lr.validate(lr.load(_write(tmp_path, rows)))
+        assert any("cap 'uncapped' not in" in p for p in probs)
+        assert any("cap 2 not in" in p for p in probs)
+        assert any("tier T2 sits above its cap T1" in p for p in probs)
+        assert any("CAP-T1 is capped at T1 by definition" in p for p in probs)
 
     def test_unknown_probe_and_bad_capability_terms(self, tmp_path):
         rows = self._all_rows()
@@ -384,6 +457,34 @@ class TestActingDrift:
         monkeypatch.setenv("CORA_ONECORA_ENSURE", "plan")
         assert lr.PROBES["ensure_mode"]() == "T0"
 
+    def test_channel_archive_probe_reads_the_flag_and_the_demotion(self, monkeypatch, tmp_path):
+        """Code #16 C1: T1 only for the exact word `act` AND no demotion file; a typo
+        never widens authority; a demotion (even a corrupt file) pins T0."""
+        dem = tmp_path / "demotion.json"
+        monkeypatch.setenv("CORA_CHANNEL_ARCHIVE_DEMOTION_PATH", str(dem))
+        monkeypatch.delenv("CORA_CHANNEL_ARCHIVE", raising=False)
+        assert lr.PROBES["channel_archive_mode"]() == "T0"
+        for val in ("propose", "off", "ACT ", "actt", "yes", "1", "live"):
+            monkeypatch.setenv("CORA_CHANNEL_ARCHIVE", val)
+            expect = "T1" if val.strip().lower() == "act" else "T0"
+            assert lr.PROBES["channel_archive_mode"]() == expect, val
+        monkeypatch.setenv("CORA_CHANNEL_ARCHIVE", "act")
+        dem.write_text('{"demoted": true, "reason": "unattributed archive"}', encoding="utf-8")
+        assert lr.PROBES["channel_archive_mode"]() == "T0"
+        dem.write_text("{not json", encoding="utf-8")
+        assert lr.PROBES["channel_archive_mode"]() == "T0"
+
+    def test_real_registry_reads_archive_act_as_drift(self, monkeypatch, tmp_path):
+        """D-326 in code: flipping the flag to `act` while the row says T0 is drift."""
+        for k in ("CORA_SENTINEL_ENFORCE", "CORA_SEND_LIVE", "CORA_DELEGATED_WORK"):
+            monkeypatch.delenv(k, raising=False)
+        monkeypatch.setenv("CORA_ONECORA_ENSURE", "live")
+        monkeypatch.setenv("CORA_CHANNEL_ARCHIVE_DEMOTION_PATH", str(tmp_path / "none.json"))
+        monkeypatch.setenv("CORA_CHANNEL_ARCHIVE", "act")
+        drift = lr.acting_drift(lr.load(_REAL))
+        assert [d.split(":")[0] for d in drift] == ["slack-channel-archive"]
+        assert "ACTING at T1 but registered T0" in drift[0]
+
     def test_real_registry_drift_is_quiet_with_every_flag_at_default(self, monkeypatch):
         for k in ("CORA_SENTINEL_ENFORCE", "CORA_SEND_LIVE", "CORA_DELEGATED_WORK"):
             monkeypatch.delenv(k, raising=False)
@@ -426,7 +527,9 @@ class TestRender:
         # pending-Harrison and is confirmed in its own commit -- which must update this pin.
         # DELIBERATE FLIP (Code #14 R14-8): the new meet-join-audit row is that case --
         # the one row awaiting Harrison's confirm.
-        assert s["pending_confirmation"] == ["meet-join-audit"]
+        # DELIBERATE FLIP (Code #16 C3): plus the two new T0 lanes, in file order.
+        assert s["pending_confirmation"] == ["meet-join-audit", *_CODE16_LANES]
+        assert s["by_tier"]["T0"] >= 2
 
 
 # ── the readers: nightly health check + Monday digest ─────────────────────────
