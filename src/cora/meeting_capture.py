@@ -1315,10 +1315,16 @@ class AuditReport:
     carve_out_breach_event_ids: list[str] = field(default_factory=list)
     carve_out_breach_transcript_ids: list[str] = field(default_factory=list)
     #: A carved meeting skipped for a QUALIFICATION reason that was recorded anyway:
-    #: information, not an alarm, and never part of the clean-day veto. (shape,
-    #: reason) plus the carved representative's event id, aligned the same way.
+    #: information, not an alarm. ONE row per carved MEETING (every transcript joined
+    #: to it collapses into that row): (shape, reason) plus the carved
+    #: representative's event id, aligned the same way.
     carved_recordings: list[tuple[str, str]] = field(default_factory=list)
     carved_recording_event_ids: list[str] = field(default_factory=list)
+    #: Aligned with carved_recordings: the Fireflies transcript id of EVERY recording
+    #: joined to that carved meeting (ids only, D-082). More than one is a DUPLICATE
+    #: capture, and vetoes the clean-day line like any other duplicate (D-051 s4#1:
+    #: two recordings of a vetoed meeting otherwise read as a clean day).
+    carved_recording_transcript_ids: list[list[str]] = field(default_factory=list)
     failed_calendars: list[tuple[str, str]] = field(default_factory=list)
     transcript_error: str = ""
     seat_note: str = ""
@@ -1348,6 +1354,19 @@ class AuditReport:
     @property
     def convened_misses(self) -> list[AuditedMeeting]:
         return [m for m in self.misses if m.convened_basis]
+
+    @property
+    def carved_recording_counts(self) -> list[int]:
+        """Transcripts per carved_recordings row, aligned with it (1 for a row the
+        aligned id list does not cover -- a report assembled by hand)."""
+        ids = self.carved_recording_transcript_ids
+        return [len(ids[i]) if i < len(ids) and ids[i] else 1
+                for i in range(len(self.carved_recordings))]
+
+    @property
+    def carved_duplicated(self) -> int:
+        """Carved meetings recorded MORE THAN ONCE -- a duplicate capture."""
+        return sum(1 for n in self.carved_recording_counts if n > 1)
 
 
 #: Marks an index key claimed by more than one meeting. Such a key can never
@@ -1700,15 +1719,29 @@ def _record_carved_hit(
     reason: str,
     event_id: str,
     transcript_id: str,
-) -> None:
-    """The ONLY writer of the carved-hit lists, so their alignment cannot drift."""
+    repeat_of: int | None = None,
+) -> int:
+    """The ONLY writer of the carved-hit lists, so their alignment cannot drift.
+    Returns the row written.
+
+    `repeat_of` (informational hits only) is the row already recorded for the SAME
+    carved meeting: the transcript id joins that row instead of adding a second
+    identical line, so a vetoed meeting recorded twice reads as ONE meeting captured
+    twice -- a duplicate -- never as two separate pieces of information (D-051 s4#1).
+    A breach is never collapsed: each breaching recording is its own row, with the
+    transcript id deleting it needs."""
     if is_breach:
         report.carve_out_breaches.append((shape, reason))
         report.carve_out_breach_event_ids.append(event_id)
         report.carve_out_breach_transcript_ids.append(transcript_id)
-    else:
-        report.carved_recordings.append((shape, reason))
-        report.carved_recording_event_ids.append(event_id)
+        return len(report.carve_out_breaches) - 1
+    if repeat_of is not None:
+        report.carved_recording_transcript_ids[repeat_of].append(transcript_id)
+        return repeat_of
+    report.carved_recordings.append((shape, reason))
+    report.carved_recording_event_ids.append(event_id)
+    report.carved_recording_transcript_ids.append([transcript_id])
+    return len(report.carved_recordings) - 1
 
 
 def audit_day(
@@ -1884,6 +1917,10 @@ def audit_day(
             by_meeting.setdefault(key, []).append(t)
             used.add(t.get("id") or "")
 
+    #: carved meeting key -> its row in report.carved_recordings (informational
+    #: hits only), so every recording of ONE vetoed meeting lands on one row.
+    carved_info_rows: dict[tuple, int] = {}
+
     def _carved_hit(c_keys: list[tuple], t: dict[str, Any]) -> None:
         """A transcript joined to a carved meeting, at EITHER breach site: one
         classifier (classify_carved_recording), one writer (_record_carved_hit). The
@@ -1897,17 +1934,26 @@ def audit_day(
         breach, it is one. Binding the first claimant alone would let a declined
         10:00 meeting on the room absorb the recording of a `[no-bot]` 15:00 one as
         mere information -- a false negative the pre-S4 any-hit-is-a-breach rule
-        could not produce."""
+        could not produce.
+
+        An INFORMATIONAL hit is grouped by the carved meeting it reports (the first
+        claimant, the one its shape names): a second recording of that meeting joins
+        its row as another transcript id -- a duplicate -- instead of printing a
+        second identical line beside a clean-day verdict (D-051 s4#1)."""
         results = [
             classify_carved_recording(carved[k], carved_no_record.get(k), t, cfg)
             for k in c_keys
         ]
         is_breach, h_ev, h_reason = next((res for res in results if res[0]), results[0])
-        _record_carved_hit(
+        group = None if is_breach else c_keys[0]
+        row = _record_carved_hit(
             report, is_breach=is_breach,
             shape=f"a meeting at {event_time_label(h_ev)}", reason=h_reason,
             event_id=(h_ev.get("id") or "").strip(), transcript_id=t.get("id") or "",
+            repeat_of=carved_info_rows.get(group) if group is not None else None,
         )
+        if group is not None:
+            carved_info_rows.setdefault(group, row)
 
     # A cal_id naming ANY copy of a CARVED meeting is exact evidence too: the join
     # to that carved meeting is decided here -- BEFORE the link/title fallbacks.
@@ -2294,16 +2340,22 @@ def render_report(report: AuditReport) -> str:
     if report.carved_recordings:
         # INFORMATIONAL (Code #15 S4): a meeting vetoed for a QUALIFICATION reason
         # -- a roster invitee declined, a copy was cancelled or had no link -- that
-        # was recorded anyway. Not a breach (nobody ruled it unrecordable) and never
-        # part of the clean-day verdict; beside the skip line it explains. SHAPE +
-        # reason only, never the title or organiser, exactly as the breach block.
+        # was recorded anyway. Not a breach (nobody ruled it unrecordable) and not
+        # part of the clean-day verdict -- unless recorded more than once (a
+        # duplicate, D-051 s4#1); beside the skip line it explains. SHAPE + reason
+        # only, never the title or organiser, exactly as the breach block.
         lines.append(
             f"\n*:information_source: Recorded though skipped "
             f"({len(report.carved_recordings)})* -- a qualification skip, not a "
             "no-record carve-out"
         )
-        for shape, reason in report.carved_recordings[:10]:
-            lines.append(f"  - {_esc(shape)}  _({_esc(reason)})_")
+        # One line per carved MEETING; a meeting recorded more than once carries its
+        # transcript count exactly as the duplicates block does (D-051 s4#1). A
+        # once-recorded meeting's line is byte-identical to before.
+        counts = report.carved_recording_counts
+        for (shape, reason), n in list(zip(report.carved_recordings, counts))[:10]:
+            dup = f"  ({n} transcripts)" if n > 1 else ""
+            lines.append(f"  - {_esc(shape)}  _({_esc(reason)})_{dup}")
         if len(report.carved_recordings) > 10:
             lines.append(f"  _...and {len(report.carved_recordings) - 10} more_")
 
@@ -2353,9 +2405,11 @@ def render_report(report: AuditReport) -> str:
     # placeholder nobody joined is not a capture failure. Misses, duplicates,
     # unmatched captures, carve-out breaches and a degraded read all still are.
     # carved_recordings (a qualification-skipped meeting recorded anyway) is
-    # information, not a failure, and is NOT in this veto either (Code #15 S4).
+    # information, not a failure, and is NOT in this veto either (Code #15 S4) --
+    # UNLESS one was recorded more than once: a double capture is a duplicate
+    # whatever the meeting's scope, and must never read as a clean day (D-051 s4#1).
     if not (report.misses or report.duplicates or report.unmatched_transcripts
-            or report.carve_out_breaches) and not degraded:
+            or report.carve_out_breaches or report.carved_duplicated) and not degraded:
         # A weekend has no meetings, and "captured exactly once" over a denominator
         # of zero reads as a success it did not earn. This report posts every day.
         if report.scheduled == 0:

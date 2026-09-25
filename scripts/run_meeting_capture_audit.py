@@ -159,9 +159,13 @@ def main() -> int:
         "carve_out_breach_event_ids": list(report.carve_out_breach_event_ids),
         "carve_out_breach_transcript_ids": list(report.carve_out_breach_transcript_ids),
         # Recorded though vetoed for a qualification reason: information, not a
-        # breach. Count + the carved representative's event id only.
+        # breach. Count of carved MEETINGS + the carved representative's event id
+        # only; aligned with it, the Fireflies transcript ids of every recording of
+        # that meeting (more than one = captured more than once, D-051 s4#1).
         "carved_recorded": len(report.carved_recordings),
         "carved_recorded_event_ids": list(report.carved_recording_event_ids),
+        "carved_recorded_transcript_ids": [
+            list(ids) for ids in report.carved_recording_transcript_ids],
         "failed_calendars": [e for e, _ in report.failed_calendars],
         "transcript_error": report.transcript_error,
         # Event ids only -- never titles. A LEX title must not reach an at-rest

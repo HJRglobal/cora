@@ -553,6 +553,15 @@ def _requester_display(name: Any, rid: Any) -> str:
     return f"{name} ({rid})" if name else rid
 
 
+#: Rides the cora_delegated_jobs text header AND its tool description (D-051 s3#0):
+#: since Code #15 S3 the view carries requester ids + roster names, so a consuming
+#: session must be told, where it reads the payload, that it is not shareable.
+_DELEGATED_JOBS_CAUTION = (
+    "- FOUNDER-LOCAL: this view names who asked (requester id + roster name). "
+    "Do not paste it into channels or team-visible docs."
+)
+
+
 def delegated_jobs() -> dict[str, Any]:
     """Delegated-work observability view (2026-08-01, Phase 1). Renders
     job_id/archetype/entity/state/cost + MTD spend -- never title or brief
@@ -576,6 +585,9 @@ def delegated_jobs() -> dict[str, Any]:
         return {"error": f"delegated-jobs view failed: {exc}", "text": ""}
     lines = [
         "# Delegated work (ids + requester only -- titles/briefs never surface here)",
+        # D-051 s3#0: the requester view names WHO asked beside FAILED / guard-class
+        # states. It is founder-local; the consuming session must not re-publish it.
+        _DELEGATED_JOBS_CAUTION,
         f"- level: {summary.get('level')}",
         f"- open jobs: {summary.get('open_jobs')}",
         f"- MTD est spend: ${summary.get('mtd_est_usd', 0):.2f} of "
@@ -891,7 +903,9 @@ _TOOL_SPECS: list[dict[str, Any]] = [
             "entity/state/cost/requester id+name, plus the failure/guard class enum of a "
             "failed job), a per-requester job count over ALL jobs, and month-to-date "
             "estimated spend vs the envelope. Read-only; job titles, briefs and failure "
-            "messages are never exposed on this surface."
+            "messages are never exposed on this surface. FOUNDER-LOCAL: the output names "
+            "who asked -- do not paste the requester view into channels or team-visible "
+            "docs."
         ),
         "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
         "fn": lambda a: delegated_jobs(),

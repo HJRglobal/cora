@@ -101,6 +101,27 @@ def test_mcp_delegated_jobs_blank_name_renders_bare_id(monkeypatch):
     assert SECRET not in json.dumps(out)
 
 
+def test_mcp_delegated_jobs_carries_a_founder_local_caution():
+    """D-051 r1 s3#0: since S3 the view names WHO asked beside FAILED / guard-class
+    states, while the Cowork skill still calls the tool "ids only". The consuming
+    session must read the caution where it reads the payload -- the text header --
+    and in the tool description the model sees before calling it."""
+    _seed()
+    out = mcp_server.delegated_jobs()
+    head = out["text"].splitlines()[:2]
+    assert head[0].startswith("# Delegated work")
+    assert "FOUNDER-LOCAL" in head[1]
+    assert "do not paste" in head[1].lower()
+    assert "channels" in head[1] and "team-visible docs" in head[1]
+    spec = next(s for s in mcp_server._TOOL_SPECS if s["name"] == "cora_delegated_jobs")
+    assert "FOUNDER-LOCAL" in spec["description"]
+    assert "do not paste the requester view into channels or team-visible docs" \
+        in spec["description"]
+    # the org-readable snapshot is requester-free and needs no caution: unchanged
+    snap = next(s for s in snaps._SPECS if s["name"] == "delegated-jobs.json")["render"]()
+    assert "FOUNDER-LOCAL" not in json.dumps(snap)
+
+
 def test_mcp_requester_display_is_one_line():
     assert mcp_server._requester_display("X", "U_X") == "X (U_X)"
     assert mcp_server._requester_display("", "U_X") == "U_X"

@@ -3131,7 +3131,8 @@ class TestBreachIsANoRecordCarveOutOnly:
     (title-marker: / no-record-title: / no-record-email: / no-record-domain:). A
     meeting vetoed for a QUALIFICATION reason (declined, cancelled, no link, all-day,
     not a meeting) that was recorded is information -- still consumed, still a shape,
-    never a title, never in the clean-day veto."""
+    never a title, never in the clean-day veto (unless that one meeting was recorded
+    more than once: a duplicate -- TestCarvedRecordingsCollapsePerMeeting, D-051 s4#1)."""
 
     # ── the live regressions ──
 
@@ -3556,3 +3557,158 @@ class TestBreachIsANoRecordCarveOutOnly:
         assert len(markers) == 1
         assert markers[0]["outputs"] == 3, "2 breaches + 1 informational line"
         assert markers[0]["detail"] == "scheduled=0 captured=0 missed=0 unconvened=0"
+
+
+# ── D-051 r1 s4#1: a vetoed meeting recorded MORE THAN ONCE is a duplicate ──────
+
+
+class TestCarvedRecordingsCollapsePerMeeting:
+    """Every recording joined to ONE qualification-skipped meeting collapses into ONE
+    informational row that carries its transcript ids. More than one is a DUPLICATE
+    capture: the line shows the count (as the duplicates block does) and the
+    clean-day verdict is withheld. At 6fad929e two recordings of the 9/18-shape
+    weekly printed two identical info lines above a green check."""
+
+    _NINE = "https://meet.google.com/cob-wren-syn"
+
+    def _weekly_day(self, second: str, *, with_nine: bool = False):
+        """The 9/18 standing weekly (in-domain, one instance id, Alex's copy
+        DECLINED -> vetoed), recorded TWICE: once by cal_id, once by `second`."""
+        events = {a: [] for a in _S4_ROSTER_ADDRS}
+        events["harrison@hjrglobal.com"].append(_s4_weekly_copy())
+        events["hannah@hjrglobal.com"].append(_s4_weekly_copy())
+        events["alex@hjrglobal.com"].append(_s4_weekly_copy(declined_by="alex@hjrglobal.com"))
+        trs = [_t("tA", title=_S4_WK_TITLE, hh=10, cal_id=_S4_WK_ID, link=_S4_WK_LINK, fred=True)]
+        trs.append(_t("tB", title=_S4_WK_TITLE, hh=10, link=_S4_WK_LINK,
+                      cal_id=(None if second == "link-only" else _S4_WK_ID)))
+        if with_nine:
+            events["harrison@hjrglobal.com"].append(
+                _ev("nine1", summary="Cobalt Wren Sync", hh=9, link=self._NINE))
+            trs.append(_t("t9", title="Cobalt Wren Sync", hh=9, cal_id="nine1", link=self._NINE))
+        return events, trs
+
+    @pytest.mark.parametrize("second", ["link-only", "same-cal-id"])
+    def test_a_declined_weekly_recorded_twice_is_one_row_and_never_a_clean_day(self, second):
+        events, trs = self._weekly_day(second)
+        r = _audit(events, trs, cfg=_s4_cfg())
+        out = mc.render_report(r)
+        # FIRST: the assertion 6fad929e fails -- a double capture never reads clean
+        assert "white_check_mark" not in out and "No qualifying roster meetings" not in out
+        assert r.carve_out_breaches == [] and r.unmatched_transcripts == []
+        # ONE row for the ONE meeting, both recordings on it (ids only)
+        assert r.carved_recordings == [("a meeting at 10:00", "roster-user-declined")]
+        assert r.carved_recording_event_ids == [_S4_WK_ID]
+        assert r.carved_recording_transcript_ids == [["tA", "tB"]]
+        assert r.carved_recording_counts == [2] and r.carved_duplicated == 1
+        assert "Recorded though skipped (1)*" in out
+        assert "\n  - a meeting at 10:00  _(roster-user-declined)_  (2 transcripts)" in out
+        # the skip line + ONE info line -- never a second identical info line
+        assert out.count("a meeting at 10:00  _(roster-user-declined)_") == 2
+        assert _S4_WK_TITLE not in out and "Saffron" not in out
+
+    def test_beside_a_meeting_captured_once_the_day_is_not_clean(self):
+        events, trs = self._weekly_day("link-only", with_nine=True)
+        r = _audit(events, trs, cfg=_s4_cfg())
+        out = mc.render_report(r)
+        assert "captured exactly once" not in out and "white_check_mark" not in out
+        assert (r.scheduled, r.captured, len(r.misses), len(r.duplicates)) == (1, 1, 0, 0)
+        assert r.carved_duplicated == 1
+        assert "  (2 transcripts)" in out
+
+    def test_recordings_naming_different_copies_of_one_meeting_collapse(self):
+        """An externally organised meeting has a different event id on each invitee's
+        calendar. Two recordings whose cal_ids name DIFFERENT copies are still one
+        meeting recorded twice: the group is the carved MEETING, not the event id."""
+        room = "https://meet.google.com/taw-nyex-tcc"
+        att = [_S4_EXT, "harrison@hjrglobal.com", "hannah@hjrglobal.com"]
+        c1 = _s4_decline(_ev("_c1", summary="Tawny review", hh=10, link=room,
+                             organizer=_S4_EXT, attendees=att), "harrison@hjrglobal.com")
+        c2 = _ev("_c2", summary="Tawny review", hh=10, link=room, organizer=_S4_EXT, attendees=att)
+        trs = [_t("t1", title="Untitled recording", hh=10, cal_id="_c1", link=room),
+               _t("t2", title="Untitled recording", hh=10, cal_id="_c2", link=room)]
+        r = _audit({"harrison@hjrglobal.com": [c1], "hannah@hjrglobal.com": [c2]}, trs)
+        assert r.carve_out_breaches == [] and r.unmatched_transcripts == []
+        assert r.carved_recordings == [("a meeting at 10:00", "roster-user-declined")]
+        assert r.carved_recording_event_ids == ["_c1"]
+        assert r.carved_recording_transcript_ids == [["t1", "t2"]]
+        out = mc.render_report(r)
+        assert "  (2 transcripts)" in out and "white_check_mark" not in out
+        assert "Tawny" not in out and "Untitled recording" not in out
+
+    def test_two_vetoed_meetings_each_recorded_once_stay_two_rows_and_a_clean_day(self):
+        """The collapse is per MEETING: two different vetoed meetings recorded once
+        each are two lines with no count, and -- nothing duplicated -- the verdict
+        stands exactly as S4 specified."""
+        la, lb = "https://meet.google.com/taw-aaa-one", "https://meet.google.com/taw-bbb-two"
+        a = _s4_decline(_ev("dec10", summary="Tawny weekly", hh=10, link=la), "harrison@hjrglobal.com")
+        b = _s4_decline(_ev("dec11", summary="Tawny later", hh=11, link=lb), "harrison@hjrglobal.com")
+        trs = [_t("t1", title="Untitled recording", hh=10, cal_id="dec10", link=la),
+               _t("t2", title="Untitled recording", hh=11, cal_id=None, link=lb)]
+        r = _audit({"harrison@hjrglobal.com": [a, b]}, trs)
+        assert r.carved_recordings == [("a meeting at 10:00", "roster-user-declined"),
+                                       ("a meeting at 11:00", "roster-user-declined")]
+        assert r.carved_recording_event_ids == ["dec10", "dec11"]
+        assert r.carved_recording_transcript_ids == [["t1"], ["t2"]]
+        assert r.carved_duplicated == 0
+        out = mc.render_report(r)
+        assert "transcripts)" not in out
+        assert "\n:white_check_mark: No qualifying roster meetings scheduled." in out
+
+    def test_a_breach_recorded_twice_is_never_collapsed(self):
+        """Each breaching recording keeps its own row + transcript id: deleting a
+        no-record recording needs every one of them."""
+        own = "https://meet.google.com/taw-nyla-rkk"
+        ev = _ev("nr1", summary="[no-bot] Tawny Lark chat", hh=10, link=own)
+        trs = [_t("t1", title="Untitled recording", hh=10, cal_id="nr1", link=own),
+               _t("t2", title="Untitled recording", hh=10, cal_id=None, link=own)]
+        r = _audit({"harrison@hjrglobal.com": [ev]}, trs)
+        assert r.carve_out_breaches == [("a meeting at 10:00", "title-marker:[no-bot]")] * 2
+        assert r.carve_out_breach_transcript_ids == ["t1", "t2"]
+        assert r.carved_recordings == [] and r.carved_recording_transcript_ids == []
+
+    def test_a_hand_built_report_without_transcript_ids_renders_as_before(self):
+        """render_report stays total over a report whose aligned id list is short
+        (assembled by hand): a row it does not cover counts as one recording."""
+        r = mc.AuditReport(day=DAY)
+        r.carved_recordings = [("a meeting at 10:00", "no-meeting-link")]
+        assert r.carved_recording_counts == [1] and r.carved_duplicated == 0
+        out = mc.render_report(r)
+        assert "\n  - a meeting at 10:00  _(no-meeting-link)_\n" in out + "\n"
+        assert "transcripts)" not in out and ":white_check_mark:" in out
+
+    def test_audit_script_ledgers_the_transcript_ids_ids_only(self, monkeypatch, caplog):
+        """The 07:22 row: carved_recorded counts MEETINGS (1), and the aligned
+        carved_recorded_transcript_ids carries both recordings -- ids only."""
+        import importlib.util
+        import logging
+
+        spec = importlib.util.spec_from_file_location(
+            "_audit_script_s4_1", _REPO_ROOT / "scripts" / "run_meeting_capture_audit.py"
+        )
+        mod = importlib.util.module_from_spec(spec)
+        monkeypatch.setattr(sys, "argv", ["run_meeting_capture_audit.py", "--day", DAY])
+        spec.loader.exec_module(mod)
+
+        events, trs = self._weekly_day("link-only")
+        report = _audit(events, trs, cfg=_s4_cfg())
+        monkeypatch.setattr(mod.mc, "load_config", lambda: _s4_cfg())
+        monkeypatch.setattr(mod.mc, "audit_day", lambda day, cfg: report)
+        markers: list[dict] = []
+        monkeypatch.setattr(mod.run_marker, "write",
+                            lambda task, **kw: markers.append(dict(task=task, **kw)))
+        printed: list[str] = []
+        monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(map(str, a))))
+        with caplog.at_level(logging.INFO, logger=mod.log.name):
+            assert mod.main() == 0
+
+        rows = [json.loads(l) for l in mc.ledger_path().read_text(encoding="utf-8").splitlines()]
+        row = [r for r in rows if r.get("lane") == "audit"][-1]
+        assert row["carved_recorded"] == 1
+        assert row["carved_recorded_event_ids"] == [_S4_WK_ID]
+        assert row["carved_recorded_transcript_ids"] == [["tA", "tB"]]
+        flat = json.dumps(row)
+        for leak in ("Saffron", _S4_WK_LINK, "roster-user-declined", "@"):
+            assert leak not in flat, leak
+        assert any("(2 transcripts)" in p for p in printed)
+        assert not any("white_check_mark" in p for p in printed)
+        assert markers[0]["outputs"] == 1, "one informational line (one meeting)"
