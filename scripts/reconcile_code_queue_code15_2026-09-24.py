@@ -119,6 +119,14 @@ def _calls(tree: ast.AST, name: str) -> list[ast.Call]:
 
 
 def _load_script(name: str, rel: str):
+    """Load a script module ONCE. An already-loaded module is reused, never replaced:
+    replacing the sys.modules entry would detach whoever holds the first copy from
+    anything keyed on that name (tests/conftest.py neutralises the purge script's
+    real Drive factory BY this name -- a replaced entry left the purge tests' copy
+    live-Drive-capable)."""
+    loaded = sys.modules.get(name)
+    if loaded is not None:
+        return loaded
     spec = importlib.util.spec_from_file_location(name, _REPO_ROOT / rel)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod
