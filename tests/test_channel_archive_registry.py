@@ -244,6 +244,15 @@ class TestRegistryShrinkCopy:
         cause, hint = reg.shrink_copy("registry_unreadable: 95 ids < floor 100")
         assert "minimum" in cause and hint == ""
 
+    @pytest.mark.parametrize("detail", ["registry_unreadable: 95 ids < floor 126",
+                                        "registry_unreadable: 99 ids < floor 180"])
+    def test_a_trim_below_the_minimum_after_a_large_read_is_not_offered_a_rebaseline(self, detail):
+        """D-051 r2 registry-ops#2: the rule keys on the COUNT, not the floor -- a 140-id
+        read trimmed to 95 must not be told to re-baseline (that command refuses < 100)."""
+        cause, hint = reg.shrink_copy(detail)
+        assert "below the 100-id minimum" in cause and hint == ""
+        assert "--rebaseline-registry" not in cause + hint
+
     def test_other_blind_details_are_not_a_shrink(self):
         assert reg.shrink_copy("registry_unreadable: coverage sentinel missing (truncated?)") is None
         assert reg.shrink_copy("") is None and reg.shrink_copy(None) is None

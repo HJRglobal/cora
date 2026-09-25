@@ -181,9 +181,14 @@ def _rebaseline(now: float, *, apply: bool) -> int:
     r = reg.load_registry(last_good_count=0)
     prev = f.last_registry_count
     if not r.ok:
-        _print(f"REFUSED: the registry is not complete ({r.reason}) -- a re-baseline accepts only "
-               "a registry with every entity section, the coverage line and at least "
-               f"{reg.MIN_REGISTRY_IDS} ids.")
+        below = reg.shrink_copy(r.reason)      # parsed complete, fewer than the 100-id minimum
+        if below is not None:
+            _print(f"REFUSED: {below[0]} -- the registry parses complete, but a re-baseline cannot go "
+                   f"below the {reg.MIN_REGISTRY_IDS}-id minimum; nothing re-baselined.")
+        else:
+            _print(f"REFUSED: the registry is structurally incomplete ({r.reason}) -- a re-baseline "
+                   "accepts only a registry with every entity section, the coverage line and at least "
+                   f"{reg.MIN_REGISTRY_IDS} ids.")
         return 1
     new_floor = reg.registry_floor(r.count)
     if not apply:

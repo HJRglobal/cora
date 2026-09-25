@@ -281,6 +281,33 @@ class TestRegistryRebaseline:
         assert SCRIPT.main(["--rebaseline-registry", "--apply"], now=az(2026, 10, 5)) == 1
         assert "REFUSED" in capsys.readouterr().out and len(st.read_events()) == before
 
+    def test_a_trim_below_the_minimum_is_never_offered_the_rebaseline_that_refuses_it(
+            self, fake, monkeypatch, tmp_path, capsys):
+        """D-051 r2 registry-ops#2: a 140-id read trimmed to 95 read BLIND with the
+        re-baseline command offered, and the command then refused the 'not complete'
+        registry. The copy keys on the count, and the refusal names the real cause."""
+        import re as _re
+        from _chanarch_fakes import REGISTRY_FIXTURE
+        lines = REGISTRY_FIXTURE.read_text(encoding="utf-8").splitlines()
+        rows = [i for i, ln in enumerate(lines) if ln.startswith("|") and _re.search(r"`C[A-Z0-9]{8,24}`", ln)]
+        drop = set(rows[1::8][:13])                           # 108 - 13 = 95 ids, every section kept
+        trimmed = tmp_path / "registry.md"
+        trimmed.write_text("\n".join(ln for i, ln in enumerate(lines) if i not in drop) + "\n",
+                           encoding="utf-8")
+        monkeypatch.setenv("CORA_CHANNEL_REGISTRY_PATH", str(trimmed))
+        from cora.channel_archive import registry as reg
+        assert reg.load_registry().count == 95
+        self._stage_old_count(140)
+        SCRIPT.main([], now=az(2026, 10, 5))
+        out = capsys.readouterr().out
+        assert "BLIND: registry_unreadable" in out and "below the 100-id minimum" in out
+        assert "--rebaseline-registry" not in out
+        before = len(st.read_events())
+        assert SCRIPT.main(["--rebaseline-registry", "--apply"], now=az(2026, 10, 5)) == 1
+        out = capsys.readouterr().out
+        assert "REFUSED" in out and "below the 100-id minimum" in out and "not complete" not in out
+        assert len(st.read_events()) == before
+
     def test_the_blind_card_names_the_shrink_and_the_command(self, fake):
         from cora.channel_archive import deliver
         self._stage_old_count(self._fixture_count() + 13)
