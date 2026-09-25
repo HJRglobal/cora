@@ -49,6 +49,12 @@ HEADER_T0 = ("*Dead-channel proposal — lane at T0: nothing will be archived.* 
              "archiving needs the lane promoted first.")
 HEADER_T1 = ("*Dead-channel proposal.* Tapping *Archive* posts a one-line notice in the "
              "channel, then archives it.")
+#: A card staged at T1 that outlived a demotion (A12). Rows it already archived stay
+#: archived -- so it never says "nothing will be archived" (A22: store truth).
+HEADER_DEMOTED = ("*Dead-channel proposal — the lane was demoted after this card went out: "
+                  "nothing more will be archived from it.* Tapping *Mark to archive* records "
+                  "your agreement only; rows it already archived are marked below.")
+CONTINUED_DEMOTED = "Nothing more is archived from this card — the lane was demoted. "
 REVERSIBLE = ("Slack archives are reversible: anyone in the channel can unarchive it from "
               "the channel settings.")
 BUTTONS_ONLY = "Buttons are the only way to act — typing 'yes' does nothing."
@@ -320,12 +326,24 @@ def fallback_text(p: st.Proposal) -> str:
     states = [p.state_of(r["cid"]) for r in p.rows]
     marked = states.count(st.AGREED)
     kept = states.count(st.KEPT)
+    archived = states.count(st.ARCHIVED)
+    unknown = states.count(st.UNKNOWN)
+    counts = (f"{len(p.rows)} listed, archived {archived}, marked {marked}, kept {kept}, "
+              f"outcome unknown {unknown}.")
     if card_tier(p) == "T1":
-        return (f"Dead-channel proposal (T1): {len(p.rows)} listed, archived "
-                f"{states.count(st.ARCHIVED)}, marked {marked}, kept {kept}, outcome unknown "
-                f"{states.count(st.UNKNOWN)}.")
+        return f"Dead-channel proposal (T1): {counts}"
+    if _demoted_card(p) or archived or unknown:
+        # A22: a demoted T1 card keeps its archived / unknown counts -- "nothing
+        # archived" is said only by a card that never archived anything
+        return f"Dead-channel proposal (lane demoted — nothing more will be archived): {counts}"
     return (f"Dead-channel proposal (T0 — nothing archived): {len(p.rows)} listed, you marked "
             f"{marked}, kept {kept}.")
+
+
+def _demoted_card(p: st.Proposal) -> bool:
+    """A card staged with T1 rows that now acts T0-equivalent (A12): demoted now, or
+    outlived a demotion Harrison has since cleared."""
+    return p.has_t1_rows and card_tier(p) == "T0"
 
 
 def render_page(fold: st.Fold, proposal_id: str, page: int, *, now: float | None = None,
@@ -370,7 +388,8 @@ def render_page(fold: st.Fold, proposal_id: str, page: int, *, now: float | None
             blocks.append(_section(head))
             blocks.append(_context(_counts_line(p)))
             return blocks, fallback_text(p)
-        blocks.append(_section(HEADER_T1 if tier == "T1" else HEADER_T0))
+        blocks.append(_section(HEADER_T1 if tier == "T1"
+                               else HEADER_DEMOTED if _demoted_card(p) else HEADER_T0))
         blocks.append(_context(f"Scanned {p.scanned} channels I belong to; inactive = no message "
                                f"from a person for 90+ days. {BUTTONS_ONLY} {REVERSIBLE}"))
         blocks.append(_context(_counts_line(p)))
@@ -382,8 +401,10 @@ def render_page(fold: st.Fold, proposal_id: str, page: int, *, now: float | None
             blocks.append({"type": "actions", "block_id": f"chanarch_agree_{proposal_id}"[:255],
                            "elements": [_btn("This list matches my read", ACTION_AGREED, proposal_id)]})
     else:
+        tier_line = ("" if tier == "T1" else CONTINUED_DEMOTED if _demoted_card(p)
+                     else "Nothing is archived at T0. ")
         blocks.append(_context(f"Dead-channel proposal (continued) — part {page} of {n_pages}. "
-                               f"{'Nothing is archived at T0. ' if tier == 'T0' else ''}{REVERSIBLE}"))
+                               f"{tier_line}{REVERSIBLE}"))
     rows = p.rows_by_cid
     a_rows = [rows[c] for c in cids if (rows.get(c) or {}).get("section") == cl.SECTION_A]
     b_rows = [rows[c] for c in cids if (rows.get(c) or {}).get("section") == cl.SECTION_B]

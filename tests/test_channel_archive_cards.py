@@ -213,7 +213,50 @@ class TestT1Card:
         blocks, text = cards.render_page(f, PID, 1, now=NOW)
         labels = {a["text"]["text"] for a in actions(blocks)}
         assert "Archive" not in labels and "Mark to archive" in labels
-        assert cards.HEADER_T0 in "\n".join(texts(blocks)) and "T0" in text
+        body = "\n".join(texts(blocks))
+        assert cards.HEADER_DEMOTED in body and cards.HEADER_T0 not in body
+        assert text.startswith("Dead-channel proposal (lane demoted")
+
+
+class TestStoreTruthAfterADemotion:
+    """c1-intents-copy#3 / c1-state-machine#1 (A22): after a demotion, a card that
+    already archived rows must never re-render text= / header / continuation as
+    'nothing archived' -- the history readers hand text= to the model as Cora's words."""
+
+    def _card_with_archives(self, n=25):
+        rows = [row(f"C0A{i:07d}", tier="T1") for i in range(n)]
+        staged(rows)
+        st.append_event(st.ARCHIVED, proposal_id=PID, cid="C0A0000000", by=HARRISON, ts=NOW + 5)
+        st.append_event(st.UNKNOWN, proposal_id=PID, cid="C0A0000001", by=HARRISON, ts=NOW + 6)
+        return rows
+
+    @pytest.mark.parametrize("how", ["demoted_now", "cleared_after_the_card"])
+    def test_archived_and_unknown_counts_survive_a_demotion(self, how):
+        from cora.channel_archive import policy
+        self._card_with_archives()
+        if how == "demoted_now":
+            policy.demotion_path().write_text('{"since": "x"}', encoding="utf-8")
+        else:
+            st.append_ledger("acknowledged", channel_id="C0ROGUE", archive_ts="1.1", by=HARRISON,
+                             demoted_since="2099-01-01T00:00:00-07:00")
+        f = st.fold(now=NOW + 10)
+        blocks, text = cards.render_page(f, PID, 1, now=NOW + 10)
+        assert "nothing archived" not in text.lower(), text
+        assert "archived 1" in text and "outcome unknown 1" in text, text
+        body = "\n".join(texts(blocks))
+        assert cards.HEADER_DEMOTED in body and cards.HEADER_T0 not in body
+        assert "nothing will be archived" not in body.lower()
+        assert "_Archived " in body                                 # the row still says so
+        blocks2, text2 = cards.render_page(f, PID, 2, now=NOW + 10)
+        body2 = "\n".join(texts(blocks2))
+        assert "Nothing is archived at T0" not in body2 and "demoted" in body2
+        assert text2 == text
+
+    def test_a_plain_t0_card_keeps_its_nothing_archived_line(self):
+        staged([row("C0AAAAAAA1"), row("C0AAAAAAA2")])
+        blocks, text = cards.render_page(st.fold(now=NOW), PID, 1, now=NOW)
+        assert text == "Dead-channel proposal (T0 — nothing archived): 2 listed, you marked 0, kept 0."
+        assert cards.HEADER_T0 in "\n".join(texts(blocks))
 
 
 def _all_rendered_strings():
@@ -239,6 +282,15 @@ def _all_rendered_strings():
         blocks, text = cards.render_page(f, pid, 1, now=NOW + 700)
         out.extend(texts(blocks))
         out.append(text)
+    # the demoted re-render of the T1 card (archived + unknown rows present, A12/A22)
+    from cora.channel_archive import policy
+    policy.demotion_path().write_text('{"since": "x"}', encoding="utf-8")
+    blocks, text = cards.render_page(st.fold(now=NOW + 700), "chanarch-fccccccccccc", 1, now=NOW + 700)
+    assert text.startswith("Dead-channel proposal (lane demoted")
+    out.extend(texts(blocks))
+    out.append(text)
+    out.append(cards.CONTINUED_DEMOTED)
+    policy.demotion_path().unlink()
     out.append(cards.notice_text(143, HARRISON))
     out.append(cards.CORRECTION_TEXT)
     for cause in cards.BLIND_CAUSES:
