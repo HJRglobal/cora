@@ -463,11 +463,19 @@ def _query_user_chunks(display_name: str, first_name: str,
                 continue
         except Exception:  # noqa: BLE001 -- fail closed: drop the chunk
             continue
+        # Code #15 S1 / D-051 r1 s1-seams#1: the composed egress belt (API tokens
+        # FIRST, then banking) runs on the FULL title/content BEFORE the [:80] /
+        # [:_MAX_CHUNK_CHARS] cuts -- a token or account number straddling a cut
+        # leaves a fragment no shape can match any more, so it would reach Haiku and
+        # the teammate DM. _chunk_context_lines re-runs the belt (idempotent). The
+        # name match and the PHI screen above keep reading the raw content.
+        title = secret_tokens.redact_chunk_egress(r[2] or "")[0]
+        body = secret_tokens.redact_chunk_egress(content)[0]
         out.append({
             "source":    r[0],
             "entity":    entity,
-            "title":     (r[2] or "")[:80],
-            "content":   content[:_MAX_CHUNK_CHARS],
+            "title":     title[:80],
+            "content":   body[:_MAX_CHUNK_CHARS],
             "deep_link": r[4] or "",
         })
         if len(out) >= _MAX_CHUNKS:
@@ -528,7 +536,9 @@ def _chunk_context_lines(chunks: list[dict]) -> list[str]:
     window would have carried its routing/account numbers straight through.
     Redaction runs BEFORE the 400-char slice so a truncated value cannot survive.
     Code #15 S1: the composed belt (secret_tokens.redact_chunk_egress) -- API-token
-    shapes FIRST, then banking -- on the title and the body alike.
+    shapes FIRST, then banking -- on the title and the body alike. _query_user_chunks
+    already ran the same belt BEFORE its own title[:80] / content[:500] cuts (D-051 r1
+    s1-seams#1); this second pass is idempotent and covers any other chunk source.
     """
     out: list[str] = []
     for c in chunks:

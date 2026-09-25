@@ -163,6 +163,75 @@ class TestDistillPrompt:
         prompt = scap._build_distill_prompt("USER: " + READ_HOST, "FNDR", phi=False)
         assert not _leaks(prompt) and st.WITHHELD in prompt
 
+    # D-051 r1 s1-seams#2: belt (a) fails closed at the SESSION level. A per-block
+    # redactor error used to put WITHHELD in place of just that block; the whole-twin
+    # guard re-scanned a marker with no shape (n == 0), so a PARTIAL transcript was
+    # distilled, the note written and the session ledger-marked -- never retried.
+    @staticmethod
+    def _flaky_block(monkeypatch):
+        real = st._redact_counts
+
+        def _flaky(text):
+            if "BOOM-BLOCK" in text:          # only a block carrying this text fails
+                raise MemoryError("simulated per-block redactor failure")
+            return real(text)
+        monkeypatch.setattr(st, "_redact_counts", _flaky)
+
+    _BOOM_TURNS = staticmethod(lambda: [
+        _user("set up the payroll export"),
+        _user("decide the BOOM-BLOCK plan: ship the payroll change on Friday"),
+        _assistant("ok, noted"),
+    ])
+
+    def test_a_per_block_redactor_failure_withholds_the_whole_twin(self, tmp_path, monkeypatch):
+        self._flaky_block(monkeypatch)
+        f = _code_session(tmp_path / "p", "sess-boom-0001", self._BOOM_TURNS())
+        s = scap.parse_transcript(f)
+        assert "payroll change" in s.text                      # RAW text is untouched
+        assert s.distill_text == st.WITHHELD                   # never a partial twin
+        assert scap._redacted_transcript(scap._distill_input(s)) is None
+
+        sess = _cowork_session(tmp_path / "cw", "boom0001", [
+            {"type": "user", "uuid": "u1", **_user("decide the BOOM-BLOCK plan")},
+            {"type": "assistant", "uuid": "a1", **_assistant("ok")},
+            {"type": "user", "uuid": "u2", **_user("and ship it " + SLACK_BOT)},
+        ])
+        c = scap.parse_cowork_session(sess)
+        assert c.distill_text == st.WITHHELD and SLACK_BOT in c.text
+
+    def test_a_per_block_failure_distills_nothing_writes_nothing_and_retries(self, tmp_path,
+                                                                             monkeypatch):
+        self._flaky_block(monkeypatch)
+        projects, fos, ledger = tmp_path / "p", tmp_path / "fos", tmp_path / "l.jsonl"
+        _code_session(projects, "sess-boom-0002", self._BOOM_TURNS())
+        client = _CapturingClient(_body())
+        results = scap.harvest(lookback_hours=24, projects_root=projects, founder_os_root=fos,
+                               ledger_path=ledger, anthropic_client=client)
+        r = results[0]
+        assert not r.distilled and r.note_path is None and r.skipped_reason == "distill_failed"
+        assert client.prompts == []                            # nothing was ever sent
+        assert not fos.exists() or not any(fos.rglob("*.md"))
+        assert scap.load_captured_ids(ledger) == set()         # retries next run
+
+    def test_a_per_block_failure_keeps_the_session_off_the_batch(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CORA_BATCH_DISABLE", raising=False)
+        monkeypatch.delenv("CORA_BATCH_CAPTURE", raising=False)
+        self._flaky_block(monkeypatch)
+        seen: dict = {}
+
+        def _fake_batch(requests, *, caller, deadline_s, **kw):
+            seen["requests"] = requests
+            return {}
+        monkeypatch.setattr(batch_client, "batch_generate", _fake_batch)
+        boom = scap.parse_transcript(_code_session(tmp_path / "p1", "sess-boom-0003",
+                                                   self._BOOM_TURNS()))
+        ok = scap.parse_transcript(_code_session(tmp_path / "p2", "sess-ok-0003",
+                                                 [_user("plain work " + SLACK_BOT), _assistant("ok")]))
+        scap._batch_distill([(boom, scap.SURFACE, "sess-boom-0003"), (ok, scap.SURFACE, "sess-ok-0003")])
+        prompts = [q["params"]["messages"][0]["content"] for q in seen["requests"]]
+        assert len(prompts) == 1                               # only the clean session
+        assert all("payroll" not in p and st.WITHHELD not in p and not _leaks(p) for p in prompts)
+
     def test_9_11_mirror_under_the_24k_cap(self, tmp_path):
         projects, fos, ledger = tmp_path / "p", tmp_path / "fos", tmp_path / "l.jsonl"
         _code_session(projects, "sess-911-0001", [_user("set up the asana identity"),

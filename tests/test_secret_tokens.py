@@ -11,6 +11,7 @@ ABSENCE of the assembled values; nothing here is a real credential.
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 import time
 from pathlib import Path
@@ -104,6 +105,17 @@ FP_SET = [
     "xo" + "xb-your-token-here",
     "xo" + "xb-1234-your-token-here",
     "HubSpot portal 246351746, Asana workspace 682743441507584.",
+    # D-051 r1 s1-regex#0: the widened '_' left / '-'/'_' right edges re-open no kebab,
+    # snake or id false positive
+    "my_" + "sk-" + "learn-pipeline-v2-integration-tests",
+    "_" + "sk-" + "12345_",
+    "KEY_" + "sk-" + "abcdefghijklmnopqrstuvwxyzabcdefgh_old",      # 34 letters, no digit
+    "_" + "sk-" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p" + "-dev",       # 31 alnum: too short
+    "x-" + "sk-" + ("Ab1" * 16) + "-dev",                            # hyphen-joined: kebab guard
+    "desk_" + "sk-" + "learn-0-24-2-upgrade-notes-and-caveats",
+    "Drive 1TSUGC4h_" + "AI" + "za" + "HjgbHuExFqf_4-lXyXm7opq5",    # AIza + 24: not 35
+    "_" + "AI" + "za" + "SyA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9-x",  # AIza + 40 alnum
+    "x-" + "AI" + "za" + "SyA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q_old",   # hyphen-joined
     st.MARKER,
     "",
 ]
@@ -130,6 +142,40 @@ class TestRedactor:
         text = f"a {pre}{tok}{post} b"
         out, n = st.redact_secret_tokens(text)
         assert (out, n) == (f"a {pre}{st.MARKER}{post} b", 1)
+
+    # D-051 r1 s1-regex#0: '_' / '-' neighbours. The sk-/AIza left edge rejected a
+    # preceding '_' (Slack/markdown italics `_tok_`, a snake join `KEY_tok`) and the
+    # bare-sk / AIza right edge rejected a following '-'/'_' (`tok-dev`, `tok_old`), so
+    # those tokens passed every egress belt and the at-rest purge untouched while an
+    # xoxb in the same position was redacted.
+    @pytest.mark.parametrize("pre,post", [("_", "_"), ("KEY_", ""), ("", "-dev"), ("", "_old"),
+                                          ("*_", "_*"), ("API_KEY_", "_v2")])
+    @pytest.mark.parametrize("name", sorted(POSITIVES))
+    def test_underscore_and_hyphen_neighbours_are_redacted(self, name, pre, post):
+        tok, _shape = POSITIVES[name]
+        text = f"a {pre}{tok}{post} b"
+        out, n = st.redact_secret_tokens(text)
+        assert n == 1 and tok not in out and _secret_free(out), name
+        if name.startswith(("asana", "google")) or name == "openai_legacy":
+            absorbed = ""        # the EXACT-run shapes: the neighbour survives byte for byte
+        else:
+            # a prefixed sk- ([0-9A-Za-z_-]) / Slack ([0-9A-Za-z-]) tail alphabet: the
+            # leading run of `post` made of it rides inside the marker; nothing else is
+            # eaten, and the left neighbour never is
+            tail = r"[0-9A-Za-z-]*" if name.startswith("slack") else r"[0-9A-Za-z_-]*"
+            absorbed = re.match(tail, post).group(0)
+        assert out == f"a {pre}{st.MARKER}{post[len(absorbed):]} b"
+
+    def test_the_exact_run_edges_still_refuse_a_longer_alnum_run(self):
+        # admitting '-'/'_' on the right must not let a LONGER run match a prefix of it:
+        # AIza stays exactly 35, a bare sk- run stays <= 300; a letter, digit or hyphen
+        # on the LEFT still refuses both (kebab / word joins)
+        for glued in (GOOGLE + "Z", GOOGLE + "9", GOOGLE + "Z-dev", GOOGLE + "9_old",
+                      "s" + "k-" + ("Ab1" * 101) + "-dev", "s" + "k-" + ("Ab1" * 101) + "_old"):
+            assert st.redact_secret_tokens(f"a {glued} b")[1] == 0, len(glued)
+        for tok in (OPENAI_LEGACY, GOOGLE, ANTHROPIC, OPENAI_PROJ):
+            for glued in ("Z" + tok, "9" + tok, "x-" + tok):
+                assert st.redact_secret_tokens(f"a {glued} b")[1] == 0, glued[:6]
 
     def test_asana_left_edge_admits_a_letter_or_a_json_escape(self):
         # the Asana leg's left edge is "not a digit" ONLY: a JSON-escaped newline, a
@@ -203,6 +249,11 @@ class TestRedactor:
             ("sk-" + "a-" * 50) * 2_000,
             (" sk-" + "a" * 31 + "1") * 6_000,
             ("xo" + "xb-1-" + "a" * 250 + " ") * 800,
+            # D-051 r1 s1-regex#0: the widened edges ('_' left, '-'/'_' right)
+            ("_sk-" + "a" * 31 + "1" + "-") * 6_000,
+            ("_sk-" + "a1" * 200 + "_") * 1_000,
+            ("_" + "AI" + "za" + "a" * 35 + "-") * 5_000,
+            ("_" + "AI" + "za" + "_-" * 40) * 2_000,
         ]
         for s in adversarial:
             t0 = time.perf_counter()
@@ -337,6 +388,88 @@ class TestMcpPath:
         assert "chunk-tok-1" in msg and "Deploy notes" not in msg and _secret_free(msg)
 
 
+# ── D-051 r1 s1-seams#0: the LEX non-custodian PHI scrub runs AFTER the token belt ──
+# PASS 2 of phi_guard.redact_cue_adjacent_names (_PROPER_NAME_RE: leading \b, no
+# trailing \b) rewrote the Title-case START of a token segment near a PHI cue into
+# '[name redacted]<rest>' BEFORE the renderer's belt ran, so the token shape no longer
+# matched and the secret tail reached the model context / the MCP content.
+LEX_SLACK_REST = "9Z8Y7X6W5V4U3T2S"
+LEX_SK_REST = "7h6g5f4d3s2a1q0w9e8r7t6y5u4i3o2p1"
+LEX_SLACK = "xo" + "xb-" + "1234567890-1234567890123-" + "Qwertyuiop" + LEX_SLACK_REST
+LEX_SK = "s" + "k-ant-api03-" + "Mnbvcxzlkj" + LEX_SK_REST + "-AbCdEf_GhIjKl"
+LEX_BODY = ("Slack app setup notes. Billing units for the member sessions are tracked "
+            "elsewhere.\nSLACK_BOT_TOKEN=" + LEX_SLACK + "\nANTHROPIC_API_KEY=" + LEX_SK + "\n")
+
+
+def _lex_res() -> SearchResult:
+    return _res(LEX_BODY, chunk_id="chunk-lex-tok-1", source="slack", entity="LEX",
+                title="setup notes", deep_link="", source_id="C0LEXFIXTURE")
+
+
+def _lex_secret_free(text: str) -> bool:
+    return not any(s in text for s in (LEX_SLACK_REST, LEX_SK_REST, LEX_SLACK, LEX_SK,
+                                       "Qwertyuiop", "Mnbvcxzlkj", "1234567890123"))
+
+
+class TestLexScrubOrder:
+    @pytest.fixture(autouse=True)
+    def _staff(self, monkeypatch):
+        from types import SimpleNamespace
+        monkeypatch.setattr(cl.org_roles, "all_roles",
+                            lambda: [SimpleNamespace(name="Shaun Hawkins")])
+
+    def test_fixture_is_the_defect_shape(self):
+        # both are live token shapes, and the PHI scrub ALONE mangles their start
+        assert st.count_by_shape(LEX_BODY) == {"slack-token": 1, "sk-key": 1}
+        from cora import phi_guard
+        mangled = phi_guard.redact_cue_adjacent_names(
+            phi_guard.scrub_lex_phi(LEX_BODY, allowed_names={"Shaun Hawkins"}),
+            allowed_names={"Shaun Hawkins"})
+        assert st.count_by_shape(mangled).get("slack-token", 0) == 0
+        assert LEX_SLACK_REST in mangled                 # why the belt must run first
+
+    def test_scrub_redacts_tokens_before_the_phi_pass(self, caplog):
+        with caplog.at_level("WARNING", logger="cora.context_loader"):
+            out = cl._apply_lex_phi_scrub([_lex_res()])
+        assert _lex_secret_free(out[0].content)
+        assert out[0].content.count(st.MARKER) == 2
+        warns = [r.getMessage() for r in caplog.records if "api-token redaction" in r.getMessage()]
+        assert warns and all("chunk-lex-tok-1" in w for w in warns)
+        assert _lex_secret_free(" ".join(r.getMessage() for r in caplog.records))
+
+    def test_slack_non_custodian_path_leaves_no_tail(self, monkeypatch):
+        monkeypatch.setattr(cl, "_KB_DB_PATH", Path(__file__).resolve().parent)  # .exists()
+        fake_kb = type("K", (), {"search": lambda self, *a, **k: [_lex_res()]})()
+        monkeypatch.setattr(cl, "get_shared_kb", lambda: fake_kb)
+        text = cl._try_kb_retrieve("LEX", "how are the member sessions billed",
+                                   phi_custodian=False)
+        assert text and _lex_secret_free(text)
+        assert text.count(st.MARKER) == 2
+
+    def test_mcp_lex_surface_leaves_no_tail(self, monkeypatch):
+        rows = [mcp_server._result_dict(r)
+                for r in mcp_server._scrub_for_founder_surface([_lex_res()], "LEX")]
+        assert _lex_secret_free(rows[0]["content"]) and rows[0]["content"].count(st.MARKER) == 2
+        _wire(monkeypatch, [_lex_res()])
+        out = mcp_server.kb_search("member sessions billing", entity="LEX", limit=5)
+        assert out["results"] and _lex_secret_free(out["results"][0]["content"])
+        assert _lex_secret_free(out["text"]) and st.MARKER in out["text"]
+
+    def test_delegated_worker_order_is_the_same_hook(self):
+        # delegated_worker calls cl._apply_lex_phi_scrub then cl._format_kb_chunks
+        block = cl._format_kb_chunks(cl._apply_lex_phi_scrub([_lex_res()]))
+        assert _lex_secret_free(block) and block.count(st.MARKER) == 2
+
+    def test_a_clean_lex_chunk_is_unchanged_by_the_token_leg(self):
+        from cora import phi_guard
+        body = "Billing units for the member sessions are tracked in the LLC sheet."
+        r = _res(body, source="slack", entity="LEX")
+        expect = phi_guard.redact_cue_adjacent_names(
+            phi_guard.scrub_lex_phi(body, allowed_names={"Shaun Hawkins"}),
+            allowed_names={"Shaun Hawkins"})
+        assert cl._apply_lex_phi_scrub([r])[0].content == expect
+
+
 class TestOtherRenderers:
     def test_format_owned_chunks(self, caplog):
         r = _res("body " + SLACK_USER, source="gmail", title=HOT_TITLE,
@@ -374,6 +507,46 @@ class TestOtherRenderers:
         assert ("xo" + "xb-") not in lines[0] and "1234567890123" not in lines[0]
         assert lines[0].startswith(f"[GMAIL/FNDR] Deploy notes {st.MARKER}:")
 
+    def test_briefing_query_redacts_before_the_80_and_500_cuts(self, monkeypatch, tmp_path):
+        """D-051 r1 s1-seams#1: _query_user_chunks cut title[:80] / content[:500] BEFORE
+        the belt ran in _chunk_context_lines, so a token straddling either cut left a
+        fragment no shape matches -- it reached the Haiku prompt and the teammate DM."""
+        import sqlite3 as s3
+        spec = importlib.util.spec_from_file_location(
+            "run_daily_briefing", _REPO_ROOT / "scripts" / "run_daily_briefing.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        tail = "Q1w2E3r4T5y6U7i8O9p0AsDf"
+        tok = "xo" + "xb-" + "1234567890-1234567890123-" + tail
+        title = "Slack workspace bot creds (rotate) -- " + tok     # the tail straddles [:80]
+        head = "Aaron Ferrucci asked to rotate these: " + " ".join([SLACK_BOT] * 3) + " "
+        pad = "x" * (mod._MAX_CHUNK_CHARS - 40 - len(head))
+        body = head + pad + " " + tok + " thanks"                  # the tail straddles [:500]
+        assert len(title) > 80 and len(head + pad + " ") + 30 < mod._MAX_CHUNK_CHARS
+        assert st.count_by_shape(title) == {"slack-token": 1}
+        db = tmp_path / "kb.db"
+        conn = s3.connect(str(db))
+        conn.execute("CREATE TABLE knowledge_chunks (source TEXT, entity TEXT, title TEXT,"
+                     " content TEXT, deep_link TEXT, ingested_at INTEGER)")
+        conn.execute("INSERT INTO knowledge_chunks VALUES (?,?,?,?,?,?)",
+                     ("gmail", "F3E", title, body, "", int(time.time())))
+        conn.commit()
+        conn.close()
+        monkeypatch.setattr(mod, "_KB_DB_PATH", db)
+        chunks = mod._query_user_chunks("Aaron Ferrucci", "Aaron", entities=["F3E"])
+        assert len(chunks) == 1
+        lines = mod._chunk_context_lines(chunks)
+
+        def _frag_free(s: str) -> bool:
+            return ("xo" + "xb-") not in s and "1234567890123" not in s and \
+                not any(tail[:k] in s for k in range(4, len(tail) + 1))
+        for surface in (chunks[0]["title"], chunks[0]["content"], lines[0]):
+            assert _frag_free(surface) and st.MARKER in surface
+        assert len(chunks[0]["title"]) <= 80 and len(chunks[0]["content"]) <= mod._MAX_CHUNK_CHARS
+        # the belt is idempotent, so the second pass in _chunk_context_lines is a no-op
+        assert st.redact_chunk_egress(chunks[0]["content"])[1:] == (0, 0)
+
     def test_materializer_source_block(self):
         block = drive_materializer._build_source_block([
             {"title": HOT_TITLE, "content": "the key is " + ANTHROPIC_ADMIN},
@@ -392,7 +565,10 @@ class TestOtherRenderers:
         assert _secret_free(out2) and st.MARKER in out2
 
 
-# ── drift: every redactor positive is a secrets_scan hit ─────────────────────
+# ── drift: every SPACE-DELIMITED fixture positive is a secrets_scan hit ───────
+# (narrowed, D-051 r1 s1-regex#0: the pre-S1 secrets_scan shapes are \b-anchored, so a
+# '_'-adjacent token the redactor catches -- `_tok_`, `KEY_tok` -- is NOT a scan hit;
+# recorded in the secret_tokens OUT OF SCOPE residuals, not bound here)
 class TestSecretsScanDrift:
     @pytest.mark.parametrize("name", sorted(POSITIVES))
     def test_every_positive_is_a_scan_hit(self, name):

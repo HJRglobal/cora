@@ -805,6 +805,21 @@ def _apply_lex_phi_scrub(results: list) -> list:
         staff = set()
     for r in results:
         try:
+            # Code #15 S1 / D-051 r1 s1-seams#0: API-token shapes FIRST, before any
+            # PHI transform. PASS 2 of redact_cue_adjacent_names (_PROPER_NAME_RE, no
+            # trailing \b) rewrites the Title-case START of a token segment near a PHI
+            # cue into '[name redacted]<rest>'; the renderer's token belt then no
+            # longer matches and the secret tail would reach the model context, the
+            # Slack reply and the MCP content. redact_secret_tokens never raises and
+            # fails CLOSED to WITHHELD. The renderer's belt still runs (idempotent),
+            # so its count is 0 for these tokens -- this WARN is the one event line.
+            redacted, n_tok = secret_tokens.redact_secret_tokens(r.content)
+            if n_tok:
+                r.content = redacted
+                log.warning(
+                    "api-token redaction: %d token(s) redacted from LEX chunk %s before the PHI scrub",
+                    n_tok, getattr(r, "chunk_id", "") or "?",
+                )
             r.content = phi_guard.scrub_lex_phi(r.content, allowed_names=staff)
             # B5 (2026-06-17): also redact a bare non-staff name sitting near a PHI
             # cue (the residual scrub_lex_phi misses -- "the client, Madison, ..." /

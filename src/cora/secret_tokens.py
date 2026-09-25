@@ -27,15 +27,24 @@ quantifier bounded (seven ReDoS incidents in this repo's history):
     admin / None / Anthropic ``ant-<kind><nn>``) allow ``_`` and ``-`` in a
     20-300 char tail that carries a digit; a BARE ``sk-`` needs 32-300 alnum with
     no hyphen, a digit AND a letter (kills kebab-case words and ``task-`` /
-    ``desk-`` joins; the left boundary rejects a preceding word char or hyphen).
-  * ``google-api-key`` -- ``AIza`` + exactly 35 of ``[0-9A-Za-z_-]``.
+    ``desk-`` joins; the left boundary rejects a preceding letter, digit or hyphen
+    but ADMITS ``_`` -- markdown/Slack italics ``_tok_`` and a snake join
+    ``KEY_tok``). The bare run may be followed by ``-`` / ``_`` (``tok-dev``,
+    ``tok_old``) but never by another alnum.
+  * ``google-api-key`` -- ``AIza`` + exactly 35 of ``[0-9A-Za-z_-]``; same edges as
+    the bare ``sk-`` (``_`` admitted on the left, ``-`` / ``_`` on the right, a
+    longer alnum run never matches).
 
 OUT OF SCOPE (recorded residuals, seeded): Slack app-level / rotating-refresh
 token prefixes, Google OAuth access/refresh tokens, the legacy Asana ``0/<32 hex>``
 form (collides with URL path hashes), and live ``.env`` values that carry no token
 shape (a vendor password, an API key without a prefix). A prefixed token glued to
-a preceding LETTER (a literal ``\\n`` escape in JSON text, "tokenxox...") is not
-matched by the three prefix shapes -- only the Asana leg tolerates that.
+a preceding LETTER or digit (a literal ``\\n`` escape in JSON text, "tokenxox...")
+is not matched by the three prefix shapes -- only the Asana leg tolerates that --
+and a HYPHEN-joined ``sk-`` / ``AIza`` (``KEY-tok``) is not matched either (the
+kebab-join guard). The pre-S1 ``scripts/secrets_scan`` shapes are ``\\b``-anchored,
+so they miss a ``_``-adjacent token this module redacts (``_tok_``, ``KEY_tok``);
+the drift test binds the two on space-delimited fixtures only.
 
 API (the ``banking_identifiers`` contract, so every seam reads the same):
   * ``redact_secret_tokens(text) -> (text, n)`` never raises; fails CLOSED to
@@ -71,13 +80,21 @@ SHAPES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("slack-token", re.compile(
         r"(?<![0-9A-Za-z])xox[abprs]-[0-9]{1,15}-"
         r"(?=[0-9A-Za-z-]{0,200}[0-9A-Za-z]{16})[0-9A-Za-z-]{10,250}(?![0-9A-Za-z-])")),
+    # D-051 r1 s1-regex#0: the sk-/AIza LEFT edge admits '_' (Slack/markdown italics
+    # `_tok_`, a snake join `KEY_tok` -- the Slack and Asana legs already did); a
+    # preceding '-' stays rejected (kebab joins). The RIGHT edge of the two EXACT-run
+    # kinds (bare sk-, AIza) admits a following '-'/'_' (`tok-dev`, `tok_old`): a run
+    # followed by alnum still fails, so bare sk- stays a full <=300 alnum run and
+    # AIza stays exactly 35. The prefixed sk- kinds keep their edge -- their tail
+    # alphabet already absorbs a '-'/'_' suffix.
     ("sk-key", re.compile(
-        r"(?<![0-9A-Za-z_-])sk-(?:"
+        r"(?<![0-9A-Za-z-])sk-(?:"
         r"(?:proj|svcacct|admin|None|ant-[a-z]{2,8}[0-9]{2})-(?=[0-9A-Za-z_-]{0,300}[0-9])[0-9A-Za-z_-]{20,300}"
-        r"|(?=[0-9A-Za-z]{0,300}[0-9])(?=[0-9A-Za-z]{0,300}[A-Za-z])[0-9A-Za-z]{32,300}"
-        r")(?![0-9A-Za-z_-])")),
+        r"(?![0-9A-Za-z_-])"
+        r"|(?=[0-9A-Za-z]{0,300}[0-9])(?=[0-9A-Za-z]{0,300}[A-Za-z])[0-9A-Za-z]{32,300}(?![0-9A-Za-z])"
+        r")")),
     ("google-api-key", re.compile(
-        r"(?<![0-9A-Za-z_-])AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])")),
+        r"(?<![0-9A-Za-z-])AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z])")),
 )
 
 SHAPE_NAMES: tuple[str, ...] = tuple(name for name, _rx in SHAPES)

@@ -176,7 +176,9 @@ class ParsedSession:
     # route_capture) and the scheduled-task check keep reading exactly what they
     # read before; only the distill input comes from here. None (a hand-built
     # session) falls back to ``text`` -- belt (b) in _build_distill_prompt still
-    # redacts it before the cap.
+    # redacts it before the cap. Exactly ``secret_tokens.WITHHELD`` = belt (a) failed
+    # on some block: the whole session is refused by _redacted_transcript (no
+    # distill, no note, no ledger row; retried next run).
     distill_text: str | None = None
 
 
@@ -214,7 +216,12 @@ def iter_transcript_files(projects_root: Path = PROJECTS_ROOT) -> Iterator[Path]
 
 
 def _tok(text: str, redact: bool) -> str:
-    return secret_tokens.redact_secret_tokens(text)[0] if redact else text
+    # STRICT (D-051 r1 s1-seams#2): a redactor error RAISES out of _extract_text so
+    # the parser fails the WHOLE twin closed (_twin_turn). The never-raise variant
+    # put WITHHELD in place of just that block, the whole-twin guard re-scanned a
+    # marker with no shape (n == 0) and a PARTIAL transcript was distilled, written
+    # and ledger-marked -- never retried.
+    return secret_tokens.redact_secret_tokens_strict(text)[0] if redact else text
 
 
 def _extract_text(content: Any, *, redact_tokens: bool = False) -> str:
@@ -223,7 +230,8 @@ def _extract_text(content: Any, *, redact_tokens: bool = False) -> str:
     ``redact_tokens`` (Code #15 S1 belt a): API-token shapes are redacted in every
     text block and in a tool_result BEFORE its 400-char cut -- a token straddling
     the cut would otherwise leave a partial prefix no later belt can match (the
-    run_daily_briefing pre-slice lesson). Off = the exact prior flattening."""
+    run_daily_briefing pre-slice lesson). Off = the exact prior flattening. With
+    ``redact_tokens`` a redactor error RAISES (the caller withholds the whole twin)."""
     if isinstance(content, str):
         return _tok(content, redact_tokens)
     if not isinstance(content, list):
@@ -247,6 +255,29 @@ def _extract_text(content: Any, *, redact_tokens: bool = False) -> str:
     return "\n".join(p for p in parts if p)
 
 
+def _twin_turn(dturns: list[str] | None, role: str, content: Any, where: Any) -> list[str] | None:
+    """Append one turn to the token-redacted twin (belt a); ``None`` = the twin has
+    FAILED for this session and stays failed (every later turn is skipped). A
+    per-block redactor error must fail the WHOLE session closed, never just that
+    block (D-051 r1 s1-seams#2): ``_join_twin`` then yields ``WITHHELD``, which
+    ``_redacted_transcript`` refuses, so the session is not distilled, not written,
+    not ledger-marked -- it retries next run."""
+    if dturns is None:
+        return None
+    try:
+        dturns.append(f"{role.upper()}: {_extract_text(content, redact_tokens=True)}")
+    except Exception as exc:  # noqa: BLE001 -- fail-CLOSED for the whole session
+        log.warning("session_capture: api-token redaction failed while flattening %s (%s) -- "
+                    "the whole session skips distill (fail-closed)",
+                    getattr(where, "name", where), type(exc).__name__)
+        return None
+    return dturns
+
+
+def _join_twin(dturns: list[str] | None) -> str:
+    return secret_tokens.WITHHELD if dturns is None else "\n\n".join(dturns)
+
+
 def _iso_to_epoch(iso: str | None) -> float | None:
     if not iso:
         return None
@@ -264,7 +295,8 @@ def parse_transcript(path: Path) -> ParsedSession | None:
     last_ts: str | None = None
     last_epoch = path.stat().st_mtime
     turns: list[str] = []
-    dturns: list[str] = []   # Code #15 S1: the token-redacted twin (distill input)
+    # Code #15 S1: the token-redacted twin (distill input); None = belt (a) failed
+    dturns: list[str] | None = []
     n_turns = 0
 
     try:
@@ -292,8 +324,7 @@ def parse_transcript(path: Path) -> ParsedSession | None:
                     # Skip pure tool-result/system noise and empty turns.
                     if text and not _is_noise_turn(text):
                         turns.append(f"{msg['role'].upper()}: {text}")
-                        dturns.append(f"{msg['role'].upper()}: "
-                                      f"{_extract_text(msg.get('content'), redact_tokens=True)}")
+                        dturns = _twin_turn(dturns, msg["role"], msg.get("content"), path)
                         n_turns += 1
     except OSError as exc:
         log.warning("session_capture: cannot read %s: %s", path, exc)
@@ -312,7 +343,7 @@ def parse_transcript(path: Path) -> ParsedSession | None:
         ended_iso=last_ts,
         text="\n\n".join(turns),
         n_turns=n_turns,
-        distill_text="\n\n".join(dturns),
+        distill_text=_join_twin(dturns),
     )
 
 
@@ -437,7 +468,8 @@ def parse_cowork_session(session_dir: Path,
     last_ts: str | None = None
     last_epoch = 0.0
     turns: list[str] = []
-    dturns: list[str] = []   # Code #15 S1: the token-redacted twin (distill input)
+    # Code #15 S1: the token-redacted twin (distill input); None = belt (a) failed
+    dturns: list[str] | None = []
     n_turns = 0
     seen_uuids: set[str] = set()
     total_chars = 0
@@ -478,8 +510,7 @@ def parse_cowork_session(session_dir: Path,
                         text = _extract_text(msg.get("content"))
                         if text and not _is_noise_turn(text):
                             turns.append(f"{msg['role'].upper()}: {text}")
-                            dturns.append(f"{msg['role'].upper()}: "
-                                          f"{_extract_text(msg.get('content'), redact_tokens=True)}")
+                            dturns = _twin_turn(dturns, msg["role"], msg.get("content"), tf)
                             n_turns += 1
                             total_chars += len(text)
                             if total_chars >= _COWORK_MAX_TEXT_CHARS:
@@ -501,7 +532,7 @@ def parse_cowork_session(session_dir: Path,
         ended_iso=last_ts,
         text="\n\n".join(turns),
         n_turns=n_turns,
-        distill_text="\n\n".join(dturns),
+        distill_text=_join_twin(dturns),
     )
 
 
@@ -562,7 +593,9 @@ def _distill_input(session: ParsedSession) -> str:
     """The distill input: the token-redacted flattening (belt a) when the parser
     built one, else the raw text (belt b below still redacts it). ``getattr``: a
     duck-typed session without the field (a caller/test stub) must not break the
-    batch or the sync path -- it falls back to ``text``."""
+    batch or the sync path -- it falls back to ``text``. A FAILED twin (exactly
+    WITHHELD) is returned as-is -- never the raw text -- and every distill path
+    refuses it through _redacted_transcript."""
     twin = getattr(session, "distill_text", None)
     return twin if twin is not None else session.text
 
@@ -571,7 +604,12 @@ def _redacted_transcript(text: str) -> str | None:
     """Belt (b), Code #15 S1: API-token shapes out of the WHOLE transcript before
     the cap is sliced. None = the redactor failed (fail-closed: no distill, the
     session is not ledger-marked and retries next run). A legitimate redaction can
-    never equal WITHHELD (its output carries the MARKER)."""
+    never equal WITHHELD (its output carries the MARKER). An input that IS exactly
+    WITHHELD is belt (a)'s whole-session failure (``_join_twin``) and is refused the
+    same way -- a flattened transcript always carries ``ROLE: `` prefixes, so it can
+    never equal the marker (D-051 r1 s1-seams#2)."""
+    if text == secret_tokens.WITHHELD:
+        return None
     safe, n = secret_tokens.redact_secret_tokens(text or "")
     if n and safe == secret_tokens.WITHHELD:
         return None
