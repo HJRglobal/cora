@@ -19,6 +19,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -234,6 +235,142 @@ def test_lex_and_copa_named_paths_outside_the_partition_are_counts_only():
     assert b"Progress" not in side and b"COPA" not in side and withheld["lex"] == 3
 
 
+# D-051 R1 rb2-r8#0 + lens-d082#0: LEX sub-entity / program / lead names OUTSIDE
+# the partition -- in _shared\meetings (Fireflies exports) and in 01-HJR-Global
+# (the accounting binder) -- were listed verbatim in the KB-ingested .md.
+LEX_NAMED_OUTSIDE_08 = [
+    "_shared\\meetings\\LBHS Leadership Sync (1).gdoc",
+    "_shared\\meetings\\Fireflies Meetings\\Summaries\\Lex-LLC Ops Review (2).gdoc",
+    "_shared\\meetings\\lts weekly huddle (1).gdoc",
+    "_shared\\meetings\\LLA Ops (1).gdoc",
+    "_shared\\meetings\\Shaun Hawkins 1-1 (1).gdoc",          # a named LEX lead (title keyword)
+    "_shared\\meetings\\Jared Harker check-in (1).gdoc",      # a named LEX lead (attendee signal)
+    "_shared\\meetings\\Case Conference notes (1).gdoc",      # a clinical title
+    "_shared\\meetings\\HCBS rates (1).pdf",
+    "01-HJR-Global\\accounting\\visibility-binder\\02 Non-Lexington\\Copy of Lex Services P&L (1).xlsx",
+    "01-HJR-Global\\accounting\\visibility-binder\\02 Non-Lexington\\Copy of LBHS budget (1).xlsx",
+    "01-HJR-Global\\accounting\\DDD contract (1).pdf",
+    "01-HJR-Global\\accounting\\LTS_budget (1).xlsx",           # '_' is a boundary for the belt
+    "01-HJR-Global\\accounting\\LexLLC 2026 (1).xlsx",
+    "01-HJR-Global\\projects\\bhrf-expansion\\plan (1).pdf",
+]
+# Must stay LISTABLE: the vocabulary inside ordinary words, and the HJRG
+# 'Non-Lexington' binder folder itself.
+NOT_LEX = [
+    "01-HJR-Global\\accounting\\visibility-binder\\02 Non-Lexington\\F3 Energy LLC\\inv (1).pdf",
+    "09-One-Stop-Nutrition\\Maricopa county permit (1).pdf",
+    "02-F3-Energy\\Alex flex complex results (1).pdf",
+    "06-HJR-Properties\\Villa lease (1).pdf",
+    "02-F3-Energy\\data exports (1).csv",
+]
+
+
+def test_lex_sub_entity_program_and_lead_names_outside_the_partition_are_counts_only():
+    md, now, diffs = _render([frow(p, suffix="paren-n") for p in LEX_NAMED_OUTSIDE_08 + NOT_LEX], [])
+    for p in LEX_NAMED_OUTSIDE_08:
+        assert hdr.is_lex_relpath(p), p
+        assert p.rsplit("\\", 1)[-1] not in md, p
+    for p in NOT_LEX:
+        assert not hdr.is_lex_relpath(p), p
+        assert f"`{p}`" in md, p
+    assert f"{len(LEX_NAMED_OUTSIDE_08)} LEX (counts only)" in md
+    side, withheld = hdr.render_full_list_csv(now, diffs)
+    assert withheld["lex"] == len(LEX_NAMED_OUTSIDE_08)
+    for p in LEX_NAMED_OUTSIDE_08:
+        assert p.rsplit("\\", 1)[-1].encode("utf-8") not in side, p
+    # manifest decisions keep the partition-only predicate
+    assert not any(hdr.is_lex_partition(p) for p in LEX_NAMED_OUTSIDE_08)
+
+
+def test_static_walk_phi_folder_segments_are_counts_only_and_imported_not_copied():
+    import incremental_sync_static  # noqa: PLC0415 -- the ingest door this report feeds
+
+    assert hdr._static_phi_segments() == frozenset(s.lower() for s in incremental_sync_static.PHI_BLACKLIST_SEGMENTS)
+    seg_paths = ["09-One-Stop-Nutrition\\clients\\roster export (1).pdf",
+                 "02-F3-Energy\\Consumers\\survey (1).pdf",
+                 "_shared\\ehr\\x (1).pdf"]
+    fine = "02-F3-Energy\\client-decks\\deck (1).pdf"     # a segment CONTAINING 'client' is not the segment
+    md, now, diffs = _render([frow(p, suffix="paren-n") for p in seg_paths + [fine]], [])
+    for p in seg_paths:
+        assert hdr.is_phi_segment_path(p) and not hdr.is_lex_relpath(p), p
+        assert p.rsplit("\\", 1)[-1] not in md, p
+    assert f"`{fine}`" in md
+    assert f"{len(seg_paths)} withheld by the PHI screen" in md
+    side, withheld = hdr.render_full_list_csv(now, diffs)
+    assert withheld["phi"] == len(seg_paths) and b"roster export" not in side and b"survey" not in side
+
+
+def test_the_lex_and_phi_segment_screens_fail_closed(monkeypatch):
+    plain = "02-F3-Energy\\plain zzfailclosed (1).pdf"
+    assert not hdr.is_lex_relpath(plain) and not hdr.is_phi_segment_path(plain)
+
+    def boom(_transcript):
+        raise RuntimeError("detector down")
+    try:
+        hdr._segment_names_lex.cache_clear()
+        monkeypatch.setattr(hdr, "_lex_detector", lambda: boom)
+        assert hdr.is_lex_relpath(plain), "a detector error counts the path as LEX"
+        hdr._segment_names_lex.cache_clear()
+        monkeypatch.setattr(hdr, "_lex_detector", lambda: None)
+        assert hdr.is_lex_relpath(plain), "an unavailable detector counts the path as LEX"
+        monkeypatch.setattr(hdr, "_static_phi_segments", lambda: None)
+        assert hdr.is_phi_segment_path(plain), "an unavailable PHI segment list withholds"
+    finally:
+        monkeypatch.undo()
+        hdr._segment_names_lex.cache_clear()   # never leave fail-closed verdicts cached
+    assert not hdr.is_lex_relpath(plain) and not hdr.is_phi_segment_path(plain)
+
+
+# An INDEPENDENT oracle (not the module's own regexes): 'lexington' anywhere, the
+# sub-entity / program codes at any non-letter boundary, and COPA.
+_ORACLE_LEX_RE = re.compile(
+    r"lexington|(?<![a-z])(?:lex[\s_-]*ll[ac]|lex|lbhs|lla|lts|ddd|hcbs|bhrf|copa)(?![a-z])", re.IGNORECASE)
+
+
+def _lex_vocabulary_hit(text: str) -> bool:
+    """Every LEX vocabulary Cora uses, applied to a LISTED line: an independent
+    oracle regex, cross_entity_guard's LEX keyword list and the fireflies detector
+    per segment -- with the HJRG 'Non-Lexington' binder folder masked (the one
+    sanctioned exception, a non-LEX entity folder)."""
+    from cora import cross_entity_guard  # noqa: PLC0415
+    from cora.connectors.fireflies_connector import classify_lex_meeting  # noqa: PLC0415
+
+    masked = text.replace("Non-Lexington", "Non-Lxngtn")
+    if _ORACLE_LEX_RE.search(masked):
+        return True
+    if "LEX" in cross_entity_guard.detect_entities(masked.replace("\\", " ").replace("_", " ")):
+        return True
+    return any(classify_lex_meeting({"title": s}).is_lex for s in hdr._segs(masked))
+
+
+def test_a_rendered_report_lists_zero_lex_vocabulary_names():
+    """The contract end to end: a synthetic tree with LEX-named offenders in every
+    listed category (NEW and standing, both sides of the cap sort) renders a
+    report and a sidecar whose LISTED lines carry no LEX vocabulary at all."""
+    lex_files = [frow(p, suffix="paren-n") for p in LEX_NAMED_OUTSIDE_08] + [
+        frow("01-HJR-Global\\Copy of LBHS census.xlsx", suffix="copy-of"),
+        frow("_shared\\meetings\\Lex Services_2.docx", suffix="underscore-n"),
+        frow("02-F3-Energy\\DDD (conflicted copy).pdf", suffix="conflicted"),
+        frow("LBHS stray note.txt"),                                  # loose at the root
+        frow("00-Founder\\lex-lla notes.md"),                         # loose at 00-Founder
+    ]
+    lex_dirs = [drow("LTS scratch"),                                  # non-canonical top
+                drow("01-HJR-Global\\LBHS 2", suffix="space-2"),
+                drow("_shared\\projects\\" + "lbhs-" + "x" * 35),     # a 40-char slug
+                drow("01-HJR-Global\\hcbs-empty", empty=True)]
+    fine_files = [frow(p, suffix="paren-n") for p in NOT_LEX] + [frow("02-F3-Energy\\Copy of deck.pptx", suffix="copy-of")]
+    fine_dirs = [drow("Slack Deep Dive"), drow("02-F3-Energy\\brand 2", suffix="space-2"),
+                 drow("04-UFL\\empty", empty=True)]
+    prior = (lex_files[:3] + fine_files[:2], [])
+    md, now, diffs = _render(lex_files + fine_files, lex_dirs + fine_dirs, prior=prior)
+    listed = [ln for ln in md.splitlines() if ln.startswith("- `") or ln.startswith("- NEW `")]
+    assert len(listed) >= len(fine_files) + len(fine_dirs), "the fine names are still listed"
+    assert [ln for ln in listed if _lex_vocabulary_hit(ln)] == []
+    side, _ = hdr.render_full_list_csv(now, diffs)
+    rows = list(csv.DictReader(io.StringIO(side.decode("utf-8-sig"))))
+    assert rows and [r["relpath"] for r in rows if _lex_vocabulary_hit(r["relpath"])] == []
+
+
 def test_kb_pinned_container_names_are_counts_only():
     pinned = ["00-Founder\\personal-finances\\tax (1).pdf",
               "_shared\\projects\\cora\\notes (1).md",
@@ -284,11 +421,22 @@ def test_week_over_week_new_vs_standing():
 
 
 def test_phi_screen_withholds_a_listed_name():
-    phi = "09-One-Stop-Nutrition\\clients\\patient John Smith diagnosis (1).pdf"
+    # D-051 R1: the original fixture ('...\\clients\\patient John Smith ...') now
+    # trips two EARLIER screens -- 'patient' is a clinical title the ONE LEX
+    # detector calls LEX, and 'clients' is a static-walk PHI segment -- so the
+    # name screen is isolated on a name only it catches, and the original path
+    # is pinned as withheld (never listed) by whichever screen catches it first.
+    phi = "09-One-Stop-Nutrition\\members\\John Smith diagnosis (1).pdf"
+    assert not hdr.is_lex_relpath(phi) and not hdr.is_phi_segment_path(phi)
     md, now, diffs = _render([frow(phi, suffix="paren-n")], [])
     assert "John Smith" not in md and "1 withheld by the PHI screen" in md
     side, withheld = hdr.render_full_list_csv(now, diffs)
     assert b"John Smith" not in side and withheld["phi"] == 1
+    original = "09-One-Stop-Nutrition\\clients\\patient John Smith diagnosis (1).pdf"
+    md, now, diffs = _render([frow(original, suffix="paren-n")], [])
+    assert "John Smith" not in md
+    side, withheld = hdr.render_full_list_csv(now, diffs)
+    assert b"John Smith" not in side and withheld["lex"] + withheld["phi"] == 1
 
 
 def test_lists_cap_at_fifty_and_the_sidecar_has_the_full_list():
@@ -401,6 +549,86 @@ def test_a_truncated_walk_is_never_a_clean_report(world, monkeypatch):
     fake_ps(monkeypatch, world, stamp="20261003-0240", files=many)
     assert rh.main(["--apply"]) == rh.EXIT_OK
     assert "stamp `20260919-0240`" in world.report("2026-10-03").read_text(encoding="utf-8")
+
+
+def test_the_floor_is_anchored_to_the_high_water_mark_and_cannot_ratchet(world, monkeypatch):
+    """D-051 R1 rb2-r8#1: 100 -> 81 (passes, 81 >= 80) -> 65 read CLEAN against the
+    81 prior, with 16 never-walked offenders reported 'resolved'."""
+    full = [frow(f"02-F3-Energy\\r\\f{i:03d} (1).pdf", suffix="paren-n") for i in range(100)]
+    seed_prior(world, "20260919-0240", files=full)
+    fake_ps(monkeypatch, world, stamp="20260926-0240", files=full[:81])
+    assert rh.main(["--apply"]) == rh.EXIT_OK
+    fake_ps(monkeypatch, world, stamp="20261003-0240", files=full[:65])
+    assert rh.main(["--apply"]) == rh.EXIT_INCOMPLETE
+    md = world.report("2026-10-03").read_text(encoding="utf-8")
+    assert "INCOMPLETE WALK" in md and "resolved since last run" not in md
+    assert "files walked 65 < 80% of the high-water full run's 100 (stamp 20260919-0240)" in md
+    row = [r for r in world.ledger_rows() if r.get("stamp") == "20261003-0240" and r["event"] == "created"]
+    assert row and row[0]["status"] == "incomplete"
+    # the week-over-week comparison run is still the newest eligible run
+    fake_ps(monkeypatch, world, stamp="20261010-0240", files=full)
+    assert rh.main(["--apply"]) == rh.EXIT_OK
+    assert "stamp `20260926-0240`" in world.report("2026-10-10").read_text(encoding="utf-8")
+
+
+def test_the_baseline_is_part_of_the_high_water_mark(world, monkeypatch):
+    full = [frow(f"02-F3-Energy\\r\\f{i:03d}.pdf") for i in range(100)]
+    write_stamp(world.outdir, rh.BASELINE_STAMP, full, BASE_DIRS, root=world.root, max_hash=200)
+    seed_prior(world, "20260926-0240", files=full[:82])
+    fake_ps(monkeypatch, world, stamp="20261003-0240", files=full[:70])   # 70 >= 80% of 82, < 80% of 100
+    assert rh.main(["--apply"]) == rh.EXIT_INCOMPLETE
+    md = world.report("2026-10-03").read_text(encoding="utf-8")
+    assert f"files walked 70 < 80% of the high-water full run's 100 (stamp {rh.BASELINE_STAMP})" in md
+    runs = rh.eligible_runs(world.outdir, "20261010-0240", world.root,
+                            rh.ledger_state(rh.read_ledger(world.ledger)))
+    assert [r.stamp for r in runs] == ["20260926-0240", rh.BASELINE_STAMP], "incomplete runs are never eligible"
+    assert rh.high_water(runs)["files_total"] == (100, rh.BASELINE_STAMP)
+
+
+def test_the_ps1_output_write_error_shapes_are_walk_errors():
+    """D-051 R1 rb2-r8#2: the exact-head match never counted the PS1's three
+    'OUTPUT-WRITE-ERROR (<what>): ...' shapes (folder-audit-inventory.ps1)."""
+    c = hdr.count_run_log("\ufeffOUTPUT-WRITE-ERROR (files CSV): denied\r\n"
+                          "OUTPUT-WRITE-ERROR (dirs CSV): denied\r\n"
+                          "OUTPUT-WRITE-ERROR (summary): denied\r\n"
+                          "FATAL-ERROR: boom\r\nFATAL-ERROR-STACK: at line 1\r\n"
+                          "WALK-FILE-ERROR: G:\\x :: y\r\nHASH-ERROR: z :: w\r\n")
+    assert c["OUTPUT-WRITE-ERROR"] == 3 and c["FATAL-ERROR"] == 1, "the stack line is not a second fatal"
+    assert c["WALK-FILE-ERROR"] == 1 and c["HASH-ERROR"] == 1
+    assert hdr.walk_error_count(c) == 5
+
+
+@pytest.mark.parametrize("which", ["files", "dirs"])
+@pytest.mark.parametrize("mode", ["missing", "undecodable"])
+def test_a_missing_or_unreadable_csv_is_an_incomplete_walk_with_a_ledger_row(world, monkeypatch, which, mode):
+    """D-051 R1 rb2-r8#2: Export-Csv failing at open leaves no CSV while the PS1
+    still exits 0 -- the runner raised FileNotFoundError: no report, no ledger
+    row, so the stamp's other files were never rotated."""
+    seed_prior(world, "20260919-0240")
+    stamp = "20260926-0240"
+    name = f"inventory-{which}-{stamp}.csv"
+    label = "files" if which == "files" else "folders"
+    runlog = [f"OUTPUT-WRITE-ERROR ({which} CSV): The process cannot access the file"] if mode == "missing" else None
+    real = fake_ps(monkeypatch, world, stamp=stamp, runlog=runlog)
+
+    def fake(cmd, **kw):
+        cp = real(cmd, **kw)
+        target = Path(cmd[cmd.index("-OutDir") + 1]) / name
+        if mode == "missing":
+            target.unlink()
+        else:
+            target.write_bytes(b"\xef\xbb\xbf\"RelPath\"\r\n\"\xff\xfe\xfd\"\r\n")
+        return cp
+    monkeypatch.setattr(rh.subprocess, "run", fake)
+    assert rh.main(["--apply"]) == rh.EXIT_INCOMPLETE
+    md = world.report().read_text(encoding="utf-8")
+    assert "INCOMPLETE WALK" in md and f"the {label} CSV is missing or unreadable" in md
+    if mode == "missing":
+        assert "1 walk errors logged" in md
+    row = [r for r in world.ledger_rows() if r.get("stamp") == stamp and r["event"] == "created"]
+    assert row and row[0]["status"] == "incomplete" and row[0]["full_root"] is True
+    assert (name in row[0]["files"]) == (mode != "missing"), "the ledger lists exactly the files that exist"
+    assert not list(world.outdir.glob("manifest-desktopini-*"))
 
 
 def test_walk_errors_make_the_walk_incomplete_and_their_paths_never_leak(world, monkeypatch, capsys):

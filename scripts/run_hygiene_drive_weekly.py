@@ -18,10 +18,13 @@ WHAT IT DOES (``--apply``, what the task passes)
  6. Finds the new stamp by diffing the listing (a pre-existing stamp = a
     collision -> exit 5; Export-Csv would have overwritten someone's run).
  7. Parses the summary + run log (counts only; the run log's lines carry paths).
- 8. SANITY FLOOR: files AND folders >= 80% of the prior full run, 0 walk errors,
-    CSV row counts == the summary totals. A failure writes an INCOMPLETE WALK
-    report (no lists, no deltas) and exits 1 -- never a clean report on a
-    partial walk (the "0 violations" failure mode).
+ 8. SANITY FLOOR: files AND folders >= 80% of the HIGH-WATER full run (the
+    largest eligible run of step 9, the 9/21 baseline included -- anchoring on
+    the prior alone let the floor ratchet down 20% a week), 0 walk errors
+    (WALK-*/FATAL/OUTPUT-WRITE run-log lines), both CSVs readable and their row
+    counts == the summary totals. A failure writes an INCOMPLETE WALK report (no
+    lists, no deltas), records the stamp as ``incomplete``, and exits 1 -- never
+    a clean report on a partial walk (the "0 violations" failure mode).
  9. Prior = the newest earlier FULL-ROOT stamp this runner recorded as passing
     the floor (its stamp ledger), or the 2026-09-21 19:48 hashing baseline;
     never a hand/subtree run, never a run that failed the floor.
@@ -59,6 +62,7 @@ CONFIG (env, read at call time; every one is redirected to tmp in tests/conftest
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import os
@@ -240,6 +244,19 @@ def read_run(d: Path, stamp: str) -> RunInfo | None:
     return RunInfo(stamp, summary, runlog)
 
 
+def load_rows(path: Path) -> list[dict] | None:
+    """One inventory CSV's rows, or None when it is missing or unreadable. The
+    PS1 still exits 0 when Export-Csv fails at open (its RunStatus is COMPLETE
+    before the finally block that writes the CSVs), so a missing CSV is a failed
+    walk -- an INCOMPLETE report plus a ledger row -- never a traceback that
+    leaves no report and unledgered (never-rotated) stamp files (D-051 R1
+    rb2-r8#2)."""
+    try:
+        return hdr.load_csv_rows(path)
+    except (OSError, ValueError, csv.Error):   # ValueError covers UnicodeDecodeError
+        return None
+
+
 def read_ledger(path: Path) -> list[dict]:
     rows = []
     try:
@@ -276,11 +293,12 @@ def append_ledger(path: Path, row: dict) -> None:
         fh.write(json.dumps(row, sort_keys=True) + "\n")
 
 
-def find_prior(outdir: Path, current: str, full_root: Path, ledger: dict[str, dict]) -> RunInfo | None:
-    """The newest earlier stamp that is a runner run which passed the floor
-    (ledger status clean/unverified, not rotated) or the 9/21 baseline, AND whose
-    own summary says COMPLETE on the full root with 0 walk errors and both CSVs
-    present. Hand and subtree runs are never eligible."""
+def eligible_runs(outdir: Path, current: str, full_root: Path, ledger: dict[str, dict]) -> list[RunInfo]:
+    """Every earlier stamp that is a runner run which passed the floor (ledger
+    status clean/unverified, not rotated) or the 9/21 baseline, AND whose own
+    summary says COMPLETE on the full root with 0 walk errors and both CSVs
+    present -- newest first. Hand and subtree runs are never eligible."""
+    out: list[RunInfo] = []
     stamps = sorted({m.group(1) for n in listing(outdir) if (m := _SUMMARY_NAME_RE.match(n))}, reverse=True)
     for st in stamps:
         if st >= current:
@@ -299,12 +317,39 @@ def find_prior(outdir: Path, current: str, full_root: Path, ledger: dict[str, di
             continue
         if not all((outdir / n).exists() for n in stamp_files(st)[:2]):
             continue
-        return info
-    return None
+        out.append(info)
+    return out
 
 
-def sanity(info: RunInfo, full_root: Path, prior: RunInfo | None, *, files_rows: int, dirs_rows: int) -> list[str]:
-    """Reasons this walk cannot be trusted (empty list = it passed)."""
+def find_prior(outdir: Path, current: str, full_root: Path, ledger: dict[str, dict]) -> RunInfo | None:
+    """The newest eligible earlier run (``eligible_runs``) -- the week-over-week
+    comparison run."""
+    runs = eligible_runs(outdir, current, full_root, ledger)
+    return runs[0] if runs else None
+
+
+def high_water(runs: list[RunInfo]) -> dict[str, tuple[int, str]]:
+    """{'files_total' / 'dirs_total': (largest total, its stamp)} over the eligible
+    runs -- every retained runner run that passed the floor PLUS the 9/21
+    baseline. The sanity floor is anchored HERE, not on the prior alone: a walk
+    that passed 80% of an already-partial prior would otherwise become next
+    week's floor, and the floor would ratchet down 20% a week (D-051 R1
+    rb2-r8#1: 100 -> 81 -> 65 read CLEAN, with 16 unwalked offenders reported
+    'resolved')."""
+    hw: dict[str, tuple[int, str]] = {}
+    for info in runs:
+        for key in ("files_total", "dirs_total"):
+            n = info.summary.get(key) or 0
+            if n and (key not in hw or n > hw[key][0]):
+                hw[key] = (n, info.stamp)
+    return hw
+
+
+def sanity(info: RunInfo, full_root: Path, prior: RunInfo | None, *, files_rows: int | None,
+           dirs_rows: int | None, high: dict[str, tuple[int, str]] | None = None) -> list[str]:
+    """Reasons this walk cannot be trusted (empty list = it passed). A row count
+    of None = that CSV is missing or unreadable. ``high`` is the high-water mark
+    the floor is anchored to (``high_water``); None = the prior alone."""
     sm, why = info.summary, []
     if sm.get("run_status") != "COMPLETE":
         why.append("the inventory did not report COMPLETE")
@@ -316,15 +361,24 @@ def sanity(info: RunInfo, full_root: Path, prior: RunInfo | None, *, files_rows:
         why.append("the run log is missing")
     elif info.walk_errors:
         why.append(f"{info.walk_errors} walk errors logged")
-    if sm.get("files_total") is None or files_rows != sm.get("files_total"):
-        why.append("the files CSV row count does not match the summary total")
-    if sm.get("dirs_total") is None or dirs_rows != sm.get("dirs_total"):
-        why.append("the folders CSV row count does not match the summary total")
-    if prior is not None:
-        for key, label in (("files_total", "files"), ("dirs_total", "folders")):
-            now_n, prior_n = sm.get(key) or 0, prior.summary.get(key) or 0
-            if prior_n and now_n < FLOOR_RATIO * prior_n:
-                why.append(f"{label} walked {now_n} < {int(FLOOR_RATIO * 100)}% of the prior full run's {prior_n}")
+    for rows, key, label in ((files_rows, "files_total", "files"), (dirs_rows, "dirs_total", "folders")):
+        if rows is None:
+            why.append(f"the {label} CSV is missing or unreadable")
+        elif sm.get(key) is None or rows != sm.get(key):
+            why.append(f"the {label} CSV row count does not match the summary total")
+    if high is None:
+        high = high_water([prior] if prior is not None else [])
+    for key, label in (("files_total", "files"), ("dirs_total", "folders")):
+        if key not in high:
+            continue
+        now_n, (hw_n, hw_stamp) = sm.get(key) or 0, high[key]
+        if now_n < FLOOR_RATIO * hw_n:
+            pct = int(FLOOR_RATIO * 100)
+            if prior is not None and hw_stamp == prior.stamp:
+                why.append(f"{label} walked {now_n} < {pct}% of the prior full run's {hw_n}")
+            else:
+                why.append(f"{label} walked {now_n} < {pct}% of the high-water full run's {hw_n} "
+                           f"(stamp {hw_stamp})")
     return why
 
 
@@ -486,10 +540,12 @@ def main(argv: list[str] | None = None) -> int:
             # a hand/subtree run must never overwrite that day's report
             _say("REFUSE: --from-stamp names a run that is not of the full audit root")
             return EXIT_REFUSED
-        files = hdr.load_csv_rows(run_dir / stamp_files(stamp)[0])
-        dirs = hdr.load_csv_rows(run_dir / stamp_files(stamp)[1])
-        prior = find_prior(cfg.outdir, stamp, cfg.root, ledger)
-        why = sanity(info, cfg.root, prior, files_rows=len(files), dirs_rows=len(dirs))
+        files = load_rows(run_dir / stamp_files(stamp)[0])
+        dirs = load_rows(run_dir / stamp_files(stamp)[1])
+        runs = eligible_runs(cfg.outdir, stamp, cfg.root, ledger)
+        prior = runs[0] if runs else None
+        why = sanity(info, cfg.root, prior, files_rows=None if files is None else len(files),
+                     dirs_rows=None if dirs is None else len(dirs), high=high_water(runs))
         status = "incomplete" if why else ("clean" if prior else "unverified")
         full_root = hdr.norm_root(info.summary.get("root")) == hdr.norm_root(cfg.root)
         _say(f"files {info.summary.get('files_total')} dirs {info.summary.get('dirs_total')} "

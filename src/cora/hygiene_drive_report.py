@@ -22,24 +22,34 @@ The report ``.md`` is written into ``_shared\hygiene-pending-moves``, and
 report lists becomes a KB chunk. So the report is a second ingest door for
 whatever it names, and gets its own belt:
 
-  * LEX -- ``08-Lexington-Services``, plus any LEX- or COPA-named path outside
-    it (``is_lex_relpath``) -- counts only, never a name or a path.
+  * LEX -- ``08-Lexington-Services``, plus any path outside it with a segment
+    naming LEX, a LEX sub-entity / program / lead, or COPA (``is_lex_relpath``:
+    the ONE LEX title detector ``fireflies_connector.classify_lex_meeting`` per
+    segment, plus a word-bounded sub-entity belt) -- counts only, never a name
+    or a path.
   * every KB-pinned container (the ``kb_exclusions`` pins inside the tree, plus
     the two RIDER B pins ``_archive`` and ``00-Founder\personal-finances``) --
     counts only: a pinned folder listed by name here would leak back into the
     KB through this door.
-  * every name that is listed is screened with ``phi_guard.is_any_phi`` and a
-    hit is replaced by a count.
+  * every name that is listed is screened with ``phi_guard.is_any_phi``, and
+    any path with one of the static walk's PHI folder segments
+    (``incremental_sync_static.PHI_BLACKLIST_SEGMENTS``, imported so the two
+    cannot drift) is withheld: a hit is replaced by a count.
   * ``_archive`` is excluded from every offender list (its "X 2" mirrors are the
     archive working as designed) and counted separately.
 
 Everything here is a pure function of its inputs: no filesystem writes, no
-environment reads, no network.
+environment reads, no network. (The two screens above are imported lazily, once,
+from their owning modules -- importing ``incremental_sync_static`` runs its own
+non-override ``load_dotenv()``, which never changes a variable already set.
+Either import failing makes its screen withhold every path: fail closed, never
+list.)
 """
 
 from __future__ import annotations
 
 import csv
+import functools
 import io
 import re
 from dataclasses import dataclass, field
@@ -110,6 +120,79 @@ def _segs(relpath: str) -> list[str]:
 # (the HJRG non-LEX entity folders) are NOT LEX and stay listable.
 _LEX_NAME_RE = re.compile(r"(?<![a-z])(?<!non-)(?<!non )(?<!non_)lexington", re.IGNORECASE)
 
+# The sub-entity / program belt (D-051 R1 rb2-r8#0 + lens-d082#0): the LEX
+# codes the rest of Cora files as LEX (cross_entity_guard's LEX list,
+# drive_entity_detect's 'lbhs') that the title detector below does not key on
+# alone. "Word-bounded" = any NON-LETTER on both sides, looser than a regex \b on
+# purpose: it fires on "LBHS_report", "LTS-weekly", "Copy of Lex Services",
+# "LexLLC", "DDD contract" -- and never inside "Alex", "flex", "complex",
+# "results", "villa" or "Lexington" (that word has the rule above, with its
+# Non-Lexington exception).
+_LEX_BELT_RE = re.compile(
+    r"(?<![a-z])(?:lex[\s_-]*ll[ac]|lex|lbhs|lla|lts|ddd|hcbs|bhrf)(?![a-z])", re.IGNORECASE)
+
+# The ONE LEX title detector, imported once (a list so a failed import is cached
+# too): [classify_lex_meeting], or [None] when the import failed.
+_LEX_DETECTOR: list = []
+
+
+def _lex_detector():
+    if not _LEX_DETECTOR:
+        try:
+            from cora.connectors.fireflies_connector import classify_lex_meeting
+        except Exception:  # noqa: BLE001 -- an unavailable detector withholds, never lists
+            classify_lex_meeting = None
+        _LEX_DETECTOR.append(classify_lex_meeting)
+    return _LEX_DETECTOR[0]
+
+
+@functools.lru_cache(maxsize=65536)
+def _segment_names_lex(seg: str) -> bool:
+    """True when ONE path segment names the LEX world. Fails CLOSED: any
+    detector error (or an unavailable detector) counts the path as LEX."""
+    if _LEX_NAME_RE.search(seg) or _LEX_BELT_RE.search(seg):
+        return True
+    try:
+        if kb_exclusions.is_copa_meeting_title(seg):
+            return True
+        detect = _lex_detector()
+        if detect is None:
+            return True
+        # The segment is offered as the title AND as an attendee name: the
+        # detector's named-lead signal (the LEX sub-entity leads) keys on
+        # attendee names, and a file named after a LEX lead is LEX-named.
+        verdict = detect({"title": seg, "meeting_attendees": [{"displayName": seg, "email": ""}]})
+        return bool(verdict.is_lex)
+    except Exception:  # noqa: BLE001 -- a screen error withholds, never lists
+        return True
+
+
+# The static walk's PHI folder segments, imported once from the ingest door this
+# report feeds (so the two lists cannot drift): [frozenset], or [None] when the
+# import failed.
+_PHI_SEGMENTS: list = []
+
+
+def _static_phi_segments() -> frozenset[str] | None:
+    if not _PHI_SEGMENTS:
+        try:
+            import incremental_sync_static as _static  # scripts/ -- on sys.path for both callers
+            segs: frozenset[str] | None = frozenset(str(s).lower() for s in _static.PHI_BLACKLIST_SEGMENTS)
+        except Exception:  # noqa: BLE001 -- an unavailable screen withholds, never lists
+            segs = None
+        _PHI_SEGMENTS.append(segs)
+    return _PHI_SEGMENTS[0]
+
+
+def is_phi_segment_path(relpath: str) -> bool:
+    """True for a path with any segment the static walk refuses as PHI
+    (``clients``, ``consumers``, ``phi``, ``clinical``, ``ehr``). Fails closed:
+    an unavailable segment list withholds every path."""
+    segs = _static_phi_segments()
+    if segs is None:
+        return True
+    return any(s.lower() in segs for s in _segs(relpath))
+
 
 def is_lex_partition(relpath: str) -> bool:
     """True for a path IN the LEX partition: a top segment starting ``08-``, or ANY
@@ -132,15 +215,22 @@ def is_lex_relpath(relpath: str) -> bool:
       * the partition (``is_lex_partition``);
       * any segment carrying a LEX name outside the partition ("Lexington
         Entities", "Lexington - Progress (16).gdoc"; not "Non-Lexington");
+      * any segment the ONE LEX title detector (``fireflies_connector.
+        classify_lex_meeting``) calls LEX -- 'LBHS', 'Lex-LLC', 'Lex Services',
+        the named LEX leads, DDD / care / clinical titles;
+      * any segment carrying a sub-entity / program code (``_LEX_BELT_RE``:
+        lex, lbhs, lla, lts, lex-llc/lla, ddd, hcbs, bhrf, non-letter bounded);
       * any segment naming the NDA'd COPA diligence (``kb_exclusions.
         is_copa_meeting_title``: whole-word ``copa``, so never "Maricopa") --
         its meeting exports live OUTSIDE the copa-bhrf folder.
 
-    Over-matching is the safe direction here: the report is a KB ingest door, and
-    a LEX path is only ever counted."""
+    A detector error counts the path as LEX (fail closed). Over-matching is the
+    safe direction here: the report is a KB ingest door, and a LEX path is only
+    ever counted. Manifest decisions keep ``is_lex_partition`` (the proposer, the
+    desktop.ini DELETE rows) -- widening those held ordinary rows."""
     if is_lex_partition(relpath):
         return True
-    return any(_LEX_NAME_RE.search(s) or kb_exclusions.is_copa_meeting_title(s) for s in _segs(relpath))
+    return any(_segment_names_lex(s) for s in _segs(relpath))
 
 
 def pinned_container(relpath: str) -> str | None:
@@ -237,6 +327,14 @@ def parse_summary(text: str) -> dict:
 
 
 _RUNLOG_PREFIXES = ("WALK-FILE-ERROR", "WALK-DIR-ERROR", "HASH-ERROR", "FATAL-ERROR", "OUTPUT-WRITE-ERROR")
+# The PS1's line shapes: "PREFIX: ..." and, for the output writes, "PREFIX (files
+# CSV): ..." / "(dirs CSV)" / "(summary)" (folder-audit-inventory.ps1 l.543/559/
+# 629). The prefix token is matched, then an optional "(qualifier)", then ':' --
+# so "FATAL-ERROR-STACK: ..." (the stack line that follows a FATAL-ERROR) is not
+# a second fatal. (D-051 R1 rb2-r8#2: the old exact-head match never counted
+# the three OUTPUT-WRITE-ERROR shapes.)
+_RUNLOG_LINE_RE = re.compile(
+    r"^(" + "|".join(re.escape(p) for p in _RUNLOG_PREFIXES) + r")(?:\s*\([^)]*\))?\s*:")
 
 
 def count_run_log(text: str) -> dict[str, int]:
@@ -244,9 +342,9 @@ def count_run_log(text: str) -> dict[str, int]:
     the lines themselves carry paths (possibly LEX) and are never echoed."""
     counts = {p: 0 for p in _RUNLOG_PREFIXES}
     for line in (text or "").lstrip("﻿").splitlines():
-        head = line.split(":", 1)[0].strip().lstrip("﻿")
-        if head in counts:
-            counts[head] += 1
+        m = _RUNLOG_LINE_RE.match(line.strip().lstrip("﻿"))
+        if m:
+            counts[m.group(1)] += 1
     return counts
 
 
@@ -387,8 +485,9 @@ class ScreenedList:
 
 
 def screen(items: set[str], new: set[str]) -> ScreenedList:
-    """NEW offenders first, then standing; LEX / pinned / PHI hits withheld as
-    counts. Every remaining name is safe to list."""
+    """NEW offenders first, then standing; LEX / pinned / PHI hits (the name
+    screen or a static-walk PHI folder segment) withheld as counts. Every
+    remaining name is safe to list."""
     out = ScreenedList([])
     ordered = [(r, True) for r in sorted(items & new, key=str.lower)]
     ordered += [(r, False) for r in sorted(items - new, key=str.lower)]
@@ -397,7 +496,7 @@ def screen(items: set[str], new: set[str]) -> ScreenedList:
             out.lex += 1
         elif pinned_container(rel):
             out.pinned += 1
-        elif phi_hit(rel):
+        elif is_phi_segment_path(rel) or phi_hit(rel):
             out.phi += 1
         else:
             out.listed.append((rel, is_new))
@@ -431,16 +530,17 @@ def render_md(facts: RunFacts, now: CategorySet, diffs: dict[str, Diff],
     lines: list[str] = [GENERATOR_MARKER, ""]
     lines.append(f"# [Hygiene] Drive -- {facts.date} (Cora weekly inventory)")
     lines.append("")
-    status = ("CLEAN (walk passed the sanity floor against the prior full run)"
+    status = ("CLEAN (walk passed the sanity floor: at least 80% of the largest retained full run)"
               if facts.status == "clean" else
               "UNVERIFIED (no prior full-root run to compare; the sanity floor was not applied)")
     lines.append(f"- Status: **{status}**")
     lines.append(f"- Run: stamp `{facts.stamp}` -- NO-HASH inventory (`-MaxHashMB 0`) of the full Founder-OS root")
     lines.append(f"- Compared with: {'stamp `' + facts.prior_stamp + '`' if facts.prior_stamp else 'nothing (first comparable run)'}")
     lines.append(f"- Walked: {facts.files_total} files, {facts.dirs_total} folders, {facts.walk_errors} walk errors")
-    lines.append("- LEX (`08-Lexington-Services`, plus any LEX- or COPA-named path elsewhere) and the "
-                 "KB-pinned containers are reported as COUNTS ONLY; "
-                 "their names are never listed. Listed names passed the PHI screen. `_archive` is "
+    lines.append("- LEX (`08-Lexington-Services`, plus any path elsewhere naming LEX, a LEX sub-entity, "
+                 "program or lead, or COPA) and the KB-pinned containers are reported as COUNTS ONLY; "
+                 "their names are never listed. Listed names passed the PHI screen (the name screen and "
+                 "the static walk's PHI folder segments). `_archive` is "
                  "excluded from every offender list and counted separately.")
     if facts.sidecar_name:
         lines.append(f"- Full lists (non-LEX): `{facts.sidecar_name}` next to the inventory in "
@@ -542,7 +642,7 @@ def render_full_list_csv(now: CategorySet, diffs: dict[str, Diff]) -> tuple[byte
             if is_lex_relpath(rel):
                 withheld["lex"] += 1
                 continue
-            if phi_hit(rel):
+            if is_phi_segment_path(rel) or phi_hit(rel):
                 withheld["phi"] += 1
                 continue
             zone = "kb-pinned" if pinned_container(rel) else ""
