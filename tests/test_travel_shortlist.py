@@ -126,6 +126,79 @@ class FakeAnthropic:
         self.messages = _Messages()
 
 
+def _sse_events(d: dict, *, blocks: int | None = None, finish: bool = True) -> list:
+    """The recorded message replayed as the API's own stream events (public SDK event
+    types, model_validate'd): message_start, a start/stop per content block (the first
+    ``blocks`` only), then message_delta + message_stop when ``finish``."""
+    start = copy.deepcopy(d)
+    start["content"], start["stop_reason"] = [], None
+    start["usage"] = dict(d["usage"], output_tokens=1,
+                          server_tool_use={"web_search_requests": 0, "web_fetch_requests": 0})
+    evs = [anthropic.types.RawMessageStartEvent.model_validate({"type": "message_start", "message": start})]
+    for i, b in enumerate(d["content"][:blocks]):
+        evs.append(anthropic.types.RawContentBlockStartEvent.model_validate(
+            {"type": "content_block_start", "index": i, "content_block": b}))
+        evs.append(anthropic.types.RawContentBlockStopEvent.model_validate(
+            {"type": "content_block_stop", "index": i}))
+    if finish:
+        evs.append(anthropic.types.RawMessageDeltaEvent.model_validate(
+            {"type": "message_delta", "delta": {"stop_reason": d["stop_reason"], "stop_sequence": None},
+             "usage": {"output_tokens": d["usage"]["output_tokens"],
+                       "server_tool_use": d["usage"]["server_tool_use"]}}))
+        evs.append(anthropic.types.RawMessageStopEvent.model_validate({"type": "message_stop"}))
+    return evs
+
+
+class _RawSSE:
+    """What the SDK's MessageStream iterates (its raw Stream): events, then an optional
+    exception mid-stream (a ReadTimeout / an overloaded error after searches ran);
+    ``pace`` seconds of real wall-clock between events (a trickling stream)."""
+
+    def __init__(self, events, exc=None, pace=0.0):
+        self.events, self.exc, self.pace = list(events), exc, pace
+        self.closed = False
+        self.yielded = 0
+
+    def __iter__(self):
+        for ev in self.events:
+            if self.closed:
+                return
+            if self.pace:
+                time.sleep(self.pace)
+            self.yielded += 1
+            yield ev
+        if self.exc is not None:
+            raise self.exc
+
+    def close(self):
+        self.closed = True
+
+
+class SdkStreamAnthropic:
+    """messages.stream(**kw) -> the REAL anthropic MessageStreamManager over a _RawSSE,
+    so run_search reads the SDK's own accumulation (current_message_snapshot, close,
+    get_final_message) -- never a hand-rolled stream."""
+
+    def __init__(self, raws):
+        self.calls: list[dict] = []
+        self.raws = list(raws)
+        outer = self
+
+        class _Messages:
+            def stream(self, **kw):
+                outer.calls.append(copy.deepcopy(kw))
+                raw = outer.raws.pop(0)
+                from anthropic.lib.streaming import MessageStreamManager
+
+                def _request():            # the SDK sends the request on __enter__
+                    if isinstance(raw, BaseException):
+                        raise raw
+                    return raw
+                return MessageStreamManager(_request, output_format=anthropic.NOT_GIVEN)
+
+        self.messages = _Messages()
+
+
 def _slack_resp(data: dict) -> SlackResponse:
     """A REAL non-dict slack_sdk response (lesson 68: a dict fake hides the seam)."""
     return SlackResponse(client=None, http_verb="POST", api_url="https://slack.test/api",
@@ -632,6 +705,57 @@ class TestRunSearch:
         assert ts.lane_searches_today() == 2
         assert any("caller=travel_shortlist" in r.getMessage() for r in caplog.records)
 
+    # D-051 r1 c2-webcall#3: 'record_usage also on error' recorded NOTHING for the
+    # create that failed -- searches only grew after get_final_message returned -- so
+    # a first create that died mid-stream after server-side searches ran never drew
+    # down the lane or org cap, and every retry got a fresh budget.
+    def test_a_first_create_that_dies_mid_stream_is_charged_its_partial_searches(self, caplog):
+        import httpx
+        caplog.set_level(logging.INFO, logger="cora.llm_usage")
+        raw = _RawSSE(_sse_events(_fx(), blocks=3, finish=False), exc=httpx.ReadTimeout("stalled"))
+        fake = SdkStreamAnthropic([raw])       # blocks 1+2 are web_search server_tool_use
+        out = ts.run_search(ts.build_request(_constraints(), max_uses=4, model=MODEL), budget=4,
+                            client_factory=lambda: fake)
+        assert out.status == "failed" and out.error == "api_error:ReadTimeout" and out.searches == 2
+        assert ts.lane_searches_today() == 2
+        rows = [json.loads(l) for l in web_guard._USAGE_LEDGER.read_text(encoding="utf-8").splitlines()]
+        assert [r["searches"] for r in rows if r.get("event") == "usage"] == [2]
+        lines = [r.getMessage() for r in caplog.records if "caller=travel_shortlist" in r.getMessage()]
+        assert len(lines) == 1 and "via=partial" in lines[0]
+
+    def test_a_resume_that_dies_mid_stream_adds_its_partial_to_the_first_creates(self):
+        import httpx
+        d1, d2 = _split_pause(_fx())
+        # d2's content: [text, server_tool_use, server_tool_use, result, result, text...]
+        raws = [_RawSSE(_sse_events(d1)), _RawSSE(_sse_events(d2, blocks=2, finish=False),
+                                                  exc=anthropic.APIConnectionError(request=MagicMock()))]
+        out = ts.run_search(ts.build_request(_constraints(), max_uses=4, model=MODEL), budget=4,
+                            client_factory=lambda: SdkStreamAnthropic(raws))
+        assert out.status == "failed" and out.searches == 3
+        assert ts.lane_searches_today() == 3
+
+    def test_a_stream_that_opened_but_never_started_is_charged_the_creates_max_uses(self):
+        import httpx
+        fake = SdkStreamAnthropic([_RawSSE([], exc=httpx.ReadTimeout("no first byte"))])
+        out = ts.run_search(ts.build_request(_constraints(), max_uses=3, model=MODEL), budget=3,
+                            client_factory=lambda: fake)
+        assert out.status == "failed" and out.searches == 3     # conservative: never under-count
+        assert ts.lane_searches_today() == 3
+
+    def test_a_request_that_never_opened_a_stream_charges_nothing(self):
+        fake = SdkStreamAnthropic([anthropic.APIConnectionError(request=MagicMock())])
+        out = ts.run_search(ts.build_request(_constraints(), max_uses=4, model=MODEL), budget=4,
+                            client_factory=lambda: fake)
+        assert out.status == "failed" and out.searches == 0
+        assert ts.lane_searches_today() == 0
+
+    def test_the_real_sdk_stream_parses_the_live_shape_end_to_end(self):
+        fake = SdkStreamAnthropic([_RawSSE(_sse_events(_fx()))])
+        out = ts.run_search(ts.build_request(_constraints(), max_uses=4, model=MODEL), budget=4,
+                            client_factory=lambda: fake)
+        assert out.status == "ok" and len(out.options) == 5 and out.searches == 4
+        assert ts.lane_searches_today() == 4
+
     def test_a_default_client_refuses_under_pytest(self, monkeypatch):
         monkeypatch.setattr(ts, "_CLIENT_FACTORY", None)
         out = ts.run_search(ts.build_request(_constraints(), max_uses=4, model=MODEL), budget=4)
@@ -994,6 +1118,73 @@ class TestCaps:
         assert ts.search_budget() == 3
         monkeypatch.setenv("CORA_WEB_SEARCH_DAILY_CAP", "10")
         assert ts.search_budget() == 0
+
+    # D-051 r1 c2-webcall#1 + c2-egress#2 (B7: "clamp EACH create to min(per-ask
+    # remaining, lane cap - lane today, org cap - org today); 0 -> no call"). The
+    # budget used to be read ONCE on the listener at route time and frozen into the
+    # Route; a queued job never re-read the ledger, so asks routed while an earlier
+    # job was in flight each billed a full 4.
+    def test_two_asks_routed_before_either_ran_never_overrun_the_lane_cap(self, monkeypatch):
+        self._usage(4, ts.LANE_CHANNEL)                       # lane 4/8 already today
+        fake = FakeAnthropic([_msg(_fx()), _msg(_fx())])
+        monkeypatch.setattr(ts, "_CLIENT_FACTORY", lambda: fake)
+        client, jobs = _slack_client(), []
+        for root in ("1790000000.000801", "1790000000.000802"):
+            r = _route(MUST_FIRE[1])
+            assert r.kind == "search" and r.budget == 4          # both routed on the same stale ledger
+            ts.execute_route(r, channel_id="D0HARRISON", thread_root_ts=root, entity="FNDR",
+                             user_id=HARRISON, client=client, say=MagicMock(),
+                             submit=lambda fn, *a, **k: jobs.append((fn, a, k)) or True, now=NOW)
+        for fn, a, k in jobs:                                    # the 1-worker pool, in order
+            fn(*a, **k)
+        assert len(fake.calls) == 1                              # the second job made NO create
+        assert ts.lane_searches_today() == 8
+        assert client.chat_postMessage.call_args.kwargs["text"] == ts.CAP_REPLY
+        refused = [r for r in _rows() if r["event"] == "refused"]
+        assert refused == [{**refused[0], "root_ts": "1790000000.000802", "reason": "daily_cap",
+                            "stage": "job", "searches": 0}]
+
+    def test_a_create_is_shrunk_to_the_live_caps_and_structurally_rebelted(self):
+        request = ts.build_request(_constraints(), max_uses=4, model=MODEL)
+        self._usage(6, ts.LANE_CHANNEL)                       # filled AFTER the route was belted
+        fake = FakeAnthropic([_msg(_fx())])
+        ts.run_search(request, budget=4, client_factory=lambda: fake)
+        (kw,) = fake.calls
+        assert kw["tools"] == [ts._tool_def(2)]
+        assert {k: v for k, v in kw.items() if k not in ("tools", "timeout")} == {
+            k: v for k, v in request.items() if k != "tools"}
+
+    def test_the_resume_re_reads_the_caps_between_creates(self, monkeypatch):
+        monkeypatch.setenv("CORA_WEB_SEARCH_DAILY_CAP", "10")
+        self._usage(4, "")                                     # org 4/10 -> the route's budget is 4
+        assert ts.search_budget() == 4
+        d1, d2 = _split_pause(_fx())
+        fake = FakeAnthropic([_msg(d1), _msg(d2)])
+        real_stream = fake.messages.stream
+
+        def concurrent(**kw):                                  # an ordinary web turn lands mid-job
+            if len(fake.calls) == 0:
+                self._usage(3, "")
+            return real_stream(**kw)
+        fake.messages.stream = concurrent
+        out = ts.run_search(ts.build_request(_constraints(), max_uses=4, model=MODEL), budget=4,
+                            client_factory=lambda: fake)
+        assert len(fake.calls) == 2 and out.status == "ok"
+        # per-ask left 2, but org left = 10 - (4 + 3 + 2) = 1
+        assert fake.calls[1]["tools"][0]["max_uses"] == 1
+
+    def test_a_job_capped_at_run_time_posts_the_cap_line_and_settles(self):
+        self._usage(8, ts.LANE_CHANNEL)
+        client, fake = _slack_client(), FakeAnthropic([])
+        ts._search_job(ts.build_request(_constraints(), max_uses=4, model=MODEL), _constraints(),
+                       channel_id=TRAVEL_CHANNEL, root_ts="1790000000.000803", entity="FNDR",
+                       user_id=HARRISON, budget=4, client=client, client_factory=lambda: fake)
+        assert fake.calls == []
+        assert client.chat_postMessage.call_args.kwargs["text"] == ts.CAP_REPLY
+        (row,) = _rows()
+        assert (row["event"], row["reason"], row["stage"], row["root_ts"]) == (
+            "refused", "daily_cap", "job", "1790000000.000803")
+        assert ts.lane_searches_today() == 8
 
     def test_env_defaults_and_fail_closed_spellings(self, monkeypatch):
         assert ts.lane_enabled() and ts.lane_daily_cap() == 8

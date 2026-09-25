@@ -1268,6 +1268,15 @@ def search_budget() -> int:
                       web_guard.daily_cap() - web_guard.searches_today()))
 
 
+def _live_budget(per_ask_left: int) -> int:
+    """B7, D-051 r1 c2-webcall#1 / c2-egress#2: what THIS create may bill --
+    min(per-ask remaining, lane cap - lane today, org cap - org today), re-read from
+    the ledger immediately before EACH create. The route's budget is a listener-time
+    snapshot: an ask queued on the 1-worker pool behind another (or a lane-thread
+    refinement sent mid-search) was routed before the running job ledgered anything."""
+    return max(0, min(int(per_ask_left), search_budget()))
+
+
 def _searches_in(resp: Any) -> int:
     try:
         stu = getattr(getattr(resp, "usage", None), "server_tool_use", None)
@@ -1288,9 +1297,43 @@ def _serialize(content: Any) -> list:
     return out
 
 
+def _max_uses(kwargs: dict) -> int:
+    try:
+        return int(kwargs["tools"][0]["max_uses"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return PER_ASK_SEARCHES
+
+
+def _partial_searches(stream: Any, max_uses: int) -> tuple[int, Any]:
+    """D-051 r1 c2-webcall#3: what a create that RAISED may already have billed.
+    No stream opened (the request itself failed, e.g. an error status) -> 0. An
+    opened stream -> the web_search server_tool_use blocks in the SDK's partial
+    snapshot (or usage.server_tool_use if the final delta arrived), at most
+    max_uses; an opened stream whose snapshot cannot be read -> max_uses (the cap
+    is never under-counted). Returns (searches, snapshot-or-None)."""
+    if stream is None:
+        return 0, None
+    try:
+        snap = stream.current_message_snapshot
+        n = sum(1 for b in (_attr(snap, "content", None) or [])
+                if _attr(b, "type") == "server_tool_use" and _attr(b, "name") == "web_search")
+    except Exception:  # noqa: BLE001 -- no snapshot yet (no message_start) / malformed
+        return max_uses, None
+    return min(max(n, _searches_in(snap)), max_uses), snap
+
+
+def _record_searches(n: int, entity: str) -> None:
+    """Ledger ONE create's searches as soon as they are known, so the next create's
+    live budget (and every other lane's pre-call check) already sees them."""
+    try:
+        web_guard.record_usage(n, 0, entity=entity, channel_name=LANE_CHANNEL)
+    except Exception:  # noqa: BLE001 -- accounting never breaks the lane
+        log.warning("travel_shortlist: usage record failed", exc_info=True)
+
+
 @dataclass
 class SearchOutcome:
-    status: str                    # ok | failed | unreadable
+    status: str                    # ok | failed | unreadable | capped (no create: caps full)
     options: list
     dropped: int = 0
     searches: int = 0
@@ -1300,36 +1343,59 @@ class SearchOutcome:
 
 def run_search(request: dict, *, budget: int, entity: str = "FNDR",
                client_factory: Callable[[], Any] | None = None) -> SearchOutcome:
-    """<= MAX_ITERATIONS streamed creates; each create clamped to the searches this
-    ask has left; web usage ALSO ledgered on error; one llm usage line per create.
-    Never raises."""
+    """<= MAX_ITERATIONS streamed creates. Before EACH create the live caps are
+    re-read (``_live_budget``): 0 before the first -> status "capped", no create;
+    0 before a resume -> no resume. A create whose max_uses must shrink is re-built
+    and re-belted structurally (``_continuation_problem``). Each create's searches
+    are ledgered as soon as known -- a create that raised is charged its partial
+    snapshot (``_partial_searches``) -- with one llm usage line per create (a
+    ``via=partial`` line for a raised create that has a snapshot). Never raises."""
     from .llm_usage import log_usage  # noqa: PLC0415 -- stdlib-only module
     responses: list = []
     contents: list[list] = []
     searches = 0
     error = ""
     try:
-        client = _client(client_factory)
-        kwargs = request
+        client = None
         for it in range(MAX_ITERATIONS):
-            if it > 0:
-                left = budget - searches
-                if left <= 0:
-                    break
+            live = _live_budget(budget - searches)
+            if live <= 0:
+                if it == 0:
+                    log.warning("travel_shortlist: search caps reached at job time -- no create")
+                    return SearchOutcome("capped", [], error="daily_cap")
+                break
+            if it == 0 and _max_uses(request) <= live:
+                kwargs = request
+            else:
                 kwargs = {
                     "model": request["model"], "max_tokens": request["max_tokens"],
                     "system": request["system"], "thinking": request["thinking"],
-                    "tools": [_tool_def(min(left, PER_ASK_SEARCHES))],
+                    "tools": [_tool_def(min(live, PER_ASK_SEARCHES))],
                     "messages": [request["messages"][0]]
                     + [{"role": "assistant", "content": c} for c in contents],
                 }
                 problem = _continuation_problem(kwargs, request, contents)
                 if problem:
                     raise RuntimeError(f"continuation_{problem}")
-            with client.messages.stream(**kwargs, timeout=API_TIMEOUT) as stream:
-                resp = stream.get_final_message()
+            if client is None:
+                client = _client(client_factory)
+            opened = None
+            try:
+                with client.messages.stream(**kwargs, timeout=API_TIMEOUT) as stream:
+                    opened = stream
+                    resp = stream.get_final_message()
+            except Exception:
+                n, partial = _partial_searches(opened, _max_uses(kwargs))
+                searches += n
+                _record_searches(n, entity)
+                if partial is not None:
+                    log_usage(partial, caller=CALLER, model=str(kwargs.get("model") or ""),
+                              iteration=it + 1, via="partial")
+                raise
             responses.append(resp)
-            searches += _searches_in(resp)
+            n = _searches_in(resp)
+            searches += n
+            _record_searches(n, entity)
             log_usage(resp, caller=CALLER, model=str(kwargs.get("model") or ""), iteration=it + 1)
             if getattr(resp, "stop_reason", None) == "pause_turn":
                 contents.append(_serialize(getattr(resp, "content", None)))
@@ -1338,11 +1404,6 @@ def run_search(request: dict, *, budget: int, entity: str = "FNDR",
     except Exception as exc:  # noqa: BLE001 -- a failed search is an outcome, not a crash
         error = f"api_error:{type(exc).__name__}"
         log.warning("travel_shortlist: web call failed (%s)", type(exc).__name__)
-    finally:
-        try:
-            web_guard.record_usage(searches, 0, entity=entity, channel_name=LANE_CHANNEL)
-        except Exception:  # noqa: BLE001 -- accounting never breaks the lane
-            log.warning("travel_shortlist: usage record failed", exc_info=True)
     if error:
         return SearchOutcome("failed", [], searches=searches, error=error)
     if not responses:
@@ -1968,6 +2029,14 @@ def _search_job(request: dict, c: TravelConstraints, *, channel_id: str, root_ts
         web_guard.record_decision(web_guard.WebDecision(True, "travel_shortlist"), entity=entity,
                                   channel_name=LANE_CHANNEL, user_id=user_id)
         outcome = run_search(request, budget=budget, entity=entity, client_factory=client_factory)
+        if outcome.status == "capped":
+            # B7 "0 -> no call": the caps filled after this ask was routed. The
+            # refusal SETTLES the ask (the monitor pairs it with the asked row).
+            append_event("refused", channel=channel_id, root_ts=root_ts, stage="job",
+                         reason="daily_cap", searches=0)
+            settled = True
+            _post(client, channel_id, root, CAP_REPLY)
+            return
         if outcome.status == "ok":
             text, blocks = render_card(c, outcome.options, dropped=outcome.dropped)
             try:
