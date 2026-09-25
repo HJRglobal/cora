@@ -283,39 +283,40 @@ def _decide_or_archive(p: st.Proposal, row: dict, actor: str, *, now: float,
 
 # ── the archive path ─────────────────────────────────────────────────────────
 def _reverify(p: st.Proposal, row: dict, read: Any, *, now: float,
-              sleep: Callable[[float], None] | None) -> tuple[str, str]:
-    """("ok"|"stale"|"retry", reason) -- the ONE classifier on a FRESH context (A5)."""
+              sleep: Callable[[float], None] | None) -> tuple[str, str, cl.Verdict | None]:
+    """("ok"|"stale"|"retry", reason, fresh verdict) -- the ONE classifier on a FRESH
+    context (A5). The fresh verdict's age is what the notice and the ledger carry."""
     from . import deliver  # noqa: PLC0415 -- lazy: deliver imports this module's peers
     cid = row["cid"]
     ctx = deliver.load_context(read, now=now)
     blind = ctx.blind_cause()
     if blind:
-        return "retry", f"reverify_{blind}"
+        return "retry", f"reverify_{blind}", None
     try:
         info = read.conversations_info(channel=cid, include_num_members=True)
         meta = scan_mod.project_channel(info.get("channel") or {})
     except Exception as exc:  # noqa: BLE001
-        return "retry", f"reverify_{cl._err_code(exc)}"
+        return "retry", f"reverify_{cl._err_code(exc)}", None
     if not meta.get("id"):
-        return "retry", "reverify_shape"
+        return "retry", "reverify_shape", None
     if reg.name_fp(str(meta.get("name") or "")) != row.get("name_fp"):
-        return "stale", "it was renamed since the card"
+        return "stale", "it was renamed since the card", None
     if meta.get("is_archived"):
-        return "stale", "it is already archived"
+        return "stale", "it is already archived", None
     v = cl.classify_channel(read, meta, ctx, now=now, sleep=sleep)
     if v.kind == cl.UNKNOWN:
-        return "retry", f"reverify_{v.reason}"
+        return "retry", f"reverify_{v.reason}", v
     if v.kind == cl.ACTIVE:
-        return "stale", "a person posted since the card"
+        return "stale", "a person posted since the card", v
     if v.kind == cl.EXEMPT:
         if v.reason == cl.X_KEPT:
-            return "stale", "it was kept since the card"
-        return "stale", f"it is exempt now ({v.reason})"
+            return "stale", "it was kept since the card", v
+        return "stale", f"it is exempt now ({v.reason})", v
     if row.get("section") == cl.SECTION_A and v.kind != cl.SECTION_A:
-        return "stale", f"it is no longer a clean candidate ({v.reason})"
+        return "stale", f"it is no longer a clean candidate ({v.reason})", v
     if row.get("section") == cl.SECTION_B and (v.kind != cl.SECTION_B or v.reason != row.get("reason")):
-        return "stale", "its class changed since the card"
-    return "ok", ""
+        return "stale", "its class changed since the card", v
+    return "ok", "", v
 
 
 def _archiver_is_cora(read: Any, cid: str, bot_uid: str, bot_id: str) -> bool | None:
@@ -372,7 +373,7 @@ def _archive_one(p: st.Proposal, row: dict, actor: str, *, now: float,
     ok, why, _f = st.claim_row(pid, cid, "archive", actor=actor, now=now)
     if not ok:
         return _refusal(why, pid), None
-    status, reason = _reverify(p, row, read, now=now, sleep=sleep)
+    status, reason, fresh = _reverify(p, row, read, now=now, sleep=sleep)
     if status == "stale":
         st.append_event(st.STALE, proposal_id=pid, cid=cid, by=actor, code=reason, ts=time.time())
         return TapResult("stale_refused", f"Not archived: {_label(row)} — {reason}.", pid), None
@@ -384,7 +385,8 @@ def _archive_one(p: st.Proposal, row: dict, actor: str, *, now: float,
     if gate != gates.ARCHIVE:
         st.append_event("released", proposal_id=pid, cid=cid, code="gate", ts=time.time())
         return TapResult("refused_transient", f"Nothing was archived — {gwhy}.", pid), None
-    age = row.get("last_person_days")
+    # the age as of THIS tap (the card's figure can be up to 14 days old)
+    age = fresh.last_person_days if fresh is not None else row.get("last_person_days")
     if not st.append_ledger("intent", proposal_id=pid, channel_id=cid,
                             channel_name=None if row.get("lex") else row.get("name"),
                             lex=True if row.get("lex") else None, age_days=age,
@@ -494,20 +496,27 @@ def _archive_all(f: st.Fold, p: st.Proposal, page: int, actor: str, *, now: floa
                                                    f"Slack client ({type(exc).__name__}). The "
                                                    "buttons stay."), p.proposal_id, page)
     aborted = ""
+    crashed = ""
     done = 0
     for i, cid in enumerate(targets):
         row = rows[cid]
-        if row.get("tier") == "T1":
-            gate, why = gates.tap_gate(row, read)
-            if gate == gates.ARCHIVE:
-                res, systemic = _archive_one(p, row, actor, now=time.time(), sleep=sleep,
-                                             override=False, read=read)
-            elif gate == gates.RECORD:
-                res, systemic = _record(p, row, actor, now, override=False, why=why), None
+        try:
+            if row.get("tier") == "T1":
+                gate, why = gates.tap_gate(row, read)
+                if gate == gates.ARCHIVE:
+                    res, systemic = _archive_one(p, row, actor, now=time.time(), sleep=sleep,
+                                                 override=False, read=read)
+                elif gate == gates.RECORD:
+                    res, systemic = _record(p, row, actor, now, override=False, why=why), None
+                else:
+                    res, systemic = TapResult("refused_transient", why, p.proposal_id), None
             else:
-                res, systemic = TapResult("refused_transient", why, p.proposal_id), None
-        else:
-            res, systemic = _record(p, row, actor, now, override=False, why=gates.t0_reason()), None
+                res, systemic = _record(p, row, actor, now, override=False,
+                                        why=gates.t0_reason()), None
+        except Exception as exc:  # noqa: BLE001 -- A18: say how far it got, never go silent
+            log.exception("channel_archive archive-all crashed at row %d of %d", i + 1, len(targets))
+            crashed = type(exc).__name__
+            break
         counts[res.outcome] = counts.get(res.outcome, 0) + 1
         done = i + 1
         if systemic:
@@ -518,7 +527,11 @@ def _archive_all(f: st.Fold, p: st.Proposal, page: int, actor: str, *, now: floa
                 progress(p.proposal_id, page)
             except Exception:  # noqa: BLE001
                 log.warning("channel_archive archive-all progress render failed", exc_info=True)
-    parts = [f"{k} {v}" for k, v in sorted(counts.items())]
+    parts = [f"{k} {v}" for k, v in sorted(counts.items())] or ["none"]
+    if crashed:
+        msg = (f"Stopped after {done} of {len(targets)} ({crashed}) — the rest were not attempted. "
+               "Outcomes so far: " + ", ".join(parts) + ". Check each row before tapping again.")
+        return TapResult("archive_all", msg, p.proposal_id, page, counts=counts)
     if not t1:
         msg = (f"Marked {counts.get('agreed', 0)} of {len(targets)} shown to archive — recorded as "
                f"T1 promotion evidence. Nothing was archived: {gates.t0_reason()}.")

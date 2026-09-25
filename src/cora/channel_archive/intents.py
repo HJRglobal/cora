@@ -124,9 +124,12 @@ def looks_like_live_followup(text: str, *, card_ts: float | None, now: float | N
 
 
 # ── replies (deterministic, code-authored, tier-truthful) ────────────────────
+#: "five to ten minutes" is pacing ARITHMETIC, not a measurement (no live scan has run
+#: from a Code session): ~100 member channels read at >= 2 s per history call, plus
+#: phase 2 + pins for the inactive ones -> roughly 6-8 minutes.
 ACK_REPLY = ("Scanning the channels I belong to for 90+ days without a person posting — "
              "metadata only; nothing will be archived by this scan. The proposal card will "
-             "follow here in about five minutes.")
+             "follow here in about five to ten minutes.")
 CHANNEL_ACK_REPLY = ("Scanning now — the proposal card will arrive in your DM; nothing will be "
                      "archived by this scan.")
 SCAN_RUNNING_REPLY = "A scan is already running; its card will arrive here."

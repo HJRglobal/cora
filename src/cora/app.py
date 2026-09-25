@@ -5078,11 +5078,17 @@ def _channel_archive_dm_intercept(event: dict, client, user_id: str, text: str) 
         if card_ts is None or not cai.looks_like_live_followup(text, card_ts=card_ts):
             return False
         if shape == "affirmative":
-            # A bare "yes" never steals a pending staged write's confirm, nor a reply
-            # typed in some other thread (a knowledge-check / gap-ask answer).
+            # A bare "yes" never steals a pending staged write's confirm, a reply typed
+            # in some other thread, or the answer to a live gap ask / knowledge-check
+            # question (those captures consume it; none of them reaches the model, so
+            # there is no archive narration to prevent -- D-173: a false refusal is a
+            # stolen turn).
             if any(_tool_dispatch.snapshot_stash_ids(user_id, "dm").values()):
                 return False
             if thread_ts and str(thread_ts) not in cai.live_card_message_ts(dm):
+                return False
+            if gap_autofill.has_live_ask(user_id) or (
+                    knowledge_check.enabled() and knowledge_check.has_live_cycle(user_id)):
                 return False
     if os.environ.get("CORA_EVAL_MODE") == "1":
         log.info("channel_archive DM intercept kind=%s under EVAL_MODE: no-op", kind)

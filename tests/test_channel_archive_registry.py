@@ -220,11 +220,13 @@ class TestLexBelt:
         assert reg.lex_by_members([HARRISON, LEXSTAFF], roles=roles)
         assert reg.lex_by_members(None, roles=roles)            # unreadable -> LEX
 
-    def test_the_live_roster_really_does_list_lex_among_harrisons_entities(self):
-        """The premise behind the primary-entity key (measured, not assumed)."""
+    def test_the_real_roster_never_makes_harrisons_presence_lex(self):
+        """The premise behind the primary-entity key (measured 2026-09-25: his roster row
+        lists LEX among `entities`). Whatever that list says later, Harrison being in a
+        channel must never make it LEX, or no channel could ever be proposed."""
         from cora import org_roles
         rec = org_roles.get_role(HARRISON)
-        assert rec is not None and "LEX" in [str(e).upper() for e in rec.entities]
+        assert rec is not None
         assert not reg.lex_by_members([HARRISON])
 
 

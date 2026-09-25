@@ -375,7 +375,36 @@ class TestArchivePath:
         assert state(A1) == st.OPEN
 
 
+class TestFreshAge:
+    def test_the_notice_and_intent_carry_the_age_at_tap_time_not_the_cards(self, fake, armed):
+        row = _row(A1, "fx-dead-one", tier="T1")
+        row["last_person_days"] = 150               # what the card said
+        stage(tier="T1", rows=[row])
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}")
+        assert r.outcome == "archived" and "200 days" in r.msg
+        notice = next(p for p in fake.posts if p["channel"] == A1)
+        assert "200 days since the last message" in notice["text"]
+        assert st.read_ledger()[0]["age_days"] == 200
+
+
 class TestArchiveAll:
+    def test_an_unexpected_crash_mid_loop_says_how_far_it_got(self, fake, armed, monkeypatch):
+        rows = [_row(A1, "fx-dead-one", tier="T1"), _row(A2, "fx-dead-two", tier="T1"),
+                _row(A3, "fx-dead-three", tier="T1")]
+        stage(tier="T1", rows=rows)
+        real = handler._archive_one
+        calls = {"n": 0}
+
+        def _flaky(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("boom")
+            return real(*a, **k)
+        monkeypatch.setattr(handler, "_archive_one", _flaky)
+        r = tap(cards.ACTION_ALL, f"{PID}:p1")
+        assert r.msg.startswith("Stopped after 1 of 3 (RuntimeError)") and "archived 1" in r.msg
+        assert fake.method_names().count("conversations_archive") == 1
+
     def test_a_systemic_error_aborts_the_loop_with_no_further_notices(self, fake, armed):
         rows = [_row(A1, "fx-dead-one", tier="T1"), _row(A2, "fx-dead-two", tier="T1"),
                 _row(A3, "fx-dead-three", tier="T1")]
@@ -399,6 +428,21 @@ class TestArchiveAll:
         r = tap(cards.ACTION_ALL, f"{PID}:p1", progress=lambda pid, page: ticks.append(page))
         assert r.counts == {"archived": 12} and ticks == [1, 1]
         assert f.method_names().count("conversations_archive") == 12
+
+
+@pytest.mark.parametrize("shape", ["chanarch-" + " " * 40000 + "x", " " * 40000,
+                                   "chanarch-aaaaaaaaaaaa:" + "C" * 40000,
+                                   "chanarch-aaaaaaaaaaaa:p" + "9" * 40000],
+                         ids=["pid-spaces", "spaces", "cid-run", "page-run"])
+def test_value_parsing_is_linear_on_degenerate_input(shape):
+    import time as _t
+    best = float("inf")
+    for _ in range(3):
+        t0 = _t.perf_counter()
+        for action in cards.ACTIONS:
+            handler.parse_value(action, shape)
+        best = min(best, _t.perf_counter() - t0)
+    assert best < 0.05
 
 
 def test_conversations_archive_has_exactly_one_call_site_in_src():
