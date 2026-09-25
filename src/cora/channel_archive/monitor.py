@@ -27,13 +27,15 @@ FAIL CLASSES
       A ledger ``failed`` outcome on an attempt whose archive Slack shows Cora made
       (an indeterminate error that landed) is reconciled ``archived`` once + WARN.
   (3) UNRESOLVED -- an intent older than 1 h with no outcome, or an ``unknown``
-      outcome. Settled from Slack's OWN history, the first archive message after the
-      intent: Cora's (within 15 min) -> ``archived (reconciled)`` carrying that
-      message's ts, and when the channel is open again its unarchive is followed as in
-      (2); a person's archive, or archived before the attempt -> ``already_archived
+      outcome. Settled from Slack's OWN history, the first archive message in
+      [intent - 2 min, intent + 1 h] (the same host-clock tolerance as (1); bounded, so a
+      busy channel is never paged through nightly): Cora's (at most 15 min after the
+      intent) -> ``archived (reconciled)`` carrying that message's ts, and when the
+      channel is open again its unarchive is followed as in (2); a person's archive, or
+      archived with no archive message in the window -> ``already_archived
       (reconciled)``; none and open -> ``failed (reconciled)``; gone from the list ->
-      ``failed (reconciled: channel gone)``; an unreadable history records NOTHING
-      (WARN). Each outcome goes to the ledger AND the store (the next card render
+      ``failed (reconciled: channel gone)``; an unreadable or malformed history records
+      NOTHING (WARN). Each outcome goes to the ledger AND the store (the next card render
       shows it), and a dry run says "would be recorded".
   (4) BLIND -- the channel list paginated incompletely, zero archived channels in
       it, no bot identity, or an unreadable ledger/store -> WARN, never OK.
@@ -69,6 +71,10 @@ WINDOW_DAYS = 35
 INTENT_BEFORE_S = 15 * 60
 INTENT_AFTER_S = 120
 UNRESOLVED_S = 3600
+#: (3) reads Slack's history over [intent - INTENT_AFTER_S, intent + this] only: the
+#: attempt's own archive lands within seconds of its intent, so a busy channel's later
+#: traffic is never paged through night after night (D-051 r2 c1-monitor#1).
+UNRESOLVED_WINDOW_S = 3600
 SCAN_STALL_S = 3600
 #: A stall no crash path recorded (a killed process) stops WARNing after this long.
 SCAN_STALL_MAX_S = 7 * 86400
@@ -134,7 +140,9 @@ def _first_after(client: Any, cid: str, since: float, now: float,
     than one page halves (the earliest target is what matters). The old newest-first
     paging from *since* with a 5-page cap never reached an early unarchive behind 1,000+
     later messages. -> (projected message, ""), (None, "") = none up to *now*, or
-    (None, code) on a read error / (None, "page_cap") past FORWARD_SEARCH_CALLS reads."""
+    (None, code) on a read error / (None, "page_cap") past FORWARD_SEARCH_CALLS reads.
+    A page with no boolean ``has_more`` or no ``messages`` list is (None, "shape"): A8,
+    a malformed page is UNKNOWN, never "nothing more" (D-051 r2 c1-false-inactive#0)."""
     lo = float(since)
     width = FORWARD_FIRST_WINDOW_S
     for _ in range(FORWARD_SEARCH_CALLS):
@@ -146,12 +154,13 @@ def _first_after(client: Any, cid: str, since: float, now: float,
                                                 inclusive=True, limit=200)
         except Exception as exc:  # noqa: BLE001
             return None, cl._err_code(exc)
-        more = resp.get("has_more") is True
+        more, page = resp.get("has_more"), resp.get("messages")
+        if not isinstance(more, bool) or not isinstance(page, list):
+            return None, "shape"              # A8: never read a malformed page as "nothing more"
         if more and hi - lo > 1.0:
             width = (hi - lo) / 2.0           # narrow toward lo: the earliest target is what counts
             continue
-        hits = [m for m in (resp.get("messages") or [])
-                if isinstance(m, dict) and m.get("subtype") in subtypes]
+        hits = [m for m in page if isinstance(m, dict) and m.get("subtype") in subtypes]
         if hits:
             m = min(hits, key=lambda x: float(x.get("ts") or 0))
             return {k: m.get(k) for k in ("ts", "user", "bot_id", "subtype")}, ""
@@ -318,6 +327,7 @@ def reconcile(client: Any, *, now: float | None = None, dry_run: bool = False,
     examine |= {cid for cid in intents if cid in archived_ids}
     used_intents: set[int] = set()
     unattributed: list[tuple[str, str, int]] = []     # (cid, archive ts, findings index)
+    newest_archive: dict[str, dict] = {}              # cid -> its CURRENT archive message (copy for (3))
     for cid in sorted(examine):
         cov["examined"] += 1
         sleep(PACE_S)
@@ -326,6 +336,8 @@ def reconcile(client: Any, *, now: float | None = None, dry_run: bool = False,
         if err:
             findings.append(f"{cid}: history unreadable ({err}) -- cannot attribute its archive")
             continue
+        if ev is not None:
+            newest_archive[cid] = ev
         if ev is None:
             findings.append(f"{cid}: archived, but no archive message in its newest "
                             f"{HISTORY_LIMIT} -- cannot attribute")
@@ -411,9 +423,14 @@ def reconcile(client: Any, *, now: float | None = None, dry_run: bool = False,
         follow_unarchive(cid, arch_ts, "ledger says archived")
 
     # -- (3) UNRESOLVED: settled from Slack's OWN history (the first archive message
-    # after the intent), never from "open now = never archived"; every path ends in a
-    # settled outcome, so no WARN repeats forever with nothing that can clear it
-    # (D-051 r1 c1-monitor#1) --
+    # around the intent), never from "open now = never archived"; every readable window
+    # ends in a settled outcome, so no WARN repeats forever with nothing that can clear
+    # it (D-051 r1 c1-monitor#1). The window uses (1)'s pairing tolerance: the intent is
+    # stamped on the HOST clock and Slack stamps the archive message, so a host running
+    # ahead puts Cora's own archive BEFORE the intent -- the search starts at
+    # its - INTENT_AFTER_S and a Cora archive in [its - INTENT_AFTER_S, its +
+    # INTENT_BEFORE_S] is this attempt's (D-051 r2 c1-false-inactive#0 / c1-monitor#0).
+    # It ends at its + UNRESOLVED_WINDOW_S (r2 c1-monitor#1) --
     for cid, rows in sorted(intents.items()):
         for r in rows:
             pid = str(r.get("proposal_id") or "")
@@ -435,7 +452,8 @@ def reconcile(client: Any, *, now: float | None = None, dry_run: bool = False,
                                 f"list (deleted, or Cora lost access), so nothing more can be checked; {tail}")
                 continue
             sleep(PACE_S)
-            first, err = _first_after(client, cid, its - 1, now, ARCHIVE_SUBTYPES)
+            first, err = _first_after(client, cid, its - INTENT_AFTER_S,
+                                      min(now, its + UNRESOLVED_WINDOW_S), ARCHIVE_SUBTYPES)
             cov["histories"] += 1
             if err:
                 findings.append(f"UNRESOLVED: {cid} intent {pid} has no settled outcome; its history "
@@ -455,12 +473,29 @@ def reconcile(client: Any, *, now: float | None = None, dry_run: bool = False,
                 findings.append(f"UNRESOLVED: {cid} intent {pid} has no settled outcome")
                 continue
             if c.get("is_archived") and not by_cora:
-                how = (f"a person (not Cora) archived it at {first.get('ts')}" if first is not None
-                       else "it was already archived before the attempt")
+                # no Cora archive in the pairing window: the attempt's own archive lands
+                # within seconds, so it did not archive the channel. An empty window
+                # cannot say WHEN someone else did; (1)'s read of the channel's CURRENT
+                # archive message names a later archiver (r2 c1-false-inactive#0)
+                late = newest_archive.get(cid) if first is None else None
+                try:
+                    late_ts = float((late or {}).get("ts") or 0)
+                except (TypeError, ValueError):
+                    late_ts = 0.0
+                if first is not None:
+                    how = f"a person (not Cora) archived it at {first.get('ts')}"
+                elif late is not None and late_ts > its + INTENT_BEFORE_S:
+                    who = ("Cora (a later archive, not this attempt's)" if _is_cora(late, bot_uid, bot_id)
+                           else "a person (not Cora)")
+                    how = f"{who} archived it at {late.get('ts')}, long after the attempt"
+                else:
+                    how = ("it archived with no archive message by Cora within 15 min of the attempt "
+                           "(none in the hour around it), so it was archived before the attempt or "
+                           "long after it, not by it")
                 _ok, tail = settle(pid, cid, r, "already_archived (reconciled)", "already_archived")
                 findings.append(f"RECONCILED: {cid} intent {pid} -- Slack shows {how}; {tail}")
                 continue
-            why = ("Slack shows it open and no archive message after the intent" if first is None
+            why = ("Slack shows it open and no archive message within an hour of the intent" if first is None
                    else f"the first archive after it is a later one by Cora at {first.get('ts')}"
                    if by_cora else f"the first archive after it is a person's at {first.get('ts')}")
             _ok, tail = settle(pid, cid, r, "failed (reconciled)", "failed")

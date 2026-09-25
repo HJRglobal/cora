@@ -448,6 +448,128 @@ class TestUnresolvedReadsSlackHistory:
         assert _outcomes() == []
 
 
+class _NoHasMore(MonSlack):
+    """A windowed history read whose page carries NO ``has_more`` key (a malformed or
+    changed response shape): A8 says that is UNKNOWN, never "nothing more"."""
+
+    def conversations_history(self, channel, oldest=None, **kw):
+        r = super().conversations_history(channel, oldest=oldest, **kw)
+        if oldest is None:
+            return r
+        data = dict(r.data)
+        data.pop("has_more", None)
+        return resp(data)
+
+
+class TestUnresolvedClockSkewD051R2:
+    """D-051 r2 c1-false-inactive#0 + c1-monitor#0 (one defect): the intent is stamped on
+    the HOST clock and Slack stamps the archive message, so a host running a few seconds
+    ahead puts Cora's own archive BEFORE the intent. Class (1) already pairs an intent up
+    to INTENT_AFTER_S after the archive; class (3) must use the SAME tolerance, or one run
+    says the intent archived the channel and also that it did not -- and a false
+    already_archived / failed record loses the A10 protection for good."""
+
+    @pytest.mark.parametrize("skew", [5, 90])
+    def test_host_ahead_reopened_channel_settles_archived_and_follows_the_unarchive(self, skew):
+        _stage_t1_row()
+        ats = NOW - 2 * DAY
+        its = ats + skew
+        intent(ARCH, its)
+        outcome(ARCH, its + 5, "unknown")
+        fake = MonSlack(archived={ARCH: {"is_archived": False}},
+                        events={ARCH: [arch_event(ats, user=BOT_UID)]},
+                        unarchives={ARCH: [{"ts": f"{ats + 3600:.6f}", "subtype": "channel_unarchive",
+                                            "user": PERSON}]})
+        out = run(fake)
+        assert out["status"] == "ok", out["findings"]
+        assert _outcomes() == ["unknown", "archived (reconciled)"]
+        rec = [r for r in st.read_ledger() if r["event"] == "outcome"][-1]
+        assert rec["archive_ts"] == pytest.approx(ats)
+        seen = [r for r in st.read_ledger() if r["event"] == "unarchived_seen"]
+        assert len(seen) == 1 and seen[0]["by"] == PERSON
+        assert st.unarchive_state(st.read_ledger())[ARCH]["by"] == PERSON        # A10 kept
+        assert st.fold(now=NOW).proposals[PID].state_of(ARCH) == st.ARCHIVED
+
+    @pytest.mark.parametrize("skew", [5, 90])
+    def test_host_ahead_still_archived_settles_archived_and_both_passes_agree(self, skew):
+        _stage_t1_row()
+        ats = NOW - 2 * DAY
+        its = ats + skew
+        intent(ARCH, its)
+        outcome(ARCH, its + 5, "unknown")
+        fake = MonSlack(archived={ARCH: {"updated": int(ats * 1000)}},
+                        events={ARCH: [arch_event(ats, user=BOT_UID)]})
+        out = run(fake)
+        assert out["status"] == "ok", out["findings"]          # no UNATTRIBUTED, no RECONCILED
+        assert not policy.is_demoted()
+        assert _outcomes() == ["unknown", "archived (reconciled)"]
+        assert st.fold(now=NOW).proposals[PID].state_of(ARCH) == st.ARCHIVED    # never "someone else"
+
+    def test_archived_with_no_archive_message_near_the_attempt_never_claims_a_clean_before(self):
+        """No Cora archive in the pairing window and none in the hour around the attempt:
+        the attempt did not archive it (its own archive lands within seconds), but Slack
+        cannot say WHEN it was archived -- the copy says so, not 'before the attempt'."""
+        _stage_t1_row()
+        its = NOW - 2 * DAY
+        intent(ARCH, its)
+        outcome(ARCH, its + 5, "unknown")
+        fake = MonSlack(archived={ARCH: {"updated": int((NOW - 40 * DAY) * 1000)}},
+                        events={ARCH: [arch_event(NOW - 40 * DAY, user=PERSON)]})
+        out = run(fake)
+        line = next(f for f in out["findings"] if "RECONCILED" in f)
+        assert "no archive message by Cora within 15 min" in line and "not by it" in line
+        assert _outcomes()[-1] == "already_archived (reconciled)"
+
+    def test_a_later_cora_archive_past_the_window_is_named_as_not_this_attempts(self):
+        _stage_t1_row()
+        its = NOW - 3 * DAY
+        intent(ARCH, its)
+        outcome(ARCH, its + 5, "unknown")
+        fake = MonSlack(archived={ARCH: {}}, events={ARCH: [arch_event(NOW - DAY, user=BOT_UID)]})
+        out = run(fake)
+        line = next(f for f in out["findings"] if "RECONCILED" in f)
+        assert "a later archive, not this attempt's" in line and "long after the attempt" in line
+        assert _outcomes()[-1] == "already_archived (reconciled)"
+
+    def test_a_page_with_no_has_more_is_unknown_and_records_nothing(self):
+        _stage_t1_row(state_event=None)
+        intent(ARCH, NOW - 2 * DAY)
+        out = run(_NoHasMore(archived={ARCH: {"is_archived": False}}))
+        assert any("UNRESOLVED" in f and "could not be searched (shape)" in f for f in out["findings"]), \
+            out["findings"]
+        assert _outcomes() == []                                # never a terminal "failed"
+
+    def test_the_first_after_search_reads_a_missing_has_more_as_a_shape_error(self):
+        fake = _NoHasMore(events={ARCH: [arch_event(NOW - DAY, user=BOT_UID)]})
+        assert mon._first_after(fake, ARCH, NOW - 2 * DAY, NOW, mon.ARCHIVE_SUBTYPES) == (None, "shape")
+
+
+class TestUnresolvedWindowIsBoundedD051R2:
+    """D-051 r2 c1-monitor#1: the attempt's own archive lands within seconds, so the
+    UNRESOLVED search reads a BOUNDED window after the intent. Reading to `now` on a busy
+    open channel hit the read cap and WARNed every night with nothing that could settle it."""
+
+    def test_a_busy_open_channel_settles_failed_inside_the_bounded_window(self):
+        _stage_t1_row(state_event=None)
+        its = NOW - 3 * DAY
+        intent(ARCH, its)
+        step = 86400.0 / 5000                                   # a bot posting 5,000 a day
+        n = int((NOW - its) / step)
+        busy = [{"ts": f"{its + 1 + i * step:.6f}", "type": "message", "bot_id": "BALERTS01"}
+                for i in range(n)]
+        hist = {"C0PERSONA1": [arch_event(NOW - 3 * DAY, user=PERSON)], ARCH: busy}
+        fake = FakeSlack(channels=[chan("C0PERSONA1", "fx-person-archived", is_archived=True,
+                                        updated=int((NOW - 3 * DAY) * 1000)),
+                                   chan(ARCH, "fx-busy-alerts")], history=hist)
+        out = run(fake)
+        line = next((f for f in out["findings"] if ARCH in f), "")
+        assert "RECONCILED" in line and "never archived by this attempt" in line, out["findings"]
+        assert _outcomes() == ["failed (reconciled)"]
+        reads = [c[1] for c in fake.calls if c[0] == "conversations_history" and c[1]["channel"] == ARCH]
+        assert reads and max(float(c["latest"]) for c in reads) <= its + mon.UNRESOLVED_WINDOW_S + 1e-3
+        assert min(float(c["oldest"]) for c in reads) >= its - mon.INTENT_AFTER_S - 1e-3
+
+
 class TestFailedOutcomeSlackArchived:
     """D-051 r1 c1-monitor#3: a ledger `failed` for an archive Slack shows Cora performed
     (internal_error / fatal_error can partly succeed) is reconciled, never read clean."""
