@@ -1728,7 +1728,9 @@ def record_gate_refusal(route: Any, *, channel_id: str, now: datetime | None = N
     stage "gate": it never registers a lane thread (is_lane_thread needs the root)
     and never settles an ask. Non-refusal replies (clarify, help, lane off) write
     nothing."""
-    reason = "eval" if eval_mode() else str(getattr(route, "reason", "") or "")
+    reason = str(getattr(route, "reason", "") or "")
+    if eval_mode() and getattr(route, "kind", "") == "search":
+        reason = "eval"            # execute_route answers a search route with EVAL_REPLY
     if reason not in GATE_REFUSALS:
         return
     append_event("refused", channel=channel_id, root_ts="", stage="gate", reason=reason, now=now)

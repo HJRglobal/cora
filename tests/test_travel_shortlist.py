@@ -1373,6 +1373,18 @@ class TestExecuteRoute:
         self._exec(route, _slack_client())
         assert _rows() == []
 
+    def test_route_turns_eval_reply_is_ledgered_as_eval(self, monkeypatch):
+        monkeypatch.setenv("CORA_EVAL_MODE", "1")
+        route = _route(MUST_FIRE[1])
+        assert (route.kind, route.reason) == ("reply", "eval")
+        self._exec(route, _slack_client())
+        assert [(r["event"], r["reason"]) for r in _rows()] == [("refused", "eval")]
+
+    def test_under_eval_a_non_refusal_reply_is_not_mislabelled_eval(self, monkeypatch):
+        monkeypatch.setenv("CORA_EVAL_MODE", "1")
+        self._exec(ts.Route("reply", ts.CLARIFY_DATES_REPLY, "clarify_dates"), _slack_client())
+        assert _rows() == []
+
     def test_a_search_acks_registers_and_submits(self):
         client = _slack_client()
         route = ts.Route("search", constraints=_constraints(), budget=3)
