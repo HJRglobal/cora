@@ -641,6 +641,50 @@ class TestFounderMention:
         assert dispatch.called and not client.chat_postMessage.called
 
 
+class TestFounderSlashAskR1:
+    """integration#4 (SPLIT -> fix): /cora-ask is a third founder entry point -- the same
+    intents as a channel @mention, answered by code top-level, never the model."""
+
+    def _run(self, text, user=HARRISON):
+        client = MagicMock()
+        body = {"channel_id": "C0B3K67J10T", "user_id": user, "text": text}
+        with patch.object(app_module.rate_limiter, "check", return_value=(True, None)), \
+             patch.object(app_module, "_resolve_channel_name", return_value="hjrg-leadership"), \
+             patch.object(app_module, "_resolve_bot_user_id"), \
+             patch.object(app_module.user_access, "check_access", return_value=None), \
+             patch.object(app_module.sibling_guard, "check_redirect", return_value=None), \
+             patch.object(app_module.cross_entity_guard, "check_cross_entity", return_value=None), \
+             patch.object(app_module.code_queue, "capture_message_signal") as capture, \
+             patch.object(app_module, "_dispatch_qa") as dispatch, \
+             patch.object(app_module, "_ca_start_scan") as start:
+            app_module.handle_cora_ask(MagicMock(), body, client)
+        return client, dispatch, capture, start
+
+    def test_the_founder_ask_scans_to_his_dm(self):
+        client, dispatch, capture, start = self._run("archive the dead channels")
+        assert start.called and not dispatch.called and not capture.called
+        assert start.call_args.args[1] == "C0B3K67J10T" and start.call_args.args[2] is None
+        assert start.call_args.kwargs["ack_text"] == intents.CHANNEL_ACK_REPLY
+        assert start.call_args.kwargs["running_text"] == intents.SCAN_RUNNING_CHANNEL_REPLY
+
+    def test_a_status_question_gets_the_ledger_line_top_level(self):
+        client, dispatch, _, start = self._run("did you archive the dead channels?")
+        assert not dispatch.called and not start.called
+        kw = client.chat_postMessage.call_args.kwargs
+        assert kw["text"].startswith("Dead-channel lane:") and kw["thread_ts"] is None
+
+    def test_an_attempt_gets_the_attempt_reply(self):
+        client, dispatch, _, _ = self._run("archive <#C0B2T18R3FG|social>")
+        assert not dispatch.called
+        assert client.chat_postMessage.call_args.kwargs["text"] == intents.ATTEMPT_REPLY
+
+    @pytest.mark.parametrize("text,user", [("archive the dead channels", PERSON),
+                                           ("how do I archive a channel in slack?", HARRISON)])
+    def test_a_member_or_a_non_lane_question_reaches_the_model(self, text, user):
+        client, dispatch, _, start = self._run(text, user=user)
+        assert dispatch.called and not start.called and not client.chat_postMessage.called
+
+
 def _cand(mmc, text, user):
     return mmc.Candidate(channel_id="DHARRISON1" if user == HARRISON else "DP", channel_name="dm",
                          is_dm=True, user_id=user, text=text, event_ts="1790000300.000100",

@@ -2601,6 +2601,14 @@ def handle_cora_ask(ack, body, client) -> None:
         client.chat_postEphemeral(channel=channel_id, user=user_id, text=cross_redirect)
         return
 
+    # ── Code #16 C1: dead-channel archive lane (founder /cora-ask, integration#4) ──
+    # The third founder entry point: the same intents as a channel @mention, answered
+    # by code top-level here (the card itself still goes to his DM) -- before the
+    # model and before code_queue's signal capture.
+    if user_id and user_id == code_queue.HARRISON_ID and _channel_archive_mention_intercept(
+            {"channel": channel_id, "ts": None}, client, text):
+        return
+
     # Build a say-equivalent that posts to the channel (not in a thread)
     def _say(**kwargs) -> dict:
         kwargs.pop("thread_ts", None)
