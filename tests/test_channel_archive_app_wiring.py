@@ -455,6 +455,41 @@ class TestFounderMention:
         _client, dispatch, _capture, start = self._run("archive the dead channels", user=PERSON)
         assert not start.called
 
+    def _run_real_scan_path(self, text):
+        """handle_mention with the REAL _ca_start_scan / _ca_run_scan (the scan itself faked)."""
+        say, client = MagicMock(), MagicMock()
+        event = {"channel": "C0B3K67J10T", "user": HARRISON, "ts": "1790000200.000100",
+                 "text": f"<@{BOT}> {text}"}
+        with patch.object(app_module.rate_limiter, "check", return_value=(True, None)), \
+             patch.object(app_module, "_resolve_channel_name", return_value="hjrg-leadership"), \
+             patch.object(app_module, "_resolve_bot_user_id"), \
+             patch.object(app_module.code_queue, "capture_message_signal"), \
+             patch.object(app_module, "_dispatch_qa") as dispatch:
+            app_module.handle_mention(event, say, client)
+        app_module._CHANNEL_ARCHIVE_SCAN_POOL.shutdown(wait=True)
+        return client, dispatch
+
+    def test_c1_intents_copy_4_a_running_scan_in_this_process_points_at_the_dm(self, monkeypatch):
+        """c1-intents-copy#4: the card always lands in Harrison's DM, never in the channel."""
+        monkeypatch.delenv("CORA_EVAL_MODE", raising=False)
+        assert app_module._CHANNEL_ARCHIVE_SCAN_GUARD.acquire(blocking=False)
+        try:
+            client, dispatch = self._run_real_scan_path("archive the dead channels")
+        finally:
+            app_module._CHANNEL_ARCHIVE_SCAN_GUARD.release()
+        posts = client.chat_postMessage.call_args_list
+        assert [c.kwargs["text"] for c in posts] == [intents.SCAN_RUNNING_CHANNEL_REPLY]
+        assert posts[0].kwargs["thread_ts"] == "1790000200.000100" and not dispatch.called
+        assert "your DM" in intents.SCAN_RUNNING_CHANNEL_REPLY
+
+    def test_c1_intents_copy_4_the_cross_process_lock_loser_points_at_the_dm(self, monkeypatch):
+        monkeypatch.delenv("CORA_EVAL_MODE", raising=False)
+        monkeypatch.setattr(deliver, "deliver_proposal",
+                            lambda **kw: {"delivered": False, "reason": "scan_running"})
+        client, _ = self._run_real_scan_path("archive the dead channels")
+        assert [c.kwargs["text"] for c in client.chat_postMessage.call_args_list] == [
+            intents.CHANNEL_ACK_REPLY, intents.SCAN_RUNNING_CHANNEL_REPLY]
+
     @pytest.mark.parametrize("text", [
         "how do I archive a channel in slack?", "which archived reports cover the retail channel?",
         "what did we decide in <#C0B2T18R3FG|hjr-archive-2024>?", "archive the amazon channel report in drive",

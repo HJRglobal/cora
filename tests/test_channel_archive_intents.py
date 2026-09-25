@@ -350,7 +350,8 @@ class TestReplies:
     def test_every_reply_passes_both_rails(self, monkeypatch, caplog):
         self._seed()
         caplog.set_level(logging.WARNING, logger=se.__name__)
-        replies = [it.ACK_REPLY, it.CHANNEL_ACK_REPLY, it.SCAN_RUNNING_REPLY, it.SCAN_FAILED_REPLY,
+        replies = [it.ACK_REPLY, it.CHANNEL_ACK_REPLY, it.SCAN_RUNNING_REPLY,
+                   it.SCAN_RUNNING_CHANNEL_REPLY, it.SCAN_FAILED_REPLY,
                    it.OFF_REPLY, it.ATTEMPT_REPLY, it.CATCHUP_DRAFT, it.followup_reply(),
                    it.status_reply(now=NOW + 60)]
         st.append_ledger("outcome", proposal_id="chanarch-aaaaaaaaaaaa", channel_id="C0AAAAAAA1",

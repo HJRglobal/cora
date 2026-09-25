@@ -242,6 +242,9 @@ ACK_REPLY = ("Scanning the channels I belong to for 90+ days without a person po
 CHANNEL_ACK_REPLY = ("Scanning now — the proposal card will arrive in your DM; nothing will be "
                      "archived by this scan.")
 SCAN_RUNNING_REPLY = "A scan is already running; its card will arrive here."
+#: the channel @mention (and /cora-ask) variant: the card ALWAYS lands in Harrison's
+#: DM (deliver_proposal), never in the channel the ask came from (c1-intents-copy#4)
+SCAN_RUNNING_CHANNEL_REPLY = "A scan is already running; its card will arrive in your DM."
 SCAN_FAILED_REPLY = ("The dead-channel scan stopped before a card was built — nothing was "
                      "archived. Ask again.")
 OFF_REPLY = "The dead-channel lane is switched off (CORA_CHANNEL_ARCHIVE=off). Nothing was scanned."

@@ -5152,10 +5152,12 @@ def _ca_post(client, channel: str, text: str, thread_ts=None) -> None:
         log.warning("channel_archive: post failed: %s", exc)
 
 
-def _ca_run_scan(client, notify_channel: str, notify_thread, trigger: str) -> None:
+def _ca_run_scan(client, notify_channel: str, notify_thread, trigger: str,
+                 running_text: str | None = None) -> None:
     """SCAN pool body. Never raises; a crash or an undelivered card says so where
     the ask was made (A18: the 'card will follow' promise can never fail silently),
-    and the in-process guard is released in finally."""
+    and the in-process guard is released in finally. *running_text* is the
+    already-running line for THIS surface (the channel variant names the DM)."""
     try:
         started = time.time()
         try:
@@ -5169,7 +5171,8 @@ def _ca_run_scan(client, notify_channel: str, notify_thread, trigger: str) -> No
             out = {"delivered": False, "reason": "crashed"}
         reason = str(out.get("reason") or "")
         if reason == "scan_running":
-            _ca_post(client, notify_channel, channel_archive_intents.SCAN_RUNNING_REPLY, notify_thread)
+            _ca_post(client, notify_channel,
+                     running_text or channel_archive_intents.SCAN_RUNNING_REPLY, notify_thread)
         elif reason == "off":
             _ca_post(client, notify_channel, channel_archive_intents.OFF_REPLY, notify_thread)
         elif not out.get("delivered") and reason != "eval_mode":
@@ -5180,19 +5183,21 @@ def _ca_run_scan(client, notify_channel: str, notify_thread, trigger: str) -> No
         _CHANNEL_ARCHIVE_SCAN_GUARD.release()
 
 
-def _ca_start_scan(client, channel: str, thread_ts, *, ack_text: str) -> None:
+def _ca_start_scan(client, channel: str, thread_ts, *, ack_text: str,
+                   running_text: str | None = None) -> None:
+    running = running_text or channel_archive_intents.SCAN_RUNNING_REPLY
     if channel_archive_policy.mode() == "off":
         _ca_post(client, channel, channel_archive_intents.OFF_REPLY, thread_ts)
         return
     if not _CHANNEL_ARCHIVE_SCAN_GUARD.acquire(blocking=False):
-        _ca_post(client, channel, channel_archive_intents.SCAN_RUNNING_REPLY, thread_ts)
+        _ca_post(client, channel, running, thread_ts)
         return
     _ca_post(client, channel, ack_text, thread_ts)
     try:
-        _CHANNEL_ARCHIVE_SCAN_POOL.submit(_ca_run_scan, client, channel, thread_ts, "ask")
+        _CHANNEL_ARCHIVE_SCAN_POOL.submit(_ca_run_scan, client, channel, thread_ts, "ask", running)
     except Exception:  # noqa: BLE001 -- RuntimeError after shutdown: never drop the ask
         log.warning("channel_archive scan pool refused -- running inline", exc_info=True)
-        _ca_run_scan(client, channel, thread_ts, "ask")
+        _ca_run_scan(client, channel, thread_ts, "ask", running)
 
 
 def _channel_archive_dm_intercept(event: dict, client, user_id: str, text: str) -> bool:
@@ -5263,7 +5268,8 @@ def _channel_archive_mention_intercept(event: dict, client, user_message: str) -
     log.info("channel_archive mention intercept kind=%s channel=%s", kind, channel)
     try:
         if kind == "ask":
-            _ca_start_scan(client, channel, thread_ts, ack_text=cai.CHANNEL_ACK_REPLY)
+            _ca_start_scan(client, channel, thread_ts, ack_text=cai.CHANNEL_ACK_REPLY,
+                           running_text=cai.SCAN_RUNNING_CHANNEL_REPLY)
         elif kind == "status":
             _ca_post(client, channel, cai.status_reply(), thread_ts)
         else:
