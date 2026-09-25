@@ -562,6 +562,75 @@ def test_guard_artifact_pass_and_phi_backstop(monkeypatch):
     assert "protected" in msg
 
 
+_SYNTH_NON_LEX_PHI = ("Summary: the catalog is drafted.\n\n# Recurring entries\n"
+                      "Note: the Lexington client roster shows autism support hours.")
+
+
+def test_guard_artifact_real_non_lex_phi_predicate_trips_on_holdco_job(monkeypatch):
+    """Code #15 S3 (cq-90568f0b1222 part a): reproduce dw-d1c6b3fba5e1's FAILED
+    mode with the REAL predicate (the sibling test above stubs it).
+
+    The LIVE leg is IRREPRODUCIBLE: the runner stages the artifact only AFTER
+    the guard passes, so the tripping text was never persisted
+    (data/delegated-work/ is empty), and the failed row records the guard CLASS
+    (non_lex_phi), not which leg of non_lex_phi_backstop_trips_live fired (DOB /
+    ICD-10 / diagnosed-with / dx-or-med + care cue / billing + program +
+    individual). The stored brief trips no leg, so the text came from model/KB
+    output. This is therefore a synthetic reproduction BY MODE: an HJRG job
+    whose composed summary+artifact carries a Lexington care cue next to a
+    curated dx term."""
+    import cora.channel_content_guard as ccg
+    import cora.org_roles as org_roles
+    import cora.phi_guard as pg
+
+    # The first leg (guard_outbound) is not under test -- it passed live.
+    monkeypatch.setattr(ccg, "guard_outbound", lambda text, **k: (text, None))
+    monkeypatch.setattr(org_roles, "all_roles", lambda: [])
+    assert pg.non_lex_phi_backstop_trips_live(_SYNTH_NON_LEX_PHI, allowed_names=set())
+    job = _job(entity="HJRG")
+    job.update(channel_id="D0SYNTH00", channel_name="dm")
+    fclass, msg, gclass = worker.guard_artifact_text(job, _SYNTH_NON_LEX_PHI)
+    assert fclass == "content_guard"
+    assert gclass == worker.GUARD_CLASS_PHI == "non_lex_phi"
+    assert "protected" in msg
+    assert "autism" not in msg and "Lexington client" not in msg
+    # The same job with clean text passes -- the trip is the text, not the job.
+    assert worker.guard_artifact_text(job, "Recurring JE catalog, 12 entries.")[0] is None
+
+
+def test_deliver_real_non_lex_phi_writes_the_template_failed_row(monkeypatch):
+    """The runner half of the same synthetic reproduction: deliver() records a
+    content-free FAILED row (the fixed 55-char template + the guard class), and
+    NO artifact is staged -- which is exactly why the live leg cannot be
+    recovered after the fact."""
+    import cora.channel_content_guard as ccg
+    import cora.org_roles as org_roles
+
+    monkeypatch.setattr(ccg, "guard_outbound", lambda text, **k: (text, None))
+    monkeypatch.setattr(org_roles, "all_roles", lambda: [])
+    _seed_job(state_events=("queued", "started"), entity="HJRG",
+              channel_id="D0SYNTH00", channel_name="dm")
+    posts = []
+    monkeypatch.setattr(runner, "post_threaded", lambda c, j, t: posts.append(t) or True)
+    monkeypatch.setattr(runner, "post_sessions_line", lambda c, t: posts.append(t))
+    summary, body = _SYNTH_NON_LEX_PHI.split("\n\n", 1)
+    runner.deliver(None, "dw-abc123def456", _ok_outcome(summary=summary, artifact_text=body))
+
+    rows = [e for e in dw._read_jsonl(dw._RUNNER_LEDGER) if e.get("event") == "failed"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["failure_class"] == dw.FAILURE_CONTENT_GUARD
+    assert row["guard_class"] == "non_lex_phi"
+    assert row["message"] == "artifact tripped the channel content guard: non_lex_phi"
+    assert len(row["message"]) == 55
+    assert "autism" not in json.dumps(row) and "Lexington client" not in json.dumps(row)
+    assert not dw.staging_dir("dw-abc123def456").exists()  # never persisted
+    rec = dw.get_job("dw-abc123def456")
+    assert rec["state"] == dw.STATE_FAILED
+    assert rec["failure"]["guard_class"] == "non_lex_phi"  # S3: the fold keeps it
+    assert "DW FAIL dw-abc123def456 content_guard non_lex_phi" in posts
+
+
 def test_guard_artifact_error_fails_closed(monkeypatch):
     import cora.channel_content_guard as ccg
 

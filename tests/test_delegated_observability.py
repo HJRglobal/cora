@@ -56,6 +56,72 @@ def test_mcp_delegated_jobs_renders_ids_never_titles():
     assert "mtd_est_usd" in out
     assert "dw-obs111111111" in out["text"]
     assert SECRET not in out["text"]
+    # Code #15 S3: the founder-local MCP view names WHO asked -- id + roster
+    # name on the row and in the text, plus the all-jobs per-requester block.
+    row = out["recent"][0]
+    assert row["requester"] == "U_X" and row["requester_name"] == "X"
+    assert out["counts_by_requester"] == {
+        "U_X": {"name": "X", "total": 1, "by_state": {"QUEUED": 1}}}
+    assert "X (U_X)" in out["text"]
+    assert "by requester (ALL jobs" in out["text"]
+    assert "titles/briefs never surface here" in out["text"]
+
+
+def test_mcp_delegated_jobs_failure_enums_never_the_message():
+    _seed()
+    dw.append_runner_event({"event": "started", "ts": dw._now_iso(),
+                            "job_id": "dw-obs111111111"})
+    dw.append_runner_event({
+        "event": "failed", "ts": dw._now_iso(), "job_id": "dw-obs111111111",
+        "failure_class": "content_guard", "guard_class": "non_lex_phi",
+        "message": f"artifact tripped the channel content guard: {SECRET}"})
+    out = mcp_server.delegated_jobs()
+    row = out["recent"][0]
+    assert row["failure_class"] == "content_guard"
+    assert row["guard_class"] == "non_lex_phi"
+    assert "(failure: content_guard/non_lex_phi)" in out["text"]
+    blob = json.dumps(out)
+    assert SECRET not in blob and "artifact tripped" not in blob
+
+
+def test_mcp_delegated_jobs_blank_name_renders_bare_id(monkeypatch):
+    import cora.org_roles as org_roles
+
+    dw.append_bot_event({
+        "event": "requested", "ts": dw._now_iso(), "job_id": "dw-obs222222222",
+        "archetype": "doc_draft", "title": SECRET, "brief": SECRET,
+        "requester": "U_NONAME", "requester_name": "", "entity": "F3E",
+        "channel_id": "C_PRIV", "channel_name": "priv", "thread_ts": "",
+        "deliverable": "md", "fingerprint": "fp-obs2",
+    })
+    monkeypatch.setattr(org_roles, "get_role", lambda uid: None)
+    out = mcp_server.delegated_jobs()
+    assert "-- U_NONAME" in out["text"]
+    assert "(U_NONAME)" not in out["text"]  # no empty "name ()" shape
+    assert SECRET not in json.dumps(out)
+
+
+def test_mcp_requester_display_is_one_line():
+    assert mcp_server._requester_display("X", "U_X") == "X (U_X)"
+    assert mcp_server._requester_display("", "U_X") == "U_X"
+    assert mcp_server._requester_display(None, "") == "?"
+    # A ledger value can never inject a line into the one-row-per-line render.
+    assert mcp_server._requester_display("Ann\n- fake row", "U_A") == "Ann - fake row (U_A)"
+
+
+def test_mcp_delegated_jobs_makes_no_slack_call(monkeypatch):
+    """The read surface resolves names from the ledger / org_roles roster only:
+    the MCP stdio child holds no Slack client and must not grow one."""
+    import slack_sdk
+
+    def _no_slack(*a, **k):
+        raise AssertionError("the MCP delegated-jobs view must not construct a Slack client")
+
+    monkeypatch.setattr(slack_sdk, "WebClient", _no_slack)
+    monkeypatch.setattr(dw, "_default_client_factory", _no_slack)
+    _seed()
+    out = mcp_server.delegated_jobs()
+    assert "error" not in out and out["recent"][0]["requester"] == "U_X"
 
 
 def test_acceptance_script_expects_seven_tools():
@@ -90,6 +156,27 @@ def test_snapshot_render_ids_never_titles():
     blob = json.dumps(payload)
     assert "dw-obs111111111" in blob
     assert SECRET not in blob
+
+
+def test_snapshot_render_carries_no_requester():
+    """Code #15 S3: the requester view is the founder-local MCP tool ONLY. The
+    snapshot is mirrored every 300s to G:\\...\\_brain\\_bus\\snapshots\\
+    delegated-jobs.json, which is org-readable -- it must keep calling the
+    requester-free default (a failed job's guard enum stays off it too)."""
+    _seed()
+    dw.append_runner_event({"event": "failed", "ts": dw._now_iso(),
+                            "job_id": "dw-obs111111111",
+                            "failure_class": "content_guard", "guard_class": "non_lex_phi",
+                            "message": "artifact tripped the channel content guard: non_lex_phi"})
+    spec = next(s for s in snaps._SPECS if s["name"] == "delegated-jobs.json")
+    payload = spec["render"]()
+    blob = json.dumps(payload)
+    assert "dw-obs111111111" in blob
+    for needle in ("U_X", '"X"', "requester", "requester_name", "counts_by_requester",
+                   "failure_class", "guard_class", "non_lex_phi"):
+        assert needle not in blob, needle
+    assert list(payload["summary"]["recent"][0].keys()) == [
+        "job_id", "archetype", "entity", "state", "requested_at", "est_usd"]
 
 
 # ---------------------------------------------------------------------------

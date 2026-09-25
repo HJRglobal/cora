@@ -40,7 +40,8 @@ async def _run() -> int:
             expected = {
                 "cora_kb_search", "cora_decisions_search", "cora_known_answers",
                 "cora_code_queue", "cora_health",
-                # Delegated-work observability (2026-08-01): ids/state/cost only.
+                # Delegated-work observability (2026-08-01): ids/state/cost, plus the
+                # requester id+name (Code #15 S3); never titles/briefs.
                 "cora_delegated_jobs",
                 # Listed but deliberately NOT called below: it is the surface's one
                 # gated WRITE tool and an acceptance check must never write.

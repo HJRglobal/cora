@@ -398,6 +398,12 @@ def _fold_jobs() -> dict[str, dict[str, Any]]:
                 "class": str(ev.get("failure_class") or "error"),
                 "message": str(ev.get("message") or ""),
             }
+            # The runner records the SPECIFIC content-guard trip class on the
+            # failed row (cq-233ca1a22976); the fold dropped it, so no read
+            # surface could say WHICH guard failed a job (Code #15 S3). Carried
+            # only when present, so a pre-8/13 row folds to the old shape.
+            if ev.get("guard_class"):
+                rec["failure"]["guard_class"] = str(ev.get("guard_class"))
             if isinstance(ev.get("cost"), dict):
                 rec["cost"] = ev["cost"]
         elif et == "expired":
@@ -1299,28 +1305,96 @@ def render_job_list(user: str, channel_id: str) -> str:
     return "\n".join(lines)
 
 
-def jobs_summary(limit: int = 15) -> dict[str, Any]:
+# A failure enum on the read surface must be a code-authored token, never text.
+# failure_class / guard_class are written by the runner from fixed tables
+# (worker outcome classes, channel_content_guard._CLASSES, GUARD_CLASS_*), but
+# the ledger is a file: anything that is not token-shaped renders as "".
+_FAILURE_ENUM_RE = re.compile(r"[a-z][a-z0-9_]{0,39}")
+
+
+def _failure_enum(value: Any) -> str:
+    s = str(value or "").strip()
+    return s if _FAILURE_ENUM_RE.fullmatch(s) else ""
+
+
+def _requester_label(requester: str, ledger_name: Any, cache: dict[str, str]) -> str:
+    """Display name for a requester id on the founder-local read surface.
+
+    The ledger value first (submit_job snapshots the org_roles roster name onto
+    every ``requested`` event), else the LIVE roster name, else "". Never a
+    Slack call: this runs inside the MCP stdio child, which holds no Slack
+    client and must not grow one. The id stays the join key -- a rename or a
+    blank snapshot changes this label, never an aggregate."""
+    name = str(ledger_name or "").strip()
+    if name:
+        return name
+    if not requester:
+        return ""
+    if requester not in cache:
+        resolved = ""
+        try:
+            from . import org_roles
+            role = org_roles.get_role(requester)
+            resolved = str(getattr(role, "name", "") or "").strip()
+        except Exception:  # noqa: BLE001 -- a label must never break the view
+            resolved = ""
+        cache[requester] = resolved
+    return cache[requester]
+
+
+def jobs_summary(
+    limit: int = 15,
+    *,
+    include_requester: bool = False,
+    include_failure: bool = False,
+) -> dict[str, Any]:
     """Observability view for the MCP tool + session snapshot. Renders
     job_id/archetype/entity/state/cost + MTD spend ONLY -- never titles or
     briefs (briefs typed in private channels must not surface on org-readable
-    mirrors; design section 9)."""
+    mirrors; design section 9).
+
+    ``include_requester`` (keyword-only, default False; Code #15 S3): each
+    ``recent`` row gains ``requester`` (Slack id) + ``requester_name``, and the
+    summary gains ``counts_by_requester`` = {id: {name, total, by_state}} over
+    EVERY folded job -- not the ``recent`` window, which truncates history (the
+    weekly uptake read needs a requester whose jobs are all older than the
+    newest ``limit``). Aggregated by id, never by name. ONLY the founder-local
+    MCP tool passes it: the session snapshot keeps the default, so the
+    org-readable ``delegated-jobs.json`` mirror on G: carries no requester.
+
+    ``include_failure`` (keyword-only, default False): each ``recent`` row gains
+    ``failure_class`` + ``guard_class`` -- code-authored enums only, never the
+    failure message. "" when the job did not fail / has no guard class.
+
+    With both flags False the output is exactly the pre-S3 shape."""
     jobs = load_jobs()
     by_state: dict[str, int] = {}
     for r in jobs:
         s = str(r.get("state") or "?")
         by_state[s] = by_state.get(s, 0) + 1
+    name_cache: dict[str, str] = {}
     recent = []
     for r in jobs[:limit]:
         cost = r.get("cost") or {}
-        recent.append({
+        row: dict[str, Any] = {
             "job_id": r.get("job_id", ""),
             "archetype": r.get("archetype", ""),
             "entity": r.get("entity", ""),
             "state": r.get("state", ""),
             "requested_at": r.get("requested_at", ""),
             "est_usd": round(float(cost.get("est_usd") or 0.0), 4),
-        })
-    return {
+        }
+        if include_requester:
+            rid = str(r.get("requester") or "")
+            row["requester"] = rid
+            row["requester_name"] = _requester_label(
+                rid, r.get("requester_name"), name_cache)
+        if include_failure:
+            failure = r.get("failure") or {}
+            row["failure_class"] = _failure_enum(failure.get("class"))
+            row["guard_class"] = _failure_enum(failure.get("guard_class"))
+        recent.append(row)
+    out: dict[str, Any] = {
         "level": delegated_level(),
         "counts_by_state": by_state,
         "open_jobs": open_job_count(),
@@ -1328,3 +1402,23 @@ def jobs_summary(limit: int = 15) -> dict[str, Any]:
         "monthly_cap_usd": monthly_usd_cap(),
         "recent": recent,
     }
+    if include_requester:
+        agg: dict[str, dict[str, Any]] = {}
+        for r in jobs:  # ALL jobs, newest first -- never jobs[:limit]
+            rid = str(r.get("requester") or "") or "?"
+            slot = agg.setdefault(rid, {"name": "", "total": 0, "by_state": {}})
+            if not slot["name"] and rid != "?":
+                # Newest non-empty snapshot wins; roster fallback if every
+                # row for this id carries a blank name.
+                slot["name"] = str(r.get("requester_name") or "").strip()
+            slot["total"] += 1
+            s = str(r.get("state") or "?")
+            slot["by_state"][s] = slot["by_state"].get(s, 0) + 1
+        for rid, slot in agg.items():
+            if not slot["name"] and rid != "?":
+                slot["name"] = _requester_label(rid, "", name_cache)
+        out["counts_by_requester"] = {
+            rid: agg[rid]
+            for rid in sorted(agg, key=lambda k: (-agg[k]["total"], k))
+        }
+    return out

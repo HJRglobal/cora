@@ -7,8 +7,11 @@ incl. OpenAI embed + PHI scrub, spawned host-side from the Windows venv).
 
 Tools (7; prefix `mcp__plugin_cora-tools_cora__`):
 cora_kb_search · cora_decisions_search · cora_known_answers · cora_code_queue ·
-cora_health · cora_delegated_jobs (delegated-work overview: ids/state/cost only, never
-titles/briefs) · cora_code_queue_seed (the ONE gated write — backlog only, never canon; D-011).
+cora_health · cora_delegated_jobs (delegated-work overview: ids/state/cost + requester id and
+roster name + failure/guard class enums, with a per-requester count over ALL jobs; never
+titles/briefs/failure messages. The requester view is this founder-local tool ONLY -- the
+org-readable `delegated-jobs.json` snapshot carries no requester) · cora_code_queue_seed (the
+ONE gated write — backlog only, never canon; D-011).
 Tools are discovered at runtime from `_TOOL_SPECS`, so a server-side tool addition needs NO
 plugin reinstall.
 

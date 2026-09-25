@@ -544,31 +544,62 @@ def code_queue_seed(
     }
 
 
+def _requester_display(name: Any, rid: Any) -> str:
+    """``Name (U123)`` -- or the bare id when no name resolved. The id is always
+    shown: it is the join key, a name is only a label. Whitespace is collapsed
+    so a ledger value can never break the one-line-per-row text render."""
+    name = " ".join(str(name or "").split())
+    rid = " ".join(str(rid or "").split()) or "?"
+    return f"{name} ({rid})" if name else rid
+
+
 def delegated_jobs() -> dict[str, Any]:
     """Delegated-work observability view (2026-08-01, Phase 1). Renders
-    job_id/archetype/entity/state/cost + MTD spend ONLY -- never title or brief
+    job_id/archetype/entity/state/cost + MTD spend -- never title or brief
     text (briefs typed in private channels must not surface on org-readable
     mirrors; the _lex_safe_view never-trust-write-side lesson applied forward).
-    The suppression lives in delegated_work.jobs_summary() by construction."""
+    The suppression lives in delegated_work.jobs_summary() by construction.
+
+    Code #15 S3: this founder-local surface ALSO shows who asked -- the
+    requester id + roster name per recent row, a per-requester block over EVERY
+    job (not the 15-row window), and the failure_class / guard_class enums of a
+    failed job (never its message). Only this tool opts in: the org-readable
+    session snapshot (delegated-jobs.json on G:) keeps the requester-free
+    default. The names come from the ledger / org_roles roster, never Slack."""
     from cora import delegated_work
 
     try:
-        summary = delegated_work.jobs_summary()
+        summary = delegated_work.jobs_summary(include_requester=True,
+                                              include_failure=True)
     except Exception as exc:  # noqa: BLE001 -- observability never crashes the server
         log.warning("MCP delegated_jobs failed: %s", exc)
         return {"error": f"delegated-jobs view failed: {exc}", "text": ""}
     lines = [
-        "# Delegated work (ids only -- titles/briefs never surface here)",
+        "# Delegated work (ids + requester only -- titles/briefs never surface here)",
         f"- level: {summary.get('level')}",
         f"- open jobs: {summary.get('open_jobs')}",
         f"- MTD est spend: ${summary.get('mtd_est_usd', 0):.2f} of "
         f"${summary.get('monthly_cap_usd', 0):.2f}",
         f"- counts: {summary.get('counts_by_state')}",
+        "- recent (newest first):",
     ]
     for r in summary.get("recent", []):
-        lines.append(f"    - {r.get('job_id')} {r.get('archetype')} "
-                     f"[{r.get('entity')}] {r.get('state')} "
-                     f"${r.get('est_usd', 0):.2f}")
+        line = (f"    - {r.get('job_id')} {r.get('archetype')} "
+                f"[{r.get('entity')}] {r.get('state')} "
+                f"${r.get('est_usd', 0):.2f} -- "
+                f"{_requester_display(r.get('requester_name'), r.get('requester'))}")
+        if r.get("failure_class"):
+            line += f" (failure: {r.get('failure_class')}"
+            if r.get("guard_class"):
+                line += f"/{r.get('guard_class')}"
+            line += ")"
+        lines.append(line)
+    by_req = summary.get("counts_by_requester") or {}
+    if by_req:
+        lines.append("- by requester (ALL jobs, not just the recent window):")
+        for rid, slot in by_req.items():
+            lines.append(f"    - {_requester_display(slot.get('name'), rid)}: "
+                         f"{slot.get('total', 0)} job(s) {slot.get('by_state', {})}")
     summary["text"] = "\n".join(lines)
     return summary
 
@@ -857,8 +888,10 @@ _TOOL_SPECS: list[dict[str, Any]] = [
         "name": "cora_delegated_jobs",
         "description": (
             "Delegated-work job overview: counts by state, recent jobs (id/archetype/"
-            "entity/state/cost), and month-to-date estimated spend vs the envelope. "
-            "Read-only; job titles and briefs are never exposed on this surface."
+            "entity/state/cost/requester id+name, plus the failure/guard class enum of a "
+            "failed job), a per-requester job count over ALL jobs, and month-to-date "
+            "estimated spend vs the envelope. Read-only; job titles, briefs and failure "
+            "messages are never exposed on this surface."
         ),
         "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
         "fn": lambda a: delegated_jobs(),

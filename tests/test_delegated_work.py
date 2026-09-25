@@ -656,6 +656,296 @@ def test_jobs_summary_never_carries_titles_or_briefs():
 
 
 # ---------------------------------------------------------------------------
+# Code #15 S3 (cq-74e6b20d5d3d): requester on the founder-local read surface.
+# The requester id + roster-name snapshot were ALREADY on every `requested`
+# event (submit_job) and already folded (_SPEC_FIELDS); the gap was the
+# projection. Exposed behind a keyword-only opt-in so the org-readable session
+# snapshot (the default caller) stays byte-identical.
+# ---------------------------------------------------------------------------
+
+_PRE_S3_SUMMARY_KEYS = ["level", "counts_by_state", "open_jobs", "mtd_est_usd",
+                        "monthly_cap_usd", "recent"]
+_PRE_S3_ROW_KEYS = ["job_id", "archetype", "entity", "state", "requested_at", "est_usd"]
+
+
+def _seed_requested(job_id, requester, name, ts, *, state_event="queued",
+                    entity="F3E", brief="synthetic seeded brief text"):
+    """A `requested` row in the exact key set submit_job writes (live-verified
+    2026-09-24 against data/state/delegated-work.jsonl), with an explicit ts so
+    recency ordering is deterministic (no quota / AZ-date coupling)."""
+    dw.append_bot_event({
+        "event": "requested", "ts": ts, "job_id": job_id,
+        "archetype": "doc_draft", "title": brief[:80], "brief": brief,
+        "requester": requester, "requester_name": name, "entity": entity,
+        "channel_id": "D_SYNTH", "channel_name": "dm", "thread_ts": "",
+        "deliverable": "md", "fingerprint": f"fp-{job_id}",
+    })
+    if state_event:
+        dw.append_bot_event({"event": state_event, "ts": ts, "job_id": job_id})
+
+
+def _ts(minute):
+    return f"2026-09-10T20:{minute:02d}:00.000000+00:00"
+
+
+def test_jobs_summary_default_has_no_requester():
+    """The default is the pre-S3 shape, key for key and in order -- the session
+    snapshot mirrors it to an org-readable G: path every 300s."""
+    _submit(brief="default-shape brief long enough here")
+    summary = dw.jobs_summary()
+    assert list(summary.keys()) == _PRE_S3_SUMMARY_KEYS
+    assert list(summary["recent"][0].keys()) == _PRE_S3_ROW_KEYS
+    blob = json.dumps(summary)
+    assert USER not in blob
+    assert "Test Teammate" not in blob
+    for key in ("requester", "counts_by_requester", "failure_class", "guard_class"):
+        assert key not in blob
+
+
+def test_jobs_summary_include_requester_id_and_name():
+    brief = "confidential board-prep brief that must stay off every surface"
+    _submit(brief=brief)
+    summary = dw.jobs_summary(include_requester=True)
+    row = summary["recent"][0]
+    assert row["requester"] == USER
+    assert row["requester_name"] == "Test Teammate"  # the ledger snapshot
+    assert "title" not in row and "brief" not in row
+    blob = json.dumps(summary)
+    assert "board-prep" not in blob and "confidential" not in blob
+    assert summary["counts_by_requester"] == {
+        USER: {"name": "Test Teammate", "total": 1, "by_state": {"QUEUED": 1}},
+    }
+    # The failure enums are a SEPARATE opt-in.
+    assert "failure_class" not in row and "guard_class" not in row
+
+
+def test_requester_name_falls_back_to_roster_then_blank(monkeypatch):
+    """Ledger value first, then the LIVE roster name, then "" -- a raising or
+    missing roster must degrade the label, never the view. No Slack call."""
+    import cora.org_roles as org_roles
+
+    _seed_requested("dw-blank0000001", "U_BLANKNAME", "", _ts(1))
+    monkeypatch.setattr(org_roles, "get_role",
+                        lambda uid: _role(name="Roster Name") if uid == "U_BLANKNAME" else None)
+    summary = dw.jobs_summary(include_requester=True)
+    assert summary["recent"][0]["requester_name"] == "Roster Name"
+    assert summary["counts_by_requester"]["U_BLANKNAME"]["name"] == "Roster Name"
+
+    def _boom(uid):
+        raise RuntimeError("roster unavailable")
+
+    monkeypatch.setattr(org_roles, "get_role", _boom)
+    summary = dw.jobs_summary(include_requester=True)
+    assert summary["recent"][0]["requester"] == "U_BLANKNAME"
+    assert summary["recent"][0]["requester_name"] == ""
+    assert summary["counts_by_requester"]["U_BLANKNAME"] == {
+        "name": "", "total": 1, "by_state": {"QUEUED": 1}}
+
+    monkeypatch.setattr(org_roles, "get_role", lambda uid: None)  # not on the roster
+    assert dw.jobs_summary(include_requester=True)["recent"][0]["requester_name"] == ""
+
+
+def test_counts_by_requester_span_all_jobs_not_recent_window():
+    """The live defect: Alex's oldest job was rank 16 of 35, outside the 15-row
+    window, and his two visible ones were FAILED -- a per-row field alone
+    cannot restore his uptake. The aggregate must fold EVERY job, by id."""
+    # OTHER's three jobs are the OLDEST (outside any 15-row window) and span a
+    # roster rename -- a name change must not split his count.
+    _seed_requested("dw-other000001", OTHER, "Old Name", _ts(1))
+    _seed_requested("dw-other000002", OTHER, "Old Name", _ts(2))
+    _seed_requested("dw-other000003", OTHER, "New Name", _ts(3))
+    dw.append_runner_event({"event": "started", "ts": _ts(4), "job_id": "dw-other000002"})
+    dw.append_runner_event({"event": "failed", "ts": _ts(5), "job_id": "dw-other000002",
+                            "failure_class": "content_guard", "guard_class": "non_lex_phi",
+                            "message": "artifact tripped the channel content guard: non_lex_phi"})
+    for i in range(17):
+        _seed_requested(f"dw-user{i:08d}", USER, "Test Teammate", _ts(10 + i))
+
+    summary = dw.jobs_summary(include_requester=True)  # default limit=15
+    assert len(summary["recent"]) == 15
+    assert {r["requester"] for r in summary["recent"]} == {USER}  # OTHER is outside
+    by_req = summary["counts_by_requester"]
+    assert set(by_req) == {USER, OTHER}
+    assert by_req[USER] == {"name": "Test Teammate", "total": 17,
+                            "by_state": {"QUEUED": 17}}
+    assert by_req[OTHER] == {"name": "New Name", "total": 3,
+                             "by_state": {"QUEUED": 2, "FAILED": 1}}
+    # Highest total first (render order), ties by id.
+    assert list(by_req) == [USER, OTHER]
+    assert sum(s["total"] for s in by_req.values()) == sum(
+        summary["counts_by_state"].values())
+
+
+def test_counts_by_requester_blank_id_buckets_under_question_mark():
+    _seed_requested("dw-noreq000001", "", "", _ts(1))
+    by_req = dw.jobs_summary(include_requester=True)["counts_by_requester"]
+    assert by_req == {"?": {"name": "", "total": 1, "by_state": {"QUEUED": 1}}}
+
+
+def test_historical_row_shape_folds_requester():
+    """Replay the EXACT live key sets of dw-d1c6b3fba5e1 (9/10): bot `requested`
+    + `queued`, runner `started` + `failed` (content_guard / non_lex_phi, the
+    55-char template message). Values are synthetic; the key sets are live.
+    Exposing the requester on history is a read projection, not a backfill."""
+    jid = "dw-d1c6b3fba5e1"
+    dw.append_bot_event({
+        "event": "requested", "ts": "2026-09-10T22:28:09.501000+00:00", "job_id": jid,
+        "archetype": "doc_draft", "title": "SYNTH TITLE", "brief": "SYNTH BRIEF " * 20,
+        "requester": "U0B3AEJCYGP", "requester_name": "Synth Requester",
+        "entity": "HJRG", "channel_id": "D0SYNTH00", "channel_name": "dm",
+        "thread_ts": "", "deliverable": "md", "fingerprint": "fp-synth",
+    })
+    dw.append_bot_event({"event": "queued", "ts": "2026-09-10T22:28:09.502000+00:00",
+                         "job_id": jid})
+    dw.append_runner_event({"event": "started", "ts": "2026-09-10T22:30:01+00:00",
+                            "job_id": jid})
+    dw.append_runner_event({
+        "event": "failed", "ts": "2026-09-10T22:31:14+00:00", "job_id": jid,
+        "failure_class": "content_guard", "guard_class": "non_lex_phi",
+        "message": "artifact tripped the channel content guard: non_lex_phi",
+        "archetype": "doc_draft", "entity": "HJRG", "channel_name": "dm",
+        "cost": {"cache_create": 0, "cache_read": 0, "est_usd": 0.2694, "fetches": 0,
+                 "input_tokens": 1, "kb_calls": 10, "output_tokens": 5711,
+                 "searches": 0, "turns": 5},
+    })
+    rec = dw.get_job(jid)
+    assert rec["failure"] == {"class": "content_guard",
+                              "message": "artifact tripped the channel content guard: non_lex_phi",
+                              "guard_class": "non_lex_phi"}
+    row = dw.jobs_summary(include_requester=True, include_failure=True)["recent"][0]
+    assert row["requester"] == "U0B3AEJCYGP"
+    assert row["requester_name"] == "Synth Requester"
+    assert row["state"] == dw.STATE_FAILED
+    assert row["failure_class"] == "content_guard"
+    assert row["guard_class"] == "non_lex_phi"
+    assert "message" not in row
+    blob = json.dumps(dw.jobs_summary(include_requester=True, include_failure=True))
+    assert "SYNTH" not in blob and "artifact tripped" not in blob
+    # The default view of the same history is still requester-free.
+    assert "U0B3AEJCYGP" not in json.dumps(dw.jobs_summary())
+
+
+def test_pre_guard_class_failed_row_folds_to_the_old_shape():
+    """The 9 pre-8/13 content_guard rows carry no guard_class: the fold adds no
+    key for them and the read surface shows an empty guard enum."""
+    _seed_requested("dw-old00000001", USER, "Test Teammate", _ts(1))
+    dw.append_runner_event({"event": "failed", "ts": _ts(2), "job_id": "dw-old00000001",
+                            "failure_class": "content_guard",
+                            "message": "artifact tripped the channel content guard"})
+    assert dw.get_job("dw-old00000001")["failure"] == {
+        "class": "content_guard", "message": "artifact tripped the channel content guard"}
+    row = dw.jobs_summary(include_failure=True)["recent"][0]
+    assert row["failure_class"] == "content_guard" and row["guard_class"] == ""
+
+
+def test_failure_enums_render_only_token_shaped_values():
+    """The ledger is a file: a failure/guard class that is not a code-authored
+    token (prose, a name, a path) renders as "", never as text."""
+    _seed_requested("dw-odd00000001", USER, "Test Teammate", _ts(1))
+    dw.append_runner_event({"event": "failed", "ts": _ts(2), "job_id": "dw-odd00000001",
+                            "failure_class": "Client Marcus Hill",
+                            "guard_class": "G:/x/LEX/secret.md"})
+    row = dw.jobs_summary(include_failure=True)["recent"][0]
+    assert row["failure_class"] == "" and row["guard_class"] == ""
+    blob = json.dumps(dw.jobs_summary(include_requester=True, include_failure=True))
+    assert "Marcus" not in blob and "secret" not in blob
+
+
+# ---------------------------------------------------------------------------
+# Code #15 S3 (cq-90568f0b1222): "two confirms, one job" -- the confirm shapes.
+# Diagnosis (recon, 9/10 bot log): only ONE confirm card ever existed; ask #2
+# never reached the tool (Haiku answered "yes" with a fabricated "Queued
+# (dw-...)" and zero tool_use). These pin that every real confirm shape
+# registers, and that the one shape which does NOT (overlapping previews) says
+# so honestly.
+# ---------------------------------------------------------------------------
+
+def _stage(brief, archetype="doc_draft"):
+    out = _tool(action="request", archetype=archetype, brief=brief)
+    assert out.startswith("WRITE_BLOCKED")
+    pending = td._peek_pending_delegated(USER, CHANNEL)
+    assert pending and pending["brief"] == brief
+    return pending["stash_id"]
+
+
+def test_two_serial_confirms_both_register_tap_path():
+    brief_a = "Draft a recurring journal-entry catalog for the holdco close"
+    brief_b = "Draft a filing runbook for the monthly close packet"
+    sid_a = _stage(brief_a)
+    assert td.resolve_and_claim_stash(sid_a, USER, "confirm")["outcome"] == "executed"
+    sid_b = _stage(brief_b)
+    assert sid_b != sid_a
+    assert td.resolve_and_claim_stash(sid_b, USER, "confirm")["outcome"] == "executed"
+    jobs = dw.load_jobs()
+    assert len(jobs) == 2
+    assert {j["brief"] for j in jobs} == {brief_a, brief_b}
+    assert len({j["job_id"] for j in jobs}) == 2
+    assert len({j["fingerprint"] for j in jobs}) == 2
+    assert {j["state"] for j in jobs} == {dw.STATE_QUEUED}
+
+
+def test_two_serial_confirms_both_register_typed_yes_path():
+    brief_a = "Draft a recurring journal-entry catalog for the holdco close"
+    brief_b = "Draft a filing runbook for the monthly close packet"
+    for brief in (brief_a, brief_b):
+        _stage(brief)
+        reply = td.try_confirm_pending_write(
+            slack_user_id=USER, channel_name=CHANNEL, entity="F3E", message="yes")
+        assert reply is not None and "Queued (dw-" in reply
+        assert td._peek_pending_delegated(USER, CHANNEL) is None
+    jobs = dw.load_jobs()
+    assert len(jobs) == 2
+    assert {j["brief"] for j in jobs} == {brief_a, brief_b}
+    assert {j["state"] for j in jobs} == {dw.STATE_QUEUED}
+
+
+def test_overlapping_previews_supersede_honestly():
+    """PINS TODAY'S single-slot-per-(user, channel) behaviour. Two previews
+    staged before either tap: the second OVERWRITES the first, so tapping the
+    first card is 'superseded' (app.py tells the requester 'This preview was
+    replaced by a newer one') and writes nothing; the second executes. Making
+    both overlapping cards register is a multi-slot store redesign across the
+    F-23 arbitration -- a ruling for Harrison, not this slice."""
+    brief_a = "Draft a recurring journal-entry catalog for the holdco close"
+    brief_b = "Draft a filing runbook for the monthly close packet"
+    sid_a = _stage(brief_a)
+    sid_b = _stage(brief_b)
+    assert td.resolve_and_claim_stash(sid_a, USER, "confirm")["outcome"] == "superseded"
+    assert dw.load_jobs() == []
+    assert td.resolve_and_claim_stash(sid_b, USER, "confirm")["outcome"] == "executed"
+    jobs = dw.load_jobs()
+    assert len(jobs) == 1 and jobs[0]["brief"] == brief_b
+
+
+def test_concurrent_submit_distinct_briefs_both_register():
+    """Two confirms racing into submit_job (tap + typed on two previews, two
+    channels) with DIFFERENT briefs: the check-and-append lock serializes them
+    and both register -- dedup keys on the brief fingerprint, not on timing."""
+    import threading
+
+    barrier = threading.Barrier(2)
+    results = []
+
+    def _go(brief, channel_id):
+        barrier.wait()
+        results.append(_submit(brief=brief, archetype="doc_draft", channel_id=channel_id))
+
+    threads = [
+        threading.Thread(target=_go, args=("Draft the recurring JE catalog for close", "C_ONE")),
+        threading.Thread(target=_go, args=("Draft the filing runbook for close packets", "C_TWO")),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert [r[1] for r in results] == ["queued", "queued"]
+    requested = [e for e in dw._read_jsonl(dw._BOT_LEDGER) if e.get("event") == "requested"]
+    assert len(requested) == 2
+    assert len({e["job_id"] for e in requested}) == 2
+    assert {j["state"] for j in dw.load_jobs()} == {dw.STATE_QUEUED}
+
+
+# ---------------------------------------------------------------------------
 # Tool surface: F-23 stash-not-echo, TTL, re-preview verbatim, trial ack
 # ---------------------------------------------------------------------------
 
