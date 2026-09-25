@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -5631,28 +5632,82 @@ def handle_revops_edit_submit(ack, body, client, view) -> None:
 # Mirrors the knowledge/catchup one-tap contract: ack() first, delegate; ALL
 # correctness (Harrison gate, idempotency, apply-then-record) lives in
 # code_queue.process_queue_action / stage_bundle / apply_edit. A single-item card
-# is its OWN message -> chat_update drops its actions block; the Monday menu is ONE
-# message with MANY actions blocks -> a threaded reply keeps the others tappable.
+# is its OWN message -> chat_update drops its actions block. The Monday menu is ONE
+# message with MANY actions blocks -> Code #15 S5 (cq-2d26f131091e): a press
+# re-renders ONLY the rows the ledger shows decided (code_queue.rerender_card_blocks)
+# and still threads the outcome. Before that every menu press was threaded and the
+# message never edited, so on 9/21 all 21 rows kept live buttons after 29 presses
+# decided 20 of them -- the D-051 lesson 48 class (f2f9733, 8/24: the
+# knowledge-review emoji path never called chat_update), never generalised to here.
+
+# Held ONLY across the ledger read and the chat_update of one card re-render --
+# never across process_queue_action / stage_bundle (a Sonnet generation) or a
+# history fetch. Without it two concurrent presses on different rows race: A reads
+# the ledger (only A decided), B writes + reads + updates (A and B), then A's
+# update lands last and B's row is shown buttoned again. Lock order: this lock ->
+# code_queue._LEDGER_LOCK (brief, inside the read); code_queue never takes this one.
+_CQ_CARD_RENDER_LOCK = threading.Lock()
+_CQ_CARD_FALLBACK_TEXT = "Cora code-session queue"
+
+
+def _cq_rerender_rows(client, channel_id: str, message_ts: str, blocks: list,
+                      fallback_text: str) -> bool:
+    """Row-level re-render of a multi-row code-queue card. Returns True when a
+    chat_update was sent. The fallback ``text`` is the card's OWN (never one
+    press's outcome -- it is the notification / accessibility text of the whole
+    menu). Raises on a chat_update failure; the caller logs it."""
+    with _CQ_CARD_RENDER_LOCK:
+        new_blocks, summary = code_queue.rerender_card_blocks(blocks, message_ts)
+        if not summary.get("changed"):
+            return False
+        client.chat_update(channel=channel_id, ts=message_ts,
+                           text=fallback_text or _CQ_CARD_FALLBACK_TEXT, blocks=new_blocks)
+    # ids + counts only (D-082)
+    log.info("code-queue card re-render channel=%s ts=%s rows=%d resolved=%d open=%d new=%s",
+             channel_id, message_ts, summary.get("rows", 0), summary.get("resolved", 0),
+             summary.get("open", 0), ",".join(summary.get("newly_resolved") or []))
+    return True
+
+
+def _cq_thread_reply(client, channel_id: str, message_ts: str, msg: str) -> None:
+    client.chat_postMessage(channel=channel_id, thread_ts=message_ts, text=msg,
+                            unfurl_links=False, unfurl_media=False)
+
 
 def _cq_ack_in_message(client, body: dict, msg: str, *, keep_card: bool = False) -> None:
-    """Ack a card button. A message with several actions blocks (the Monday menu)
-    is always threaded; a single-item card is consumed (buttons replaced by the
-    outcome) ONLY when the action changed state -- keep_card=True threads instead,
-    because a refusal / evidence-floor hold / error / in-flight race changed
-    nothing and the card must stay tappable (D-051 lens B MED #6: the floor's
-    re-card used to delete the very Dismiss/Edit/Later buttons it pointed at)."""
+    """Ack a card button. keep_card=True (a refusal / evidence-floor hold / error /
+    in-flight race changed nothing) only threads the reason and the card stays
+    tappable (D-051 lens B MED #6: the floor's re-card used to delete the very
+    Dismiss/Edit/Later buttons it pointed at). Otherwise:
+
+      * the Monday menu (several actions blocks, or any menu-row block_id -- a menu
+        down to its last open row has ONE actions block left) re-renders ONLY its
+        decided rows (Code #15 S5) and STILL threads the outcome, so the approve
+        path's "kickoff did NOT generate" text is never lost;
+      * a single-item card is consumed: buttons replaced by the outcome."""
     channel_id = (body.get("channel") or {}).get("id", "")
-    message_ts = (body.get("message") or {}).get("ts", "")
+    message = body.get("message") or {}
+    message_ts = message.get("ts", "")
     if not (channel_id and message_ts):
         log.warning("code-queue ack: no channel/ts pointer on the interaction body -- "
                     "outcome not surfaced: %s", msg[:120])
         return
-    blocks = (body.get("message") or {}).get("blocks") or []
+    blocks = message.get("blocks") or []
     actions_blocks = [b for b in blocks if b.get("type") == "actions"]
+    if not keep_card and (len(actions_blocks) > 1 or code_queue.is_menu_card(blocks)):
+        try:
+            _cq_rerender_rows(client, channel_id, message_ts, blocks,
+                              str(message.get("text") or ""))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("code-queue card re-render failed: %s", exc)
+        try:
+            _cq_thread_reply(client, channel_id, message_ts, msg)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("code-queue ack update failed: %s", exc)
+        return
     try:
-        if keep_card or len(actions_blocks) > 1:
-            client.chat_postMessage(channel=channel_id, thread_ts=message_ts, text=msg,
-                                    unfurl_links=False, unfurl_media=False)
+        if keep_card:
+            _cq_thread_reply(client, channel_id, message_ts, msg)
         else:
             section_blocks = [b for b in blocks if b.get("type") == "section"]
             new_blocks = section_blocks + [
@@ -5677,7 +5732,11 @@ def _handle_code_queue_button(body: dict, client, action_id: str) -> None:
         if action_id == code_queue.ACTION_STAGE and value.startswith("bundle:"):
             outcome, msg = code_queue.stage_bundle(value, actor_id)
         else:
-            outcome, msg = code_queue.process_queue_action(action_id, value, actor_id)
+            # Code #15 S5: the card's own ts makes a repeat Keep on the SAME card a
+            # no-op (process_queue_action reads it for ACTION_KEEP only).
+            outcome, msg = code_queue.process_queue_action(
+                action_id, value, actor_id,
+                card_ts=str((body.get("message") or {}).get("ts", "") or ""))
         # Code #13 slice 1 (kickoff section 9 ask 7): parity with the typed-verb log
         # line -- until now a button tap logged NOTHING on success, so the 9/14
         # forensics could not see WHO staged 13 rows or through which door.
@@ -5842,21 +5901,58 @@ def _open_cq_modal(body: dict, client, builder, label: str) -> None:
         log.warning("code-queue %s-modal open failed (non-fatal)", label, exc_info=True)
 
 
-def _cq_ack_view_submit(client, meta: dict, msg: str) -> None:
-    """Ack a modal submit as a THREADED reply under the original card: the Monday
-    menu is one message with many actions blocks, so the Rider-D chat_update idiom
-    would drop every other row's buttons; a view submit carries only the metadata
-    pointer, not the message body, so the thread is the one safe surface."""
+def _cq_fetch_card(client, channel_id: str, ts: str) -> dict | None:
+    """The card message at EXACTLY ``ts``, or None. A view submit carries only the
+    private_metadata pointer, never the message body, so the re-render needs a
+    fetch. latest=ts + oldest=ts + inclusive bounds the window to that one ts, and
+    the returned ts is REQUIRED to equal it: on a deleted card a bare latest+limit=1
+    returns the next OLDER message, which would then be rewritten (the two sibling
+    fetches, app.py _handle_react_to_task and code_queue._fetch_message_text, check
+    neither)."""
+    resp = client.conversations_history(channel=channel_id, latest=ts, oldest=ts,
+                                        inclusive=True, limit=1)
+    msgs = resp.get("messages") if hasattr(resp, "get") else None
+    if not isinstance(msgs, list) or not msgs or not isinstance(msgs[0], dict):
+        log.warning("code-queue modal re-render: card ts=%s not found -- thread only", ts)
+        return None
+    if str(msgs[0].get("ts") or "") != ts:
+        log.warning("code-queue modal re-render: history returned ts=%s for card ts=%s -- "
+                    "not editing a different message; thread only",
+                    str(msgs[0].get("ts") or "")[:40], ts)
+        return None
+    return msgs[0]
+
+
+def _cq_ack_view_submit(client, meta: dict, msg: str, *, rerender: bool = False) -> None:
+    """Ack a modal submit (Park / Dismiss w/ note). rerender=True (the submit's
+    outcome was not a refusal): fetch the card by its exact ts and run the same
+    locked row-level re-render as a button press (Code #15 S5), so the parked /
+    dismissed row stops showing buttons. The THREADED reply is always posted too --
+    it carries the park trigger / dismissal note, which the resolved row
+    deliberately does not. A failed or mismatched fetch falls back to the thread."""
     ch, ts = str(meta.get("dm_channel") or ""), str(meta.get("dm_ts") or "")
     if not (ch and ts):
         log.warning("code-queue modal ack: no card pointer in private_metadata -- "
                     "outcome not surfaced: %s", msg[:120])
         return
+    if rerender:
+        try:
+            card = _cq_fetch_card(client, ch, ts)
+            if card is not None:
+                _cq_rerender_rows(client, ch, ts, card.get("blocks") or [],
+                                  str(card.get("text") or ""))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("code-queue modal re-render failed: %s", exc)
     try:
-        client.chat_postMessage(channel=ch, thread_ts=ts, text=msg,
-                                unfurl_links=False, unfurl_media=False)
+        _cq_thread_reply(client, ch, ts, msg)
     except Exception as exc:  # noqa: BLE001
         log.warning("code-queue modal ack failed: %s", exc)
+
+
+def _cq_submit_rerenders(outcome: str) -> bool:
+    """A modal submit re-renders the card on the same outcomes a button press does:
+    not on a refusal / error (nothing changed), not for an unauthorised actor."""
+    return outcome not in _CQ_KEEP_CARD_OUTCOMES and outcome != "not_authorized"
 
 
 def _view_value(state: dict, block_id: str, key: str = "value") -> str:
@@ -5897,9 +5993,9 @@ def handle_cq_park_submit(ack, body, client, view) -> None:
         acked = True
         meta = json.loads(view.get("private_metadata") or "{}")
         actor_id = (body.get("user") or {}).get("id", "")
-        _outcome, msg = code_queue.park_item(
+        outcome, msg = code_queue.park_item(
             str(meta.get("cq_id") or ""), actor_id, reason, until=until, trigger_event=trigger)
-        _cq_ack_view_submit(client, meta, msg)
+        _cq_ack_view_submit(client, meta, msg, rerender=_cq_submit_rerenders(outcome))
     except Exception:  # noqa: BLE001
         if not acked:
             _ack_view_once(ack)
@@ -5926,9 +6022,9 @@ def handle_cq_dismiss_submit(ack, body, client, view) -> None:
         acked = True
         meta = json.loads(view.get("private_metadata") or "{}")
         actor_id = (body.get("user") or {}).get("id", "")
-        _outcome, msg = code_queue.dismiss_with_evidence(
+        outcome, msg = code_queue.dismiss_with_evidence(
             str(meta.get("cq_id") or ""), actor_id, note)
-        _cq_ack_view_submit(client, meta, msg)
+        _cq_ack_view_submit(client, meta, msg, rerender=_cq_submit_rerenders(outcome))
     except Exception:  # noqa: BLE001
         if not acked:
             _ack_view_once(ack)

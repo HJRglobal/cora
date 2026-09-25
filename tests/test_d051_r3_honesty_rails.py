@@ -186,7 +186,10 @@ class TestTypedIdAllowlistR3:
         monkeypatch.setattr(cq, "_FINGERPRINT_LEDGER", tmp_path / "fp.jsonl")
         monkeypatch.setattr(cq, "_SIGNALS_LEDGER", tmp_path / "sig.jsonl")
         cq._KNOWN_IDS_CACHE.update({"key": None, "ids": frozenset()})
-        # cq-2d26f131091e is the real card the read's own FOOTER names.
+        # cq-2d26f131091e is the real card the read's own FOOTER names (Code #15 S5
+        # rewrote the footer to what the code now does; it still cites the id, so a
+        # relayed footer must still pass the fabricated-id screen).
+        assert "cq-2d26f131091e" in cq.QUEUE_STATUS_FOOTER
         for cid in ("cq-0123456789ab", "cq-2d26f131091e"):
             cq._append_event({"event": "captured", "id": cid, "ts": cq._now_iso(),
                               "status": "APPROVED", "title": "mirror", "kind": "capability_ask",

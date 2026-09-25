@@ -53,7 +53,41 @@ class TestCardKeptOnNoChange:
         kw = client.chat_update.call_args.kwargs
         assert kw["ts"] == "9.9" and not [b for b in kw["blocks"] if b.get("type") == "actions"]
 
-    def test_menu_message_always_threads(self):
+    def test_menu_press_rerenders_only_the_pressed_row(self):
+        """Code #15 S5 (cq-2d26f131091e) INVERTS the old pin (was
+        test_menu_message_always_threads, asserting chat_update.assert_not_called()):
+        that branch is what left all 21 rows of the 9/21 menu buttoned after 29
+        presses. A press now re-renders ONLY the row the ledger shows decided since
+        the card went out, keeps the menu's fallback text, and still threads."""
+        ids = ["cq-aaaaaaaaaaa1", "cq-aaaaaaaaaaa2", "cq-aaaaaaaaaaa3"]
+        card_ts = "1789999254.143349"
+        for cid in ids:
+            cq._append_event({"event": "captured", "id": cid, "ts": "2026-09-20T10:00:00+00:00",
+                              "status": "PROPOSED", "title": "t", "entity": "F3E", "kind": "bug"})
+        cq._append_event({"event": "approved", "id": ids[1], "ts": "2026-09-21T15:00:00+00:00"})
+        blocks = []
+        for cid in ids:
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"row {cid}"}})
+            blocks.append({"type": "actions", "block_id": f"cq_proposed_{cid}", "elements": [
+                {"type": "button", "action_id": aid, "value": cid,
+                 "text": {"type": "plain_text", "text": aid}}
+                for aid in (cq.ACTION_APPROVE, cq.ACTION_PARK, cq.ACTION_DISMISS_NOTE)]})
+        body = {"actions": [{"value": ids[1]}], "user": {"id": HARRISON}, "channel": {"id": "D1"},
+                "message": {"ts": card_ts, "text": "menu fallback", "blocks": blocks}}
+        client = MagicMock()
+        with patch.object(cq, "process_queue_action", return_value=("approved", "ok")):
+            app_module._handle_code_queue_button(body, client, cq.ACTION_APPROVE)
+        client.chat_update.assert_called_once()
+        kw = client.chat_update.call_args.kwargs
+        assert kw["ts"] == card_ts and kw["text"] == "menu fallback"
+        new = kw["blocks"]
+        assert len(new) == len(blocks)
+        assert new[3]["type"] == "context" and new[3]["block_id"] == f"cq_done_proposed_{ids[1]}"
+        assert new[1] == blocks[1] and new[5] == blocks[5]       # the other rows keep their buttons
+        assert [new[0], new[2], new[4]] == [blocks[0], blocks[2], blocks[4]]
+        assert client.chat_postMessage.call_args.kwargs["thread_ts"] == card_ts
+
+    def test_a_non_queue_multi_action_message_is_threaded_not_edited(self):
         client = MagicMock()
         with patch.object(cq, "process_queue_action", return_value=("approved", "ok")):
             app_module._handle_code_queue_button(_body(n_actions=3), client, cq.ACTION_APPROVE)

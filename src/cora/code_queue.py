@@ -525,13 +525,17 @@ def _warn_ledger_anomaly(key: str, msg: str, *args: Any) -> None:
     log.warning(msg, *args)
 
 
-def _fold_items() -> dict[str, dict[str, Any]]:
+def _fold_items(rows: list[dict[str, Any]] | None = None) -> dict[str, dict[str, Any]]:
     """Fold the append-only event ledger into {id: record}. Last-write-wins per
     field; process_queue_action enforces which transitions are legal to write.
     An unknown event kind or an orphaned event is skipped LOUDLY (F4), never
-    silently -- see ledger_integrity() for the counted view."""
+    silently -- see ledger_integrity() for the counted view.
+
+    ``rows`` (Code #15 S5): fold an already-read snapshot instead of re-reading
+    the file, so a caller that also needs the raw events (rerender_card_blocks)
+    reads the ledger ONCE and the two views cannot disagree across a write."""
     items: dict[str, dict[str, Any]] = {}
-    for ev in _read_jsonl(_EVENT_LEDGER):
+    for ev in (_read_jsonl(_EVENT_LEDGER) if rows is None else rows):
         et = ev.get("event")
         if et not in _KNOWN_EVENT_TYPES:
             _warn_ledger_anomaly(
@@ -2496,10 +2500,14 @@ def maybe_flush_overflow(*, client_factory: Callable | None = None) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 def process_queue_action(action_id: str, cq_id: str, actor_id: str, *,
                          bundle_id: str = "", branch: str = "",
-                         commit: str = "") -> tuple[str, str]:
+                         commit: str = "", card_ts: str = "") -> tuple[str, str]:
     """Apply a card button action. Returns (outcome, message). Harrison-only
     (org-wide intake, founder-only approval per the locked decision). Idempotent.
     All correctness lives here; the app.py wrapper is only Slack I/O.
+
+    card_ts (Code #15 S5): the Slack ts of the card the press came from (the
+    button handler passes body.message.ts). Only ACTION_KEEP reads it -- a second
+    Keep on the SAME card is a no-op. Typed verbs and scripts pass none.
 
     bundle_id / branch / commit (Code #12 C7, the bundle-linkage HARD GATE ruled
     2026-09-02): the provenance a `shipped` event must carry. A step-7.5 reconcile
@@ -2631,11 +2639,26 @@ def process_queue_action(action_id: str, cq_id: str, actor_id: str, *,
         # no reason, no trigger and no ceiling (audit F6: 16 of 23 aged STAGED rows
         # suppressed by one tap each). At the cap the row must be parked WITH a
         # trigger, shipped, or dismissed -- a stale Keep button is a no-op.
-        kc = int(rec.get("keep_count") or 0)
-        if kc >= KEEP_CAP:
-            return "noop", (f"Keep is capped at {KEEP_CAP} for this item (kept x{kc}) -- park it "
-                            "with a trigger, ship it, or dismiss it.")
-        _append_event({"event": "kept", "ts": _now_iso(), "id": cq_id})
+        #
+        # Code #15 S5 (cq-2d26f131091e): Keep is idempotent PER CARD. A second press
+        # of the same card's Keep (a stale client, a double-tap) appended another
+        # `kept` and burned the item's last Keep; it is now a no-op when a `kept`
+        # event exists at or after THIS card's ts. Keyed on the card ts, never a
+        # wall-clock window, so next week's menu can still Keep. Check-and-append
+        # under the ledger lock so two concurrent taps cannot both pass the check.
+        card_dt = card_ts_to_dt(card_ts) if card_ts else None
+        with _LEDGER_LOCK:
+            fresh = get_item(cq_id) or rec
+            kc = int(fresh.get("keep_count") or 0)
+            if card_dt is not None:
+                for ev in _events_by_id().get(str(cq_id).lower(), []):
+                    ts = _parse_ts(ev.get("ts"))
+                    if ev.get("event") == "kept" and ts is not None and ts >= card_dt:
+                        return "noop", f"Already kept on this card (x{kc})."
+            if kc >= KEEP_CAP:
+                return "noop", (f"Keep is capped at {KEEP_CAP} for this item (kept x{kc}) -- park "
+                                "it with a trigger, ship it, or dismiss it.")
+            _append_event({"event": "kept", "ts": _now_iso(), "id": cq_id})
         left = KEEP_CAP - (kc + 1)
         return "kept", (f"Kept (x{kc + 1}) -- staleness clock reset"
                         + (f"; {left} Keep left before the cap." if left else
@@ -3958,8 +3981,9 @@ def stage_bundle(value: str, actor_id: str) -> tuple[str, str]:
     recs = [r for r in (get_item(i) for i in ids) if r]
     if not recs:
         return "error", "No items to stage."
-    # Idempotency (D-051): the Monday menu is one multi-item message, so its
-    # "Stage bundle" button threads a reply (it is NOT consumed) and can be tapped
+    # Idempotency (D-051): the Monday menu is one multi-item message. Since Code #15
+    # S5 a press re-renders the bundle's row once EVERY id in it is decided, but a
+    # stale client (or a partial stage, which keeps the button) can still tap it
     # again. Only stage items still awaiting a prompt; a re-tap finds none pending
     # and is a no-op pointing at the existing prompt (no second Sonnet call).
     pending = [r for r in recs if r.get("status") in ("PROPOSED", "APPROVED")]
@@ -4571,11 +4595,19 @@ _QS_CARDED_KEYS = ("approved", "stale_actionable", "proposed_actionable", "parke
                    "expired_snoozed")
 _QS_CAPTURE_CARD_DAYS = 7
 _QS_TITLE_CHARS = 80
+# Code #15 S5 (cq-2d26f131091e): rewritten to what the code now does -- the old text
+# stated the non-refreshing card as permanent fact. Pinned by test_queue_status_force.
 QUEUE_STATUS_FOOTER = (
-    "The card's own text does NOT refresh after a press (known: cq-2d26f131091e), so a "
-    "card can read as unanswered after the press registered -- this ledger is the "
-    "source of truth. A repeat press is safe: Approve / Stage / Dismiss / Ship are "
-    "no-ops once recorded; a repeat Keep or Later records one more keep / snooze.")
+    "A press re-renders the card it was made on (cq-2d26f131091e): on the Monday menu "
+    "only the pressed row changes -- its buttons become a one-line outcome once this "
+    "ledger records a decision after the menu went out, every other row keeps its "
+    "buttons, and the outcome is also threaded under the menu; a capture card's buttons "
+    "are replaced by the outcome (a refusal or an evidence-floor hold keeps them and "
+    "threads the reason). A card decided from another surface (a typed verb, a "
+    "different card), or a menu posted before this change, refreshes only on its next "
+    "press -- this ledger is the source of truth. A repeat press is safe: Approve / "
+    "Stage / Dismiss / Ship are no-ops once recorded and a repeat Keep on the same card "
+    "is a no-op; a repeat Park or Later records one more park / snooze.")
 # D-051 forcing-seams-2: the read states its own scope, so a turn forced onto it by
 # a question about some OTHER card surface cannot relay the Monday-menu tally as
 # that surface's truth.
@@ -4606,9 +4638,9 @@ def latest_menu_run() -> dict[str, Any] | None:
     return rows[-1] if rows else None
 
 
-def _events_by_id() -> dict[str, list[dict[str, Any]]]:
+def _events_by_id(rows: list[dict[str, Any]] | None = None) -> dict[str, list[dict[str, Any]]]:
     out: dict[str, list[dict[str, Any]]] = {}
-    for ev in _read_jsonl(_EVENT_LEDGER):
+    for ev in (_read_jsonl(_EVENT_LEDGER) if rows is None else rows):
         cid = str(ev.get("id") or "").lower()
         if cid:
             out.setdefault(cid, []).append(ev)
@@ -4726,3 +4758,229 @@ def render_card_status(cq_ids: Any = None, *, now: datetime | None = None) -> st
     lines.append(QUEUE_STATUS_SCOPE)
     lines.append(QUEUE_STATUS_FOOTER)
     return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Code #15 S5 (cq-2d26f131091e): row-level re-render of a multi-row queue card
+# ─────────────────────────────────────────────────────────────────────────────
+# 9/21: the Monday menu went out as ONE DM message carrying 21 actions rows and
+# Harrison pressed 29 times. app._cq_ack_in_message threaded EVERY press on a
+# message with more than one actions block and never edited the message -- a
+# deliberate branch ("keep the other rows tappable"), not a failing chat_update --
+# so all 21 rows kept live buttons after 20 of them were decided, and he asked
+# whether the cards had registered. The class is D-051 lesson 48 / f2f9733 (8/24,
+# C4: the knowledge-review emoji path never called chat_update, so executed cards
+# kept live buttons): fixed once for one card surface and never generalised.
+#
+# rerender_card_blocks is the row surgery. PURE: no Slack I/O, no writes, one
+# ledger read. It rewrites only the actions blocks of the rows the LEDGER shows
+# decided since the card went out, keyed on block_id + button values -- NEVER on
+# the echoed text, which Slack hands back with emoji shortcodes and &gt; entities
+# (feedback_slack_api_readback). "Decided" is R14-9's own predicate
+# (_QS_DECISION_EVENTS via _first_decision_after, bound at the card ts), so the
+# card and cora_queue_status agree by construction. The section text above a row
+# is left as posted. app.py holds the render lock and does the chat_update.
+_CARD_ROW_PREFIXES = ("cq_single_", "cq_bundle_", "cq_proposed_", "cq_parked_", "cq_stale_")
+_CARD_DONE_PREFIX = "cq_done_"
+_CARD_DONE_ID_RE = re.compile(r"\Acq_done_(?:single|proposed|parked|stale)_(cq-[0-9a-f]{12})\Z")
+_CARD_ID_RE = re.compile(r"\Acq-[0-9a-f]{12}\Z")
+_CARD_TS_RE = re.compile(r"\A(\d{1,12})(?:\.(\d{1,6}))?\Z")
+_CARD_MAX_BLOCKS = 50        # Slack's ceiling for one message
+_CARD_CHAIN_MAX = 3          # decisions shown on one resolved row, newest last
+# Static event -> label map (every _QS_DECISION_EVENTS kind; pinned by a test). The
+# resolved line carries NO title, prompt path or park / dismiss reason -- LEX / PHI
+# safe by construction (D-082): labels, counts and an AZ time only.
+_CARD_DECISION_LABELS: dict[str, str] = {
+    "approved": "✅ Queued (APPROVED)",
+    "staged": "📝 Prompt staged",
+    "kept": "🔁 Kept",
+    "parked": "⏸ Parked",
+    "dismissed": "🗑️ Dismissed",
+    "shipped": "🚢 Shipped",
+    "snoozed": "⏸ Snoozed",
+    "superseded": "🔀 Superseded",
+    "blocked": "⛔ Blocked",
+}
+
+
+def card_ts_to_dt(card_ts: Any) -> datetime | None:
+    """A Slack message ts ('1789999254.143349') as an aware UTC datetime, exact to the
+    microsecond (no float round-trip), or None when it is not a Slack ts."""
+    m = _CARD_TS_RE.match(str(card_ts or "").strip())
+    if not m:
+        return None
+    try:
+        sec = int(m.group(1))
+        if sec <= 0:
+            return None
+        micro = int((m.group(2) or "0").ljust(6, "0"))
+        return datetime.fromtimestamp(sec, tz=timezone.utc) + timedelta(microseconds=micro)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def is_menu_card(blocks: Any) -> bool:
+    """True when the blocks carry a Monday-menu row -- live (an actions row) or
+    already resolved (a cq_done_ context row). A menu whose LAST open row is pressed
+    has one actions block left, so the single-card consume must not be chosen by the
+    actions-block count alone (it would drop every resolved row above it)."""
+    prefixes = _CARD_ROW_PREFIXES + (_CARD_DONE_PREFIX,)
+    return any(isinstance(b, dict) and str(b.get("block_id") or "").startswith(prefixes)
+               for b in (blocks or []))
+
+
+def _card_row_ids(block: dict[str, Any]) -> list[str] | None:
+    """The cq ids one menu actions row acts on, read from its BUTTON VALUES (every
+    button in a menu row carries the same value: the id, or 'bundle:id1,id2'). None
+    for a row this renderer must leave alone (no buttons, mixed values, a non-id)."""
+    vals = {str(e.get("value") or "") for e in (block.get("elements") or [])
+            if isinstance(e, dict)}
+    if len(vals) != 1:
+        return None
+    value = next(iter(vals))
+    raw = value[len("bundle:"):].split(",") if value.startswith("bundle:") else [value]
+    ids = [x.strip().lower() for x in raw if x.strip()]
+    if not ids or not all(_CARD_ID_RE.match(x) for x in ids):
+        return None
+    return ids
+
+
+def _card_label(kind: str, evs: list[dict[str, Any]]) -> str:
+    if kind == "kept":
+        n = sum(1 for e in evs if e.get("event") == "kept")
+        return (f"{_CARD_DECISION_LABELS['kept']} (x{n})"
+                + (" -- Keep cap reached" if n >= KEEP_CAP else ""))
+    return _CARD_DECISION_LABELS.get(kind, kind)
+
+
+def _card_id_state(cid: str, events: dict[str, list[dict[str, Any]]],
+                   fold: dict[str, dict[str, Any]], after: datetime
+                   ) -> tuple[bool, str, str]:
+    """(resolved, label, latest decision ts) for one id on a card posted at `after`."""
+    evs = events.get(cid, [])
+    if _first_decision_after(evs, after) is not None:
+        # The same rule _first_decision_after applies: a decision kind with a
+        # parseable ts at or after the card ts (an unparseable ts never counts).
+        decs = []
+        for e in evs:
+            ts = _parse_ts(e.get("ts"))
+            if e.get("event") in _QS_DECISION_EVENTS and ts is not None and ts >= after:
+                decs.append(e)
+        chain: list[str] = []
+        for e in decs:
+            kind = str(e.get("event"))
+            if not chain or chain[-1] != kind:
+                chain.append(kind)
+        label = " → ".join(_card_label(k, evs) for k in chain[-_CARD_CHAIN_MAX:])
+        return True, label, str(decs[-1].get("ts") or "")
+    rec = fold.get(cid)
+    if rec is None:
+        # Every press on it answers "no longer exists" -- a live button would lie.
+        return True, "Not in the queue ledger", ""
+    status = str(rec.get("status") or "").upper()
+    if status in _TERMINAL_STATUSES:
+        # Closed by an event the card's own ts predates (built, then closed, then
+        # posted): every press is a no-op, so the row must not stay buttoned.
+        return True, f"Closed ({status})", ""
+    return False, "", ""
+
+
+def _card_row_text(ids: list[str], events: dict[str, list[dict[str, Any]]],
+                   fold: dict[str, dict[str, Any]], after: datetime) -> str | None:
+    """The one-line outcome for a row, or None while ANY of its ids is undecided (a
+    bundle staged only in part -- the evidence floor refuses the floored ids --
+    keeps its button; a re-tap names the refused ids again)."""
+    states = []
+    for cid in ids:
+        ok, label, ts = _card_id_state(cid, events, fold, after)
+        if not ok:
+            return None
+        states.append((label, ts))
+    stamps = [ts for _label, ts in states if _parse_ts(ts) is not None]
+    when = (" · " + _qs_az(max(stamps, key=lambda t: _parse_ts(t)))) if stamps else ""
+    if len(ids) == 1:
+        return states[0][0] + when
+    counts: dict[str, int] = {}
+    for label, _ts in states:
+        counts[label] = counts.get(label, 0) + 1
+    return (f"Bundle ({len(ids)} items): "
+            + ", ".join(f"{label} x{n}" for label, n in counts.items()) + when)
+
+
+def rerender_card_blocks(blocks: Any, card_ts: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """(new_blocks, summary) for a multi-row code-queue card posted at ``card_ts``.
+
+    Every Monday-menu actions row (block_id cq_single_ / cq_bundle_ / cq_proposed_
+    / cq_parked_ / cq_stale_) whose ids ALL have a decision event at or after the
+    card ts (or are closed / gone from the ledger) is replaced 1:1 by a context
+    block ``cq_done_<rest of the block_id>`` carrying a static label + AZ time. A
+    resolved single row (cq_done_<kind>_<id>) is re-derived from the ledger, so a
+    row queued on the card and staged later reads both once the card next renders;
+    a resolved bundle row is kept verbatim. Undecided rows (the evidence-floor
+    hold), the sections and every non-queue block pass through untouched.
+
+    Deterministic (same blocks + same ledger -> identical output; our own output
+    is a fixpoint), block count unchanged, never above 50 blocks, block_ids unique
+    -- else no edit. Fails CLOSED (input back, changed=False, WARNING) on an
+    unparseable card ts or an empty / missing ledger: a blind read must never
+    strip every button off a live menu. Writes nothing. summary carries ids and
+    counts only: {changed, rows, resolved, open, newly_resolved: [cq ids], reason}.
+    """
+    orig = [b for b in (blocks or [])]
+    summary: dict[str, Any] = {"changed": False, "rows": 0, "resolved": 0, "open": 0,
+                               "newly_resolved": [], "reason": ""}
+    live = [(i, b) for i, b in enumerate(orig) if isinstance(b, dict)
+            and b.get("type") == "actions"
+            and str(b.get("block_id") or "").startswith(_CARD_ROW_PREFIXES)]
+    done = [(i, b, m) for i, b in enumerate(orig) if isinstance(b, dict)
+            and b.get("type") == "context"
+            for m in [_CARD_DONE_ID_RE.match(str(b.get("block_id") or ""))] if m]
+    if not live and not done:
+        summary["reason"] = "no_queue_rows"
+        return orig, summary
+    after = card_ts_to_dt(card_ts)
+    if after is None:
+        log.warning("code_queue: card re-render skipped -- unparseable card ts %r; the "
+                    "card is left as posted", str(card_ts)[:40])
+        summary["reason"] = "bad_card_ts"
+        return orig, summary
+    ledger = _read_jsonl(_EVENT_LEDGER)   # ONE read: events + fold share a snapshot
+    if not ledger:
+        log.warning("code_queue: card re-render skipped -- the queue ledger read empty "
+                    "(%s); the card is left as posted", _EVENT_LEDGER.name)
+        summary["reason"] = "ledger_empty"
+        return orig, summary
+    events = _events_by_id(ledger)
+    fold = {str(k).lower(): v for k, v in _fold_items(ledger).items()}
+    out = list(orig)
+    for i, b in live:
+        summary["rows"] += 1
+        ids = _card_row_ids(b)
+        text = _card_row_text(ids, events, fold, after) if ids else None
+        if text is None:
+            summary["open"] += 1
+            continue
+        bid = str(b.get("block_id"))
+        out[i] = {"type": "context", "block_id": (_CARD_DONE_PREFIX + bid[3:])[:255],
+                  "elements": [{"type": "mrkdwn", "text": text}]}
+        summary["resolved"] += 1
+        summary["newly_resolved"].extend(ids or [])
+    for i, b, m in done:
+        summary["rows"] += 1
+        summary["resolved"] += 1
+        text = _card_row_text([m.group(1)], events, fold, after)
+        if text is None:
+            continue   # never resurrect a button from a context row; keep it verbatim
+        out[i] = {"type": "context", "block_id": str(b.get("block_id")),
+                  "elements": [{"type": "mrkdwn", "text": text}]}
+    if not summary["newly_resolved"]:
+        summary["reason"] = "nothing_new"
+        return out, summary
+    bids = [str(b.get("block_id")) for b in out if isinstance(b, dict) and b.get("block_id")]
+    if len(out) != len(orig) or len(out) > _CARD_MAX_BLOCKS or len(bids) != len(set(bids)):
+        log.warning("code_queue: card re-render refused by the shape guard (blocks %d->%d, "
+                    "unique ids %d/%d); the card is left as posted",
+                    len(orig), len(out), len(set(bids)), len(bids))
+        return orig, {**summary, "newly_resolved": [], "reason": "shape_guard"}
+    summary["changed"] = True
+    return out, summary

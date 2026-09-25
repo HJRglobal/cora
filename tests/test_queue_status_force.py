@@ -530,9 +530,17 @@ class TestRenderer:
         assert "No Monday menu has been sent yet" in out
 
     def test_the_footer_says_only_what_the_code_does(self):
-        """Lesson 40 (measure, do not reason): a repeat Keep / Later DOES write
-        another event, so 'pressing again is a no-op' would be false."""
-        assert "repeat Keep or Later records one more" in cq.QUEUE_STATUS_FOOTER
+        """Lesson 40 (measure, do not reason). Code #15 S5 (cq-2d26f131091e): a press
+        now re-renders its row, and a repeat Keep on the SAME card is a no-op -- but a
+        repeat Park / Later still writes another event, so 'every repeat press is a
+        no-op' would be false. The behaviour behind each clause is measured in
+        tests/test_code_queue_card_rerender.py (TestFooterClaims)."""
+        f = cq.QUEUE_STATUS_FOOTER
+        assert "does NOT refresh" not in f            # the pre-S5 bug stated as fact
+        assert "re-renders the card it was made on" in f
+        assert "repeat Keep on the same card is a no-op" in f
+        assert "repeat Park or Later records one more park / snooze" in f
+        assert "this ledger is the source of truth" in f
         assert cq.KEEP_CAP >= 1
 
     def test_the_read_writes_nothing(self, qledger, monkeypatch):
