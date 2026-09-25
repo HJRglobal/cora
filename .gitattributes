@@ -4,3 +4,8 @@
 # Shell scripts must stay LF — CRLF breaks sh shebang on Git Bash / Unix
 *.sh text eol=lf
 .githooks/* text eol=lf
+
+# Code #15 R8: byte-identical vendored copy of the Drive folder-audit inventory PS1.
+# scripts/run_hygiene_drive_weekly.py pins its sha256 over the ORIGINAL (LF) bytes,
+# so it must never be eol-converted on checkout (text=auto would write CRLF here).
+deployment/hygiene/folder-audit-inventory.ps1 -text

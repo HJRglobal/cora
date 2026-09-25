@@ -488,6 +488,18 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     monkeypatch.setenv("FLYWHEEL_MIRROR_DIR", str(tmp_path / "flywheel-mirror"))
     monkeypatch.setenv("LEXICON_ROSTER_PATH", str(tmp_path / "lexicon-roster.yaml"))
     monkeypatch.setenv("STRATEGY_HEARTBEAT_PATH", str(tmp_path / "strategy-heartbeat.json"))
+    # Code #15 R8 (cq-592baba613f1): the weekly Drive-hygiene runner
+    # (scripts/run_hygiene_drive_weekly.py) -- its inventory PS1, the audited
+    # root, the Downloads out-dir (inventory CSVs, sidecars, desktop.ini
+    # manifest, keep-4 rotation deletes), the Drive report dir and its own stamp
+    # ledger. Redirected in the SAME commit that introduced the writer. The PS1
+    # and root point at paths that do not exist, so a test that forgets its own
+    # setup fails closed (no walk, no report) instead of reaching G:.
+    monkeypatch.setenv("HYGIENE_INVENTORY_PS1", str(tmp_path / "hygiene" / "no-such-inventory.ps1"))
+    monkeypatch.setenv("HYGIENE_AUDIT_ROOT", str(tmp_path / "hygiene" / "no-such-root"))
+    monkeypatch.setenv("HYGIENE_AUDIT_OUTDIR", str(tmp_path / "hygiene" / "outdir"))
+    monkeypatch.setenv("HYGIENE_REPORT_DIR", str(tmp_path / "hygiene" / "report-dir"))
+    monkeypatch.setenv("HYGIENE_STAMP_LEDGER_PATH", str(tmp_path / "hygiene" / "stamps.jsonl"))
     # Code #13 slice 9b: the repeat-signal escalation ledger (cora.repeat_signal;
     # writers: the expected-invoice check, the nightly decision-gate check, the
     # decision-card tap). Redirected in the SAME commit that introduced it.

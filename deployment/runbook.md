@@ -124,6 +124,38 @@ host task:
 .\deployment\remove-linkedin-spy-task.ps1
 ```
 
+### Pending registration: `cowork-cora-hygiene-drive-weekly` (Code #15 R8, cq-592baba613f1)
+
+Not in the generated table above until Harrison registers it and the manifest
+is regenerated. **Weekly Sat 02:40 AZ** -> `scripts/run_hygiene_drive_weekly.py --apply`
+(windowless, Interactive/Limited, 1 h limit). Script-side only: no restart.
+
+- **What it does:** runs the VENDORED folder-audit inventory
+  (`deployment/hygiene/folder-audit-inventory.ps1`, a byte-identical copy of the
+  Drive original, sha256 `339d456d...` pinned in the runner and marked `-text` in
+  `.gitattributes`) with `-MaxHashMB 0` -- a NO-HASH, read-only walk (~90 s) -- then
+  writes `_shared\hygiene-pending-moves\YYYY-MM-DD_fndr_hygiene-findings.md`
+  (week-over-week counts, NEW vs standing offenders, capped lists) plus, in
+  `Downloads\hjr-folder-audit`, `hygiene-findings-full-YYYY-MM-DD.csv` (full
+  non-LEX list) and `manifest-desktopini-YYYY-MM-DD.csv` (DELETE rows, non-LEX,
+  apply.ps1 schema; trend only -- Drive for Desktop recreates desktop.ini).
+- **Disclosure:** the report folder is static_md-ingested, so `08-Lexington-Services`
+  and every KB-pinned container (incl. `_archive` + `00-Founder\personal-finances`)
+  are COUNTS ONLY and listed names pass `phi_guard.is_any_phi`.
+- **Safety:** never mkdirs the report folder; never overwrites a same-named file
+  without the generator marker; a walk that fails the 80% floor / has walk errors
+  writes an INCOMPLETE WALK report and exits 1 (never a clean report). Keep-4
+  rotation deletes only stamps the runner itself recorded
+  (`data/state/hygiene-drive-stamps.jsonl`), never `20260921-1948`, hand or subtree
+  runs, `manifest-*`, `_applied-*` or `_dryrun-*`.
+- **Exit codes:** 0 ok; 1 incomplete walk; 2 G: unavailable; 3 refused (PS1 hash /
+  config); 4 PS1 failed; 5 stamp detection / collision; 6 report write refused.
+- **Notion:** the `[Hygiene] Drive` page stays Cowork-side -- the rewritten Cowork
+  `hygiene-drive` task publishes this `.md` (keeps the orchestrator's 8-page count).
+- **Dry-run (writes nothing):** `.\.venv\Scripts\python.exe scripts\run_hygiene_drive_weekly.py`
+- **Register (elevated):** `.\deployment\setup-hygiene-drive-weekly-task.ps1`, then
+  `.\.venv\Scripts\python.exe scripts\generate_task_estate_manifest.py --update-docs`.
+
 ---
 
 ## External Health Check
