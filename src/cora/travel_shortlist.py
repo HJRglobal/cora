@@ -99,7 +99,10 @@ UNREADABLE_REPLY = ("The lodging search came back unreadable — nothing to show
 POST_FAILED_REPLY = ("The lodging shortlist couldn't be posted — nothing to show; "
                      "try again later.")
 ACK_TEXT = ":mag: searching lodging… the shortlist will post here."
-FOLLOWUP_HELP_REPLY = ("I can re-search with different dates, area, budget or party size; "
+# The phrasing example keeps the line honest when it declines (D-051 r2 c2-trigger#2):
+# it shows the grammar the re-search takes instead of only claiming the capability.
+FOLLOWUP_HELP_REPLY = ("I can re-search with different dates, area, budget or party size "
+                       "— say e.g. \"try Oct 20–22 instead\" or \"under $250 a night\"; "
                        "I can't book — booking stays with a person. For anything else, "
                        "ask me outside this thread.")
 CLARIFY_DATES_REPLY = ("I need check-in and check-out dates for a lodging shortlist "
@@ -988,13 +991,20 @@ _LOCATIVE_BEFORE_RE = re.compile(
     r"(?: (?:the|downtown|north|south|east|west|central|old town|greater|metro|uptown|midtown)){0,2} $"
 )
 _AREA_AFTER_RE = re.compile(r" (?:area|metro|instead)\b")
+# In a lane-thread FOLLOW-UP "from X" is where someone travels from, never the new
+# lodging area ("what about oct 20-22? we're coming from denver"; D-051 r2 c2-trigger#3).
+_LOCATIVE_BEFORE_FOLLOWUP_RE = re.compile(
+    r"(?:^|[ (])(?:in|near|around|at|by|to|try|outside|within|close to|outside of|nearby)"
+    r"(?: (?:the|downtown|north|south|east|west|central|old town|greater|metro|uptown|midtown)){0,2} $"
+)
 
 
-def _parse_areas(norm: str, lm: LaneMap) -> tuple[str, ...]:
+def _parse_areas(norm: str, lm: LaneMap, *, followup: bool = False) -> tuple[str, ...]:
     """Allowlisted areas in LOCATIVE context only (B5): 'in X', 'near X', 'the X
     area', 'X instead', or a slash/comma/and list whose head or tail is. A
     possessive "X's" is never a place ('near Gilbert's place'); a longer word is
-    never a place ('tempest')."""
+    never a place ('tempest'). A follow-up never reads 'from X' as a place."""
+    locative_re = _LOCATIVE_BEFORE_FOLLOWUP_RE if followup else _LOCATIVE_BEFORE_RE
     if lm.alias_re is None:
         return ()
     hits = []
@@ -1011,7 +1021,7 @@ def _parse_areas(norm: str, lm: LaneMap) -> tuple[str, ...]:
     out: list[str] = []
     for g in groups:
         start, end = g[0][0], g[-1][1]
-        if (_LOCATIVE_BEFORE_RE.search(norm[max(0, start - 40):start])
+        if (locative_re.search(norm[max(0, start - 40):start])
                 or _AREA_AFTER_RE.match(norm, end)):
             for _s, _e, key in g:
                 if key not in out:
@@ -1081,9 +1091,10 @@ def _parse_budget(norm: str) -> tuple[int | None, int | None]:
     return lo, hi
 
 
-def parse_fields(text: Any, *, today: date | None = None) -> dict:
+def parse_fields(text: Any, *, today: date | None = None, followup: bool = False) -> dict:
     """Every field the text carries, each None/empty when absent. Used by the
-    fresh-ask parser AND the lane-thread follow-up merge."""
+    fresh-ask parser AND the lane-thread follow-up merge (*followup*: 'from X' is
+    not a place)."""
     today = today or datetime.now(_AZ).date()
     lm = _load_map()
     norm = _norm(_clean(text))
@@ -1114,7 +1125,7 @@ def parse_fields(text: Any, *, today: date | None = None) -> dict:
     styles = tuple(name for name, rx in _STYLE_RES if rx.search(norm))
     return {
         "stay": stay, "dates_malformed": bool(matched and stay is None),
-        "areas": _parse_areas(norm, lm), "party_size": party,
+        "areas": _parse_areas(norm, lm, followup=followup), "party_size": party,
         "budget_min": lo, "budget_max": hi, "beds": beds, "bedrooms": bedrooms,
         "kind": kind, "styles": styles,
     }
@@ -1152,7 +1163,7 @@ def merge_followup(stored: TravelConstraints, text: Any, *,
                    today: date | None = None) -> tuple[TravelConstraints | None, bool, bool]:
     """(merged, changed, malformed) -- a lane-thread follow-up's NEW fields override
     the stored structured ones (B3). Raw text is never stored or re-read."""
-    f = parse_fields(text, today=today)
+    f = parse_fields(text, today=today, followup=True)
     if f["dates_malformed"]:
         return None, False, True
     upd: dict[str, Any] = {}
@@ -2114,26 +2125,62 @@ def _clarify(pr: ParseResult) -> Route:
 # area / a bed or bedroom change, or a turn that OPENS with a date or "in <place>").
 # "what's the weather in phoenix?" or "draft a note about the offsite in tempe oct
 # 20-22" carry a field but are not refinements: they get the help line, never a card.
+# D-051 r2 (c2-trigger#2/#3): the grammar also takes the ORDINARY ways people change a
+# field ("can we do oct 20-22?", "same thing but in phoenix", "search again", "6 people
+# now", "keep it under 250 a night", "$200-300/night", "prefer a king", "something with
+# a pool") -- and the gate reads the TOPIC first: a turn about another subject (flights,
+# weather, dinner, a car, the agenda, a meeting, the gym ...) is never a lodging
+# refinement even when it carries a date or an area ("in the meantime, what's the
+# weather in phoenix?", "what about flights to phoenix on oct 17?") unless it is itself
+# a strict lodging ask. The "in <place>" opener needs an allowlisted area right after it
+# ("in any case ..." is not one).
 _REFINE_RE = re.compile(
     _WB + r"(?:try|what about|how about|instead|make it|cheaper|less expensive|more expensive"
     r"|pricier|more affordable|same dates|other dates|different (?:dates?|days|nights|area|city"
     r"|neighbou?rhood|part of town|hotels?|options)|another (?:area|city|neighbou?rhood"
     r"|part of town)|(?:party|group) of \d{1,2}|(?:king|queen|two queens?|double queens?) beds?"
-    r"|two queens|\d{1,2}[- ]?(?:bedrooms?|br|bdrm))" + _WE
-    + r"|" + _WB + r"(?:under|below|less than|up to|max|no more than|at most|over|above|at least"
-    r"|around|about) \$ ?\d"
-    + r"|" + _WB + r"for (?:\d{1,2}|two|three|four|five|six|seven|eight|nine|ten|twelve)"
+    r"|two queens|\d{1,2}[- ]?(?:bedrooms?|br|bdrm)"
+    r"|(?:can|could|would|will) (?:we|you|u) (?:please )?(?:do|try|check|search"
+    r"|look (?:in|at|around|near|for))|also (?:check|try|look|search|do)"
+    r"|(?:search|look|check) (?:again|in|near|around)|re-?run|redo|run it again|re-?search"
+    r"|same (?:thing|search|again)|(?:what's|what is|anything) available"
+    r"|change (?:the )?(?:dates?|area|city|location|budget) to|switch (?:it )?to"
+    r"|(?:a|prefer(?:ably)?(?: a)?) (?:king|queen)|with a pool"
+    r"|(?:modern|quiet|quieter|walkable|luxury|luxurious|upscale|photogenic) (?:please|pls"
+    r"|instead|ones?|options?|places?)|something (?:more )?(?:modern|quiet|quieter|walkable"
+    r"|luxurious|upscale|photogenic))" + _WE
+    + r"|" + _WB + r"(?:under|below|less than|up to|max|maximum|no more than|at most|over|above"
+    r"|at least|around|about) \$? ?\d"
+    + r"|\$ ?\d|\d ?(?:/ ?(?:night|nt|nite)|per night|a night|nightly)"
+    + r"|" + _WB + r"(?:for )?(?:\d{1,2}|two|three|four|five|six|seven|eight|nine|ten|twelve)"
     r" (?:people|persons|guests|adults|travell?ers|of us)" + _WE
 )
 _REFINE_START_RE = re.compile(
     r"^(?:(?:ok|okay|actually|or|and|maybe|hmm|now|so)[ ,]+)?(?:" + _MONTH_WORD
-    + r"\.? \d{1,2}|\d{1,2}/\d{1,2}|(?:in|near|around|closer to) )"
+    + r"\.? \d{1,2}|\d{1,2}/\d{1,2}|(?P<loc>(?:in|near|around|closer to) (?:the )?"
+    r"(?:downtown |north |south |east |west |central )?))"
 )
+_OFF_TOPIC_RE = re.compile(
+    _WB + r"(?:flights?|fly|flying|flew|lands?|landing|weather|forecast|dinner|lunch"
+    r"|restaurants?|cars?|uber|lyft|shuttle|drive|driving|agenda|meetings?|gym)" + _WE
+)
+
+
+def _refine_opener(t: str) -> bool:
+    m = _REFINE_START_RE.match(t)
+    if not m:
+        return False
+    if m.group("loc") is None:
+        return True                              # opens with a date
+    lm = _load_map()
+    return bool(lm.alias_re is not None and lm.alias_re.match(t, m.end()))
 
 
 def _is_refinement(text: Any) -> bool:
     t = _norm(_clean(text))
-    return bool(_REFINE_RE.search(t) or _REFINE_START_RE.match(t)) or is_lodging_shaped(text)
+    if _OFF_TOPIC_RE.search(t):
+        return _is_strict_ask(text)
+    return bool(_REFINE_RE.search(t) or _refine_opener(t)) or is_lodging_shaped(text)
 
 
 def route_turn(text: Any, *, user_id: str, channel_id: str, channel_name: str = "",

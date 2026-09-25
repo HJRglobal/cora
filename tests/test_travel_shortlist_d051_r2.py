@@ -427,6 +427,116 @@ class TestHeadNounFrame:
         assert _best_of_3(run) < 0.05
 
 
+# ── r2:c2-trigger#2 + #3: refinements re-run; turns about another subject do not ──
+
+LANE_ROOT = "1790000000.000910"
+
+MUST_RERUN = [
+    ("can we do oct 20-22?", {"check_in": date(2026, 10, 20)}),
+    ("also check oct 20-22", {"check_in": date(2026, 10, 20)}),
+    ("can you search oct 24-28", {"check_in": date(2026, 10, 24)}),
+    ("same thing but in phoenix", {"areas": ("phoenix",)}),
+    ("what's available in mesa?", {"areas": ("mesa",)}),
+    ("can you look in tempe too?", {"areas": ("tempe",)}),
+    ("please look in chandler", {"areas": ("chandler",)}),
+    ("search again for oct 20-22 in mesa", {"areas": ("mesa",), "check_in": date(2026, 10, 20)}),
+    ("6 people now", {"party_size": 6}),
+    ("actually it's 6 of us", {"party_size": 6}),
+    ("keep it under 250 a night", {"budget_max": 250}),
+    ("$200-300/night please", {"budget_min": 200, "budget_max": 300}),
+    ("max 250/night", {"budget_max": 250}),
+    ("prefer a king", {"beds": "king"}),
+    ("something with a pool", {"styles": ("pool",)}),
+    ("modern please", {"styles": ("modern",)}),
+    ("change dates to oct 20-22", {"check_in": date(2026, 10, 20)}),
+    ("switch to tempe", {"areas": ("tempe",)}),
+    ("what about oct 20-22? we're coming from denver",            # 'from X' is not a place
+     {"check_in": date(2026, 10, 20), "areas": ("scottsdale",)}),
+    ("hotels near old town with free breakfast oct 20-22", {"check_in": date(2026, 10, 20)}),
+    ("find hotels near the meeting venue in mesa oct 18-22", {"areas": ("mesa",)}),
+    ("in the scottsdale area oct 20-22?", {"check_in": date(2026, 10, 20)}),
+]
+MUST_HELP = [
+    "in the meantime, what's the weather in phoenix?",
+    "what about flights to phoenix on oct 17?",
+    "try southwest flights from denver instead",
+    "what about rental cars in scottsdale?",
+    "and in mesa, is there a good gym?",
+    "oct 17 is when jordan lands in phoenix",
+    "thanks! also what about the offsite agenda for oct 20-22",
+    "what about dinner in tempe oct 20-22?",
+    "can we do the meeting in mesa oct 20-22 instead?",
+    "in any case, the offsite moved to oct 20-22 in tempe",
+    "book the second one",
+]
+
+
+class TestRefinementGateRound2:
+    def _seed(self):
+        c = ts.parse_constraints("find hotels in scottsdale oct 17-21 for 4 people",
+                                 today=TODAY).constraints
+        ts.append_event("asked", channel="D0HARRISON", root_ts=LANE_ROOT,
+                        constraints=c.to_record(), registered=True)
+
+    def _route(self, text):
+        return ts.route_turn(text, user_id=HARRISON, channel_id="D0HARRISON", channel_name="dm",
+                             thread_root_ts=LANE_ROOT, lane_thread=True, today=TODAY)
+
+    @pytest.mark.parametrize("text,expect", MUST_RERUN)
+    def test_an_ordinary_refinement_re_runs_on_the_merged_fields(self, text, expect):
+        self._seed()
+        r = self._route(text)
+        assert r is not None and r.kind == "search" and r.followup, (text, r)
+        for k, v in expect.items():
+            assert getattr(r.constraints, k) == v, (text, k, getattr(r.constraints, k))
+
+    @pytest.mark.parametrize("text", MUST_HELP)
+    def test_a_turn_about_another_subject_gets_the_help_line(self, text):
+        self._seed()
+        r = self._route(text)
+        assert r is not None and r.kind == "reply" and r.reply == ts.FOLLOWUP_HELP_REPLY, (text, r)
+
+    def test_the_help_line_shows_the_grammar_it_declined(self):
+        assert "try Oct 20–22 instead" in ts.FOLLOWUP_HELP_REPLY
+        assert "under $250 a night" in ts.FOLLOWUP_HELP_REPLY
+
+    def test_through_the_real_handler_weather_bills_nothing_and_new_dates_re_run(
+            self, lane, monkeypatch):
+        client = _slack_client()
+        _mention(client, MagicMock(), ASK, user=_tessa())
+        _drain()
+        assert len(lane.calls) == 1
+        monkeypatch.setattr(app_module, "_TRAVEL_SHORTLIST_POOL", ThreadPoolExecutor(1))
+        client2 = _slack_client()
+        _mention(client2, MagicMock(), "in the meantime, what's the weather in phoenix?",
+                 user=_tessa(), ts_="1790000000.000300", thread_ts=ASK_TS)
+        (call,) = client2.chat_postMessage.call_args_list
+        assert call.kwargs["text"] == ts.FOLLOWUP_HELP_REPLY
+        assert len(lane.calls) == 1                     # no second (billed) web call
+        lane._responses.append(_msg(_fx()))
+        client3 = _slack_client()
+        _mention(client3, MagicMock(), "can we do oct 20-22?", user=_tessa(),
+                 ts_="1790000000.000400", thread_ts=ASK_TS)
+        _drain()
+        assert _card_call(client3)["thread_ts"] == ASK_TS
+        assert len(lane.calls) == 2 and "October 20" in lane.calls[-1]["messages"][0]["content"]
+
+    @pytest.mark.parametrize("shape", [
+        " " * 40000, "can you " * 5000, "also " * 8000, "$" * 40000, "1/" * 20000,
+        "in the " * 6000, "something more " * 3000, "6 people " * 4000, "weather " * 5000,
+        "under " * 7000,
+    ], ids=["spaces", "can-you", "also", "dollars", "slashes", "in-the", "something", "people",
+            "weather", "under"])
+    def test_the_gate_is_linear(self, shape):
+        def run():
+            ts._REFINE_RE.search(shape)
+            ts._REFINE_START_RE.match(shape)
+            ts._OFF_TOPIC_RE.search(shape)
+            ts._is_refinement(shape)
+            ts._LOCATIVE_BEFORE_FOLLOWUP_RE.search(shape[:40])
+        assert _best_of_3(run) < 0.25
+
+
 # ── r2:c2-trigger#5: the date shorthands parse; P2 never reads a check-out month ──
 
 class TestDateShorthandsRound2:
