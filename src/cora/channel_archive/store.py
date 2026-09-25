@@ -720,12 +720,13 @@ def clear_demotion(*, actor: str, dry_run: bool) -> dict:
     if dry_run:
         out["would_clear"] = True
         return out
-    for e in events:
-        if not append_ledger("acknowledged", channel_id=e["channel_id"],
-                             archive_ts=e["archive_ts"], by=actor,
-                             demoted_since=state.get("since")):
-            out["reason"] = "ledger write failed -- the demotion stays"
-            return out
+    if events:
+        for e in events:
+            if not append_ledger("acknowledged", channel_id=e["channel_id"],
+                                 archive_ts=e["archive_ts"], by=actor,
+                                 demoted_since=state.get("since")):
+                out["reason"] = "ledger write failed -- the demotion stays"
+                return out
     elif not append_ledger("acknowledged", by=actor, demoted_since=state.get("since")):
         # A12: even a demotion with no event to ack (an unreadable file) leaves its
         # history in the ledger, so every card older than this clear stays T0.
