@@ -10,7 +10,7 @@ SYNTHETIC ("Jordan Riverstone"); the loyalty number is a made-up digit run.
 from __future__ import annotations
 
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -551,3 +551,73 @@ class TestShiftSchedulerEscapeInALaneThread:
         monkeypatch.setenv("CORA_TRAVEL_SHORTLIST_THREADS_PATH", str(d))
         _dm(_slack_client(), FOLLOW_UP, user=HARRISON, ts_="1790000000.000300", thread_ts=ASK_TS)
         assert len(handled) == 1
+
+
+# ── c2-trigger#6: stay-cue / last-range preference, arrive/leave, check in/out, leap day ─
+
+TODAY = date(2026, 9, 25)
+
+
+class TestDateParserRound1:
+    @pytest.mark.parametrize("text,ci,co", [
+        # two ranges: the one after a stay cue ("for") wins, else the LAST one
+        ("find hotels in scottsdale like the one we used sep 20-22, but for oct 17-21",
+         date(2026, 10, 17), date(2026, 10, 21)),
+        ("hotels in scottsdale, sep 20-22 last time; this time oct 17-21",
+         date(2026, 10, 17), date(2026, 10, 21)),
+        ("hotels in scottsdale for oct 17-21, we went sep 20-22 last year",
+         date(2026, 10, 17), date(2026, 10, 21)),
+        # arrive / leave and check in / check out phrasing
+        ("find hotels in scottsdale, arriving oct 17, leaving oct 21",
+         date(2026, 10, 17), date(2026, 10, 21)),
+        ("find hotels in scottsdale, check in oct 17 check out oct 21",
+         date(2026, 10, 17), date(2026, 10, 21)),
+        ("hotels in scottsdale: check-in oct 17, check-out oct 21",
+         date(2026, 10, 17), date(2026, 10, 21)),
+        ("hotels in scottsdale checking in 10/17 and checking out 10/21",
+         date(2026, 10, 17), date(2026, 10, 21)),
+        ("hotels in scottsdale, arrive on oct 17th and leave on the 21st",
+         date(2026, 10, 17), date(2026, 10, 21)),
+        ("hotels in sedona arriving dec 30, departing jan 2",
+         date(2026, 12, 30), date(2027, 1, 2)),
+        ("hotels in scottsdale check-in oct 17 – check-out oct 21",
+         date(2026, 10, 17), date(2026, 10, 21)),
+        # a Feb 29 with no year is the NEXT Feb 29 inside the 2-year window
+        ("hotels in sedona feb 29 - mar 2", date(2028, 2, 29), date(2028, 3, 2)),
+        ("hotels in sedona feb 29 for 2 nights", date(2028, 2, 29), date(2028, 3, 2)),
+        ("hotels in sedona feb 27 - feb 29", date(2028, 2, 27), date(2028, 2, 29)),
+    ])
+    def test_formats(self, text, ci, co):
+        c = ts.parse_constraints(text, today=TODAY).constraints
+        assert c is not None, text
+        assert (c.check_in, c.check_out) == (ci, co), text
+
+    def test_the_lane_searches_the_stay_the_user_asked_for(self):
+        r = ts.route_turn("find hotels in scottsdale like the one we used sep 20-22, but for "
+                          "oct 17-21", user_id=HARRISON, channel_id="D0HARRISON",
+                          channel_name="dm", today=TODAY)
+        assert r.kind == "search"
+        assert (r.constraints.check_in, r.constraints.check_out) == (date(2026, 10, 17),
+                                                                    date(2026, 10, 21))
+
+    def test_check_in_check_out_phrasing_is_not_asked_for_dates_again(self):
+        r = ts.route_turn("find hotels in scottsdale, check in oct 17 check out oct 21",
+                          user_id=HARRISON, channel_id="D0HARRISON", channel_name="dm",
+                          today=TODAY)
+        assert r.kind == "search", r
+
+    @pytest.mark.parametrize("text", [
+        "hotels in scottsdale feb 30 - mar 2",          # no such day in ANY year
+        "hotels in scottsdale oct 1 - nov 15",          # > 30 nights in every year
+        "hotels in scottsdale, check in oct 17 check out oct 17",
+    ])
+    def test_still_malformed(self, text):
+        pr = ts.parse_constraints(text, today=TODAY)
+        assert pr.constraints is None and pr.malformed is True
+
+    @pytest.mark.parametrize("shape", [
+        "check in oct 1 " * 2500, "arriving " * 5000, "oct 17-21 " * 4000, "for " * 10000,
+    ], ids=["check-in", "arriving", "ranges", "for"])
+    def test_the_date_candidates_are_linear(self, shape):
+        assert _best_of_3(lambda: ts._parse_dates(ts._norm(shape), TODAY)) < 0.25
+        assert _best_of_3(lambda: ts.parse_constraints(shape, today=TODAY)) < 0.05

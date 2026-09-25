@@ -663,73 +663,132 @@ def _year(tok: str | None) -> int | None:
     return y + 2000 if y < 100 else y
 
 
+# P6 (D-051 r1 c2-trigger#6): "arriving oct 17, leaving oct 21", "check in oct 17
+# check out oct 21", "checking in 10/17 and checking out 10/21", "arrive on oct 17
+# and leave on the 21st". Named groups (the _MONTH_RX group would renumber).
+_IN_DATE = (r"(?:(?P<m1>" + _MONTH_WORD + r")\.? (?P<d1>\d{1,2})|(?P<n1>\d{1,2})/(?P<e1>\d{1,2}))"
+            r"(?:,? (?P<y1>20\d\d))?")
+_OUT_DATE = (r"(?:(?P<m2>" + _MONTH_WORD + r")\.? (?P<d2>\d{1,2})|(?P<n2>\d{1,2})/(?P<e2>\d{1,2})"
+             r"|(?:the )?(?P<f2>\d{1,2}))(?:,? (?P<y2>20\d\d))?")
+_DATE_P6 = re.compile(
+    r"\b(?:arriv(?:e|es|ing)|check(?:ing)?[- ]?in)(?: on| date(?: is)?:?)?,? " + _IN_DATE
+    + r"[ ,;&-]{0,4}(?:(?:and|then) )?"
+    r"(?:leav(?:e|es|ing)|depart(?:s|ing)?|check(?:ing)?[- ]?out)(?: on| date(?: is)?:?)?,? "
+    + _OUT_DATE + r"(?![\d/])"
+)
+# A stay cue right before a range: "... used sep 20-22, but FOR oct 17-21".
+_RANGE_CUE_BEFORE_RE = re.compile(
+    r"(?:^|[^a-z])(?:for|from|between|staying|stay|dates?(?: are| is)?:?) ?$")
+
+
+def _candidate_years(y: int | None, today: date) -> tuple[int, ...]:
+    """An explicit year is the only year; otherwise this year and the next two (the
+    next Feb 29 can be two years out -- still inside the 730-day window)."""
+    return (y,) if y is not None else (today.year, today.year + 1, today.year + 2)
+
+
 def _resolve_check_in(m: int, d: int, y: int | None, today: date) -> date | None:
     """An explicit year wins; otherwise the next occurrence on or after today. None
     for a day that does not exist, a past check-in, or one more than 2 years out."""
-    try:
-        if y is None:
-            ci = date(today.year, m, d)
-            if ci < today:
-                ci = date(today.year + 1, m, d)
-        else:
-            ci = date(y, m, d)
-    except ValueError:
-        return None
-    if ci < today or ci > today + timedelta(days=730):
-        return None
-    return ci
+    for yr in _candidate_years(y, today):
+        try:
+            ci = date(yr, m, d)
+        except ValueError:
+            continue
+        if today <= ci <= today + timedelta(days=730):
+            return ci
+    return None
 
 
 def _resolve_stay(m1: int, d1: int, y1: int | None, m2: int, d2: int, y2: int | None,
                   today: date) -> tuple[date, date] | None:
     """Check-in per _resolve_check_in; a check-out on or before it (with no year of
-    its own) rolls to the next year (Dec 30 - Jan 2). None = malformed (bad day,
-    past stay, outside 1..30 nights)."""
-    ci = _resolve_check_in(m1, d1, y1, today)
-    if ci is None:
-        return None
-    try:
-        co = date(y2 if y2 is not None else ci.year, m2, d2)
-        if co <= ci and y2 is None:
-            co = date(ci.year + 1, m2, d2)
-    except ValueError:
-        return None
-    return (ci, co) if 1 <= (co - ci).days <= 30 else None
+    its own) rolls to the next year (Dec 30 - Jan 2). With no check-in year, the
+    first year the whole stay exists wins ("feb 27 - feb 29"). None = malformed (bad
+    day, past stay, outside 1..30 nights)."""
+    for yr in _candidate_years(y1, today):
+        ci = _resolve_check_in(m1, d1, yr, today)
+        if ci is None:
+            continue
+        try:
+            co = date(y2 if y2 is not None else ci.year, m2, d2)
+            if co <= ci and y2 is None:
+                co = date(ci.year + 1, m2, d2)
+        except ValueError:
+            continue
+        if 1 <= (co - ci).days <= 30:
+            return ci, co
+    return None
+
+
+def _p6_stay(m: "re.Match[str]", today: date) -> tuple[date, date] | None:
+    if m.group("m1"):
+        mo1, d1 = _month_num(m.group("m1")), int(m.group("d1"))
+    else:
+        mo1, d1 = int(m.group("n1")), int(m.group("e1"))
+    if m.group("m2"):
+        mo2, d2 = _month_num(m.group("m2")), int(m.group("d2"))
+    elif m.group("n2"):
+        mo2, d2 = int(m.group("n2")), int(m.group("e2"))
+    else:
+        mo2, d2 = mo1, int(m.group("f2"))
+    return _resolve_stay(mo1, d1, _year(m.group("y1")), mo2, d2, _year(m.group("y2")), today)
+
+
+def _date_candidates(text: str, today: date) -> list[tuple[int, int, Any, bool]]:
+    """(start, end, stay-or-None, explicit) for every stay phrase, in pattern
+    priority order (P6, P1, P5, P2, P3, P4) with overlapping spans dropped."""
+    out: list[tuple[int, int, Any, bool]] = []
+    taken = bytearray(len(text) + 1)            # linear overlap check (no pairwise scan)
+
+    def add(m: "re.Match[str]", stay: Any, explicit: bool = False) -> None:
+        s, e = m.span()
+        if not any(taken[s:e]):
+            taken[s:e] = b"\x01" * (e - s)
+            out.append((s, e, stay, explicit))
+
+    for m in _DATE_P6.finditer(text):
+        add(m, _p6_stay(m, today), True)
+    for m in _DATE_P1.finditer(text):
+        add(m, _resolve_stay(_month_num(m.group(1)), int(m.group(2)), _year(m.group(3)),
+                             _month_num(m.group(4)), int(m.group(5)), _year(m.group(6)), today))
+    for m in _DATE_P5.finditer(text):
+        ci = _resolve_check_in(_month_num(m.group(1)), int(m.group(2)), _year(m.group(3)), today)
+        nights = _num(m.group(4))
+        add(m, (ci, ci + timedelta(days=nights)) if ci is not None and 1 <= nights <= 30 else None)
+    for m in _DATE_P2.finditer(text):
+        mo = _month_num(m.group(1))
+        add(m, _resolve_stay(mo, int(m.group(2)), _year(m.group(4)), mo, int(m.group(3)),
+                             _year(m.group(4)), today))
+    for m in _DATE_P3.finditer(text):
+        mo = _month_num(m.group(3))
+        add(m, _resolve_stay(mo, int(m.group(1)), _year(m.group(4)), mo, int(m.group(2)),
+                             _year(m.group(4)), today))
+    for m in _DATE_P4.finditer(text):
+        add(m, _resolve_stay(int(m.group(1)), int(m.group(2)), _year(m.group(3)),
+                             int(m.group(4)), int(m.group(5)), _year(m.group(6)), today))
+    return out
 
 
 def _parse_dates(norm: str, today: date) -> tuple[tuple[date, date] | None, bool]:
-    """(stay or None, matched_something). matched-but-invalid = malformed."""
+    """(stay or None, matched_something). matched-but-invalid = malformed.
+
+    Several stay phrases (D-051 r1 c2-trigger#6): an explicit arrive/check-in ...
+    leave/check-out phrase wins; otherwise the ranges right after a stay cue ("for",
+    "from", "staying") are preferred over the rest, and within that pool the LAST
+    valid one wins -- "like the one we used sep 20-22, but for oct 17-21" searches
+    Oct 17-21, never the first range rolled into next year."""
     text = _ORDINAL_RE.sub(r"\1", norm)
-    m = _DATE_P1.search(text)
-    if m:
-        return _resolve_stay(_month_num(m.group(1)), int(m.group(2)), _year(m.group(3)),
-                             _month_num(m.group(4)), int(m.group(5)), _year(m.group(6)),
-                             today), True
-    m = _DATE_P5.search(text)
-    if m:
-        ci = _resolve_check_in(_month_num(m.group(1)), int(m.group(2)), _year(m.group(3)), today)
-        nights = _num(m.group(4))
-        if ci is None or not 1 <= nights <= 30:
-            return None, True
-        return (ci, ci + timedelta(days=nights)), True
-    m = _DATE_P2.search(text)
-    if m:
-        mo = _month_num(m.group(1))
-        return _resolve_stay(mo, int(m.group(2)), _year(m.group(4)), mo, int(m.group(3)),
-                             _year(m.group(4)), today), True
-    m = _DATE_P3.search(text)
-    if m:
-        mo = _month_num(m.group(3))
-        return _resolve_stay(mo, int(m.group(1)), _year(m.group(4)), mo, int(m.group(2)),
-                             _year(m.group(4)), today), True
-    m = _DATE_P4.search(text)
-    if m:
-        try:
-            return _resolve_stay(int(m.group(1)), int(m.group(2)), _year(m.group(3)),
-                                 int(m.group(4)), int(m.group(5)), _year(m.group(6)), today), True
-        except ValueError:
-            return None, True
-    return None, False
+    cands = _date_candidates(text, today)
+    if not cands:
+        return None, False
+    pool = [c for c in cands if c[3]]
+    if not pool:
+        pool = [c for c in cands if _RANGE_CUE_BEFORE_RE.search(text[max(0, c[0] - 24):c[0]])]
+    for _s, _e, stay, _x in sorted(pool or cands, key=lambda c: c[0], reverse=True):
+        if stay is not None:
+            return stay, True
+    return None, True
 
 
 _LIST_SEP_RE = re.compile(r" ?(?:/|,|&|,? (?:and|or)) ?")
