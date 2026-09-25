@@ -299,6 +299,10 @@ def _isolate_cross_test_global_state(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "MEETING_ASK_STATE_PATH", str(tmp_path / "meeting-ask-pending.json")
     )
+    # Code #15 S1 (cq-d9d0c92cc797): the combined KB purge script's INTENT/APPLIED
+    # records (scripts/purge_kb_code15_2026-09.py; default <repo>/logs/). Resolved
+    # per call from this env var; redirected in the SAME commit as the writer.
+    monkeypatch.setenv("CORA_KB_PURGE_OUT_DIR", str(tmp_path / "kb-purge-code15"))
     # Code #13 slice 5 (cq-7a724ee43964): the meeting-recap card store (append-only
     # events) + its send ledger. Both resolve per call; both born with their
     # redirect in the same change, per the session-#11 S4 rule.
