@@ -1936,16 +1936,33 @@ def audit_day(
         mere information -- a false negative the pre-S4 any-hit-is-a-breach rule
         could not produce.
 
-        An INFORMATIONAL hit is grouped by the carved meeting it reports (the first
-        claimant, the one its shape names): a second recording of that meeting joins
-        its row as another transcript id -- a duplicate -- instead of printing a
-        second identical line beside a clean-day verdict (D-051 s4#1)."""
+        An INFORMATIONAL hit (no claimant breaches) names ONE carved meeting -- the
+        claimant whose start is NEAREST the recording's time (first-seen on a tie) --
+        and that one meeting is both its shape label and its collapse group: a second
+        recording of the meeting joins its row as another transcript id -- a
+        duplicate -- instead of printing a second identical line beside a clean-day
+        verdict (D-051 s4#1). Binding the room's FIRST-SEEN claimant instead filed
+        every link-only recording under that one meeting, whatever its time: a 10:00
+        meeting recorded by cal_id and by link split over two rows and read clean,
+        while a 09:00 and a 10:00 recorded once each collapsed into a phantom 09:00
+        duplicate (D-051 r2 s3s4#r2-0). Breach precedence is unchanged: any
+        breaching claimant wins, and a breach is never grouped. The pick only chooses
+        AMONG carved claimants; which transcripts 3b claims at all is still the
+        time-blind link join (cq-4df9da0cb483)."""
         results = [
             classify_carved_recording(carved[k], carved_no_record.get(k), t, cfg)
             for k in c_keys
         ]
-        is_breach, h_ev, h_reason = next((res for res in results if res[0]), results[0])
-        group = None if is_breach else c_keys[0]
+        breach = next((res for res in results if res[0]), None)
+        if breach is not None:
+            is_breach, h_ev, h_reason = breach
+            group = None
+        else:
+            t_ts = _transcript_ts(t)
+            i = min(range(len(c_keys)),
+                    key=lambda j: abs(event_start_ts(carved[c_keys[j]][0]) - t_ts))
+            is_breach, h_ev, h_reason = results[i]
+            group = c_keys[i]
         row = _record_carved_hit(
             report, is_breach=is_breach,
             shape=f"a meeting at {event_time_label(h_ev)}", reason=h_reason,

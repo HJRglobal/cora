@@ -3352,8 +3352,12 @@ class TestBreachIsANoRecordCarveOutOnly:
         t = _t("t1", title="Tawny room", hh=15, cal_id=None, link=_S4_ROOM)
         r = _audit(events, [t])
         assert r.carve_out_breaches == []
-        # the first claimant, as the single-key index bound it before (time-blind)
-        assert r.carved_recordings == [("a meeting at 10:00", "roster-user-declined")]
+        # the claimant NEAREST the recording's time names it (D-051 r2 s3s4#r2-0);
+        # ed133cd5 filed it under the room's first claimant, the 10:00 meeting
+        assert r.carved_recordings == [("a meeting at 15:00", "roster-user-declined")]
+        assert r.carved_recording_event_ids == ["dec15"]
+        assert r.carved_recording_transcript_ids == [["t1"]]
+        assert "Tawny" not in mc.render_report(r)
 
     # ── fail closed on a reason nobody classified ──
 
@@ -3653,6 +3657,107 @@ class TestCarvedRecordingsCollapsePerMeeting:
         out = mc.render_report(r)
         assert "transcripts)" not in out
         assert "\n:white_check_mark: No qualifying roster meetings scheduled." in out
+
+    # ── D-051 r2 s3s4#r2-0: on a SHARED static room the group is the meeting the
+    # recording's TIME names, never the room's first carved claimant ──
+
+    @staticmethod
+    def _room_day(*order):
+        """Two DECLINED meetings on one static room: 09:00 (`k0`) and 10:00 (`kk`),
+        seen in `order` on the calendar read (the link index is first-seen)."""
+        who = "harrison@hjrglobal.com"
+        evs = {
+            "k0": _s4_decline(_ev("k0", summary="Tawny early", hh=9, link=_S4_ROOM), who),
+            "kk": _s4_decline(_ev("kk", summary="Tawny later", hh=10, link=_S4_ROOM), who),
+        }
+        return {who: [evs[k] for k in (order or ("k0", "kk"))]}
+
+    def test_a_shared_room_meeting_recorded_by_cal_id_and_by_link_is_one_duplicate_row(self):
+        """r2probe case C: the 10:00 is recorded twice, once by cal_id and once
+        link-only. At ed133cd5 the link-only copy was filed under the room's FIRST
+        carved meeting (09:00): two single rows, carved_duplicated 0, and the green
+        clean-day verdict -- the s4#1 symptom on a shared room."""
+        trs = [_t("tA", title="Untitled recording", hh=10, cal_id="kk", link=_S4_ROOM),
+               _t("tB", title="Untitled recording", hh=10, cal_id=None, link=_S4_ROOM)]
+        r = _audit(self._room_day(), trs)
+        out = mc.render_report(r)
+        assert "white_check_mark" not in out and "No qualifying roster meetings" not in out
+        assert r.carve_out_breaches == [] and r.unmatched_transcripts == []
+        assert r.carved_recordings == [("a meeting at 10:00", "roster-user-declined")]
+        assert r.carved_recording_event_ids == ["kk"]
+        assert r.carved_recording_transcript_ids == [["tA", "tB"]]
+        assert r.carved_recording_counts == [2] and r.carved_duplicated == 1
+        assert "\n  - a meeting at 10:00  _(roster-user-declined)_  (2 transcripts)" in out
+        assert "Tawny" not in out and "Untitled recording" not in out
+
+    def test_two_shared_room_meetings_each_recorded_once_link_only_stay_two_rows(self):
+        """r2probe case D: the 09:00 and the 10:00 are each recorded ONCE, link-only.
+        At ed133cd5 both collapsed into one phantom 'a meeting at 09:00 ... (2
+        transcripts)' row and the clean-day verdict was withheld for a duplicate that
+        never happened; the 10:00 line vanished."""
+        trs = [_t("tA", title="Untitled recording", hh=9, cal_id=None, link=_S4_ROOM),
+               _t("tB", title="Untitled recording", hh=10, cal_id=None, link=_S4_ROOM)]
+        r = _audit(self._room_day(), trs)
+        out = mc.render_report(r)
+        assert r.carve_out_breaches == [] and r.unmatched_transcripts == []
+        assert r.carved_recordings == [("a meeting at 09:00", "roster-user-declined"),
+                                       ("a meeting at 10:00", "roster-user-declined")]
+        assert r.carved_recording_event_ids == ["k0", "kk"]
+        assert r.carved_recording_transcript_ids == [["tA"], ["tB"]]
+        assert r.carved_duplicated == 0 and "transcripts)" not in out
+        assert "\n:white_check_mark: No qualifying roster meetings scheduled." in out
+        assert "Tawny" not in out and "Untitled recording" not in out
+
+    def test_the_time_pick_is_independent_of_calendar_order(self):
+        """The room's first-seen claimant is the LATER meeting here; a 09:00 link-only
+        recording still names the 09:00 meeting, and a 10:00 cal_id recording plus a
+        10:00 link-only one still collapse onto the 10:00 row."""
+        trs = [_t("t9", title="Untitled recording", hh=9, cal_id=None, link=_S4_ROOM),
+               _t("tA", title="Untitled recording", hh=10, cal_id="kk", link=_S4_ROOM),
+               _t("tB", title="Untitled recording", hh=10, cal_id=None, link=_S4_ROOM)]
+        r = _audit(self._room_day("kk", "k0"), trs)
+        by_event = dict(zip(r.carved_recording_event_ids, r.carved_recording_transcript_ids))
+        assert by_event == {"kk": ["tA", "tB"], "k0": ["t9"]}
+        assert dict(zip(r.carved_recording_event_ids, r.carved_recordings)) == {
+            "kk": ("a meeting at 10:00", "roster-user-declined"),
+            "k0": ("a meeting at 09:00", "roster-user-declined"),
+        }
+        assert r.carved_duplicated == 1
+        assert "white_check_mark" not in mc.render_report(r)
+
+    def test_an_equidistant_recording_goes_to_the_first_seen_claimant(self):
+        """A tie (a 10:00 recording between a 09:00 and an 11:00 meeting on the room)
+        is broken by first-seen order -- deterministic, and the pre-fix binding."""
+        who = "harrison@hjrglobal.com"
+        events = {who: [
+            _s4_decline(_ev("k9", summary="Tawny early", hh=9, link=_S4_ROOM), who),
+            _s4_decline(_ev("k11", summary="Tawny late", hh=11, link=_S4_ROOM), who),
+        ]}
+        r = _audit(events, [_t("t1", title="Untitled recording", hh=10, link=_S4_ROOM)])
+        assert r.carved_recordings == [("a meeting at 09:00", "roster-user-declined")]
+        assert r.carved_recording_event_ids == ["k9"]
+
+    def test_breach_precedence_on_a_shared_room_is_unchanged(self):
+        """r2probe case B: a declined 10:00 and a `[no-bot]` 15:00 share the room. The
+        cal_id recording of the 10:00 is information; EVERY link-only recording on
+        the room -- the 15:00 one and a second 10:00 one -- is a breach of its own
+        (any breaching claimant wins, never grouped). The time pick applies only when
+        no claimant breaches."""
+        who = "harrison@hjrglobal.com"
+        events = {who: [
+            _s4_decline(_ev("k1", summary="Tawny chat", hh=10, link=_S4_ROOM), who),
+            _ev("k2", summary="[no-bot] Tawny private", hh=15, link=_S4_ROOM),
+        ]}
+        trs = [_t("t10", title="Untitled recording", hh=10, cal_id="k1", link=_S4_ROOM),
+               _t("t15", title="Untitled recording", hh=15, cal_id=None, link=_S4_ROOM),
+               _t("t10b", title="Untitled recording", hh=10, cal_id=None, link=_S4_ROOM)]
+        r = _audit(events, trs)
+        assert r.carve_out_breaches == [("a meeting at 15:00", "title-marker:[no-bot]")] * 2
+        assert r.carve_out_breach_event_ids == ["k2", "k2"]
+        assert r.carve_out_breach_transcript_ids == ["t15", "t10b"]
+        assert r.carved_recordings == [("a meeting at 10:00", "roster-user-declined")]
+        assert r.carved_recording_transcript_ids == [["t10"]]
+        assert "Tawny" not in mc.render_report(r)
 
     def test_a_breach_recorded_twice_is_never_collapsed(self):
         """Each breaching recording keeps its own row + transcript id: deleting a
