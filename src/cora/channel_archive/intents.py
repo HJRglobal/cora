@@ -30,6 +30,10 @@ from typing import Any
 
 MAX_CHARS = 300
 FOLLOWUP_WINDOW_S = 30 * 60
+#: A card ts is SLACK's clock and ``now`` is the host's (and a .6f stamp rounds up
+#: about half the time): a card up to this far in the FUTURE is clock skew, not a
+#: stale card (harness-isolation#0).
+FOLLOWUP_SKEW_S = 120
 
 _MENTION_TOKEN_RE = re.compile(r"<@[A-Za-z0-9_]{2,24}(?:\|[^>\n]{0,40})?>")
 _CHANNEL_TOKEN_RE = re.compile(r"<#C[A-Z0-9]{6,24}(?:\|[^>\n]{0,80})?>")
@@ -120,7 +124,7 @@ def looks_like_live_followup(text: str, *, card_ts: float | None, now: float | N
     if shape == "imperative":
         return True
     now = time.time() if now is None else float(now)
-    return 0 <= now - float(card_ts) <= FOLLOWUP_WINDOW_S
+    return -FOLLOWUP_SKEW_S <= now - float(card_ts) <= FOLLOWUP_WINDOW_S
 
 
 # ── replies (deterministic, code-authored, tier-truthful) ────────────────────

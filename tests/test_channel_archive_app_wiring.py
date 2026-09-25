@@ -276,7 +276,7 @@ class TestFounderDM:
     def test_a_followup_to_a_live_card_is_refused_but_a_yes_for_a_staged_write_is_not(self, dm, monkeypatch):
         _stage()
         st.append_event("delivered", proposal_id=PID, page=1, dm_channel="DHARRISON1",
-                        message_ts=f"{time.time():.6f}", rendered_cids=[A1], buttons=True)
+                        message_ts=f"{time.time() - 5:.6f}", rendered_cids=[A1], buttons=True)
         client = MagicMock()
         app_module.handle_message_event(_event("archive them"), client)
         assert "Typed replies don't act" in _texts(client)[-1]
@@ -288,7 +288,7 @@ class TestFounderDM:
     def test_a_bare_yes_never_steals_a_live_gap_or_kc_answer(self, dm, monkeypatch):
         _stage()
         st.append_event("delivered", proposal_id=PID, page=1, dm_channel="DHARRISON1",
-                        message_ts=f"{time.time():.6f}", rendered_cids=[A1], buttons=True)
+                        message_ts=f"{time.time() - 5:.6f}", rendered_cids=[A1], buttons=True)
         client = MagicMock()
         app_module.handle_message_event(_event("yes"), client)          # gap + KC live (fixture)
         assert "Typed replies don't act" not in " ".join(t or "" for t in _texts(client))
@@ -299,6 +299,21 @@ class TestFounderDM:
         before = dm.qa.call_count
         app_module.handle_message_event(_event("yes"), client2)
         assert "Typed replies don't act" in _texts(client2)[-1] and dm.qa.call_count == before
+
+    def test_a_card_stamped_a_hair_ahead_of_the_host_clock_still_refuses_a_bare_yes(self, dm, monkeypatch):
+        """harness-isolation#0: a card ts is Slack's clock and ``now`` is the host's, and
+        a .6f stamp rounds UP about half the time -- a card a moment in the FUTURE is
+        clock skew, not a stale card, so the A21(d) rail must still answer."""
+        _stage()
+        st.append_event("delivered", proposal_id=PID, page=1, dm_channel="DHARRISON1",
+                        message_ts=f"{time.time() + 1.0:.6f}", rendered_cids=[A1], buttons=True)
+        monkeypatch.setattr(app_module.gap_autofill, "has_live_ask", lambda uid: False)
+        monkeypatch.setattr(app_module.knowledge_check, "has_live_cycle", lambda uid: False)
+        client = MagicMock()
+        before = dm.qa.call_count
+        app_module.handle_message_event(_event("yes"), client)
+        assert _texts(client) and _texts(client)[-1] == intents.followup_reply()
+        assert dm.qa.call_count == before
 
     def test_eval_mode_is_a_silent_no_op(self, dm, monkeypatch):
         monkeypatch.setenv("CORA_EVAL_MODE", "1")

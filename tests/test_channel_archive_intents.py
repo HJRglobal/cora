@@ -174,3 +174,14 @@ class TestReplies:
         monkeypatch.setenv("CORA_SENTINEL_ENFORCE", "enforce")
         for r in replies:
             assert se.screen_phantom_write_claims(r, tool_use_count=0) == r, r
+
+
+class TestClockSkew:
+    """harness-isolation#0: the card ts is Slack's clock, ``now`` is the host's."""
+
+    def test_a_card_stamp_a_hair_in_the_future_is_skew_not_stale(self):
+        assert it.looks_like_live_followup("yes", card_ts=NOW + 0.0005, now=NOW)
+        assert it.looks_like_live_followup("ok", card_ts=NOW + 60, now=NOW)
+
+    def test_a_card_far_in_the_future_is_not_live(self):
+        assert not it.looks_like_live_followup("yes", card_ts=NOW + 10 * 60, now=NOW)
