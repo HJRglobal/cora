@@ -192,15 +192,24 @@ class TestPriorTurnLegAndSkipLabel:
     ])
     def test_coras_own_lodging_words_in_the_window_do_not_withhold(self, lane, user, channel,
                                                                     entity):
-        """Cora's replies ("full suite green", a hotel list she posted) are the bot's
-        prose, not a person's PII-bearing ask -- an unrelated explicit web ask attaches."""
+        """Cora's WEAK-tier prose ("full suite green" beside a date, a booked conference
+        room) is the bot's prose, not a person's PII-bearing ask -- an unrelated explicit
+        web ask attaches. DELIBERATE FLIP (D-051 r2 c2-egress#2, ruled SPLIT -> fix): a
+        Cora turn with a STRONG term ("I listed three hotels in Scottsdale ...") now
+        withholds -- her relay of a KB/tool answer can name the guests. Full tables:
+        test_travel_shortlist_d051_r2.TestPriorTurnLegByOriginalAuthor."""
         user = _tessa() if user == "tessa" else user
         prior = [{"role": "user", "content": "what did the test run say?"},
-                 {"role": "assistant", "content": "Full suite green: 19,342 passed. Earlier I "
-                                                  "listed three hotels in Scottsdale for Oct 17-21."}]
+                 {"role": "assistant", "content": "Full suite green: 19,342 passed -- merged Sep "
+                                                  "24. The 2:00 conference room is booked."}]
         seen = _drive_dispatch("google the Deposco API changelog", user=user, channel_id=channel,
                                channel_name="dm", entity=entity, prior=prior)
         assert seen and seen[-1].get("web_tools") is True
+        strong = [prior[0], {"role": "assistant", "content": "Earlier I listed three hotels in "
+                                                             "Scottsdale for Oct 17-21."}]
+        seen = _drive_dispatch("google the Deposco API changelog", user=user, channel_id=channel,
+                               channel_name="dm", entity=entity, prior=strong)
+        assert seen and seen[-1].get("web_tools") is False
 
     def test_a_persons_lodging_ask_in_the_window_still_withholds(self, lane):
         prior = [{"role": "user", "content": "rooms in scottsdale oct 17-21 for Jordan Riverstone"}]

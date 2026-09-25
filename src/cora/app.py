@@ -257,6 +257,57 @@ def _resolve_channel_name(client, channel_id: str) -> str:
         return channel_id
 
 
+# The fold's own labels (below), shared with the travel lane's prior-turn leg so it can
+# split a folded turn back into its authors (D-051 r2 c2-trigger#4).
+_CORA_OPENED_MARK = "[Context -- Cora opened this thread with:]\n"
+_CORA_REPLY_MARK = "\n\n[The reply to it:]\n"
+
+
+class _AuthoredHistory(list):
+    """A merged history list (exactly what the model sees) that also carries each
+    message's ORIGINAL author, read BEFORE the same-role merge and the
+    _ensure_user_first fold re-role Cora's opening as 'user' (D-051 r2
+    c2-trigger#4). ``authored`` = ((role, text), ...), oldest first. Consumers copy
+    the list (``list(prior_messages)``) before sending it, so the attribute never
+    reaches the API."""
+    __slots__ = ("authored",)
+
+
+def _with_authors(merged: list[dict], history: list[dict]) -> list[dict]:
+    out = _AuthoredHistory(merged)
+    out.authored = tuple((t["role"], t["content"]) for t in history)
+    return out
+
+
+def _prior_turns_by_author(prior_messages) -> tuple[list[str], list[str]]:
+    """(person_texts, cora_texts) of a prior window by ORIGINAL author. Reads the
+    builders' pre-merge record when the list carries it; otherwise splits a folded
+    turn on the fold's own labels (Cora's part, then the reply) -- a list that lost
+    the record (a copy, a hand-built history) still never scans Cora's opening as
+    the person's. Never raises on a malformed row (skipped)."""
+    authored = getattr(prior_messages, "authored", None)
+    if authored is not None:
+        return ([c for r, c in authored if r == "user" and isinstance(c, str)],
+                [c for r, c in authored if r == "assistant" and isinstance(c, str)])
+    person: list[str] = []
+    cora: list[str] = []
+    for m in prior_messages or ():
+        if not isinstance(m, dict) or not isinstance(m.get("content"), str):
+            continue
+        content = m["content"]
+        if m.get("role") == "assistant":
+            cora.append(content)
+        elif m.get("role") == "user":
+            if content.startswith(_CORA_OPENED_MARK):
+                opened, sep, reply = content[len(_CORA_OPENED_MARK):].partition(_CORA_REPLY_MARK)
+                cora.append(opened)
+                if sep:
+                    person.append(reply)
+            else:
+                person.append(content)
+    return person, cora
+
+
 def _ensure_user_first(merged: list[dict]) -> list[dict]:
     """Make history start with a user turn WITHOUT throwing the opening away.
 
@@ -282,14 +333,14 @@ def _ensure_user_first(merged: list[dict]) -> list[dict]:
         dropped.append(merged.pop(0)["content"])
     if not dropped:
         return merged
-    context = "[Context -- Cora opened this thread with:]\n" + "\n".join(dropped)
+    context = _CORA_OPENED_MARK + "\n".join(dropped)
     if merged:
         # Prepended to the first user turn rather than inserted as a turn of its
         # own, so the result keeps the strict alternation the merge loop above
         # maintains.
         merged[0] = {
             "role": "user",
-            "content": context + "\n\n[The reply to it:]\n" + merged[0]["content"],
+            "content": context + _CORA_REPLY_MARK + merged[0]["content"],
         }
         return merged
     # D-051: THE CASE THIS FUNCTION EXISTS FOR, and the first cut still returned
@@ -369,7 +420,7 @@ def _fetch_thread_history(
         "thread_history: fetched %d turns for channel=%s thread_ts=%s",
         len(merged), channel_id, thread_root_ts,
     )
-    return merged
+    return _with_authors(merged, history)   # the pre-merge authors ride along (r2 c2-trigger#4)
 
 
 def _build_grant_context(
@@ -1640,16 +1691,20 @@ def _dispatch_qa(
     # named a guest or a loyalty account sits in the DM / thread history the model
     # composes search strings from, and a non-custodian's prior turns are NOT
     # dropped on a web turn -- so a later "google restaurants near there" must not
-    # carry web tools while that ask is in the window. A PERSON's turns only (D-051
-    # r1 integration#2): Cora's own prose ("full suite green", a card's text) is not
-    # a PII-bearing ask, and the person's ask is itself in the window.
+    # carry web tools while that ask is in the window. By ORIGINAL author (D-051 r2
+    # c2-trigger#4 / c2-egress#2): a PERSON's turn with the full loose predicate; CORA's
+    # turn -- including the opening the history builders fold into the first user turn
+    # -- with the STRONG tier only, so her "Full suite green ... Sep 24" (weak noun +
+    # date) never withholds but her relay of a KB/tool answer naming "the hotel for
+    # Jordan" or "Hilton Honors 482915736" does (the person's original ask may sit in
+    # another channel, not this window).
     try:
+        _travel_person_prior, _travel_cora_prior = _prior_turns_by_author(prior_messages)
         _travel_web_withhold = (
             _travel_lane_thread or _travel_store_error
             or travel_shortlist.is_lodging_shaped(user_message)
-            or any(travel_shortlist.is_lodging_shaped(m.get("content", ""))
-                   for m in prior_messages
-                   if isinstance(m, dict) and m.get("role") == "user")
+            or any(travel_shortlist.is_lodging_shaped(t) for t in _travel_person_prior)
+            or any(travel_shortlist.is_lodging_strong(t) for t in _travel_cora_prior)
         )
     except Exception:  # noqa: BLE001 -- fail closed: no web
         _travel_web_withhold = True
@@ -3152,7 +3207,7 @@ def _fetch_dm_history(client, channel_id: str, current_msg_ts: str, limit: int =
         else:
             merged.append({"role": turn["role"], "content": turn["content"]})
     merged = _ensure_user_first(merged)
-    return merged
+    return _with_authors(merged, history)   # the pre-merge authors ride along (r2 c2-trigger#4)
 
 
 def _handle_dm_qa(event: dict, client, user_id: str, text: str) -> None:
