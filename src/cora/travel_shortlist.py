@@ -1247,6 +1247,50 @@ def parse_fields(text: Any, *, today: date | None = None, followup: bool = False
     }
 
 
+# D-051 r3 (c2-trigger#4, SPLIT -> fix): the head-noun rule accepts an allowlisted area
+# right after the lodging noun group ("find hotels scottsdale oct 17-21"), so a FRESH ask
+# reads the area in that same slot -- directly after the group, or after one date phrase
+# ("find a hotel oct 17-21 scottsdale", "find hotels, oct 17-21, scottsdale") -- instead
+# of telling someone who typed Scottsdale "I didn't recognise the area". Only there:
+# "for X" is never read (a person: "a hotel for charlotte"), a follow-up never reads the
+# slot, a possessive is never a place, and the aliases that are everyday words stay
+# locative-only ("surprise me", "page 2").
+_SLOT_DATE = (r"(?:" + _MONTH_WORD + r"\.? \d{1,2}(?:st|nd|rd|th)?(?: ?(?:-|to|through|thru"
+              r"|until|till) ?(?:" + _MONTH_WORD + r"\.? )?\d{1,2}(?:st|nd|rd|th)?)?"
+              r"|\d{1,2}/\d{1,2}(?:/\d{2,4})?(?: ?(?:-|to|through|thru) ?\d{1,2}"
+              r"(?:/\d{1,2}(?:/\d{2,4})?)?)?)(?:,? 20\d\d)?")
+_HEAD_SLOT_LEAD_RE = re.compile(r"(?: ?[,:-] ?| )(?:" + _SLOT_DATE + r"(?: ?[,:-] ?| ))?")
+_SLOT_WORD_ALIASES = frozenset({"surprise", "page", "carefree"})
+
+
+def _head_slot_areas(text: Any) -> tuple[str, ...]:
+    """The allowlisted area group in the fresh ask's head slot, or ()."""
+    lm = _load_map()
+    if lm.alias_re is None:
+        return ()
+    clause = _first_clause(_clean(text))
+    m = _FRAME_RE.match(clause)
+    if not m:
+        return ()
+    pos = _HEAD_SLOT_LEAD_RE.match(clause, _noun_group_end(clause, m.end()))
+    if not pos:
+        return ()
+    at = _AREA_PREFIX_RE.match(clause, pos.end()).end()
+    out: list[str] = []
+    while len(out) < MAX_AREAS:
+        a = lm.alias_re.match(clause, at)
+        if not a or clause.startswith("'s", a.end()) or a.group(0) in _SLOT_WORD_ALIASES:
+            break
+        key = lm.alias_to_key[a.group(0)]
+        if key not in out:
+            out.append(key)
+        sep = _LIST_SEP_RE.match(clause, a.end())
+        if not sep:
+            break
+        at = sep.end()
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class ParseResult:
     constraints: TravelConstraints | None
@@ -1258,6 +1302,8 @@ def parse_constraints(text: Any, *, today: date | None = None) -> ParseResult:
     """A fresh ask -> the frozen dataclass, or what is missing. Names, emails,
     phone numbers and loyalty/brand-account phrases have no field: DROPPED."""
     f = parse_fields(text, today=today)
+    if not f["areas"]:
+        f["areas"] = _head_slot_areas(text)       # the head rule's own area slot (D-051 r3)
     missing = []
     if f["stay"] is None:
         missing.append("dates")

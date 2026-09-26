@@ -389,3 +389,76 @@ class TestPersonStayPhrase:
     def test_the_phrase_is_linear(self, shape):
         assert _best_of_3(lambda: ts._PERSON_STAY_RE.search(shape)) < 0.05
         assert _best_of_3(lambda: ts.is_lodging_shaped(shape)) < 0.25
+
+
+# ── r3:c2-trigger#4 (SPLIT -> fix): a bare allowlisted area after the noun is parsed ──
+
+HEAD_SLOT_AREA_ROWS = [
+    # the r2 HEAD_NOUN_MUST_FIRE bare-area rows, and the finding's others
+    ("find hotels scottsdale oct 17-21", ("scottsdale",)),
+    ("find a hotel oct 17-21 scottsdale", ("scottsdale",)),
+    ("find hotels, oct 17-21, scottsdale", ("scottsdale",)),
+    ("find hotels 10/17-10/21 scottsdale", ("scottsdale",)),
+    ("find hotels mesa/gilbert oct 17-21", ("mesa", "gilbert")),
+    ("find hotels phx oct 17-21", ("phoenix",)),
+    ("find a hotel downtown phoenix oct 17-21", ("phoenix",)),
+    ("find hotels old town scottsdale oct 17-21", ("scottsdale",)),
+    ("find hotels - scottsdale, oct 17-21", ("scottsdale",)),
+    ("find hotels and airbnbs sedona oct 17-21", ("sedona",)),
+    ("Hey Cora, find hotels scottsdale oct 17-21?", ("scottsdale",)),
+]
+# not the head slot (a person-name risk, or no allowlisted area there): the honest
+# clarify stays, and a locative area elsewhere still wins
+HEAD_SLOT_NOT_AN_AREA = [
+    "find hotels for vegas oct 17-18", "find a hotel for charlotte oct 17-21",
+    "find hotels for austin oct 17-21", "find hotels surprise me oct 17-21",
+    "find hotels page 2 oct 17-21", "find hotels with a pool oct 17-21",
+    "find hotels oct 17-21 gilbert's place",
+]
+
+
+class TestHeadSlotArea:
+    @pytest.mark.parametrize("text,areas", HEAD_SLOT_AREA_ROWS)
+    def test_the_area_after_the_noun_is_searched(self, text, areas):
+        for v in (text, _wire(text)):
+            r = ts.route_turn(v, user_id=HARRISON, channel_id="D0HARRISON", channel_name="dm",
+                              today=TODAY)
+            assert r is not None and r.kind == "search", (v, r)
+            assert r.constraints.areas == areas, (v, r.constraints.areas)
+            assert r.reply != ts.CLARIFY_AREA_REPLY
+
+    @pytest.mark.parametrize("text", HEAD_SLOT_NOT_AN_AREA)
+    def test_precision_no_head_slot_area(self, text):
+        pr = ts.parse_constraints(text, today=TODAY)
+        assert pr.constraints is None and "area" in pr.missing, (text, pr)
+
+    def test_a_locative_area_elsewhere_still_wins(self):
+        c = ts.parse_constraints("find hotels scottsdale oct 17-21 in mesa",
+                                 today=TODAY).constraints
+        assert c is not None and c.areas == ("mesa",)
+
+    def test_a_follow_up_merge_never_reads_the_head_slot(self):
+        stored = ts.parse_constraints("find hotels in scottsdale oct 17-21",
+                                      today=TODAY).constraints
+        merged, changed, _m = ts.merge_followup(stored, "the hotels mesa had were full",
+                                                today=TODAY)
+        assert not changed and merged.areas == ("scottsdale",)
+
+    def test_through_harrisons_dm_the_bare_area_ask_posts_the_card(self, lane):
+        client = _slack_client()
+        _dm(client, "find hotels scottsdale oct 17-21", user=HARRISON)
+        _drain()
+        assert _card_call(client)["thread_ts"] == ASK_TS
+        assert "Scottsdale" in lane.calls[-1]["messages"][0]["content"]
+
+    @pytest.mark.parametrize("shape", [
+        " " * 40000, "find hotels" + " " * 40000, "find hotels " + "oct 1 " * 6000,
+        "find hotels " + ", " * 20000, "find hotels " + "10/1" * 10000,
+        "find hotels " + "mesa/" * 8000, "find hotels " + " - " * 13000,
+    ], ids=["spaces", "noun-spaces", "dates", "commas", "md", "mesa-slash", "dashes"])
+    def test_the_head_slot_is_linear(self, shape):
+        def run():
+            ts._HEAD_SLOT_LEAD_RE.match(shape, 11)
+            ts._head_slot_areas(shape)
+            ts.parse_constraints(shape, today=TODAY)
+        assert _best_of_3(run) < 0.05
