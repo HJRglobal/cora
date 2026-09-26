@@ -629,7 +629,7 @@ _BUSINESS_TAIL_RE = re.compile(
     r"|for (?:the |our |a |an )?(?:[a-z0-9&-]{1,20} )?(?:sponsorships?|partnerships?|pitch(?:es)?"
     r"|decks?|outreach|prospecting|distribution)"
     r"|(?:in|on|from) (?:our|the|my) (?:pipeline|prospect(?:s| list)?|lead list|target list"
-    r"|budget (?:sheet|doc)|sheets?|docs?|drive|inbox))(?![a-z0-9])"
+    r"|budget (?:sheet|doc)|sheets?|docs?|inbox)|in (?:our|the|my) drive)(?![a-z0-9])"
 )
 # "pull (up)" is a DATA verb ("pull hotel spend from quickbooks", "pull up airbnb payouts
 # for q3") -- it frames a lodging ask only when options-shaped or locative (D-051 r2
@@ -742,7 +742,6 @@ def _pull_ask(clause: str) -> bool:
 
 
 def _is_strict_ask(text: Any) -> bool:
-    cleaned = _clean(text)
     return _framed_ask(text, head_rule=True)
 
 
@@ -1199,13 +1198,21 @@ _NOUN_LED_RE = re.compile(r"^(?:(?:ok|okay|actually|so|and|or|maybe|now|hmm|also
 _PARTY_LIST_RE = re.compile(r"(?:^|, )(?:(?:about|around|roughly|maybe) |~ ?)?" + _NUM_RX + r" "
                             r"(?:people|persons|person|guests|adults|travell?ers|of us|ppl|pax)"
                             r"(?![a-z0-9])")
+_BUDGET_VERB = (r"(?:make it|keep it(?: at| to| around)?|try|budget(?: of| is| at| to| should be"
+                r"| needs to be| has to be| would be| can be| will be)?[,:]?"
+                r"|(?:change|switch|set|bump|drop|raise|lower|up) (?:the )?budget to)")
 _BUDGET_DIRECTIVE_RE = re.compile(
-    r"\b(?:make it|keep it(?: at| to| around)?|try|budget(?: of| is| at| to)?[,:]?"
-    r"|(?:change|switch|set|bump|drop|raise|lower|up) (?:the )?budget to|go with|how about"
-    r"|what about) " + _MONEY_RX + _PER_NIGHT_RX + r"\b")
+    r"\b(?:" + _BUDGET_VERB + r"|go with|how about|what about) " + _MONEY_RX + _PER_NIGHT_RX
+    + r"\b")
+# A copula right before a price DESCRIBES a posted option ("the 2nd one is $450/night",
+# "the first one's about $389", "it costs $329") -- never after a relative pronoun
+# ("something that's under $300 a night" asks for one), and "be" is a request ("can it
+# be under $300").
 _COPULA_BEFORE_RE = re.compile(
-    r"(?:^|[^a-z'])(?:is|was|are|were|'s|be|cost|costs|costing|runs?|ran|priced|says|said"
-    r"|shows?|showing|listed)(?: (?:only|just|about|around|like|roughly))? ?$")
+    r"(?:(?<![a-z'])(?<!that )(?<!which )(?<!who )(?:is|was|are|were)"
+    r"|(?<=[a-z])(?<!that)(?<!which)(?<!who)'s"
+    r"|(?<![a-z'])(?:cost|costs|costing|runs?|ran|priced|says|said|shows?|showing|listed))"
+    r"(?: (?:only|just|about|around|like|roughly))? ?$")
 _PARTY_WORD = r"(?:people|persons|person|guests|adults|travell?ers|of us|ppl|pax)"
 _PARTY_DIRECTIVE_RE = re.compile(
     r"\b(?:(?:for|but|now|we're|we are|there are|there'll be|there will be|it's|it is|it'll be"
@@ -2512,9 +2519,10 @@ _REFINE_FIELD_RE = re.compile(
     _WB + r"(?:(?:party|group) of \d{1,2}|(?:king|queen|two queens?|double queens?) beds?"
     r"|two queens|\d{1,2}[- ]?(?:bedrooms?|br|bdrm)|with a pool)" + _WE
 )
-# A LISTING FACT (what a posted option offers), never a request: "sleeps 6 people".
-_LISTING_FACT_RE = re.compile(r"\b(?:sleeps|fits|holds|accommodates|accomodates) (?:up to )?"
-                              + _NUM_RX + r"(?![a-z0-9])")
+# A LISTING FACT (what a posted option offers), never a request: "it sleeps 6 people";
+# after a relative pronoun it is a requirement ("a condo that sleeps 6").
+_LISTING_FACT_RE = re.compile(r"(?<!that )(?<!which )(?<!who )\b(?:sleeps|fits|holds"
+                              r"|accommodates|accomodates) (?:up to )?" + _NUM_RX + r"(?![a-z0-9])")
 # Any money mention (with its budget word), for the "described after a copula" test.
 _MONEY_MENTION_RE = re.compile(
     r"(?:\b(?:" + _BUDGET_CEIL_WORDS + r"|" + _BUDGET_FLOOR_WORDS + r"|" + _BUDGET_APPROX_WORDS
@@ -2527,8 +2535,7 @@ _DATES_ARE_RE = re.compile(
 # Money in DIRECTIVE shape (the gate's twin of _parse_budget(followup=True)).
 _REFINE_MONEY_RE = re.compile(
     r"(?:\b(?:" + _BUDGET_CEIL_WORDS + r"|" + _BUDGET_FLOOR_WORDS + r"|" + _BUDGET_APPROX_WORDS
-    + r"|budget(?: of| is| at| to)?|make it|keep it(?: at| to| around)?|try"
-    r"|(?:change|switch|set|bump|drop|raise|lower|up) (?:the )?budget to)[,:]? |~ ?)\$? ?\d"
+    + r"|" + _BUDGET_VERB + r") |~ ?)\$? ?\d"
     r"|" + _MONEY_RX + r" ?(?:-|to) ?" + _MONEY_RX + _PER_NIGHT_RX + r"\b"
 )
 # A clause boundary: ; ! ? a comma or a period before a space (never inside "$1,200" or
@@ -2682,7 +2689,8 @@ def _refinement_clauses(text: Any) -> tuple[list[str], bool]:
     for clause in clauses:
         c = clause.lower()
         if ((_COMMENT_RE.search(c) or _CARD_REF_RE.search(c) or _describes_a_listing(c))
-                and not _refine_verb(c, sole=sole)):
+                and not _refine_verb(c, sole=sole)
+                and not _frame_governs_lodging_noun(clause)):   # "find a hotel that looks ..."
             continue
         kept.append(clause)
     return kept, sole

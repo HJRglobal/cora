@@ -155,6 +155,7 @@ GROUP_MUST_FIRE = [
     "find hotels for the ufl fight in vegas oct 17-18",
     "find hotels in vegas for the sponsorship team oct 17-18",
     "find hotels to stay in near the venue in mesa oct 17-21",
+    "find hotels on the drive to sedona oct 17-21",
 ]
 # the budget words the head rule accepts ARE the parser's (they cannot drift)
 BUDGET_PARSE_ROWS = [
@@ -495,6 +496,7 @@ CARD_COMMENT_MUST_HELP = [
     "thanks, gilbert",                                    # a person named Gilbert
     "Hotel Valley Ho is $329/night", "Hotel Valley Ho sleeps 6 people",
     "the 2nd one has two queens", "the 3rd one is for 6 people",
+    "the 2nd one's $450/night", "it sleeps 6 people",
 ]
 # A refinement verb / shape still re-runs on the merged fields.
 DIRECTIVE_MUST_RERUN = [
@@ -524,6 +526,13 @@ DIRECTIVE_MUST_RERUN = [
      {"areas": ("mesa",), "party_size": 6, "budget_min": 250, "budget_max": 250}),
     ("hotels in mesa oct 17-21 for 4 people $250/night",
      {"areas": ("mesa",), "party_size": 4, "budget_min": 250, "budget_max": 250}),
+    # a request phrased with "be" / a relative clause is not a description
+    ("can it be under $300 a night?", {"budget_min": None, "budget_max": 300}),
+    ("something that's under $300 a night", {"budget_min": None, "budget_max": 300}),
+    ("anything that is under $300 a night?", {"budget_min": None, "budget_max": 300}),
+    ("the budget should be $300 a night", {"budget_min": 300, "budget_max": 300}),
+    ("find a condo that sleeps 6 in scottsdale oct 20-22", {"check_in": date(2026, 10, 20)}),
+    ("find a hotel that looks modern in mesa oct 20-22", {"areas": ("mesa",)}),
 ]
 # A comment clause beside a refinement never lends it a field.
 MIXED_ROWS = [
