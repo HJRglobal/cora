@@ -246,3 +246,98 @@ class TestPersonStayCoordinatedGroup:
         assert _best_of_3(lambda: ts.is_lodging_shaped(shape)) < 0.25
 
 
+# ── r4:c2-trigger#2: an idle user's plainly-lodging DM escapes the scheduler keyword ──
+
+ESCAPE_ROWS = [
+    # the finding's seven rows: lodging asks the r3 head rule declines, with 'availability'
+    "find a hotel and a rental car with availability in scottsdale oct 17-21",
+    "need a hotel and rental car, check availability oct 17-21 in scottsdale",
+    "find hotel room blocks with availability in scottsdale oct 17-21",
+    "can you find a hotel room block with availability in scottsdale oct 17-21 for 12 people",
+    "find hotels and flights with availability for oct 17-21 in scottsdale",
+    "find hotels for the partnership meeting with availability in scottsdale oct 17-21",
+    "find hotels for the ufl sponsorship summit with availability in vegas oct 17-18",
+]
+SCHEDULER_ROWS = [
+    "submit availability", "i want to submit availability", "my availability this week",
+    "can i update my availability", "what is my schedule", "my shifts", "when do i work",
+    "check availability for oct 20-22 instead",      # outside a lane thread (r1 pin)
+    # lodging-shaped but NOT a framed ask: the escape is narrow (verdict-1's pre-Code-16
+    # class; the scheduler keeps them exactly as before)
+    "check hotel availability in scottsdale oct 17-21",
+    "does the hyatt in scottsdale have availability oct 17-21?",
+]
+
+
+def _shift_calls(monkeypatch) -> list:
+    handled: list = []
+    monkeypatch.setattr(app_module.osn_shift_handler, "handle_dm",
+                        lambda **k: handled.append(k))
+    return handled
+
+
+def _dm_ordinary(text, *, user, ts_="1790000000.000100"):
+    seen: list = []
+    client = _slack_client()
+    client.chat_postMessage.side_effect = None
+    client.chat_postMessage.return_value = {"ok": True}
+    with _model_path(seen):
+        _dm(client, text, user=user, ts_=ts_)
+    return seen, client
+
+
+class TestIdleLodgingDmEscapesTheSchedulerKeyword:
+    @pytest.mark.parametrize("text", ESCAPE_ROWS)
+    @pytest.mark.parametrize("who", ["harrison", "tessa"])
+    def test_an_idle_users_lodging_dm_takes_the_ordinary_path(self, lane, monkeypatch,
+                                                             text, who):
+        user = HARRISON if who == "harrison" else _tessa()
+        assert app_module._dm_is_shift_message(user, text)       # the keyword WOULD claim it
+        assert not ts.looks_like_travel_ask(text, user_id=user, channel_id="D0TRAVELDM",
+                                            channel_type="im")   # the lane declines it
+        handled = _shift_calls(monkeypatch)
+        fired: list = []
+        monkeypatch.setattr(ts, "execute_route", lambda *a, **k: fired.append(1))
+        seen, _client = _dm_ordinary(text, user=user)
+        assert handled == []                                     # never the scheduler
+        assert fired == [] and lane.calls == []                  # nor the lane (nothing billed)
+        assert seen and all(kw.get("web_tools") is False for kw in seen)   # B1 withholds
+
+    @pytest.mark.parametrize("text", ESCAPE_ROWS[:3])
+    def test_a_mid_flow_user_stays_with_the_scheduler(self, lane, monkeypatch, text):
+        handled = _shift_calls(monkeypatch)
+        monkeypatch.setattr(app_module.osn_shift_handler, "get_dm_state",
+                            lambda uid: {"step": "collecting_days"})
+        _dm(_slack_client(), text, user=HARRISON)
+        assert len(handled) == 1
+
+    @pytest.mark.parametrize("text", SCHEDULER_ROWS)
+    def test_scheduler_phrases_still_reach_the_scheduler(self, lane, monkeypatch, text):
+        handled = _shift_calls(monkeypatch)
+        _dm(_slack_client(), text, user=HARRISON)
+        assert len(handled) == 1, text
+
+    def test_a_mid_flow_reply_still_reaches_the_scheduler(self, lane, monkeypatch):
+        handled = _shift_calls(monkeypatch)
+        monkeypatch.setattr(app_module.osn_shift_handler, "get_dm_state",
+                            lambda uid: {"step": "collecting_days"})
+        _dm(_slack_client(), "i'm available monday", user=HARRISON)
+        assert len(handled) == 1
+
+    def test_the_strict_ask_still_owns_the_lane(self, lane, monkeypatch):
+        """Lane ownership is unchanged: the strict ask with 'availability' runs the lane."""
+        handled = _shift_calls(monkeypatch)
+        client = _slack_client()
+        _dm(client, "find hotels with availability in scottsdale oct 17-21", user=HARRISON)
+        _drain()
+        assert handled == [] and len(lane.calls) == 1
+
+    def test_an_unreadable_predicate_leaves_the_scheduler_its_turn(self, lane, monkeypatch):
+        handled = _shift_calls(monkeypatch)
+
+        def boom(_t):
+            raise RuntimeError("predicate failed")
+
+        monkeypatch.setattr(ts, "_frame_governs_lodging_noun", boom)
+        _dm(_slack_client(), ESCAPE_ROWS[2], user=HARRISON)
+        assert len(handled) == 1

@@ -1250,12 +1250,24 @@ def _travel_dm_lane_thread(event: dict) -> bool:
 
 
 def _travel_ask_escapes_shift_keywords(user_id: str, travel_dm_ask: bool,
-                                       lane_thread_probe=None) -> bool:
+                                       lane_thread_probe=None, text: str = "") -> bool:
     """True only for a strict travel ask -- or a turn in a registered lane thread
     (D-051 r1 c2-trigger#5: "check availability for oct 20-22 instead" is the lane's
     follow-up, B3) -- from a user who is NOT mid-flow in the OSN shift scheduler
-    (mid-flow users always stay with the scheduler)."""
-    if not travel_dm_ask:
+    (mid-flow users always stay with the scheduler). D-051 r4 c2-trigger#2: ALSO a
+    DM that plainly asks for lodging (B1's frame leg on *text*: an ask-for-options
+    frame governs a strict lodging noun) -- the lane declines a combined / room-block
+    / business-event ask, but it is plainly not a shift message, so it takes the
+    ordinary path (web withheld by B1) instead of the bare-"availability" keyword
+    starting the availability flow. Lane ownership stays on the strict predicate; a
+    failing frame check reads as NO (the scheduler keeps its turn)."""
+    plainly_lodging = False
+    if not travel_dm_ask and text:
+        try:
+            plainly_lodging = bool(travel_shortlist._frame_governs_lodging_noun(text))
+        except Exception:  # noqa: BLE001 -- unknown: leave the scheduler its turn
+            plainly_lodging = False
+    if not travel_dm_ask and not plainly_lodging:
         try:
             if lane_thread_probe is None or not lane_thread_probe():
                 return False
@@ -4016,11 +4028,12 @@ def handle_message_event(event: dict, client) -> None:
             # take a travel-lane ask ("hotels with availability Oct 17-21"); a user
             # mid-flow in the scheduler stays there regardless.
             # A reply in a lane thread escapes too (D-051 r1 c2-trigger#5); probed only
-            # when the keyword leg would claim the turn (the store read is lazy).
+            # when the keyword leg would claim the turn (the store read is lazy). So
+            # does a plainly-lodging DM the lane declines (D-051 r4 c2-trigger#2).
             if _dm_is_shift_message(user_id, text):
                 if not _travel_ask_escapes_shift_keywords(
                         user_id, _travel_dm_ask,
-                        lane_thread_probe=lambda: _travel_dm_lane_thread(event)):
+                        lane_thread_probe=lambda: _travel_dm_lane_thread(event), text=text):
                     log.info("osn_shift_handler: DM from user=%s text=%r", user_id, text[:80])
                     osn_shift_handler.handle_dm(text=text, slack_user_id=user_id, client=client)
                     return
