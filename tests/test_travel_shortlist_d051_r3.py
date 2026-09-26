@@ -670,3 +670,99 @@ class TestLaneThreadGateRound3:
             ts._is_refinement(shape)
             ts.merge_followup(stored, shape, today=TODAY)
         assert _best_of_3(run) < 0.25
+
+
+# ── r3:integration#1 + r3:c2-egress#0: consecutive same-author messages are ONE turn ──
+
+from test_travel_shortlist_d051_r2 import (  # noqa: E402,F401 -- `real_history` is a fixture
+    _cora, _dm_client, _person, _web_tools_through_the_dm, real_history,
+)
+
+LATER_DM = "google restaurants near old town scottsdale that weekend"
+LATER_THREAD = "google the best steakhouses in scottsdale"
+
+
+def _thread_web_tools(client, text, *, user, root, channel="C0F3ESALES", name="f3e-sales"):
+    seen: list = []
+    with _model_path(seen):
+        _mention(client, _say_no_placeholder(), text, user=user, ts_="1790000000.000990",
+                 thread_ts=root, channel=channel, name=name)
+    assert seen, "the ordinary pipeline never reached the model"
+    return [kw.get("web_tools") for kw in seen]
+
+
+class TestConsecutivePersonMessagesAreOneTurn:
+    def test_the_split_dm_ask_withholds_a_later_web_turn(self, lane, real_history):
+        """Tessa's two quick messages merge into ONE user turn the model sees; the weak
+        noun ('suites') and its cue ('oct 17-21') were judged apart."""
+        assert web_guard.evaluate(LATER_DM, "HJRG", kb_meta={}, model=MODEL_SONNET).attach
+        assert not ts.is_lodging_shaped(LATER_DM)
+        client = _dm_client([
+            _cora("1790000000.000600", "Got it - noted the dates."),
+            _cora("1790000000.000500", "Happy to help. Which city?"),
+            _person("1790000000.000400", _tessa(), "oct 17-21 for Mike Jones and Sarah Lee"),
+            _person("1790000000.000300", _tessa(), "we need two suites"),
+        ])
+        hist = app_module._fetch_dm_history(client, "D0TESSA", "1790000000.000990")
+        assert hist[0] == {"role": "user", "content": "we need two suites\noct 17-21 for "
+                                                        "Mike Jones and Sarah Lee"}
+        assert app_module._prior_turns_by_author(hist)[0] == [hist[0]["content"]]
+        assert _web_tools_through_the_dm(client, LATER_DM, user=_tessa()) == [False]
+        assert any(r.get("reason") == "gate_skipped:travel_lane" for r in _web_rows())
+
+    @pytest.mark.parametrize("first,second", [
+        ("Jordan Riverstone and his manager land Friday - can we get them a casita?",
+         "yes, Oct 17-21"),
+        ("Mike Jones wants a suite, phone 602-555-0142", "ok -- somewhere in Scottsdale"),
+        ("put Mike Jones on our Honors", "482915736"),
+        ("can we get Jordan a room", "Oct 17-21"),
+        ("Jordan wants a rental", "in scottsdale"),
+    ])
+    def test_the_split_channel_thread_ask_withholds_a_later_web_turn(self, lane, real_history,
+                                                                      first, second):
+        """Two people's consecutive thread messages merge into one user turn."""
+        assert web_guard.evaluate(LATER_THREAD, "F3E", kb_meta={}, model=MODEL_SONNET).attach
+        assert not ts.is_lodging_shaped(first) and not ts.is_lodging_shaped(second)
+        root = "1790000000.000200"
+        client = _dm_client([
+            _person("1790000000.000400", _tessa(), second),
+            _person(root, "U0ALEX", first),
+        ])
+        assert _thread_web_tools(client, LATER_THREAD, user=_tessa(), root=root) == [False]
+
+    def test_precision_an_interleaved_cora_reply_keeps_the_messages_apart(self, lane,
+                                                                           real_history):
+        """The model sees person / Cora / person as three turns -- no merged lodging
+        turn, so an unrelated web ask attaches (unchanged from round 2)."""
+        client = _dm_client([
+            _person("1790000000.000500", _tessa(), "nice, thanks"),
+            _cora("1790000000.000450", "Full suite green: 19,342 passed."),
+            _person("1790000000.000400", _tessa(), "what did the test run say?"),
+        ])
+        assert _web_tools_through_the_dm(client, "google the Deposco API changelog",
+                                         user=_tessa()) == [True]
+
+    def test_precision_two_plain_person_messages_do_not_withhold(self, lane, real_history):
+        client = _dm_client([
+            _person("1790000000.000500", _tessa(), "and the Deposco sandbox too"),
+            _person("1790000000.000400", _tessa(), "what changed in the API last week?"),
+        ])
+        assert _web_tools_through_the_dm(client, "google the Deposco API changelog",
+                                         user=_tessa()) == [True]
+
+    def test_the_record_groups_runs_exactly_like_the_merge(self, real_history):
+        client = _dm_client([
+            _cora("1790000000.000700", "c2"), _cora("1790000000.000600", "c1"),
+            _person("1790000000.000500", "U1", "p3"), _person("1790000000.000400", "U1", "p2"),
+            _cora("1790000000.000300", "c0"), _person("1790000000.000200", "U1", "p1"),
+        ])
+        hist = app_module._fetch_dm_history(client, "D0X", "1790000000.000990")
+        person, cora = app_module._prior_turns_by_author(hist)
+        assert person == ["p1", "p2\np3"] and cora == ["c0", "c1\nc2"]
+        assert [t["content"] for t in hist if t["role"] == "user"] == ["p1", "p2\np3"]
+
+    def test_a_leading_cora_run_stays_coras(self, real_history):
+        client = _dm_client([_person("1790000000.000500", "U1", "nice"),
+                             _cora("1790000000.000400", "a"), _cora("1790000000.000300", "b")])
+        hist = app_module._fetch_dm_history(client, "D0X", "1790000000.000990")
+        assert app_module._prior_turns_by_author(hist) == (["nice"], ["b\na"])

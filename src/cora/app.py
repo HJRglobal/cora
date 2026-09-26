@@ -284,11 +284,24 @@ def _prior_turns_by_author(prior_messages) -> tuple[list[str], list[str]]:
     builders' pre-merge record when the list carries it; otherwise splits a folded
     turn on the fold's own labels (Cora's part, then the reply) -- a list that lost
     the record (a copy, a hand-built history) still never scans Cora's opening as
-    the person's. Never raises on a malformed row (skipped)."""
+    the person's. Never raises on a malformed row (skipped).
+
+    CONSECUTIVE same-author messages are ONE text, joined with a newline exactly as
+    the builders' same-role merge joins them (D-051 r3 integration#1 / c2-egress#0):
+    the model sees two quick messages -- "we need two suites" then "oct 17-21 for Mike
+    Jones" -- as one turn, so the lodging noun and its cue are judged together. Only
+    the fold (Cora's opening re-roled as the person's) is undone."""
     authored = getattr(prior_messages, "authored", None)
     if authored is not None:
-        return ([c for r, c in authored if r == "user" and isinstance(c, str)],
-                [c for r, c in authored if r == "assistant" and isinstance(c, str)])
+        runs: list[list[str]] = []                  # [role, text], same-role runs merged
+        for r, c in authored:
+            if r not in ("user", "assistant") or not isinstance(c, str):
+                continue
+            if runs and runs[-1][0] == r:
+                runs[-1][1] += "\n" + c
+            else:
+                runs.append([r, c])
+        return ([c for r, c in runs if r == "user"], [c for r, c in runs if r == "assistant"])
     person: list[str] = []
     cora: list[str] = []
     for m in prior_messages or ():
