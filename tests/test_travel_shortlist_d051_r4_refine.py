@@ -245,3 +245,78 @@ class TestAListedFieldIsReadNeverDropped:
             ts.merge_followup(stored, shape, today=TODAY)
         assert _best_of_3(regexes) < 0.1
         assert _best_of_3(predicates) < 0.1
+
+
+# ── r4:c2-trigger#4: the adjudicated directives in copula / contraction / postposed form ──
+
+MAX250, MAX300 = {"budget_min": None, "budget_max": 250}, {"budget_min": None, "budget_max": 300}
+DIRECTIVE_FORMS_MUST_RERUN = [
+    ("our max is $250 a night", MAX250), ("the max is $250 a night", MAX250),
+    ("budget's $250 a night", B250), ("our budget's 250 a night", B250),
+    ("$250/night max", MAX250), ("250 a night max", MAX250),
+    ("make that 6 people", P6), ("actually it's for 6 people", P6),
+    ("oh it's for 6 people, not 4", P6),
+    # neighbours
+    ("$250/night maximum", MAX250), ("$250 a night tops", MAX250),
+    ("$250/night or less", MAX250), ("250 a night at most", MAX250),
+    ("the budget is under $300 a night", MAX300), ("the budget's under $300 a night", MAX300),
+    ("our limit is $250 a night", MAX250), ("the cap is $250/night", MAX250),
+    ("max would be $250 a night", MAX250), ("the max's $250 a night", MAX250),
+    ("our budget was $250 a night", B250), ("budget is $250/night max", MAX250),
+    ("make that for 6 people", P6), ("it's for 6 people", P6), ("it is for 6 people", P6),
+    # the r3 contrast rows still re-run
+    ("our budget is $250 a night", B250), ("top budget is $250/night", B250),
+    ("it's actually 6 people", P6), ("change it to 6 people", P6),
+]
+# A card-reference / description form stays a comment.
+DESCRIPTION_FORMS_MUST_HELP = [
+    "the second one is $250 a night", "the first one is for 6 people",
+    "the 2nd one's $250/night max", "the first one is $250/night max",
+    "that one is $250 a night or less", "it's $250 a night max", "the price is $250 a night",
+    "the rate is $250 a night", "the max occupancy is 6 people",
+    "the hotel in mesa is $250/night max", "Hotel Valley Ho is $250/night max",
+    "the second one is under $300 a night", "the airbnb is for 6 people",
+    "that one's for 6 people", "the hotel's max is $250 a night", "our max is $250",
+    "max is 6 people", "make that oct 20-22",
+]
+
+
+class TestTheDirectiveFormsReRun:
+    @pytest.mark.parametrize("stored_ask", [STORED_S2, STORED_S3], ids=["s2", "s3"])
+    @pytest.mark.parametrize("text,expect", DIRECTIVE_FORMS_MUST_RERUN)
+    def test_a_directive_in_copula_or_postposed_form_re_runs(self, route, text, expect,
+                                                              stored_ask):
+        _assert_search(route(text, stored_ask), text, expect, stored_ask)
+
+    @pytest.mark.parametrize("stored_ask", [STORED_S2, STORED_S3], ids=["s2", "s3"])
+    @pytest.mark.parametrize("text", DESCRIPTION_FORMS_MUST_HELP)
+    def test_a_description_of_a_posted_option_stays_a_comment(self, route, text, stored_ask):
+        _assert_help(route(text, stored_ask), text)
+
+    def test_the_fresh_parser_is_unchanged(self):
+        f = ts.parse_fields("hotels in mesa oct 17-21 $250/night max", today=TODAY)
+        assert (f["budget_min"], f["budget_max"]) == (250, 250)
+        f = ts.parse_fields("hotels in mesa oct 17-21, the max is $250 a night", today=TODAY)
+        assert (f["budget_min"], f["budget_max"]) == (250, 250)
+
+    @pytest.mark.parametrize("shape", [
+        " " * 40000, "max is $" * 5000, "budget's $2" * 3600, "it's for " * 4400,
+        "$250/night max " * 2600, "make that " * 4000, "the max is " * 3600,
+        "budget " * 5700, "max's " * 6600, "$250/night " * 3600,
+    ], ids=["spaces", "max-is", "budget-s", "its-for", "night-max", "make-that", "the-max-is",
+            "budget", "max-s", "per-night"])
+    def test_the_directive_forms_are_linear(self, shape):
+        stored = ts.parse_constraints(STORED_S3, today=TODAY).constraints
+
+        def regexes():
+            for rx in (ts._BUDGET_CEIL_SUBJ_RE, ts._BUDGET_CEIL_POST_RE, ts._BUDGET_DIRECTIVE_RE,
+                       ts._REFINE_MONEY_RE, ts._PARTY_DIRECTIVE_RE, ts._MONEY_MENTION_RE):
+                rx.search(shape)
+            for i in range(0, 40000, 997):
+                ts._COPULA_BEFORE_RE.search(shape[max(0, i - 24):i])
+
+        def predicates():
+            ts._is_refinement(shape)
+            ts.merge_followup(stored, shape, today=TODAY)
+        assert _best_of_3(regexes) < 0.1
+        assert _best_of_3(predicates) < 0.1

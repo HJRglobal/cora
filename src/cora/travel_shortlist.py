@@ -1202,25 +1202,44 @@ _NOUN_LED_RE = re.compile(r"^(?:(?:ok|okay|actually|so|and|or|maybe|now|hmm|also
 _PARTY_LIST_RE = re.compile(r"(?:^|, )(?:(?:about|around|roughly|maybe) |~ ?)?" + _NUM_RX + r" "
                             r"(?:people|persons|person|guests|adults|travell?ers|of us|ppl|pax)"
                             r"(?![a-z0-9])")
-_BUDGET_VERB = (r"(?:make it|keep it(?: at| to| around)?|try|budget(?: of| is| at| to| should be"
-                r"| needs to be| has to be| would be| can be| will be)?[,:]?"
+_BUDGET_VERB = (r"(?:make it|keep it(?: at| to| around)?|try|budget(?:'s| of| is| was| at| to"
+                r"| should be| needs to be| has to be| would be| can be| will be)?[,:]?"
                 r"|(?:change|switch|set|bump|drop|raise|lower|up) (?:the )?budget to)")
 _BUDGET_DIRECTIVE_RE = re.compile(
     r"\b(?:" + _BUDGET_VERB + r"|go with|how about|what about) " + _MONEY_RX + _PER_NIGHT_RX
     + r"\b")
+# D-051 r4 (c2-trigger#4, adjudicated): the ceiling directives in copula and postposed
+# form -- "our max is $250 a night", "the limit's $250/night", "$250/night max", "250 a
+# night tops / or less" -- read as the ceiling in a lane-thread follow-up (a fresh ask
+# keeps its own grammar). A copula whose SUBJECT is a budget word is a directive, never a
+# description of a posted option (_COPULA_BEFORE_RE below).
+_BUDGET_SUBJ_COPULA = r"(?:'s| is| was| would be| should be| will be| of)"
+_BUDGET_CEIL_SUBJ_RE = re.compile(r"\b(?:max|maximum|limit|cap|ceiling)" + _BUDGET_SUBJ_COPULA
+                                  + r"?[,:]? " + _MONEY_RX + _PER_NIGHT_RX + r"\b")
+_BUDGET_CEIL_POST = r",? (?:max|maximum|tops|or less|or under|at most|at the most)(?![a-z0-9])"
+_BUDGET_CEIL_POST_RE = re.compile(_MONEY_RX + _PER_NIGHT_RX + _BUDGET_CEIL_POST)
 # A copula right before a price DESCRIBES a posted option ("the 2nd one is $450/night",
 # "the first one's about $389", "it costs $329") -- never after a relative pronoun
-# ("something that's under $300 a night" asks for one), and "be" is a request ("can it
-# be under $300").
+# ("something that's under $300 a night" asks for one), never after a budget word ("our
+# max is $250 a night", "the budget's under $300"; D-051 r4) unless that word is itself
+# possessed ("the hotel's max is $250" describes the hotel), and "be" is a request ("can
+# it be under $300").
+_BUDGET_SUBJ_WORDS = ("budget", "max", "maximum", "limit", "cap", "ceiling")
+_NOT_BUDGET_SUBJ = "".join(r"(?<!(?<!'s )\b" + w + r")" for w in _BUDGET_SUBJ_WORDS)
+_NOT_BUDGET_SUBJ_SP = "".join(r"(?<!(?<!'s )\b" + w + r" )" for w in _BUDGET_SUBJ_WORDS)
 _COPULA_BEFORE_RE = re.compile(
-    r"(?:(?<![a-z'])(?<!that )(?<!which )(?<!who )(?:is|was|are|were)"
-    r"|(?<=[a-z])(?<!that)(?<!which)(?<!who)'s"
+    r"(?:(?<![a-z'])(?<!that )(?<!which )(?<!who )" + _NOT_BUDGET_SUBJ_SP + r"(?:is|was|are|were)"
+    r"|(?<=[a-z])(?<!that)(?<!which)(?<!who)" + _NOT_BUDGET_SUBJ + r"'s"
     r"|(?<![a-z'])(?:cost|costs|costing|runs?|ran|priced|says|said|shows?|showing|listed))"
     r"(?: (?:only|just|about|around|like|roughly))? ?$")
 _PARTY_WORD = r"(?:people|persons|person|guests|adults|travell?ers|of us|ppl|pax)"
+# ...and "make that N people" / "it's (actually) for N people" are party directives
+# (D-051 r4); "the first one is for 6 people" stays a description (the "for" follows a
+# copula).
 _PARTY_DIRECTIVE_RE = re.compile(
-    r"\b(?:(?:for|but|now|we're|we are|there are|there'll be|there will be|it's|it is|it'll be"
-    r"|make it(?: for)?|(?:change|bump|up) (?:it|the party|the group) to)"
+    r"\b(?:(?:for|but|now|we're|we are|there are|there'll be|there will be"
+    r"|(?:it's|it is|it'll be)(?: (?:now|actually|just))?(?: for)?"
+    r"|make (?:it|that)(?: for)?|(?:change|bump|up) (?:it|the party|the group) to)"
     r"(?: now| actually| just)?(?: about| around| roughly| maybe| like)? " + _NUM_RX
     + r" " + _PARTY_WORD + r"|" + _NUM_RX + r" " + _PARTY_WORD
     + r" (?:now|instead|total|in total|this time))(?![a-z0-9])")
@@ -1261,7 +1280,8 @@ def _parse_budget(norm: str, *, mode: str = "fresh") -> tuple[int | None, int | 
         lo, hi = sorted((_money(m.group(1)), _money(m.group(2))))
     else:
         lo = hi = None
-        m = first(_BUDGET_CEIL_RE)
+        m = first(_BUDGET_CEIL_RE) or (None if mode == "fresh" else (         # D-051 r4
+            first(_BUDGET_CEIL_SUBJ_RE) or first(_BUDGET_CEIL_POST_RE)))
         if m:
             hi = _money(m.group(1))
         else:
@@ -2653,7 +2673,9 @@ _DATES_ARE_RE = re.compile(
 _REFINE_MONEY_RE = re.compile(
     r"(?:\b(?:" + _BUDGET_CEIL_WORDS + r"|" + _BUDGET_FLOOR_WORDS + r"|" + _BUDGET_APPROX_WORDS
     + r"|" + _BUDGET_VERB + r") |~ ?)\$? ?\d"
+    r"|\b(?:max|maximum|limit|cap|ceiling)" + _BUDGET_SUBJ_COPULA + r"?[,:]? \$? ?\d"   # D-051 r4
     r"|" + _MONEY_RX + r" ?(?:-|to) ?" + _MONEY_RX + _PER_NIGHT_RX + r"\b"
+    r"|" + _MONEY_RX + _PER_NIGHT_RX + _BUDGET_CEIL_POST
 )
 # A clause boundary: ; ! ? a comma or a period before a space (never inside "$1,200" or
 # "st. louis"). The delimiter is captured so a clause keeps its question mark.
