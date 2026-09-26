@@ -508,15 +508,17 @@ def _weak_with_cue(t: str) -> bool:
 
 def is_lodging_shaped(text: Any) -> bool:
     """B1's loose predicate: does this turn mention lodging at all? STRONG term, or
-    WEAK noun + cue, on either view -- or the STRICT predicate itself, so every ask
-    the lane would take is lodging-shaped by construction (strict is a subset of
-    loose; pinned over the MUST_FIRE asks in Slack wire form)."""
+    WEAK noun + cue, on either view -- or a frame governing a strict lodging noun
+    (the strict predicate WITHOUT the lane's head-noun rule, D-051 r3 c2-egress#2),
+    so every ask the lane would take is lodging-shaped by construction (strict is a
+    subset of loose; pinned over the MUST_FIRE asks in Slack wire form) and none of
+    B1's recall rides on the lane's precision rule."""
     if not text:
         return False
     for view in _loose_views_cased(text):
         if view and (_strong_view(view) or _weak_with_cue(view.lower())):
             return True
-    return _is_strict_ask(text)
+    return _frame_governs_lodging_noun(text)
 
 
 # STRICT nouns: suite / resort / rental never trigger the lane alone (B5).
@@ -725,12 +727,30 @@ def _pull_ask(clause: str) -> bool:
 
 def _is_strict_ask(text: Any) -> bool:
     cleaned = _clean(text)
+    return _framed_ask(text, head_rule=True)
+
+
+def _frame_governs_lodging_noun(text: Any) -> bool:
+    """B1's frame leg (D-051 r3 c2-egress#2): an ask-for-options frame governing a
+    strict lodging noun, bails applied -- WITHOUT the lane's head-noun rule. That rule
+    is the lane's PRECISION (does this ask belong to the lane?); B1 is recall-biased,
+    so "search for inns online for <guests>" (the one strict noun the loose tiers read
+    as WEAK) withholds web even though the lane declines it. Strict is a subset of
+    this by construction."""
+    return _framed_ask(text, head_rule=False)
+
+
+def _framed_ask(text: Any, *, head_rule: bool) -> bool:
+    cleaned = _clean(text)
     clause = _first_clause(cleaned)
     if not clause:
         return False
     m = _FRAME_RE.match(clause)
-    if not ((m and _head_noun_ends(clause, m.end())) or _pull_ask(clause)
-            or _PLACES_RE.match(clause) or _NOUN_OPTIONS_RE.match(clause)):
+    if head_rule:
+        framed = (m and _head_noun_ends(clause, m.end())) or _pull_ask(clause)
+    else:
+        framed = m or _PULL_RE.match(clause)
+    if not (framed or _PLACES_RE.match(clause) or _NOUN_OPTIONS_RE.match(clause)):
         return False
     if _BAIL_RE.search(clause):
         return False

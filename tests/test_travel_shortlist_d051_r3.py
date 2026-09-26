@@ -18,10 +18,12 @@ import pytest
 
 import cora.app as app_module
 from cora import travel_shortlist as ts
+from cora import web_guard
+from cora.model_router import MODEL_SONNET
 from test_travel_shortlist import NOW, _fx, _msg, _slack_client
 from test_travel_shortlist_wiring import (  # noqa: F401 -- `lane` is a fixture
-    ASK_TS, TRAVEL_CHANNEL, _card_call, _dm, _drain, _mention, _model_path,
-    _say_no_placeholder, _tessa, lane,
+    ASK_TS, TRAVEL_CHANNEL, _card_call, _dm, _drain, _drive_dispatch, _mention, _model_path,
+    _say_no_placeholder, _tessa, _web_rows, lane,
 )
 
 HARRISON = "U0B2RM2JYJ1"
@@ -269,3 +271,60 @@ class TestNounGroupHeadRule:
             ts.looks_like_travel_ask(shape, user_id=HARRISON, channel_id="D0H", channel_type="im")
             ts.is_lodging_shaped(shape)
         assert _best_of_3(run) < 0.05
+
+
+# ── r3:c2-egress#2 (SPLIT -> fix): B1's recall never rides on the lane's head rule ──
+
+# A frame-governed lodging noun the head rule declines (the lane's PRECISION rule) still
+# withholds web on the normal path -- 'inn' is the one strict noun the loose tiers read
+# as WEAK, so these reached a web-enabled turn with the guest names in the message.
+E2_MUST_WITHHOLD = [
+    "search for inns online for Mike Jones and Sarah Lee",
+    "search for inns via google for Mike Jones",
+    "search for an inn online for Mike Jones, loyalty is on file",
+    "search for some inns online for Jordan Riverstone and his wife",
+    "find inns and restaurants online for Mike Jones",
+    "find inn/airbnb costs for Mike Jones",
+    "find inns to partner with online for Mike Jones",
+    "find inns in our pipeline for Mike Jones",
+]
+
+
+class TestLooseRecallIsIndependentOfTheHeadRule:
+    @pytest.mark.parametrize("text", E2_MUST_WITHHOLD)
+    def test_withholds_in_plain_and_wire_form(self, text):
+        assert not ts._is_strict_ask(text), text             # the lane declines it...
+        assert ts.is_lodging_shaped(text), text              # ...B1 still withholds
+        assert ts.is_lodging_shaped(_wire(text)), text
+
+    @pytest.mark.parametrize("text", GROUP_MUST_NOT_FIRE + E2_MUST_WITHHOLD)
+    def test_every_head_rule_reject_with_a_lodging_noun_withholds(self, text):
+        assert ts.is_lodging_shaped(text), text
+
+    @pytest.mark.parametrize("text", [
+        "search for inns online for Mike Jones and Sarah Lee",
+        "search for inns via google for Mike Jones",
+    ])
+    def test_the_web_ask_is_withheld_on_the_real_dispatch(self, lane, text):
+        # web_guard WOULD attach (explicit intent) -- only the travel withhold stops it
+        assert web_guard.evaluate(text, "HJRG", kb_meta={}, model=MODEL_SONNET).attach
+        seen = _drive_dispatch(text, user=_tessa(), channel_id="D0TESSA", channel_name="dm",
+                               entity="HJRG")
+        assert seen and all(kw.get("web_tools") is False for kw in seen)
+        assert any(r.get("reason") == "gate_skipped:travel_lane" for r in _web_rows())
+
+    @pytest.mark.parametrize("text", [
+        "The Inn at the Biltmore account ordered 12 cases", "what's our last resort",
+        "google the Deposco API changelog", "find the inn receipt from last month",
+        "search online for good restaurants near there that weekend",
+    ])
+    def test_precision_rows_stay_clear(self, text):
+        assert not ts.is_lodging_shaped(text), text
+
+    @pytest.mark.parametrize("shape", [
+        " " * 40000, "search for inns " * 2500, "find " + "a " * 20000 + "inn",
+        "pull up inns in " * 2000,
+    ], ids=["spaces", "search-inns", "det-x20000", "pull-in"])
+    def test_the_frame_leg_is_linear(self, shape):
+        assert _best_of_3(lambda: ts._frame_governs_lodging_noun(shape)) < 0.05
+        assert _best_of_3(lambda: ts.is_lodging_shaped(shape)) < 0.25
