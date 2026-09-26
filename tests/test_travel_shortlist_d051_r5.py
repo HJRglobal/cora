@@ -168,5 +168,59 @@ class TestAPostposedCeilingIsNotReadAsADirective:
             t0 = time.perf_counter()
             ts._REFINE_MONEY_RE.search(shape)
             ts._BUDGET_CEIL_SUBJ_RE.search(shape)
+            ts._CEIL_WORD_FRAG_RE.match(shape)
             best = min(best, time.perf_counter() - t0)
         assert best < 0.1, best
+
+
+# ── D-051 r7: never a silent partial re-search ──────────────────────────────────────
+# A dropped clause that still STATES a field -- an any(thing)-in question naming its own
+# area, a remark carrying an undescribed per-night price, or a listed clause that is only
+# a postposed ceiling word -- sends the whole turn to the help line when another clause
+# survives, instead of a billed re-search on the STORED area/budget.
+R7_MUST_HELP = [
+    "anything in mesa $250/night max, oct 20-22?", "any in gilbert $250/night max, oct 20-22",
+    "anything in mesa $250 a night tops? oct 20-22 works",
+    "anything in mesa $250/night at most? try oct 20-22",
+    "anything near tempe $250/night max; 6 people now", "anything in mesa around 250? oct 20-22",
+    "anything in mesa under 250, oct 20-22?", "anything in mesa $250 or less, oct 20-22?",
+    "oct 20-22, $250/night, max", "$250/night, max, oct 20-22",
+    "can we do oct 20-22, $250/night, max?", "oct 20-22, $250 a night, tops",
+    "oct 20-22, $250 a night, or less", "oct 20-22, $250/night, at most",
+    "oct 20-22, $250/night. max", "3 bedrooms, $250/night, max",
+    "these are all too pricey - $250/night max. can we try oct 20-22?",
+    "over budget -- $250/night max; try gilbert",
+    "too pricey $250/night or less please; what about tempe?",
+    "love the options but $250/night max; what about tempe?",
+    "the first one is nice but $250/night max; try oct 20-22",
+    "too pricey - $250/night max; 6 people now",
+    "too pricey - we need $250/night. what about oct 20-22?",
+]
+# ...while a question/remark that states no field, a DESCRIBED price and an ordinary list
+# still re-run exactly as before.
+R7_MUST_RERUN = [
+    ("anything in mesa for oct 20-22?", {"areas": ("mesa",), **OCT20}),
+    ("anything in mesa?, oct 20-22", {"areas": ("mesa",), **OCT20}),
+    ("anything in mesa?", {"areas": ("mesa",)}),
+    ("the 2nd option is $450/night, too pricey, try oct 20-22", OCT20),
+    ("love the first one; try oct 20-22", OCT20),
+    ("let's do oct 20-22, the one in gilbert looked great", OCT20),
+    ("that one's $250 a night max, can we do oct 20-22?", OCT20),
+    ("oct 20-22, 6 people", {**OCT20, "party_size": 6}),
+    ("mesa, oct 20-22", {**OCT20, "areas": ("mesa",)}),
+    ("oct 20-22, max $250/night", {**OCT20, "budget_min": None, "budget_max": 250}),
+]
+
+
+class TestNeverASilentPartialReSearch:
+    @pytest.mark.parametrize("text", R7_MUST_HELP)
+    @pytest.mark.parametrize("stored", [STORED_S2, STORED_S1], ids=["s2", "s1"])
+    def test_a_dropped_clause_that_states_a_field_gets_the_help_line(self, route, text, stored):
+        _assert_help(route(text, stored), text)
+
+    @pytest.mark.parametrize("text,expect", R7_MUST_RERUN)
+    def test_a_turn_whose_every_field_is_read_still_re_runs(self, route, text, expect):
+        r = route(text, STORED_S1)
+        assert r is not None and r.kind == "search" and r.followup, (text, r)
+        for k, v in expect.items():
+            assert getattr(r.constraints, k) == v, (text, k, getattr(r.constraints, k), v)

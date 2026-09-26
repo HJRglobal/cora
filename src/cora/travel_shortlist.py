@@ -1439,6 +1439,10 @@ _FRAG_TAIL = (r"(?: (?:too|then|please|pls|now|instead|total|in total|this time|
 _PARTY_FRAG_RE = re.compile(r"^" + _FRAG_LEAD + r"(?:(?:about|around|roughly|maybe|like) |~ ?)?"
                             + _NUM_RX + r" " + _PARTY_WORD + _FRAG_TAIL + r"$")
 _PRICE_FRAG_RE = re.compile(r"^" + _FRAG_LEAD + _MONEY_RX + _PER_NIGHT_RX + _FRAG_TAIL + r"$")
+# a clause that is ONLY a postposed ceiling word ("..., $250/night, max"): the postposed
+# form is not read (D-051 r6), so a list carrying one is a field the reader cannot read
+_CEIL_WORD_FRAG_RE = re.compile(r"^" + _FRAG_LEAD + r"(?:max|maximum|tops|or less|or under"
+                                r"|at most|at the most)" + _FRAG_TAIL + r"[.!]*$")
 # any other money-only clause ("$250", "under $250", "250 bucks") -- read only if the
 # turn's directive reading already took a budget
 _MONEY_FRAG_RE = re.compile(
@@ -1473,6 +1477,8 @@ def _list_items(clauses: list[str], f: dict, base_areas: tuple, *,
     items: list[tuple[int, str, Any]] = []
     for i, clause in enumerate(clauses):
         c = _norm(clause)
+        if _CEIL_WORD_FRAG_RE.match(c):          # "oct 20-22, $250/night, max" (D-051 r7)
+            return None
         m = _PARTY_FRAG_RE.match(c)
         if m:
             n = _num(next(g for g in m.groups() if g))
@@ -2903,20 +2909,35 @@ def _refinement_clauses(text: Any) -> tuple[list[str], bool]:
     6") -- with no refinement VERB (a bare field mention never rescues it), and every
     clause whose refinement verb takes a posted option as its object ("let's go with
     the one in gilbert", "is anything in gilbert pet friendly?"; D-051 r4) even when it
-    has one; *sole* = the turn is one clause."""
+    has one; *sole* = the turn is one clause.
+
+    D-051 r7 (never a silent partial re-search): a dropped clause that still STATES a
+    field -- an "any(thing) in <area> ...?" question ("anything in mesa $250/night max,
+    oct 20-22?") or a remark carrying an undescribed per-night price ("too pricey -
+    $250/night max; try gilbert") -- empties the turn when another clause survives, so
+    the lane answers with the help line instead of re-searching the STORED area/budget
+    the person just moved away from."""
     clauses = _clauses(text)
     sole = len(clauses) == 1
     kept = []
+    field_dropped = False
     for clause in clauses:
         c = clause.lower()
         if ((_verb_takes_card(c) or _asks_about_options(c))
                 and not _frame_governs_lodging_noun(clause)):
+            if _asks_about_options(c):
+                field_dropped = True
             continue
         if ((_COMMENT_RE.search(c) or _CARD_REF_RE.search(c) or _describes_a_listing(c))
                 and not _refine_verb(c, sole=sole)
                 and not _frame_governs_lodging_noun(clause)):   # "find a hotel that looks ..."
+            n = _norm(clause)
+            if any(not _described(n, m.start()) for m in _BUDGET_SINGLE_RE.finditer(n)):
+                field_dropped = True
             continue
         kept.append(clause)
+    if field_dropped and kept:
+        return [], sole
     return kept, sole
 
 
