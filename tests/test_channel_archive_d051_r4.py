@@ -63,6 +63,9 @@ STATUS_FIRE_R4_RESIDUAL = [
     "were the dead channels archived by the team deadline?",
     "were the dead channels archived by the staff standup?",
     "were the dead channels archived by the team offsite?",
+    # 'her' as the determiner of a modifier is a deadline too (like "his team call")
+    "were the dead channels archived by her team call?", "were the dead channels archived by her staff meeting?",
+    "were the dead channels archived by her team's offsite?",
 ]
 STATUS_FIRE_R4_BY = STATUS_FIRE_R4_REGRESS + STATUS_FIRE_R4_RESIDUAL
 #: a phrase-FINAL actor noun (or a person / mention) is still someone else's archive
@@ -75,7 +78,12 @@ STATUS_NOT_R4_BY = [
     "which channels were archived by the time-tracking script?", "were the channels archived by staff at lunch?",
     "were the channels archived by an admin after the call?", "were the channels archived by our team?",
     "were the channels archived by your team?", "were the channels archived by people in the meeting?",
-    "were the channels archived by the admin team?",
+    "were the channels archived by the admin team?", "were the channels archived by her team yesterday?",
+    "were the channels archived by her meeting?", "were the channels archived by her staff?",
+    # an AUTOMATION actor followed by an event-ish noun is still the actor
+    "were any channels archived by the zapier sync?", "were the channels archived by the workflow update?",
+    "were the channels archived by the integration sync?", "were the channels archived by the slack workflow review?",
+    "were the channels archived by the cleanup script's update?", "which channels were archived by the script run?",
 ]
 
 
@@ -130,7 +138,11 @@ class TestArchivedByModifierR4:
         "archived by " + "time " * 8000 + "staff",
         "archived by " + "x " * 20000,
         "archived by the " + "team's " * 5700 + "meeting",
-    ], ids=["spaces", "by-spaces", "team-run", "possessive-run", "time-run", "filler-run", "team's-run"])
+        "archived by her " + "team " * 8000 + "call",
+        "archived by her " + "x " * 20000 + "team call",
+        "archived by the " + "zapier " * 5700 + "sync",
+    ], ids=["spaces", "by-spaces", "team-run", "possessive-run", "time-run", "filler-run", "team's-run",
+            "her-team-run", "her-filler-run", "automation-run"])
     def test_the_changed_actor_regex_is_fast_on_40k(self, raw):
         best = float("inf")
         for _ in range(3):

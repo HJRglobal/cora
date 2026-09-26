@@ -190,15 +190,18 @@ _ROSTER_FIRST_NAMES = ("aaron|alex|alina|brei|daniel|demi|elena|eric|hannah|harr
                        "jennifer|jerry|justin|larry|matt|micah|sara|shaun|tessa|tommy")
 _BY_PERSON = ("(?:someone|somebody|anyone|anybody|everyone|everybody|me|myself|him|himself|herself|"
               "them|others|other people|whoever|hand|slack|slackbot|" + _ROSTER_FIRST_NAMES + ")")
-_BY_ACTOR_NOUN = ("(?:scripts?|admins?|administrators?|owners?|team|staff|person|people|humans?|"
-                  "users?|members?|employees?|workflows?|zaps?|zapier|integrations?)")
+#: a human / group actor noun (it can also MODIFY an event noun: "team call") ...
+_BY_HUMAN_NOUN = ("(?:admins?|administrators?|owners?|team|staff|person|people|humans?|"
+                  "users?|members?|employees?)")
+#: ... and an automation actor noun ("the zapier sync" is still the actor)
+_BY_AUTOMATION_NOUN = "(?:scripts?|workflows?|zaps?|zapier|integrations?)"
 _BY_LANE_NOUN = "(?:lane|cards?|bot|scans?|proposals?|monitor|taps?|buttons?)"
 _BY_DET = "(?:the|a|an|my|your|our|his|her|their|this|that|some|any|another|one of(?: the| our| my)?)"
 #: ... 'time' is never filler: "by the time people got in" is a time frame (D-051 r4
 #: c1-intents-copy#0; the whole word only -- "the time-tracking script" is an actor)
 _BY_FILLER = r"(?!(?:the|a|an|my|your|our|his|her|their)\b|time(?![a-z0-9'_-]))[a-z0-9'_-]+"
-#: An actor noun that MODIFIES an event noun is not the actor: "by monday's team call",
-#: "by tomorrow's staff meeting", "by the team's offsite" are deadlines (D-051 r4
+#: A human actor noun that MODIFIES an event noun is not the actor: "by monday's team
+#: call", "by tomorrow's staff meeting", "by the team's offsite" are deadlines (D-051 r4
 #: c1-intents-copy#0) -- the noun must END the phrase ("by her team?", "by staff?").
 _BY_EVENT_NOUN = ("(?:meetings?|calls?|syncs?|huddles?|stand-?ups?|reviews?|check-?ins?|"
                   "off-?sites?|retros?|retrospectives?|retreats?|lunch(?:es)?|dinners?|"
@@ -207,9 +210,10 @@ _BY_EVENT_NOUN = ("(?:meetings?|calls?|syncs?|huddles?|stand-?ups?|reviews?|chec
                   "part(?:y|ies)|planning)")
 _BY_ACTOR_RE = re.compile(
     r"\barchived by (?:" + _BY_PERSON + r"\b"
-    + r"|her\b(?! (?:" + _BY_FILLER + r" ){0,2}?" + _BY_LANE_NOUN + r"\b)"
-    + r"|(?:" + _BY_DET + r" )?(?:" + _BY_FILLER + r" ){0,2}?" + _BY_ACTOR_NOUN
-    + r"\b(?!(?:['’]s?)? " + _BY_EVENT_NOUN + r"\b))")
+    + r"|her\b(?! (?:" + _BY_FILLER + r" ){0,2}?(?:" + _BY_LANE_NOUN + "|" + _BY_HUMAN_NOUN
+           + r"(?:['\u2019]s?)? " + _BY_EVENT_NOUN + r")\b)"
+    + r"|(?:" + _BY_DET + r" )?(?:" + _BY_FILLER + r" ){0,2}?(?:" + _BY_AUTOMATION_NOUN + r"\b|"
+    + _BY_HUMAN_NOUN + r"\b(?!(?:['\u2019]s?)? " + _BY_EVENT_NOUN + r"\b)))")
 #: a capitalised word right after "archived by" (read on the CASED view) is a name --
 #: unless it is one of the lane / manner / time words ("by Mistake", "by Friday",
 #: "by October", "by Cora", "by The lane")
