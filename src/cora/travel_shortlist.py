@@ -1208,21 +1208,20 @@ _BUDGET_VERB = (r"(?:make it|keep it(?: at| to| around)?|try|budget(?:'s| of| is
 _BUDGET_DIRECTIVE_RE = re.compile(
     r"\b(?:" + _BUDGET_VERB + r"|go with|how about|what about) " + _MONEY_RX + _PER_NIGHT_RX
     + r"\b")
-# D-051 r4 (c2-trigger#4, adjudicated): the ceiling directives in copula and postposed
-# form -- "our max is $250 a night", "the limit's $250/night", "$250/night max", "250 a
-# night tops / or less" -- read as the ceiling in a lane-thread follow-up (a fresh ask
-# keeps its own grammar). A copula whose SUBJECT is a budget word is a directive, never a
-# description of a posted option (_COPULA_BEFORE_RE below).
+# D-051 r4 (c2-trigger#4, adjudicated): the ceiling directive in copula form -- "our max
+# is $250 a night", "the limit's $250/night" -- reads as the ceiling in a lane-thread
+# follow-up (a fresh ask keeps its own grammar). A copula whose SUBJECT is a budget word is
+# a directive, never a description of a posted option (_COPULA_BEFORE_RE below).
+# D-051 r5/r6: the POSTPOSED form ("$250/night max", "250 a night tops / or less") is NOT
+# read as a directive. Its r4 leg read "$289/night, max 6 guests" (an occupancy) as a price
+# ceiling -- a comment on the card became a billed re-search -- and each lookahead that
+# tried to tell a ceiling from a count opened the other side ("max 3 bedrooms" dropped the
+# cap; "max: 6 guests" / "max. 6 guests" still read as one). A postposed ceiling gets the
+# honest help line, which names the working phrasing ("under $250 a night"); nothing is
+# billed. The redesign (read a follow-up price by what it modifies) is seeded.
 _BUDGET_SUBJ_COPULA = r"(?:'s| is| was| would be| should be| will be| of)"
 _BUDGET_CEIL_SUBJ_RE = re.compile(r"\b(?:max|maximum|limit|cap|ceiling)" + _BUDGET_SUBJ_COPULA
                                   + r"?[,:]? " + _MONEY_RX + _PER_NIGHT_RX + r"\b")
-# D-051 r5 (c2-trigger#0): the ceiling word must END the price phrase -- "max" that OPENS a
-# count/occupancy ("$289/night, max 6 guests", "max 4 per room", "max capacity 8")
-# describes a posted option; read as a ceiling it turned a comment into a billed re-search.
-_BUDGET_CEIL_POST = (r",? (?:max|maximum|tops|or less|or under|at most|at the most)(?![a-z0-9])"
-                     r"(?! ?(?:\d|(?:one|two|three|four|five|six|seven|eight|nine|ten|twelve"
-                     r"|occupancy|capacity|guests?|people|persons?|adults|ppl|pax|per|of)\b))")
-_BUDGET_CEIL_POST_RE = re.compile(_MONEY_RX + _PER_NIGHT_RX + _BUDGET_CEIL_POST)
 # A copula right before a price DESCRIBES a posted option ("the 2nd one is $450/night",
 # "the first one's about $389", "it costs $329") -- never after a relative pronoun
 # ("something that's under $300 a night" asks for one), never after a budget word ("our
@@ -1286,7 +1285,7 @@ def _parse_budget(norm: str, *, mode: str = "fresh") -> tuple[int | None, int | 
     else:
         lo = hi = None
         m = first(_BUDGET_CEIL_RE) or (None if mode == "fresh" else (         # D-051 r4
-            first(_BUDGET_CEIL_SUBJ_RE) or first(_BUDGET_CEIL_POST_RE)))
+            first(_BUDGET_CEIL_SUBJ_RE)))
         if m:
             hi = _money(m.group(1))
         else:
@@ -2689,7 +2688,6 @@ _REFINE_MONEY_RE = re.compile(
     + r"|" + _BUDGET_VERB + r") |~ ?)\$? ?\d"
     r"|\b(?:max|maximum|limit|cap|ceiling)" + _BUDGET_SUBJ_COPULA + r"?[,:]? \$? ?\d"   # D-051 r4
     r"|" + _MONEY_RX + r" ?(?:-|to) ?" + _MONEY_RX + _PER_NIGHT_RX + r"\b"
-    r"|" + _MONEY_RX + _PER_NIGHT_RX + _BUDGET_CEIL_POST
 )
 # A clause boundary: ; ! ? a comma or a period before a space (never inside "$1,200" or
 # "st. louis"). The delimiter is captured so a clause keeps its question mark.

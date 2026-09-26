@@ -262,16 +262,14 @@ MAX250, MAX300 = {"budget_min": None, "budget_max": 250}, {"budget_min": None, "
 DIRECTIVE_FORMS_MUST_RERUN = [
     ("our max is $250 a night", MAX250), ("the max is $250 a night", MAX250),
     ("budget's $250 a night", B250), ("our budget's 250 a night", B250),
-    ("$250/night max", MAX250), ("250 a night max", MAX250),
     ("make that 6 people", P6), ("actually it's for 6 people", P6),
     ("oh it's for 6 people, not 4", P6),
     # neighbours
-    ("$250/night maximum", MAX250), ("$250 a night tops", MAX250),
-    ("$250/night or less", MAX250), ("250 a night at most", MAX250),
     ("the budget is under $300 a night", MAX300), ("the budget's under $300 a night", MAX300),
     ("our limit is $250 a night", MAX250), ("the cap is $250/night", MAX250),
     ("max would be $250 a night", MAX250), ("the max's $250 a night", MAX250),
-    ("our budget was $250 a night", B250), ("budget is $250/night max", MAX250),
+    # D-051 r6: the postposed "max" is no longer read; "budget is $250" is the directive
+    ("our budget was $250 a night", B250), ("budget is $250/night max", B250),
     ("make that for 6 people", P6), ("it's for 6 people", P6), ("it is for 6 people", P6),
     # the r3 contrast rows still re-run
     ("our budget is $250 a night", B250), ("top budget is $250/night", B250),
@@ -288,6 +286,14 @@ DESCRIPTION_FORMS_MUST_HELP = [
     "that one's for 6 people", "the hotel's max is $250 a night", "our max is $250",
     "max is 6 people", "make that oct 20-22",
 ]
+# D-051 r5/r6: the POSTPOSED ceiling ("$250/night max", "tops", "or less", "at most") is not
+# read as a directive -- its leg read an occupancy ("$289/night, max 6 guests") as a price
+# ceiling, and each lookahead that tried to separate the two opened the other side. These
+# get the honest help line (it names "under $250 a night"); nothing is billed.
+POSTPOSED_MUST_HELP = [
+    "$250/night max", "250 a night max", "$250/night maximum", "$250 a night tops",
+    "$250/night or less", "250 a night at most",
+]
 
 
 class TestTheDirectiveFormsReRun:
@@ -300,6 +306,11 @@ class TestTheDirectiveFormsReRun:
     @pytest.mark.parametrize("stored_ask", [STORED_S2, STORED_S3], ids=["s2", "s3"])
     @pytest.mark.parametrize("text", DESCRIPTION_FORMS_MUST_HELP)
     def test_a_description_of_a_posted_option_stays_a_comment(self, route, text, stored_ask):
+        _assert_help(route(text, stored_ask), text)
+
+    @pytest.mark.parametrize("stored_ask", [STORED_S2, STORED_S3], ids=["s2", "s3"])
+    @pytest.mark.parametrize("text", POSTPOSED_MUST_HELP)
+    def test_a_postposed_ceiling_gets_the_help_line_not_a_guess(self, route, text, stored_ask):
         _assert_help(route(text, stored_ask), text)
 
     def test_the_fresh_parser_is_unchanged(self):
@@ -318,7 +329,7 @@ class TestTheDirectiveFormsReRun:
         stored = ts.parse_constraints(STORED_S3, today=TODAY).constraints
 
         def regexes():
-            for rx in (ts._BUDGET_CEIL_SUBJ_RE, ts._BUDGET_CEIL_POST_RE, ts._BUDGET_DIRECTIVE_RE,
+            for rx in (ts._BUDGET_CEIL_SUBJ_RE, ts._BUDGET_DIRECTIVE_RE,
                        ts._REFINE_MONEY_RE, ts._PARTY_DIRECTIVE_RE, ts._MONEY_MENTION_RE):
                 rx.search(shape)
             for i in range(0, 40000, 997):
@@ -350,7 +361,8 @@ INTERACTION_MUST_RERUN = [
     ("let's do oct 20-22, the one in gilbert looked great", OCT20),
     ("oct 20-22, 6 people, the airbnb one", {**OCT20, **P6}),
     ("oct 20-22, max $250/night", {**OCT20, **MAX250}),
-    ("hotels in mesa oct 17-21, $250/night max", {"areas": ("mesa",), "kind": "hotel", **MAX250}),
+    # D-051 r6: a restated ask reads its price N-N again (the postposed max is not a directive)
+    ("hotels in mesa oct 17-21, $250/night max", {"areas": ("mesa",), "kind": "hotel", **B250}),
     ("mesa, oct 20-22, gilbert's pick was great", {**OCT20, "areas": ("mesa",)}),
 ]
 
