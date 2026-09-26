@@ -1328,7 +1328,14 @@ _SLOT_DATE = (r"(?:" + _MONTH_WORD + r"\.? \d{1,2}(?:st|nd|rd|th)?(?: ?(?:-|to|t
               r"|until|till) ?(?:" + _MONTH_WORD + r"\.? )?\d{1,2}(?:st|nd|rd|th)?)?"
               r"|\d{1,2}/\d{1,2}(?:/\d{2,4})?(?: ?(?:-|to|through|thru) ?\d{1,2}"
               r"(?:/\d{1,2}(?:/\d{2,4})?)?)?)(?:,? 20\d\d)?")
-_HEAD_SLOT_LEAD_RE = re.compile(r"(?: ?[,:-] ?| )(?:" + _SLOT_DATE + r"(?: ?[,:-] ?| ))?")
+# ...and past up to two FIELD phrases the head rule itself accepts there -- a date, a bed
+# spec, a price ("find hotels king bed scottsdale oct 17-21", "find hotels max $400/night
+# scottsdale oct 17-21").
+_SLOT_FIELD = (r"(?:" + _SLOT_DATE + r"|(?:king|queen|two queens?|double queens?)(?:[- ]size)?"
+               r" beds?|(?:(?:" + _BUDGET_CEIL_WORDS + r"|" + _BUDGET_FLOOR_WORDS + r"|"
+               + _BUDGET_APPROX_WORDS + r"|budget) )?\$? ?\d{2,5}(?: ?(?:-|to) ?\$? ?\d{2,5})?"
+               + _PER_NIGHT_RX + r"?)")
+_HEAD_SLOT_LEAD_RE = re.compile(r"(?:(?: ?[,:-] ?| )" + _SLOT_FIELD + r"){0,2}(?: ?[,:-] ?| )")
 _SLOT_WORD_ALIASES = frozenset({"surprise", "page", "carefree"})
 
 

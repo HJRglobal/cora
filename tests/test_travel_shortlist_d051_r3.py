@@ -407,6 +407,10 @@ HEAD_SLOT_AREA_ROWS = [
     ("find hotels - scottsdale, oct 17-21", ("scottsdale",)),
     ("find hotels and airbnbs sedona oct 17-21", ("sedona",)),
     ("Hey Cora, find hotels scottsdale oct 17-21?", ("scottsdale",)),
+    # past the field phrases the head rule accepts after the noun
+    ("find hotels king bed scottsdale oct 17-21", ("scottsdale",)),
+    ("find hotels max $400/night scottsdale oct 17-21", ("scottsdale",)),
+    ("find hotels oct 17-21, king bed, scottsdale", ("scottsdale",)),
 ]
 # not the head slot (a person-name risk, or no allowlisted area there): the honest
 # clarify stays, and a locative area elsewhere still wins
@@ -456,7 +460,10 @@ class TestHeadSlotArea:
         " " * 40000, "find hotels" + " " * 40000, "find hotels " + "oct 1 " * 6000,
         "find hotels " + ", " * 20000, "find hotels " + "10/1" * 10000,
         "find hotels " + "mesa/" * 8000, "find hotels " + " - " * 13000,
-    ], ids=["spaces", "noun-spaces", "dates", "commas", "md", "mesa-slash", "dashes"])
+        "find hotels " + "king bed " * 4000, "find hotels " + "$300 " * 8000,
+        "find hotels " + "max $300/night " * 2500,
+    ], ids=["spaces", "noun-spaces", "dates", "commas", "md", "mesa-slash", "dashes",
+            "king-bed", "dollars", "max-per-night"])
     def test_the_head_slot_is_linear(self, shape):
         def run():
             ts._HEAD_SLOT_LEAD_RE.match(shape, 11)
