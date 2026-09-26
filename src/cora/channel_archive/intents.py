@@ -194,11 +194,22 @@ _BY_ACTOR_NOUN = ("(?:scripts?|admins?|administrators?|owners?|team|staff|person
                   "users?|members?|employees?|workflows?|zaps?|zapier|integrations?)")
 _BY_LANE_NOUN = "(?:lane|cards?|bot|scans?|proposals?|monitor|taps?|buttons?)"
 _BY_DET = "(?:the|a|an|my|your|our|his|her|their|this|that|some|any|another|one of(?: the| our| my)?)"
-_BY_FILLER = r"(?!(?:the|a|an|my|your|our|his|her|their)\b)[a-z0-9'_-]+"
+#: ... 'time' is never filler: "by the time people got in" is a time frame (D-051 r4
+#: c1-intents-copy#0; the whole word only -- "the time-tracking script" is an actor)
+_BY_FILLER = r"(?!(?:the|a|an|my|your|our|his|her|their)\b|time(?![a-z0-9'_-]))[a-z0-9'_-]+"
+#: An actor noun that MODIFIES an event noun is not the actor: "by monday's team call",
+#: "by tomorrow's staff meeting", "by the team's offsite" are deadlines (D-051 r4
+#: c1-intents-copy#0) -- the noun must END the phrase ("by her team?", "by staff?").
+_BY_EVENT_NOUN = ("(?:meetings?|calls?|syncs?|huddles?|stand-?ups?|reviews?|check-?ins?|"
+                  "off-?sites?|retros?|retrospectives?|retreats?|lunch(?:es)?|dinners?|"
+                  "breakfasts?|updates?|chats?|sessions?|events?|demos?|briefings?|all-hands|"
+                  "kick-?offs?|one-on-ones?|1:1s?|deadlines?|cut-?offs?|outings?|trainings?|"
+                  "part(?:y|ies)|planning)")
 _BY_ACTOR_RE = re.compile(
     r"\barchived by (?:" + _BY_PERSON + r"\b"
     + r"|her\b(?! (?:" + _BY_FILLER + r" ){0,2}?" + _BY_LANE_NOUN + r"\b)"
-    + r"|(?:" + _BY_DET + r" )?(?:" + _BY_FILLER + r" ){0,2}?" + _BY_ACTOR_NOUN + r"\b)")
+    + r"|(?:" + _BY_DET + r" )?(?:" + _BY_FILLER + r" ){0,2}?" + _BY_ACTOR_NOUN
+    + r"\b(?!(?:['’]s?)? " + _BY_EVENT_NOUN + r"\b))")
 #: a capitalised word right after "archived by" (read on the CASED view) is a name --
 #: unless it is one of the lane / manner / time words ("by Mistake", "by Friday",
 #: "by October", "by Cora", "by The lane")
