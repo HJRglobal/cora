@@ -1425,11 +1425,13 @@ def parse_constraints(text: Any, *, today: date | None = None) -> ParseResult:
 # ONLY a field fragment -- "6 people", "$250/night", "mesa", "mesa or gilbert" -- is a
 # LIST ITEM ("oct 20-22, 6 people", "mesa, oct 20-22"): it is read when another kept
 # clause carries a field. A listed field the lane cannot read -- "$250" with no per-night
-# marker, "40 people", or a party / price joined by and / & / plus onto another field
-# ("oct 20-22 and 6 people") -- gets the help line, never a silent partial re-search. A
-# lone fragment keeps today's help line; "thanks, gilbert" (no other field) stays a comment.
+# marker, "40 people", a clause that opens on a party / price it does not read ("6 people
+# on the team"), or a party / price joined by and / & / plus onto another field ("oct
+# 20-22 and 6 people") -- gets the help line, never a silent partial re-search. A lone
+# fragment keeps today's help line; "thanks, gilbert" (no other field) stays a comment.
 _FRAG_LEAD = r"(?:(?:and|also|plus|with|or|oh|ok|okay|actually|so|but|&) )?"
-_FRAG_TAIL = r"(?: (?:too|then|please|pls|now|instead|total|in total|this time|again|as well))*\??"
+_FRAG_TAIL = (r"(?: (?:too|then|please|pls|now|instead|total|in total|this time|again|as well"
+              r"|or so))*\??")
 _PARTY_FRAG_RE = re.compile(r"^" + _FRAG_LEAD + r"(?:(?:about|around|roughly|maybe|like) |~ ?)?"
                             + _NUM_RX + r" " + _PARTY_WORD + _FRAG_TAIL + r"$")
 _PRICE_FRAG_RE = re.compile(r"^" + _FRAG_LEAD + _MONEY_RX + _PER_NIGHT_RX + _FRAG_TAIL + r"$")
@@ -1443,6 +1445,9 @@ _LIST_JOINED_RE = re.compile(
     r",? (?:and|&|plus) (?:(?:about|around|roughly|maybe|like) |~ ?)?(?:(?P<party>\d{1,2}|one|two"
     r"|three|four|five|six|seven|eight|nine|ten|eleven|twelve) " + _PARTY_WORD
     + r"|(?P<price>\$ ?\d))[^,;]{0,40}$")
+_LIST_LEAD_RE = re.compile(
+    r"^" + _FRAG_LEAD + r"(?:(?:about|around|roughly|maybe|like) |~ ?)?(?:(?P<party>" + _NUM_RX
+    + r" " + _PARTY_WORD + r")|(?P<price>\$ ?\d|" + _MONEY_RX + _PER_NIGHT_RX + r"))(?![a-z0-9])")
 
 
 def _list_items(clauses: list[str], f: dict, base_areas: tuple, *,
@@ -1478,6 +1483,10 @@ def _list_items(clauses: list[str], f: dict, base_areas: tuple, *,
             if not f_budget:
                 return None                      # "$250", "under $250", "250 bucks"
             continue
+        m = _LIST_LEAD_RE.match(c)               # "6 people on the team", "$250/night ideally"
+        if m and ((m.group("party") and f["party_size"] is None)
+                  or (m.group("price") and not f_budget)):
+            return None
         keys = _slot_areas([clause], sole=True)
         if keys:
             items.append((i, "areas", keys))

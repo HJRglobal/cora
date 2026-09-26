@@ -203,6 +203,8 @@ LIST_MUST_RERUN = [
     ("hotels in mesa oct 17-21, 6 guests, $250/night",            # restated (r3 pinned)
      {"areas": ("mesa",), **P6, **B250, "kind": "hotel"}),
     ("try mesa and send this to 2 people", {"areas": ("mesa",)}),  # r3 MIXED (pinned)
+    ("oct 20-22, 6 people or so", {**OCT20, **P6}),
+    ("mesa, 6 people or so, oct 20-22", {**OCT20, **P6, "areas": ("mesa",)}),
 ]
 # ...a listed field the lane cannot read gets the help line, never a partial re-search;
 # a lone fragment (or one beside a verb that carries no field) keeps today's help line.
@@ -213,6 +215,13 @@ LIST_MUST_HELP = [
     "try mesa, $250", "mesa, oct 20-22, 250 bucks",
     "6 people", "$250/night", "thanks, gilbert", "search again, 6 people", "try again, gilbert",
     "6 people, $250/night", "mesa, $250/night",
+    # a clause that opens on a party / price it does not read
+    "can we do oct 20-22, 6 people on the team?", "oct 20-22, 2 people from the team will share",
+    "oct 20-22, $250/night would be ideal", "can we do oct 20-22, 250 a night ideally",
+    # conflicts, restated asks, and a list read that would leave an area behind
+    "for 4 people, oct 20-22, 6 people", "6 people, oct 20-22, $250",
+    "hotels in mesa oct 17-21 and 6 guests", "hotels in mesa oct 17-21, 40 guests",
+    "oct 20-22, 6 people, jordan flies out of phoenix",
 ]
 
 
@@ -237,7 +246,7 @@ class TestAListedFieldIsReadNeverDropped:
         stored = ts.parse_constraints(STORED_S3, today=TODAY).constraints
 
         def regexes():
-            for rx in (ts._PARTY_FRAG_RE, ts._PRICE_FRAG_RE, ts._MONEY_FRAG_RE):
+            for rx in (ts._PARTY_FRAG_RE, ts._PRICE_FRAG_RE, ts._MONEY_FRAG_RE, ts._LIST_LEAD_RE):
                 rx.match(shape)
             ts._LIST_JOINED_RE.search(shape)
 
@@ -320,3 +329,39 @@ class TestTheDirectiveFormsReRun:
             ts.merge_followup(stored, shape, today=TODAY)
         assert _best_of_3(regexes) < 0.1
         assert _best_of_3(predicates) < 0.1
+
+
+# ── the three rules together: a pick, a list and a directive in one turn ──
+
+INTERACTION_MUST_HELP = [
+    "let's go with the one in gilbert, 6 people",       # a pick + a lone fragment
+    "can you look at the one in gilbert for oct 20-22?",  # a pick carrying a date
+    "look at the one in gilbert under $300 a night",    # a pick carrying a price
+    "let's go with the 2 queens one", "go with the $250/night one",
+    "the first one's max is $250 a night",               # a possessed budget word
+    "the max is $250 a night and 6 people",              # a directive + an and-joined party
+    "let's go with oct 20-22 and 6 people",
+    "mesa, the second one is $250 a night",              # a fragment + a description
+]
+INTERACTION_MUST_RERUN = [
+    ("our max is $250 a night, the first one is $389", MAX250),
+    ("that one's $250 a night max, can we do oct 20-22?", OCT20),
+    ("make that 6 people and oct 20-22", {**OCT20, **P6}),
+    ("let's do oct 20-22, the one in gilbert looked great", OCT20),
+    ("oct 20-22, 6 people, the airbnb one", {**OCT20, **P6}),
+    ("oct 20-22, max $250/night", {**OCT20, **MAX250}),
+    ("hotels in mesa oct 17-21, $250/night max", {"areas": ("mesa",), "kind": "hotel", **MAX250}),
+    ("mesa, oct 20-22, gilbert's pick was great", {**OCT20, "areas": ("mesa",)}),
+]
+
+
+class TestTheRulesTogether:
+    @pytest.mark.parametrize("stored_ask", [STORED_S2, STORED_S3], ids=["s2", "s3"])
+    @pytest.mark.parametrize("text", INTERACTION_MUST_HELP)
+    def test_help(self, route, text, stored_ask):
+        _assert_help(route(text, stored_ask), text)
+
+    @pytest.mark.parametrize("stored_ask", [STORED_S2, STORED_S3], ids=["s2", "s3"])
+    @pytest.mark.parametrize("text,expect", INTERACTION_MUST_RERUN)
+    def test_re_run(self, route, text, expect, stored_ask):
+        _assert_search(route(text, stored_ask), text, expect, stored_ask)
