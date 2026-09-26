@@ -1216,7 +1216,12 @@ _BUDGET_DIRECTIVE_RE = re.compile(
 _BUDGET_SUBJ_COPULA = r"(?:'s| is| was| would be| should be| will be| of)"
 _BUDGET_CEIL_SUBJ_RE = re.compile(r"\b(?:max|maximum|limit|cap|ceiling)" + _BUDGET_SUBJ_COPULA
                                   + r"?[,:]? " + _MONEY_RX + _PER_NIGHT_RX + r"\b")
-_BUDGET_CEIL_POST = r",? (?:max|maximum|tops|or less|or under|at most|at the most)(?![a-z0-9])"
+# D-051 r5 (c2-trigger#0): the ceiling word must END the price phrase -- "max" that OPENS a
+# count/occupancy ("$289/night, max 6 guests", "max 4 per room", "max capacity 8")
+# describes a posted option; read as a ceiling it turned a comment into a billed re-search.
+_BUDGET_CEIL_POST = (r",? (?:max|maximum|tops|or less|or under|at most|at the most)(?![a-z0-9])"
+                     r"(?! ?(?:\d|(?:one|two|three|four|five|six|seven|eight|nine|ten|twelve"
+                     r"|occupancy|capacity|guests?|people|persons?|adults|ppl|pax|per|of)\b))")
 _BUDGET_CEIL_POST_RE = re.compile(_MONEY_RX + _PER_NIGHT_RX + _BUDGET_CEIL_POST)
 # A copula right before a price DESCRIBES a posted option ("the 2nd one is $450/night",
 # "the first one's about $389", "it costs $329") -- never after a relative pronoun
