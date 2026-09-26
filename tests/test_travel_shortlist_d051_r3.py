@@ -328,3 +328,64 @@ class TestLooseRecallIsIndependentOfTheHeadRule:
     def test_the_frame_leg_is_linear(self, shape):
         assert _best_of_3(lambda: ts._frame_governs_lodging_noun(shape)) < 0.05
         assert _best_of_3(lambda: ts.is_lodging_shaped(shape)) < 0.25
+
+
+# ── r3:c2-trigger#5: "where <name> could stay" / "a place for <name> to stay" ──
+
+PERSON_STAY_MUST_WITHHOLD = [
+    "google where jordan riverstone could stay",
+    "google somewhere jordan riverstone can stay",
+    "search the web for a place for jordan riverstone to stay",
+    "google a spot for jordan riverstone to crash",
+    "look up a place jordan riverstone can crash tonight",
+    "google where mike jones would stay",
+    "google where Jordan Riverstone might sleep",
+    "google anywhere mike jones could stay near the arena",
+    "search online for places for mike and sarah to stay",
+]
+PERSON_STAY_MUST_NOT_WITHHOLD = [
+    "where the data should stay", "that's where the bot could crash",
+    "find where the importer might crash", "the cache is where the tokens will stay",
+    "where it could crash", "stay tuned", "google where the stadium is",
+    "google where jordan riverstone works", "a place for everything",
+]
+
+
+class TestPersonStayPhrase:
+    @pytest.mark.parametrize("text", PERSON_STAY_MUST_WITHHOLD)
+    def test_withholds_as_a_persons_turn_only(self, text):
+        assert ts.is_lodging_shaped(text), text
+        assert ts.is_lodging_shaped(_wire(text)), text
+        # kept OUT of the STRONG tier that also reads Cora's own prose
+        assert not ts.is_lodging_strong(text) or "sleep" in text, text
+
+    @pytest.mark.parametrize("text", PERSON_STAY_MUST_NOT_WITHHOLD)
+    def test_precision_rows_stay_clear(self, text):
+        assert not ts.is_lodging_shaped(text), text
+
+    @pytest.mark.parametrize("text", PERSON_STAY_MUST_WITHHOLD[:4])
+    def test_the_web_ask_is_withheld_on_the_real_dispatch(self, lane, text):
+        assert web_guard.evaluate(text, "HJRG", kb_meta={}, model=MODEL_SONNET).attach
+        seen = _drive_dispatch(text, user=_tessa(), channel_id="D0TESSA", channel_name="dm",
+                               entity="HJRG")
+        assert seen and all(kw.get("web_tools") is False for kw in seen)
+        assert any(r.get("reason") == "gate_skipped:travel_lane" for r in _web_rows())
+
+    def test_coras_prose_with_the_phrase_does_not_withhold(self, lane):
+        """Cora's turns read the STRONG tier only: her "that's where the values should
+        stay" / "where imports might crash" never blacks out a later web ask."""
+        prior = [{"role": "user", "content": "what did the test run say?"},
+                 {"role": "assistant", "content": "The cache is where builds would crash; "
+                                                  "somewhere jobs can stay queued."}]
+        seen = _drive_dispatch("google the Deposco API changelog", user=_tessa(),
+                               channel_id="D0TESSA", channel_name="dm", entity="HJRG",
+                               prior=prior)
+        assert seen and seen[-1].get("web_tools") is True
+
+    @pytest.mark.parametrize("shape", [
+        " " * 40000, "where " * 7000, "where a " * 5000, "place for " * 4000,
+        "where jordan " * 3000, "somewhere x could " * 2000, "spot " * 8000,
+    ], ids=["spaces", "where", "where-a", "place-for", "where-name", "could", "spot"])
+    def test_the_phrase_is_linear(self, shape):
+        assert _best_of_3(lambda: ts._PERSON_STAY_RE.search(shape)) < 0.05
+        assert _best_of_3(lambda: ts.is_lodging_shaped(shape)) < 0.25

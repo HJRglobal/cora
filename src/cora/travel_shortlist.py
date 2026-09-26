@@ -437,6 +437,20 @@ _DATE_CUE_RE = re.compile(
 )
 
 
+# D-051 r3 (c2-trigger#5): "where <name> could stay", "somewhere <name> can stay", "a place
+# for <name> to stay", "a spot for <name> to crash" -- the STRONG "place to stay" with a
+# person in the middle. A PERSON-turn pattern only (is_lodging_shaped), never the STRONG
+# tier that also reads Cora's prose, and never a determiner-led subject ("where the bot
+# could crash", "where the data should stay" -- the software senses R2 kept out). Linear:
+# closed words, <= 3 bounded tokens between.
+_PERSON_STAY_RE = re.compile(
+    _WB + r"(?:where|somewhere|anywhere|places?|spots?)(?: for)? "
+    r"(?!(?:the|a|an|this|that|these|those|our|my|your|its|it|their|his|her|some|any|all"
+    r"|each|every|no)(?![a-z0-9']))(?:[a-z'.-]{1,30} ){1,3}"
+    r"(?:to|can|could|will|would|should|might|may) (?:stay|crash|sleep)" + _WE
+)
+
+
 def _loose_views_cased(text: Any) -> tuple[str, str]:
     """(body, token_innards): _clean's folding WITHOUT the cap -- Slack <...> tokens
     become spaces in the body (their innards, e.g. a pasted listing link's URL and
@@ -516,8 +530,10 @@ def is_lodging_shaped(text: Any) -> bool:
     if not text:
         return False
     for view in _loose_views_cased(text):
-        if view and (_strong_view(view) or _weak_with_cue(view.lower())):
-            return True
+        if view:
+            low = view.lower()
+            if _strong_view(view) or _weak_with_cue(low) or _PERSON_STAY_RE.search(low):
+                return True
     return _frame_governs_lodging_noun(text)
 
 
