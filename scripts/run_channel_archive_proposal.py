@@ -23,7 +23,9 @@ Usage (from the repo root, main's tree checked out):
     # out this calendar month -- and, once a monthly attempt FAILED this month, on every
     # later Monday too until a full, sighted card (any trigger) lands; else skips.
     # Writes the run marker (ok delivered / ok skipped / FAILED month_undelivered |
-    # month_blind | month_partial + exit 1).
+    # month_blind | month_partial + exit 1). A fire that finds ANOTHER scan running is
+    # ok skipped:scan_running -- that scan's card decides the month (a full, sighted
+    # one settles it; with none, the next Monday retries).
     .venv\\Scripts\\python.exe scripts\\run_channel_archive_proposal.py --apply --monthly
 
     # Harrison only: show / clear the automatic demotion (clearing appends an
@@ -77,6 +79,9 @@ def fully_delivered(p: st.Proposal) -> bool:
 
 #: The ok=False outcomes of a monthly fire that did not deliver this month's card.
 FAILED_MONTH_OUTCOMES = ("month_undelivered", "month_blind", "month_partial")
+#: The ok=True outcome of a monthly fire refused because ANOTHER scan held the lock
+#: (D-051 r3 registry-ops#0): not a failed month -- that scan's own card decides it.
+DEFERRED_OUTCOME = "skipped:scan_running"
 #: Leads every FAILED marker detail: the nightly shows only its first 120 characters.
 RETRY_STEP = "retried next Monday until a full card lands (or DM Cora 'archive the dead channels')"
 
@@ -112,6 +117,24 @@ def failed_monthly_attempt(now: float, fold: st.Fold, markers: list[dict] | None
     return min(seen) if seen else None
 
 
+def deferred_monthly_attempt(now: float, markers: list[dict] | None) -> float | None:
+    """The epoch of this AZ calendar month's EARLIEST monthly fire that found another
+    scan running (an ok=True ``skipped:scan_running`` marker of this task), or None."""
+    key = _month_key(now)
+    seen: list[float] = []
+    for m in markers or []:
+        if (str(m.get("task") or "") != TASK_NAME or m.get("ok") is not True
+                or str(m.get("outcome") or "") != DEFERRED_OUTCOME):
+            continue
+        try:
+            at = float(m.get("attempt_ts") or 0) or datetime.fromisoformat(str(m.get("ts"))).timestamp()
+        except (TypeError, ValueError):
+            continue
+        if str(m.get("month") or _month_key(at)) == key:
+            seen.append(at)
+    return min(seen) if seen else None
+
+
 def monthly_due(now: float, fold: st.Fold, markers: list[dict] | None = None) -> tuple[bool, str]:
     """(due, why). Due inside the month's first-Monday week (AZ: first Monday <= today <
     first Monday + 7 days) until a NON-blind, FULLY delivered MONTHLY card went out this
@@ -126,7 +149,14 @@ def monthly_due(now: float, fold: st.Fold, markers: list[dict] | None = None) ->
     (which would supersede an open ask card, A14) -- a month with NO attempt waits for
     the NEXT first Monday. A blind card proposes nothing and a partial one leaves rows
     unposted, so neither is the month's card. A full ask card after a failed attempt
-    settles the month, so the recovery the marker names is never superseded by a retry."""
+    settles the month, so the recovery the marker names is never superseded by a retry.
+
+    A fire refused because another scan held the lock is NOT a failed month (D-051 r3
+    registry-ops#0): the running scan is about to deliver its own card, and its
+    ``staged`` ts is its START (up to st.SCAN_LOCK_STALE_S before the refusal -- a lock
+    is stale after that). So a non-blind, fully delivered card of any trigger created at
+    or after (refusal - SCAN_LOCK_STALE_S) this month settles the month; with none, the
+    running scan did not deliver it and the month is due again (a retry, never lost)."""
     today = datetime.fromtimestamp(now, _AZ).date()
     fm = first_monday(today.year, today.month)
     if today < fm:
@@ -143,6 +173,14 @@ def monthly_due(now: float, fold: st.Fold, markers: list[dict] | None = None) ->
             if p.created >= failed_at and not p.blind and fully_delivered(p) \
                     and _month_key(p.created) == _month_key(now):
                 return False, "delivered_after_failed_attempt"
+        return True, "due"
+    deferred_at = deferred_monthly_attempt(now, markers)
+    if deferred_at is not None:
+        floor = deferred_at - st.SCAN_LOCK_STALE_S
+        for p in fold.proposals.values():
+            if p.created >= floor and not p.blind and fully_delivered(p) \
+                    and _month_key(p.created) == _month_key(now):
+                return False, "delivered_by_the_running_scan"
         return True, "due"
     if today >= fm + timedelta(days=7):
         return False, "not_due_after_first_monday_week"
@@ -318,6 +356,16 @@ def main(argv: list[str] | None = None, *, now: float | None = None) -> int:
                              detail="CORA_CHANNEL_ARCHIVE=off", elapsed_s=round(time.time() - t0, 1),
                              extra=month)
             _print("Lane switched off (CORA_CHANNEL_ARCHIVE=off) -- no card.")
+            return 0
+        if out.get("reason") == "scan_running":
+            # D-051 r3 registry-ops#0: another scan (an ask, a manual run) holds the lock
+            # and is about to deliver ITS card -- not a failed month. Skip green; the next
+            # Monday's monthly_due lets that scan's own card decide (settled, or due again).
+            run_marker.write(TASK_NAME, script=SCRIPT, ok=True, outputs=0, outcome=DEFERRED_OUTCOME,
+                             detail="another dead-channel scan was running; its card decides this "
+                                    "month (a full card settles it, else next Monday retries)",
+                             elapsed_s=round(time.time() - t0, 1), extra=month)
+            _print("Another dead-channel scan is running -- its card decides this month; no second scan.")
             return 0
         failed = _month_not_done(out, now) if out.get("delivered") else None
         if failed is not None:

@@ -247,16 +247,86 @@ class TestMonthlyRetryAfterAFailedAttemptD051R2:
         assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 12)) == 0
         assert markers()[-1]["outcome"] == "delivered"
 
-    def test_a_first_monday_that_left_only_a_marker_is_still_retried(self, fake):
-        """A scan already running (the lock held) returns before any store event, so the
-        month_undelivered marker is the only record of the attempt."""
+    def test_a_first_monday_refused_by_a_held_lock_that_staged_no_card_is_retried(self, fake):
+        """A scan already running (the lock held) returns before any store event. D-051 r3
+        registry-ops#0: that is NOT a failed month (ok skipped:scan_running, exit 0) -- the
+        running scan's own card decides; here the holder staged nothing, so the next
+        Monday retries instead of losing the month."""
         token = st.acquire_scan_lock(now=az(2026, 10, 5))
         assert token is not None
-        assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 5)) == 1
-        assert markers()[-1]["outcome"] == "month_undelivered" and st.read_events() in ([], None)
+        assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 5)) == 0
+        m = markers()[-1]
+        assert m["ok"] is True and m["outcome"] == SCRIPT.DEFERRED_OUTCOME and m["month"] == "2026-10"
+        assert st.read_events() in ([], None) and not fake.posts
         st.release_scan_lock(token)
+        assert SCRIPT.monthly_due(az(2026, 10, 12), st.fold(now=az(2026, 10, 12)),
+                                  SCRIPT.run_marker.read_markers()) == (True, "due")
         assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 12)) == 0
-        assert markers()[-1]["outcome"] == "delivered" and self._no_green_skip_after(0)
+        assert markers()[-1]["outcome"] == "delivered"
+
+    def _ask_scan_that_the_monthly_fire_meets(self, monkeypatch, *, blind: bool = False):
+        """The finding's race through the REAL code: Harrison's ask scan takes the lock at
+        07:04; while it is scanning, the 07:07 monthly fire runs and is refused
+        (scan_running); then the ask card lands, stamped with its 07:04 START."""
+        import cora.channel_archive.scan as scan_mod
+        from cora.channel_archive import deliver
+        from cora.channel_archive import registry as reg
+        real_scan, real_policy = scan_mod.scan, reg.load_deny_policy
+        fired: list[int] = []
+
+        def _scan(*a, **k):
+            if not fired:
+                fired.append(SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 5, 7, 7)))
+            return real_scan(*a, **k)
+        monkeypatch.setattr(scan_mod, "scan", _scan)
+        if blind:
+            monkeypatch.setattr(reg, "load_deny_policy", lambda *a, **k: None)
+        out = deliver.deliver_proposal(trigger="ask", now=az(2026, 10, 5, 7, 4), sleep=no_sleep)
+        monkeypatch.setattr(scan_mod, "scan", real_scan)
+        monkeypatch.setattr(reg, "load_deny_policy", real_policy)
+        return out, fired
+
+    def test_a_fire_refused_by_a_running_ask_scan_is_not_a_failed_month(self, fake, monkeypatch):
+        """r3:registry-ops#0 -- the ask card that the running scan delivers settles the
+        month: no week of false 'NOT DELIVERED' WARNs, and no Monday retry card that would
+        supersede the live ask card (A14) and drop a later 'This list matches my read'."""
+        out, fired = self._ask_scan_that_the_monthly_fire_meets(monkeypatch)
+        assert out["delivered"] and fired == [0]
+        m = markers()
+        assert len(m) == 1 and m[0]["ok"] is True and m[0]["outcome"] == SCRIPT.DEFERRED_OUTCOME
+        assert m[0]["attempt_ts"] == az(2026, 10, 5, 7, 7) and m[0]["month"] == "2026-10"
+        ask = st.fold(now=az(2026, 10, 5, 8, 0)).latest()
+        assert ask.trigger == "ask" and ask.created < m[0]["attempt_ts"]        # stamped at its start
+        posts = len(fake.posts)
+        for d in (12, 19, 26):
+            assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, d)) == 0
+            last = markers()[-1]
+            assert last["ok"] is True and last["outcome"] == "skipped:delivered_by_the_running_scan", last
+        assert len(fake.posts) == posts
+        f = st.fold(now=az(2026, 10, 26, 8, 0))
+        assert f.superseded_by(ask.proposal_id) is None and f.is_live(ask.proposal_id, az(2026, 10, 12, 8, 0))
+
+    def test_a_deferred_month_whose_running_scan_went_blind_is_retried(self, fake, monkeypatch):
+        """... and when the running scan's own result is NOT the month's card (blind), the
+        next Monday is due -- the month is never lost to the deferral."""
+        out, fired = self._ask_scan_that_the_monthly_fire_meets(monkeypatch, blind=True)
+        assert out["delivered"] and out["blind"] and fired == [0]
+        assert markers()[-1]["outcome"] == SCRIPT.DEFERRED_OUTCOME
+        assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 12)) == 0
+        assert markers()[-1]["outcome"] == "delivered"
+        assert SCRIPT.main(["--apply", "--monthly"], now=az(2026, 10, 19)) == 0
+        assert markers()[-1]["outcome"] == "skipped:already_delivered_this_month"
+
+    def test_another_months_deferral_does_not_reopen_this_month(self):
+        deferred = [{"task": SCRIPT.TASK_NAME, "ok": True, "outcome": SCRIPT.DEFERRED_OUTCOME,
+                     "month": "2026-09", "attempt_ts": az(2026, 9, 7), "ts": "2026-09-07T14:07:00+00:00"}]
+        assert SCRIPT.monthly_due(az(2026, 10, 12), st.fold(events=[], ledger=[]), deferred) == (
+            False, "not_due_after_first_monday_week")
+        deferred[0]["month"] = "2026-10"
+        assert SCRIPT.monthly_due(az(2026, 10, 12), st.fold(events=[], ledger=[]), deferred) == (True, "due")
+        deferred[0]["task"] = "some-other-task"
+        assert SCRIPT.monthly_due(az(2026, 10, 12), st.fold(events=[], ledger=[]), deferred) == (
+            False, "not_due_after_first_monday_week")
 
     def test_a_partial_first_monday_is_retried_on_every_later_monday(self, monkeypatch):
         from _chanarch_fakes import api_error
