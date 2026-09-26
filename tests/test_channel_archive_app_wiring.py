@@ -956,3 +956,52 @@ class TestStatusScopeR2:
         monkeypatch.setattr(mmc.user_access, "check_access", lambda *a, **k: None)
         out = mmc.generate_draft(MagicMock(), _cand(mmc, text, HARRISON))
         assert out.draft_text == "a model draft", text
+
+
+# ── D-051 round 3 (Code #16) ────────────────────────────────────────────────
+#: r3:c1-intents-copy#0/#1/#2 -- lane-status questions the round-2 scope bails sent to
+#: the zero-tool model: a manner / cause / time / lane object after "archived by", a
+#: day-precise frame after the lane's birth (an absolute year, so no date rot), and a
+#: coordinated modifier list. Every founder entry point answers them with the ledger line.
+STATUS_FIRE_R3 = [
+    "which channel got archived by mistake?", "were any channels archived by the nightly monitor?",
+    "were any channels archived by the dead-channel lane?",
+    "which channels were archived since sept 28, 2026?",
+    "did you archive the dead and inactive channels?",
+]
+#: ... while a real ACTOR (a Slack mention included) still reaches the model.
+STATUS_NOT_R3 = ["were any channels archived by <@U0B3VGWJTMJ>?", "were any channels archived by Matt?"]
+
+
+class TestStatusR3:
+    @pytest.mark.parametrize("text", STATUS_FIRE_R3)
+    def test_the_dm_question_gets_the_ledger_line_not_the_model(self, dm, text):
+        client = MagicMock()
+        app_module.handle_message_event(_event(text), client)
+        texts = _texts(client)
+        assert texts and texts[0].startswith("Dead-channel lane:"), (text, texts)
+        assert not dm.qa.called and not dm.capture.called and not dm.scans, text
+
+    @pytest.mark.parametrize("text", STATUS_FIRE_R3)
+    def test_the_mention_and_slash_questions_get_the_ledger_line(self, text):
+        client, dispatch, capture, start = TestFounderMention()._run(text)
+        assert client.chat_postMessage.call_args.kwargs["text"].startswith("Dead-channel lane:"), text
+        assert not dispatch.called and not capture.called and not start.called, text
+        client, dispatch, capture, start = TestFounderSlashAskR1()._run(text)
+        assert client.chat_postMessage.call_args.kwargs["text"].startswith("Dead-channel lane:"), text
+        assert not dispatch.called and not capture.called and not start.called, text
+
+    @pytest.mark.parametrize("text", STATUS_FIRE_R3)
+    def test_the_catch_up_drafts_the_fixed_line(self, monkeypatch, text):
+        from cora import missed_message_catchup as mmc
+        monkeypatch.setattr(mmc, "HARRISON_ID", HARRISON)
+        monkeypatch.setattr(mmc, "_run_dispatch_capture",
+                            lambda *a, **k: pytest.fail("the model must not draft this"))
+        out = mmc.generate_draft(MagicMock(), _cand(mmc, text, HARRISON))
+        assert out.status == "draft" and out.draft_text == intents.CATCHUP_DRAFT, text
+
+    @pytest.mark.parametrize("text", STATUS_NOT_R3)
+    def test_an_actor_question_reaches_the_model(self, dm, text):
+        client = MagicMock()
+        app_module.handle_message_event(_event(text), client)
+        assert dm.qa.called and _texts(client) == [], text

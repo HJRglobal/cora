@@ -839,3 +839,80 @@ class TestDayPreciseFramesR3:
                                          now=NOW)
             best = min(best, time.perf_counter() - t0)
         assert best < 0.05
+
+
+#: r3:c1-intents-copy#0 -- "archived by" bails only on an ACTOR. Manner / cause
+#: ("by mistake", "by accident", "by itself"), time ("by the time the card came") and
+#: the lane naming itself ("by the dead-channel lane", "by my taps", "by tapping") stay
+#: the lane's status question (A21(c)) -- the post-demotion moment its line matters most.
+STATUS_FIRE_R3_BY = [
+    "which channel got archived by mistake?", "were any channels archived by mistake?",
+    "did a channel get archived by accident?", "were any channels archived by itself?",
+    "were any channels archived by the nightly monitor?",
+    "were the dead channels archived by the time the card came?",
+    "were any channels archived by the dead-channel lane?", "were any channels archived by tapping?",
+    "were any channels archived by your lane?", "were any channels archived by the dead channel card?",
+    "were any channels archived by my taps?", "were any channels archived by the monitor?",
+    "Were any channels archived by Mistake?", "were any channels archived by error?",
+    "were any channels archived by themselves?", "were the dead channels archived by October?",
+    "were the dead channels archived by Friday?", "were the channels archived by Cora's lane?",
+    "were the dead channels archived by the end of the week?",
+    "were the channels archived by the time the team met?",
+]
+#: ... and an ACTOR still bails: a Slack mention, a person pronoun, hand / slack, a
+#: roster or capitalised name, or "the <x> script" / another human or automation noun.
+STATUS_NOT_R3_BY = [
+    "were any channels archived by <@U0B3VGWJTMJ>?", "were the channels archived by <@U0B3VGWJTMJ|alex>?",
+    "were any channels archived by him?", "were any channels archived by her?",
+    "were any channels archived by them?", "were any channels archived by someone?",
+    "were any channels archived by anyone?", "were any channels archived by Alex?",
+    "were any channels archived by Matt?", "which channels were archived by the cleanup script?",
+    "were the channels archived by an admin?", "were the channels archived by the workspace admin?",
+    "were the channels archived by someone else?", "were any channels archived by hannah?",
+    "were the channels archived by alex's script?", "were any channels archived by Tommy?",
+    "were the channels archived by one of the admins?", "were any channels archived by Jordan?",
+    "were the channels archived by her team?", "were any channels archived by myself?",
+    "were any channels archived by *<@U0B3VGWJTMJ>*?",
+]
+
+
+class TestArchivedByActorR3:
+    @pytest.mark.parametrize("text", STATUS_FIRE_R3_BY)
+    def test_manner_cause_time_and_lane_objects_are_lane_status(self, text):
+        assert it.looks_like_archive_status(text, now=NOW), text
+
+    @pytest.mark.parametrize("text", STATUS_NOT_R3_BY)
+    def test_an_actor_after_archived_by_is_not_lane_status(self, text):
+        assert not it.looks_like_archive_status(text, now=NOW), text
+
+    @pytest.mark.parametrize("text", STATUS_FIRE_R2 + STATUS_FIRE_R3_COORD)
+    def test_the_earlier_lane_rows_still_fire(self, text):
+        assert it.looks_like_archive_status(text, now=NOW), text
+
+    @pytest.mark.parametrize("text", STATUS_NOT_R2)
+    def test_the_earlier_actor_and_pre_lane_rows_still_bail(self, text):
+        assert not it.looks_like_archive_status(text, now=NOW), text
+
+    def test_normalize_is_unchanged_by_the_mention_placeholder(self):
+        """The actor check reads its OWN view (a mention becomes 'someone'); every
+        predicate's normalized text still drops mentions."""
+        assert it.normalize("<@U0B44MDGC5R>, archive <#C0B2T18R3FG|x>") == "archive #chan"
+        assert it.normalize("were they archived by <@U0B3VGWJTMJ>?") == "were they archived by ?"
+
+    @pytest.mark.parametrize("shape", ["were the channels archived by " + "the " * 67,
+                                       "were the channels archived by " + "by " * 90,
+                                       "were the channels archived by " + "<@U0B3VGWJTMJ> " * 17,
+                                       "were the channels archived by " + "Alex " * 54,
+                                       "were the channels archived by one of " * 7 + "x",
+                                       "were the channels archived by " + "a-b " * 67 + "script"],
+                             ids=["det-run", "by-run", "mention-run", "name-run", "one-of-run", "filler-run"])
+    def test_the_actor_check_is_fast_on_capped_worst_cases(self, shape):
+        best = float("inf")
+        for _ in range(3):
+            t0 = time.perf_counter()
+            it.looks_like_archive_status(shape, now=NOW)
+            it.looks_like_archive_status(" " * 40000, now=NOW)
+            it.looks_like_archive_status("were the channels archived by" + " " * 40000 + "Alex", now=NOW)
+            it.looks_like_archive_status("were the channels archived by " + "<@U1> " * 8000, now=NOW)
+            best = min(best, time.perf_counter() - t0)
+        assert best < 0.05

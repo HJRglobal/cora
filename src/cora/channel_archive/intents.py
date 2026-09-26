@@ -174,14 +174,43 @@ _STATUS_LANE_RE = re.compile(
     r"channel[ -]archiv(?:e|ing)) (?:cards?|proposals?|lane|scans?)\b"
     r"|\b(?:dead|inactive|stale)[ -]channels? archiv(?:e|al|ing)\b")
 #: ... but the lane's line answers what the LANE did (D-051 r2 integration#3): an
-#: archive BY someone else ("archived by alex / me / slack / the sprawl script") is
-#: not its question. "by you / cora / the lane / a tap" and a deadline ("by now",
-#: "by friday", "by 5pm") still are.
-_BY_OTHER_RE = re.compile(
-    r"\barchived by (?!(?:you|u|cora|yourself|the (?:lane|card|cards|bot|scan|proposal)|a tap|"
-    r"my tap|taps?|now|then|today|tonight|tomorrow|yesterday|this|next|last|the end|end|eod|"
-    r"eow|cob|noon|midnight|mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:rs|rsday)?|"
-    r"fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b|\d)[a-z#]")
+#: archive BY someone else is not its question. "archived by" bails ONLY when an ACTOR
+#: follows (D-051 r3 c1-intents-copy#0 -- the default is the lane): a Slack mention (the
+#: actor check's own view turns it into "someone"), a person pronoun, "hand" / "slack",
+#: a roster name or a capitalised name, or "the <x> script" / another human or
+#: automation noun ("an admin", "the workspace admin", "one of the admins"). Every other
+#: object stays the lane's status question (A21(c)): manner / cause ("by mistake", "by
+#: accident", "by itself"), time ("by the time the card came", "by friday", "by now"),
+#: and the lane naming itself ("by you / cora", "by the dead-channel lane", "by my
+#: taps", "by tapping").
+#: Staff first names (data/maps/slack-to-asana.yaml display names + org-roles.yaml, as
+#: of 2026-09-25). A name missing here fails toward the lane's own counts-only status
+#: line, never toward the zero-tool model.
+_ROSTER_FIRST_NAMES = ("aaron|alex|alina|brei|daniel|demi|elena|eric|hannah|harrison|jake|jason|jeff|"
+                       "jennifer|jerry|justin|larry|matt|micah|sara|shaun|tessa|tommy")
+_BY_PERSON = ("(?:someone|somebody|anyone|anybody|everyone|everybody|me|myself|him|himself|herself|"
+              "them|others|other people|whoever|hand|slack|slackbot|" + _ROSTER_FIRST_NAMES + ")")
+_BY_ACTOR_NOUN = ("(?:scripts?|admins?|administrators?|owners?|team|staff|person|people|humans?|"
+                  "users?|members?|employees?|workflows?|zaps?|zapier|integrations?)")
+_BY_LANE_NOUN = "(?:lane|cards?|bot|scans?|proposals?|monitor|taps?|buttons?)"
+_BY_DET = "(?:the|a|an|my|your|our|his|her|their|this|that|some|any|another|one of(?: the| our| my)?)"
+_BY_FILLER = r"(?!(?:the|a|an|my|your|our|his|her|their)\b)[a-z0-9'_-]+"
+_BY_ACTOR_RE = re.compile(
+    r"\barchived by (?:" + _BY_PERSON + r"\b"
+    + r"|her\b(?! (?:" + _BY_FILLER + r" ){0,2}?" + _BY_LANE_NOUN + r"\b)"
+    + r"|(?:" + _BY_DET + r" )?(?:" + _BY_FILLER + r" ){0,2}?" + _BY_ACTOR_NOUN + r"\b)")
+#: a capitalised word right after "archived by" (read on the CASED view) is a name --
+#: unless it is one of the lane / manner / time words ("by Mistake", "by Friday",
+#: "by October", "by Cora", "by The lane")
+_BY_NAME_RE = re.compile(r"(?i:\barchived by )([A-Z][a-z][A-Za-z'\u2019-]*)")
+_NOT_A_NAME = frozenset((
+    "you u cora yourself itself themselves mistake accident error default design chance now then "
+    "today tonight tomorrow yesterday this next last end eod eow cob noon midnight the a an my "
+    "your our their his these those that some any every each one another lane card cards bot scan "
+    "scans proposal proposals monitor tap taps button buttons monday mon tuesday tue tues "
+    "wednesday wed thursday thu thur thurs friday fri saturday sat sunday sun").split())
+_POSSESSIVE_RE = re.compile(r"['\u2019]s?\Z")
+_MENTION_AS_ACTOR = " someone "
 #: ... nor a named time frame that STARTS before the lane was born (monitor.LANE_EPOCH,
 #: 2026-09-25): "in june", "last summer", "since june", "in 2025", "last year", the
 #: June sprawl. A relative "last week" / "today" / "yet" is lane time. The month /
@@ -275,20 +304,39 @@ _BARE_YES_RE = re.compile(
     r"(?:,? @?cora)?[?.!]*\Z")
 
 
-def normalize(text: str, *, bot_user_id: str | None = None) -> str:
-    """Lowercase, entity-unescaped, Slack mention tokens removed, channel tokens
-    replaced by ``#chan`` (a channel's NAME never feeds a predicate), whitespace
-    collapsed to single spaces, list marker / code / bold / italic / strike wrappers
-    and any leading punctuation a stripped mention left behind removed, capped."""
+def _normalize_cased(text: str, *, mention_as: str = " ") -> str:
     t = html.unescape(str(text or "")[: MAX_CHARS * 4])
-    t = _MENTION_TOKEN_RE.sub(" ", t)
+    t = _MENTION_TOKEN_RE.sub(mention_as, t)
     t = _CHANNEL_TOKEN_RE.sub(" " + CHANNEL_PLACEHOLDER + " ", t)
     t = " ".join(t.split())
     t = _LIST_MARKER_RE.sub("", t)
     t = t.replace("`", "").replace("*", "")
     t = _EMPHASIS_RE.sub("", t)
     t = _LEAD_PUNCT_RE.sub("", t.strip())
-    return " ".join(t.split()).lower()[:MAX_CHARS]
+    return " ".join(t.split())
+
+
+def normalize(text: str, *, bot_user_id: str | None = None) -> str:
+    """Lowercase, entity-unescaped, Slack mention tokens removed, channel tokens
+    replaced by ``#chan`` (a channel's NAME never feeds a predicate), whitespace
+    collapsed to single spaces, list marker / code / bold / italic / strike wrappers
+    and any leading punctuation a stripped mention left behind removed, capped."""
+    return _normalize_cased(text).lower()[:MAX_CHARS]
+
+
+def _names_other_actor(text: str) -> bool:
+    """True when an "archived by" in *text* is followed by an ACTOR (see _BY_ACTOR_RE):
+    read on a view where a Slack mention is "someone" (a person was named there) and
+    the case is kept (a capitalised word is a name unless it is a lane / manner /
+    time word)."""
+    view = _normalize_cased(text, mention_as=_MENTION_AS_ACTOR)
+    if _BY_ACTOR_RE.search(view.lower()):
+        return True
+    for m in _BY_NAME_RE.finditer(view):
+        w = _POSSESSIVE_RE.sub("", m.group(1).lower())
+        if w not in _NOT_A_NAME and w not in _MONTH_NUM and not w.endswith("ing"):
+            return True
+    return False
 
 
 def _ok(t: str) -> bool:
@@ -313,7 +361,7 @@ def looks_like_archive_status(text: str, *, now: float | None = None) -> bool:
         return False
     if _STATUS_BAIL_RE.search(t) or not _STATUS_LANE_RE.search(t):
         return False
-    if _BY_OTHER_RE.search(t):
+    if "archived by" in t and _names_other_actor(text):
         return False
     try:
         return not _names_pre_lane_period(t, time.time() if now is None else float(now))
