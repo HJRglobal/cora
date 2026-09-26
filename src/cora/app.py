@@ -279,7 +279,8 @@ def _with_authors(merged: list[dict], history: list[dict]) -> list[dict]:
     return out
 
 
-def _prior_turns_by_author(prior_messages) -> tuple[list[str], list[str]]:
+def _prior_turns_by_author(prior_messages, *,
+                           with_members: bool = False) -> tuple[list[str], list[str]]:
     """(person_texts, cora_texts) of a prior window by ORIGINAL author. Reads the
     builders' pre-merge record when the list carries it; otherwise splits a folded
     turn on the fold's own labels (Cora's part, then the reply) -- a list that lost
@@ -290,18 +291,31 @@ def _prior_turns_by_author(prior_messages) -> tuple[list[str], list[str]]:
     the builders' same-role merge joins them (D-051 r3 integration#1 / c2-egress#0):
     the model sees two quick messages -- "we need two suites" then "oct 17-21 for Mike
     Jones" -- as one turn, so the lodging noun and its cue are judged together. Only
-    the fold (Cora's opening re-roled as the person's) is undone."""
+    the fold (Cora's opening re-roled as the person's) is undone.
+
+    ``with_members`` (B1's person leg, D-051 r4 c2-egress#0 / integration#0) ALSO
+    returns, after the runs, each pre-merge person message of a run that joined two
+    or more -- the UNION: the run catches a noun and its cue split across messages;
+    the single message keeps the loose predicate's first-clause frame leg and its
+    capability bail scoped to that message ("UFL shoot logistics thread" then "can
+    you find some inns for Mike Jones and Sarah Lee?" -- the run's first clause is
+    the root post). Cora's texts stay the runs (her STRONG tier is a plain search;
+    joining never shrinks it). A list without the record is unchanged."""
     authored = getattr(prior_messages, "authored", None)
     if authored is not None:
-        runs: list[list[str]] = []                  # [role, text], same-role runs merged
+        runs: list[list] = []                       # [role, text, members], same-role merged
         for r, c in authored:
             if r not in ("user", "assistant") or not isinstance(c, str):
                 continue
             if runs and runs[-1][0] == r:
                 runs[-1][1] += "\n" + c
+                runs[-1][2].append(c)
             else:
-                runs.append([r, c])
-        return ([c for r, c in runs if r == "user"], [c for r, c in runs if r == "assistant"])
+                runs.append([r, c, [c]])
+        person = [c for r, c, _m in runs if r == "user"]
+        if with_members:
+            person += [m for r, _c, ms in runs if r == "user" and len(ms) > 1 for m in ms]
+        return (person, [c for r, c, _m in runs if r == "assistant"])
     person: list[str] = []
     cora: list[str] = []
     for m in prior_messages or ():
@@ -1710,9 +1724,11 @@ def _dispatch_qa(
     # -- with the STRONG tier only, so her "Full suite green ... Sep 24" (weak noun +
     # date) never withholds but her relay of a KB/tool answer naming "the hotel for
     # Jordan" or "Hilton Honors 482915736" does (the person's original ask may sit in
-    # another channel, not this window).
+    # another channel, not this window). The person leg reads each joined run AND
+    # each pre-merge message of it (the union, D-051 r4 c2-egress#0 / integration#0).
     try:
-        _travel_person_prior, _travel_cora_prior = _prior_turns_by_author(prior_messages)
+        _travel_person_prior, _travel_cora_prior = _prior_turns_by_author(
+            prior_messages, with_members=True)
         _travel_web_withhold = (
             _travel_lane_thread or _travel_store_error
             or travel_shortlist.is_lodging_shaped(user_message)
