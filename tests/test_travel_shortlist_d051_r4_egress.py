@@ -175,3 +175,74 @@ class TestPriorTurnPersonLegIsAUnion:
                 == app_module._prior_turns_by_author(plain) == (["a\nb"], ["c"]))
 
 
+# ── r4:c2-egress#1: the person slot takes a coordinated group ──────────────────────
+
+PERSON_GROUP_MUST_WITHHOLD = [
+    # the finding's four rows
+    "google where mike jones and sarah lee could stay",
+    "google where jordan riverstone and his wife can stay",
+    "search online for a place for Mike Jones and Sarah Lee to stay",
+    "google somewhere Mike and Sarah Jones can stay",
+    # the other conjunctions, and a group on each side
+    "google where mike jones & sarah lee could stay",
+    "search online for a spot for mike jones + sarah lee to crash",
+    "look up somewhere jordan riverstone and his manager might sleep",
+    "google anywhere mike jones and sarah lee would stay near the arena",
+    "search the web for places for mike jones and the lee family to stay",
+]
+PERSON_GROUP_MUST_NOT_WITHHOLD = [
+    # determiner / pronoun subjects stay out, with or without a group
+    "where the data and the logs should stay", "where the bot and the importer could crash",
+    "that's where the api and the queue could crash", "where it and the cache might crash",
+    "google where mike jones and sarah lee work", "google where the stadium and the arena are",
+    "a place for everything and everyone", "somewhere mike and sarah went last year",
+]
+
+
+class TestPersonStayCoordinatedGroup:
+    @pytest.mark.parametrize("text", PERSON_GROUP_MUST_WITHHOLD)
+    def test_withholds_as_a_persons_turn_only(self, text):
+        assert ts.is_lodging_shaped(text), text
+        assert ts.is_lodging_shaped(_wire(text)), text
+        # kept OUT of the STRONG tier that also reads Cora's own prose
+        assert not ts.is_lodging_strong(text) or "sleep" in text, text
+
+    @pytest.mark.parametrize("text", PERSON_GROUP_MUST_NOT_WITHHOLD
+                             + PERSON_STAY_MUST_NOT_WITHHOLD)
+    def test_precision_rows_stay_clear(self, text):
+        assert not ts.is_lodging_shaped(text), text
+
+    @pytest.mark.parametrize("text", PERSON_STAY_MUST_WITHHOLD)
+    def test_the_r3_rows_still_withhold(self, text):
+        assert ts.is_lodging_shaped(text), text
+
+    @pytest.mark.parametrize("text", PERSON_GROUP_MUST_WITHHOLD[:4])
+    def test_the_web_ask_is_withheld_on_the_real_dispatch(self, lane, text):
+        # web_guard WOULD attach (explicit intent) -- only the travel withhold stops it
+        assert web_guard.evaluate(text, "HJRG", kb_meta={}, model=MODEL_SONNET).attach
+        seen = _drive_dispatch(text, user=_tessa(), channel_id="D0TESSA", channel_name="dm",
+                               entity="HJRG")
+        assert seen and all(kw.get("web_tools") is False for kw in seen)
+        assert any(r.get("reason") == "gate_skipped:travel_lane" for r in _web_rows())
+
+    def test_coras_prose_with_a_group_does_not_withhold(self, lane):
+        prior = [{"role": "user", "content": "what did the test run say?"},
+                 {"role": "assistant", "content": "That's where builds and imports could "
+                                                  "crash; somewhere jobs and retries can stay."}]
+        seen = _drive_dispatch("google the Deposco API changelog", user=_tessa(),
+                               channel_id="D0TESSA", channel_name="dm", entity="HJRG",
+                               prior=prior)
+        assert seen and seen[-1].get("web_tools") is True
+
+    @pytest.mark.parametrize("shape", [
+        " " * 40000, "where mike and " * 2700, "where a and b " * 2900, "place for x and " * 2500,
+        "somewhere " + "mike & " * 5700, "where " + "x + " * 10000, "and " * 10000,
+        "where mike jones and sarah lee " * 1300, "spots for " + "ab and cd " * 4000,
+    ], ids=["spaces", "where-and", "where-a-and-b", "place-for-and", "amp", "plus", "and",
+            "group", "spots-group"])
+    def test_the_phrase_is_linear(self, shape):
+        assert len(shape) >= 39000
+        assert _best_of_3(lambda: ts._PERSON_STAY_RE.search(shape)) < 0.1
+        assert _best_of_3(lambda: ts.is_lodging_shaped(shape)) < 0.25
+
+
