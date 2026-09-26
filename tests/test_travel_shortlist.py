@@ -1064,16 +1064,23 @@ class TestFieldSanitizer:
         "Boo\u0332\u0333ked for you", "Booked\ufe0ffor you", "Booked\u0332for you",
         "Con\ufe0ffirmed: king suite", "Res\u034ferved under your name", "Do\u3164ne",
         "He\u180bld for you", "Ho\ufe0fld on it", "Boo\ufe0fking confirmed",
+        # D-051 r3 c2-injection-card#0: the C1 controls (U+0080-U+009F, category Cc) --
+        # NFKC keeps them, they are not default-ignorable, and a Chromium client draws
+        # them as nothing (U+0085 NEL was already whitespace to str.split)
+        "Boo\x81ked for 4 guests", "Con\x90firmed", "Boo\x80ked for you", "Boo\x9fked for you",
+        "He\x8dld for you", "Do\x9cne", "Res\x8ferved under your name", "Boo\x85ked for you",
     ])
     def test_invisible_and_non_spacing_characters_never_split_a_booking_word(self, raw):
         import unicodedata
         out = ts.sanitize_field(raw, 160)
-        # what a reader sees: every non-spacing / format / default-ignorable char dropped
-        seen = "".join(ch for ch in out if unicodedata.category(ch) not in ("Mn", "Me", "Cf")
+        # what a reader sees: every non-spacing / format / default-ignorable / control
+        # char dropped (a Chromium Slack client draws C1 controls as zero-width)
+        seen = "".join(ch for ch in out if unicodedata.category(ch) not in ("Mn", "Me", "Cf", "Cc")
                        and not ts._INVISIBLE_RE.match(ch)).lower()
         for bad in ("book", "reserv", "confirm", "done", "held", "hold"):
             assert bad not in seen, (raw, out)
         assert not ts._INVISIBLE_RE.search(out), (raw, out)
+        assert not [ch for ch in out if unicodedata.category(ch) == "Cc"], (raw, out)
 
     @pytest.mark.parametrize("raw", [
         "Café Monarch", "Cafe\u0301 Monarch", "Hôtel Valley Ho", "Diné Inn", "Kinłání Lodge",

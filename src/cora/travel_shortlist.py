@@ -1764,7 +1764,10 @@ def extract_json_options(text: str) -> list | None:
     return data if isinstance(data, list) else None
 
 
-_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+# Every control character -- C0, DEL and the C1 block U+0080-U+009F (D-051 r3
+# c2-injection-card#0: category Cc, kept by NFKC, not default-ignorable, drawn as
+# nothing by a Chromium client, so 'Boo<U+0081>ked' split the neutralizer's word).
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _SPECIAL_MENTION_RE = re.compile(r"<[!@#][^<>]{0,200}>")
 _AT_SPECIAL_RE = re.compile(r"@(?:here|channel|everyone)\b", re.IGNORECASE)
 # Domain-SHAPED: a label character, a dot, two letters -- every host with a 2+ letter
@@ -1822,7 +1825,8 @@ def sanitize_field(value: Any, cap: int) -> str:
     """A model/web string -> a card-safe PLAIN string (unescaped; escaping happens
     at render). ORDER MATTERS (D-051 r1 c2-injection-card#0/#1): NFKC-fold, then
     Unicode format characters (category Cf: zero-width, bidi, soft hyphen) and
-    control characters become spaces, then the markdown characters -- FIRST, so
+    control characters (C0, DEL and C1 -- D-051 r3) become spaces, then the markdown
+    characters -- FIRST, so
     no wrapper ('**x.com**', '_Booked_', '_@here_') survives into the passes below
     and no translate re-exposes a word they skipped. Then Slack special tokens and
     @here/@channel/@everyone are removed, every token that CONTAINS a URL/domain
