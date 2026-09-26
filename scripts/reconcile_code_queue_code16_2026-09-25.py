@@ -69,8 +69,8 @@ BRANCH = "claude/code-16-new-capability-lanes-2026-09-21"
 
 # The commits that closed each item (build + D-051 fixes), on the branch as merged.
 COMMITS: dict[str, str] = {
-    "cq-be90cea867c3": "bd63aa27,def660ef,40d560e4,3bf2dbc5,327dab51,0ab4804e,38a79c98",
-    "cq-e9ef3f581d60": "bd63aa27,2e31eff4,f9007a24,a16224f9,11478209,1d2961d7",
+    "cq-be90cea867c3": "bd63aa27,def660ef,40d560e4,3bf2dbc5,327dab51,0ab4804e,38a79c98,d275085f,e03fa0c1,1882c883,7e5314f0,2f1a258c,e0a7efee,f90b6262,cea9d521,ef1effa8,9299fcb8,db175ed0,05b91d63,4fc9eada,64ba6a94,cecf7406,a0e2a412,fe0184e1,ccec822e,c8ebb012,ce8209bc,c7147040,26dd3671,7890a4a6,28f4be1f,d01057a3,3d11eea7,1b65316a,8075c29d,27635832,8f816fd2,c335fc19,dfdf1835,63b4a8e1,928e76e8,6ebdef31,396ce8b6,4a1897b0,f09d8842,29b831b7,c2c76acd,a6072fc4,0040accf,cbfbe4f0,efbd2616,fcd2e1d9,0488149c,8acd5b1d,7b8c445c,2aebb58a,6e4e9184,228a19ea",
+    "cq-e9ef3f581d60": "bd63aa27,2e31eff4,f9007a24,a16224f9,11478209,1d2961d7,b145a63e,c7df9d2f,910c6932,a6813444,45d47e05,1110372e,1463fa34,9f9b06c9,785bffae,ef517807,0a168133,12bcaf1d,2168de4d,c92c336e,812e0305,a6737860,32c969a5,b58033cf,6dbc47f2,72ce2a94,86d46040,de73b7fd,6f19c84a,e63da3dc,5ab7f250,591f6043,ec5f2aee,122b95a5,5ef8f93b,03075ab5,99e44a91,d5f943a7,256afbc2,367b3168,1cc6eda9,f73d4ee8,6667331e,e491261a,fdda9bb0,375f39a5,c5ce65bc,5fc6cd53,72d70bc1,a023a8b0,e46030d0,876dfa6c,a9ba2af2,06a79ce6,8a2c97b7",
 }
 SUPERSEDE_COMMIT = COMMITS["cq-be90cea867c3"]
 
@@ -229,6 +229,24 @@ SEEDS: list[tuple[str, str, str, str]] = [
      "auth.test x-oauth-scopes (2026-09-25) shows 74 scopes incl. channels:manage, groups:write, pins:read, "
      "bookmarks:read, channels:join; the checked-in manifest and runbook.md:812 still say 15. Refresh the "
      "manifest from the live app config (read-only export) so a rebuild does not silently drop scopes."),
+    ("bug", "P3", "[code-16] Travel lane-thread follow-up price grammar: read a price by what it modifies",
+     "D-051 r4-r6 (Code #16): a postposed ceiling ('$250/night max', 'tops', 'or less') was added, then "
+     "found to read an occupancy ('$289/night, max 6 guests') as a price ceiling; a lookahead failed both "
+     "ways, so the leg was REVERTED (06a79ce6) -- postposed ceilings now get the help line -- and belts "
+     "(8a2c97b7) send a turn whose DROPPED clause still states a field to the help line. Still open "
+     "(pre-existing): a single KEPT clause with an unread price and another field re-runs on the other "
+     "field at the STORED budget ('$250/night max 3 bedrooms', 'can we do oct 20-22 for $250?', "
+     "'oct 20-22 with 6 people'), and a listed price wrapped in markdown/brackets/quotes or led by a dash or "
+     "an adverb ('oct 20-22, *$250/night max*', 'what about tempe? - $250/night max'); and the belts cost "
+     "some recall (a real refinement next to a priced remark "
+     "gets the help line). Redesign: attach each price/count to what it modifies; the help line only when a "
+     "kept clause carries a price the merge did not read. Tables in the Code #16 report."),
+    ("bug", "P3", "[code-16] OSN shift scheduler claims any DM containing the word 'availability'",
+     "_SHIFT_DM_TRIGGERS matches the bare substring 'availability', so an idle user's lodging DM with no "
+     "ask-for-options frame ('check hotel availability in scottsdale oct 17-21', 'does the hyatt have "
+     "availability oct 17-21?') starts the availability flow and captures later DMs until cancel. Code #16 "
+     "r4 added a narrow frame escape only (a framed lodging ask escapes). Pre-dates Code #16; decide the "
+     "trigger's scope (e.g. require a shift/schedule context word)."),
     ("config", "P3", "[code-16] channel_content_guard parity on the travel shortlist card",
      "The travel card posts web-derived fit notes in blocks without channel_content_guard.guard_outbound "
      "(the lane bypasses _dispatch_qa's reply gates by design; slack_egress sanitize_text runs at build). "
