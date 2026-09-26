@@ -462,3 +462,211 @@ class TestHeadSlotArea:
             ts._head_slot_areas(shape)
             ts.parse_constraints(shape, today=TODAY)
         assert _best_of_3(run) < 0.05
+
+
+# ── r3:c2-trigger#0 (adjudicated) + r3:c2-trigger#2 (SPLIT -> fix): the lane-thread gate ──
+
+LANE_ROOT = "1790000000.000920"
+# the 9/15-shaped stored ask: hotels AND airbnbs, 4 people, $300-400
+STORED_ASK = "find hotels and airbnbs in scottsdale oct 17-21 for 4 people $300-400/night"
+
+# A comment ON the posted card is never a billed re-search, and never a new constraint.
+CARD_COMMENT_MUST_HELP = [
+    "the 2nd option is $450/night, too pricey",
+    "the first one says $389/night, that works",
+    "the last one is only $210 a night!",
+    "I'll send this to 2 people on the team",
+    "can you check with jordan if oct 20-22 works",
+    "thanks! the 3rd one is $450/night",
+    "the 2nd option is 450 a night",
+    "love the first one", "love the second one", "the first is too far", "thanks",
+    "the second hotel looks great, thanks!",
+    "the airbnb in gilbert looks perfect",
+    "the hotel in mesa is only $210 a night!",
+    "hotels in gilbert look perfect",
+    "that one is $389 per night, works for me",
+    "could you check with tessa if the 2nd one works",
+    "can we check with 2 people on the team first",
+    "i'll show this to 3 guests tomorrow",
+    "nice, the one in scottsdale is $250 nightly",
+    "the 3rd one sleeps 6 people",
+    "the first one is about $389 a night",
+    "the 2nd one is under $300 a night, nice",
+    "thanks, gilbert",                                    # a person named Gilbert
+    "Hotel Valley Ho is $329/night", "Hotel Valley Ho sleeps 6 people",
+    "the 2nd one has two queens", "the 3rd one is for 6 people",
+]
+# A refinement verb / shape still re-runs on the merged fields.
+DIRECTIVE_MUST_RERUN = [
+    ("keep it under 250 a night", {"budget_max": 250, "budget_min": None}),
+    ("$200-300/night please", {"budget_min": 200, "budget_max": 300}),
+    ("max 250/night", {"budget_max": 250}),
+    ("6 people now", {"party_size": 6}),
+    ("actually it's 6 of us", {"party_size": 6}),
+    ("same dates but 6 people", {"party_size": 6}),
+    ("make it for 6 people", {"party_size": 6}),
+    ("we're 6 people now", {"party_size": 6}),
+    ("for 6 people", {"party_size": 6}),
+    ("group of twelve", {"party_size": 12}),
+    ("something less expensive, under $200 a night", {"budget_max": 200}),
+    ("budget $250/night please", {"budget_min": 250, "budget_max": 250}),
+    ("make it $300/night", {"budget_min": 300, "budget_max": 300}),
+    ("try $300 a night", {"budget_min": 300, "budget_max": 300}),
+    ("around $300 a night", {"budget_min": 300, "budget_max": 300}),
+    ("can you check oct 20-22", {"check_in": date(2026, 10, 20)}),
+    ("also check oct 20-22", {"check_in": date(2026, 10, 20)}),
+    ("can you look in mesa", {"areas": ("mesa",)}),
+    ("can you check mesa", {"areas": ("mesa",)}),
+    ("thanks! try mesa instead", {"areas": ("mesa",)}),
+    ("find hotels in mesa oct 17-21 from $200 a night",        # a re-typed full ask
+     {"areas": ("mesa",), "budget_min": 200, "budget_max": 200}),
+    ("hotels in mesa oct 17-21, 6 guests, $250/night",          # a restated noun-led ask
+     {"areas": ("mesa",), "party_size": 6, "budget_min": 250, "budget_max": 250}),
+    ("hotels in mesa oct 17-21 for 4 people $250/night",
+     {"areas": ("mesa",), "party_size": 4, "budget_min": 250, "budget_max": 250}),
+]
+# A comment clause beside a refinement never lends it a field.
+MIXED_ROWS = [
+    ("love the first one, but can we do oct 20-22?",
+     {"check_in": date(2026, 10, 20), "budget_min": 300, "budget_max": 400, "party_size": 4}),
+    ("thanks! the 3rd one is $450/night, can we do oct 20-22?",
+     {"check_in": date(2026, 10, 20), "budget_min": 300, "budget_max": 400}),
+    ("try mesa, the airbnb one looked nice", {"areas": ("mesa",), "kind": "both"}),
+    ("try mesa and send this to 2 people", {"areas": ("mesa",), "party_size": 4}),
+    ("that one but under $300 a night", {"budget_min": None, "budget_max": 300}),
+    ("two queens instead", {"beds": "two_queens"}),
+]
+# c2-trigger#2: the ordinary area / date moves re-run.
+AREA_DATE_MUST_RERUN = [
+    ("what about mesa?", {"areas": ("mesa",)}), ("how about tempe?", {"areas": ("tempe",)}),
+    ("what about phoenix", {"areas": ("phoenix",)}), ("anything in mesa?", {"areas": ("mesa",)}),
+    ("mesa?", {"areas": ("mesa",)}), ("prefer mesa", {"areas": ("mesa",)}),
+    ("mesa or gilbert?", {"areas": ("mesa", "gilbert")}), ("same but mesa", {"areas": ("mesa",)}),
+    ("add mesa", {"areas": ("mesa",)}), ("include gilbert", {"areas": ("gilbert",)}),
+    ("look at mesa too", {"areas": ("mesa",)}), ("tempe too?", {"areas": ("tempe",)}),
+    ("thanks, mesa?", {"areas": ("mesa",)}),
+    ("let's do oct 20-22", {"check_in": date(2026, 10, 20)}),
+    ("move it to oct 20-22", {"check_in": date(2026, 10, 20)}),
+    ("push it to oct 20-22", {"check_in": date(2026, 10, 20)}),
+    ("go with oct 20-22", {"check_in": date(2026, 10, 20)}),
+    ("new dates are oct 20-22", {"check_in": date(2026, 10, 20)}),
+    ("dates changed to oct 20-22", {"check_in": date(2026, 10, 20)}),
+    ("switch the dates to oct 20-22", {"check_in": date(2026, 10, 20)}),
+    ("it's actually oct 20-22", {"check_in": date(2026, 10, 20)}),
+    ("can we move it to oct 20-22?", {"check_in": date(2026, 10, 20)}),
+    ("sorry, dates are oct 18-22", {"check_in": date(2026, 10, 18)}),
+    ("any in gilbert?", {"areas": ("gilbert",)}),
+    ("hmm, too pricey. anything under $250 a night?", {"budget_min": None, "budget_max": 250}),
+    ("these are great! could you also look for airbnbs?", {"kind": "rental"}),
+]
+# ...while a turn about something else, with no stay referent, stays the help line.
+MOVE_MUST_HELP = [
+    "in any case, the offsite moved to oct 20-22 in tempe",
+    "draft a note to the team about the offsite in tempe oct 20-22",
+    "the offsite got pushed to oct 20-22",
+    "tell the team the retreat is now oct 20-22 in mesa",
+    "the conference is oct 20-22 now", "jordan arrives oct 20-22",
+    "can we do the meeting in mesa oct 20-22 instead?", "gilbert said the first one is great",
+    "talk to austin about it", "what about gilbert's suggestion?", "send this to charlotte",
+    "how about we ask gilbert", "move the meeting to oct 20-22", "push the offsite to oct 20-22",
+    "let's do dinner in tempe oct 20-22", "the offsite dates are oct 20-22",
+]
+
+
+class TestLaneThreadGateRound3:
+    def _seed(self):
+        c = ts.parse_constraints(STORED_ASK, today=TODAY).constraints
+        assert c.kind == "both" and (c.budget_min, c.budget_max) == (300, 400)
+        ts.append_event("asked", channel="D0HARRISON", root_ts=LANE_ROOT,
+                        constraints=c.to_record(), registered=True)
+
+    def _route(self, text):
+        return ts.route_turn(text, user_id=HARRISON, channel_id="D0HARRISON", channel_name="dm",
+                             thread_root_ts=LANE_ROOT, lane_thread=True, today=TODAY)
+
+    @pytest.mark.parametrize("text", CARD_COMMENT_MUST_HELP + MOVE_MUST_HELP)
+    def test_a_comment_on_the_card_gets_the_help_line_and_bills_nothing(self, text):
+        self._seed()
+        r = self._route(text)
+        assert r is not None and r.kind == "reply" and r.reply == ts.FOLLOWUP_HELP_REPLY, (text, r)
+
+    @pytest.mark.parametrize("text,expect", DIRECTIVE_MUST_RERUN + MIXED_ROWS
+                             + AREA_DATE_MUST_RERUN)
+    def test_a_refinement_re_runs_on_the_merged_fields_only(self, text, expect):
+        self._seed()
+        r = self._route(text)
+        assert r is not None and r.kind == "search" and r.followup, (text, r)
+        for k, v in expect.items():
+            assert getattr(r.constraints, k) == v, (text, k, getattr(r.constraints, k))
+
+    @pytest.mark.parametrize("text", [
+        "the 2nd option is $450/night, too pricey", "the first one is about $389 a night",
+        "I'll send this to 2 people on the team", "the 3rd one sleeps 6 people",
+        "the 2nd one is under $300 a night, nice", "Hotel Valley Ho is $329/night",
+        "hotels like that one cost $329/night", "Hotel Valley Ho sleeps 6 people",
+    ])
+    def test_merge_never_reads_a_description_as_a_constraint(self, text):
+        stored = ts.parse_constraints(STORED_ASK, today=TODAY).constraints
+        merged, changed, malformed = ts.merge_followup(stored, text, today=TODAY)
+        assert not changed and not malformed and merged == stored, (text, merged)
+
+    def test_the_fresh_parser_is_unchanged(self):
+        f = ts.parse_fields("hotels in mesa oct 17-21 for 4 people $250/night", today=TODAY)
+        assert f["party_size"] == 4 and (f["budget_min"], f["budget_max"]) == (250, 250)
+        f = ts.parse_fields("hotels in mesa oct 17-21, 6 guests", today=TODAY)
+        assert f["party_size"] == 6
+
+    def test_through_the_real_handler_a_price_remark_bills_nothing_and_what_about_re_runs(
+            self, lane, monkeypatch):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from test_travel_shortlist import _msg as _m
+        from test_travel_shortlist_wiring import ASK
+        client = _slack_client()
+        _mention(client, lambda **k: None, ASK, user=_tessa())
+        _drain()
+        assert len(lane.calls) == 1
+        monkeypatch.setattr(app_module, "_TRAVEL_SHORTLIST_POOL", ThreadPoolExecutor(1))
+        client2 = _slack_client()
+        _mention(client2, lambda **k: None, "the 2nd option is $450/night, too pricey",
+                 user=_tessa(), ts_="1790000000.000300", thread_ts=ASK_TS)
+        (call,) = client2.chat_postMessage.call_args_list
+        assert call.kwargs["text"] == ts.FOLLOWUP_HELP_REPLY
+        assert len(lane.calls) == 1                     # no second (billed) web call
+        lane._responses.append(_m(_fx()))
+        client3 = _slack_client()
+        _mention(client3, lambda **k: None, "what about tempe?", user=_tessa(),
+                 ts_="1790000000.000400", thread_ts=ASK_TS)
+        _drain()
+        assert _card_call(client3)["thread_ts"] == ASK_TS
+        assert len(lane.calls) == 2 and "Tempe" in lane.calls[-1]["messages"][0]["content"]
+        assert "450" not in lane.calls[-1]["messages"][0]["content"]
+
+    @pytest.mark.parametrize("shape", [
+        " " * 40000, "the " * 10000, "love " * 8000, "the first one " * 3000, "is $" * 10000,
+        ", " * 20000, "? " * 20000, "what about " * 3000, "mesa " * 8000, "mesa/" * 8000,
+        "mesa too " * 4000, "for 6 people " * 3000, "make it $" * 5000, "is about $3" * 4000,
+        "let's do " * 5000, "move it to " * 3500, "can you check " * 3000, "st. " * 10000,
+        "sleeps " * 6000, "dates are " * 4000, "hotels " * 6000, ", 6 people" * 4000,
+        "is under $" * 4000,
+    ], ids=["spaces", "the", "love", "first-one", "is-dollar", "commas", "questions",
+            "what-about", "mesa", "mesa-slash", "mesa-too", "for-people", "make-it", "is-about",
+            "lets-do", "move-it", "check", "st-dot", "sleeps", "dates-are", "hotels",
+            "list-party", "is-under"])
+    def test_the_round3_gate_is_linear(self, shape):
+        stored = ts.parse_constraints(STORED_ASK, today=TODAY).constraints
+
+        def run():
+            for rx in (ts._CLAUSE_SPLIT_RE, ts._COMMENT_RE, ts._REFINE_RE, ts._REFINE_MONEY_RE,
+                       ts._PARTY_DIRECTIVE_RE, ts._BUDGET_DIRECTIVE_RE, ts._REFINE_FIELD_RE,
+                       ts._LISTING_FACT_RE, ts._MONEY_MENTION_RE, ts._PARTY_LIST_RE):
+                rx.search(shape)
+            ts._DATES_ARE_RE.match(shape)
+            ts._NOUN_LED_RE.match(shape)
+            ts._CARD_REF_RE.search(shape)
+            ts._SLOT_LEAD_RE.match(shape)
+            ts._SLOT_TAIL_RE.match(shape, 5)
+            ts._COPULA_BEFORE_RE.search(shape[:24])
+            ts._is_refinement(shape)
+            ts.merge_followup(stored, shape, today=TODAY)
+        assert _best_of_3(run) < 0.25

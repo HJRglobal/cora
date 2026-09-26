@@ -1180,25 +1180,86 @@ _STYLE_RES = (
 )
 
 
+# D-051 r3 (c2-trigger#0): in a lane-thread FOLLOW-UP a price or a head count is a new
+# constraint only in DIRECTIVE shape. A remark on the posted card -- "the 2nd option is
+# $450/night, too pricey", "the first one is about $389 a night", "I'll send this to 2
+# people on the team", "the 3rd one sleeps 6 people" -- describes a listing or says
+# something else, and is never re-searched as the budget or the party. A money phrase
+# right after a copula ("is", "was", "costs", "says" ...) describes; a bare "$N/night"
+# counts only after a directive verb (make it / keep it / try / budget ...); a range, an
+# under / max / at least / around $N does; a party needs for / but / now / we're / it's
+# / make it before it, or now / instead / total after it (or "party of N"). A RESTATED
+# ask in the thread (a frame ask, or one that opens on the lodging noun: "hotels in mesa
+# oct 17-21, 6 guests, $250/night") states its own price and party: there only a
+# described price is skipped and a bare head count counts as a list item.
+_FIELD_MODES = ("fresh", "restated", "directive")
+_NOUN_LED_RE = re.compile(r"^(?:(?:ok|okay|actually|so|and|or|maybe|now|hmm|also)[ ,]+)?"
+                          r"(?:(?:some|any|other|more|a few|cheaper|nicer|better|different"
+                          r"|similar|good|nice|\d{1,2}) )?" + _STRICT_NOUN + r"(?![a-z0-9])")
+_PARTY_LIST_RE = re.compile(r"(?:^|, )(?:(?:about|around|roughly|maybe) |~ ?)?" + _NUM_RX + r" "
+                            r"(?:people|persons|person|guests|adults|travell?ers|of us|ppl|pax)"
+                            r"(?![a-z0-9])")
+_BUDGET_DIRECTIVE_RE = re.compile(
+    r"\b(?:make it|keep it(?: at| to| around)?|try|budget(?: of| is| at| to)?[,:]?"
+    r"|(?:change|switch|set|bump|drop|raise|lower|up) (?:the )?budget to|go with|how about"
+    r"|what about) " + _MONEY_RX + _PER_NIGHT_RX + r"\b")
+_COPULA_BEFORE_RE = re.compile(
+    r"(?:^|[^a-z'])(?:is|was|are|were|'s|be|cost|costs|costing|runs?|ran|priced|says|said"
+    r"|shows?|showing|listed)(?: (?:only|just|about|around|like|roughly))? ?$")
+_PARTY_WORD = r"(?:people|persons|person|guests|adults|travell?ers|of us|ppl|pax)"
+_PARTY_DIRECTIVE_RE = re.compile(
+    r"\b(?:(?:for|but|now|we're|we are|there are|there'll be|there will be|it's|it is|it'll be"
+    r"|make it(?: for)?|(?:change|bump|up) (?:it|the party|the group) to)"
+    r"(?: now| actually| just)?(?: about| around| roughly| maybe| like)? " + _NUM_RX
+    + r" " + _PARTY_WORD + r"|" + _NUM_RX + r" " + _PARTY_WORD
+    + r" (?:now|instead|total|in total|this time))(?![a-z0-9])")
+
+
+def _described(norm: str, start: int) -> bool:
+    """Is the money phrase starting at *start* a DESCRIPTION ("is $450/night")?"""
+    return bool(_COPULA_BEFORE_RE.search(norm[max(0, start - 24):start]))
+
+
+def _parse_party(norm: str, mode: str) -> int | None:
+    if mode == "fresh":
+        m = _PARTY_RE_1.search(norm) or _PARTY_RE_2.search(norm)
+    else:                                          # never "the 3rd one is for 6 people"
+        m = _PARTY_RE_1.search(norm) or next(
+            (d for d in _PARTY_DIRECTIVE_RE.finditer(norm) if not _described(norm, d.start())),
+            None)
+        if not m and mode == "restated":
+            m = _PARTY_LIST_RE.search(norm)
+    if not m:
+        return None
+    n = _num(next(g for g in m.groups() if g))
+    return n if 1 <= n <= 20 else None
+
+
 def _money(tok: str) -> int:
     return int(tok.replace(",", ""))
 
 
-def _parse_budget(norm: str) -> tuple[int | None, int | None]:
-    m = _BUDGET_RANGE_RE.search(norm)
+def _parse_budget(norm: str, *, mode: str = "fresh") -> tuple[int | None, int | None]:
+    def first(rx: "re.Pattern[str]") -> "re.Match[str] | None":
+        if mode == "fresh":
+            return rx.search(norm)
+        return next((m for m in rx.finditer(norm) if not _described(norm, m.start())), None)
+
+    m = first(_BUDGET_RANGE_RE)
     if m:
         lo, hi = sorted((_money(m.group(1)), _money(m.group(2))))
     else:
         lo = hi = None
-        m = _BUDGET_CEIL_RE.search(norm)
+        m = first(_BUDGET_CEIL_RE)
         if m:
             hi = _money(m.group(1))
         else:
-            m = _BUDGET_FLOOR_RE.search(norm)
+            m = first(_BUDGET_FLOOR_RE)
             if m:
                 lo = _money(m.group(1))
             else:
-                m = _BUDGET_APPROX_RE.search(norm) or _BUDGET_SINGLE_RE.search(norm)
+                m = first(_BUDGET_APPROX_RE) or first(_BUDGET_DIRECTIVE_RE if mode == "directive"
+                                                      else _BUDGET_SINGLE_RE)
                 if m:
                     lo = hi = _money(m.group(1))
     for v in (lo, hi):
@@ -1207,20 +1268,21 @@ def _parse_budget(norm: str) -> tuple[int | None, int | None]:
     return lo, hi
 
 
-def parse_fields(text: Any, *, today: date | None = None, followup: bool = False) -> dict:
+def parse_fields(text: Any, *, today: date | None = None, followup: bool = False,
+                 field_mode: str | None = None) -> dict:
     """Every field the text carries, each None/empty when absent. Used by the
     fresh-ask parser AND the lane-thread follow-up merge (*followup*: 'from X' is
-    not a place)."""
+    not a place). *field_mode* (default: "directive" for a follow-up, else "fresh")
+    says how a price and a head count are read (D-051 r3, _FIELD_MODES)."""
     today = today or datetime.now(_AZ).date()
+    mode = field_mode or ("directive" if followup else "fresh")
+    if mode not in _FIELD_MODES:
+        raise ValueError(f"unknown field_mode {mode!r}")
     lm = _load_map()
     norm = _norm(_clean(text))
     stay, matched = _parse_dates(norm, today)
-    party = None
-    m = _PARTY_RE_1.search(norm) or _PARTY_RE_2.search(norm)
-    if m:
-        n = _num(m.group(1))
-        party = n if 1 <= n <= 20 else None
-    lo, hi = _parse_budget(norm)
+    party = _parse_party(norm, mode)
+    lo, hi = _parse_budget(norm, mode=mode)
     if _TWO_QUEENS_RE.search(norm):
         beds = "two_queens"
     elif _KING_RE.search(norm):
@@ -1324,15 +1386,26 @@ def parse_constraints(text: Any, *, today: date | None = None) -> ParseResult:
 def merge_followup(stored: TravelConstraints, text: Any, *,
                    today: date | None = None) -> tuple[TravelConstraints | None, bool, bool]:
     """(merged, changed, malformed) -- a lane-thread follow-up's NEW fields override
-    the stored structured ones (B3). Raw text is never stored or re-read."""
-    f = parse_fields(text, today=today, followup=True)
+    the stored structured ones (B3). Raw text is never stored or re-read. Fields are
+    read from the turn's REFINEMENT clauses only -- a comment on the posted card
+    ("love the first one", "the 2nd one is $450/night") is never a new constraint
+    (D-051 r3 c2-trigger#0) -- and an area named in a refinement slot ("what about
+    mesa?", "prefer mesa", "mesa or gilbert?") counts (c2-trigger#2)."""
+    clauses, sole = _refinement_clauses(text)
+    kept = ", ".join(clauses)
+    # an ask RESTATED in the thread ("find hotels in mesa oct 17-21 from $200 a night",
+    # "hotels in mesa oct 17-21, 6 guests") states its price and party as the search
+    restated = bool(_is_strict_ask(kept) or _NOUN_LED_RE.match(_norm(kept)))
+    f = parse_fields(kept, today=today, followup=True,
+                     field_mode="restated" if restated else "directive")
     if f["dates_malformed"]:
         return None, False, True
+    areas = f["areas"] or _slot_areas(clauses, sole=sole)
     upd: dict[str, Any] = {}
     if f["stay"] is not None:
         upd["check_in"], upd["check_out"] = f["stay"]
-    if f["areas"]:
-        upd["areas"] = f["areas"]
+    if areas:
+        upd["areas"] = areas
     if f["party_size"] is not None:
         upd["party_size"] = f["party_size"]
     if f["budget_min"] is not None or f["budget_max"] is not None:
@@ -2389,27 +2462,112 @@ def _clarify(pr: ParseResult) -> Route:
 # weather in phoenix?", "what about flights to phoenix on oct 17?") unless it names the
 # lodging itself. The "in <place>" opener needs an allowlisted area right after it ("in
 # any case ..." is not one).
+# D-051 r3 (c2-trigger#0, adjudicated): a COMMENT ON THE POSTED CARD -- "love the second
+# one", "the first is too far", "thanks", "the 2nd option is $450/night, too pricey",
+# "I'll send this to 2 people on the team", "can you check with jordan if oct 20-22
+# works" -- is never a billed re-search. The turn is read CLAUSE BY CLAUSE
+# (_refinement_clauses): a clause that is evaluative (_COMMENT_RE) or opens on a card
+# reference ("the second hotel ...", "that one ...") and carries no refinement verb /
+# shape is dropped, and a field is read only from the clauses left. Round 2's bare legs
+# are gone: money counts only in directive shape (a range, under / max / at least /
+# around $N, make it / keep it / try / budget $N -- never after "is" / "costs" /
+# "says"), a party only as for / but / now / we're / it's / make it N people, N people
+# now / instead / total, or party of N, and "can/could you check" only before a date,
+# an area, again or availability.
+# D-051 r3 (c2-trigger#2, SPLIT -> fix): the ordinary area and date moves re-run too --
+# "what about mesa?", "how about tempe?", "mesa?", "prefer mesa", "mesa or gilbert?",
+# "same but mesa", "add mesa", "include gilbert", "look at mesa too", "anything in mesa?"
+# (an alias in a refinement SLOT, _slot_areas: the whole clause is the slot word + an
+# area list + too / instead / then ...), and "let's do / move it to / push it to / go
+# with / new dates are / dates changed to / switch the dates to / it's actually" + a
+# date. "the offsite moved to oct 20-22" / "jordan arrives oct 20-22" / "move the
+# meeting to oct 20-22" stay the help line (no stay referent).
+# The VERBS / shapes of a refinement ...
 _REFINE_RE = re.compile(
     _WB + r"(?:try|what about|how about|instead|make it|cheaper|less expensive|more expensive"
     r"|pricier|more affordable|same dates|other dates|different (?:dates?|days|nights|area|city"
     r"|neighbou?rhood|part of town|hotels?|options)|another (?:area|city|neighbou?rhood"
-    r"|part of town)|(?:party|group) of \d{1,2}|(?:king|queen|two queens?|double queens?) beds?"
-    r"|two queens|\d{1,2}[- ]?(?:bedrooms?|br|bdrm)"
-    r"|(?:can|could|would|will) (?:we|you|u) (?:please )?(?:do|try|check|search"
-    r"|look (?:in|at|around|near|for))|also (?:check|try|look|search|do)"
-    r"|(?:search|look) (?:again|in|near|around)|check again|re-?run|redo|run it again|re-?search"
-    r"|same (?:thing|search|again)|(?:what's|what is|anything) available"
-    r"|change (?:the )?(?:dates?|area|city|location|budget) to|switch (?:it )?to"
-    r"|(?:a|prefer(?:ably)?(?: a)?) (?:king|queen)|with a pool"
+    r"|part of town)"
+    r"|(?:(?:can|could|would|will) (?:we|you|u) (?:please )?|also )(?:do|try|search"
+    r"|look (?:in|at|around|near|for)|check(?= (?:again|availability|in|near|around|at|for|on"
+    r"|" + _MONTH_WORD + r")(?![a-z0-9])| \d))"
+    r"|(?:search|look) (?:again|in|near|around|at)|check again|re-?run|redo|run it again"
+    r"|re-?search|same (?:thing|search|again|but)|(?:what's|what is|anything) available"
+    r"|any(?:thing)? (?:in|near|around|closer to)"
+    r"|change (?:the )?(?:dates?|area|city|location|budget) to"
+    r"|switch (?:it |the (?:dates?|area|city|location) )?to"
+    r"|let's (?:do|try|go with|look at|make it|move it|push it|switch)"
+    r"|(?:move|push|shift|bump|change|switch) (?:it|them|the dates?|the stay|the search"
+    r"|our stay|the trip)(?: back| out| up| forward)? to"
+    r"|go with|(?:new|updated|revised) dates?|dates? (?:changed|moved|shifted|are now|is now)"
+    r"|(?:it's|it is) actually|actually (?:it's|it is)"
+    r"|(?:a|prefer(?:ably)?(?: a)?) (?:king|queen)"
     r"|(?:modern|quiet|quieter|walkable|luxury|luxurious|upscale|photogenic) (?:please|pls"
     r"|instead|ones?|options?|places?)|something (?:more )?(?:modern|quiet|quieter|walkable"
     r"|luxurious|upscale|photogenic))" + _WE
-    + r"|" + _WB + r"(?:under|below|less than|up to|max|maximum|no more than|at most|over|above"
-    r"|at least|around|about) \$? ?\d"
-    + r"|\$ ?\d|\d ?(?:/ ?(?:night|nt|nite)|per night|a night|nightly)"
-    + r"|" + _WB + r"(?:for )?(?:\d{1,2}|two|three|four|five|six|seven|eight|nine|ten|twelve)"
-    r" (?:people|persons|guests|adults|travell?ers|of us)" + _WE
 )
+# ...and the bare FIELD legs (a bed / bedroom / group / pool mention). A field leg alone
+# never rescues a comment on the card ("the 2nd one has two queens") -- D-051 r3.
+_REFINE_FIELD_RE = re.compile(
+    _WB + r"(?:(?:party|group) of \d{1,2}|(?:king|queen|two queens?|double queens?) beds?"
+    r"|two queens|\d{1,2}[- ]?(?:bedrooms?|br|bdrm)|with a pool)" + _WE
+)
+# A LISTING FACT (what a posted option offers), never a request: "sleeps 6 people".
+_LISTING_FACT_RE = re.compile(r"\b(?:sleeps|fits|holds|accommodates|accomodates) (?:up to )?"
+                              + _NUM_RX + r"(?![a-z0-9])")
+# Any money mention (with its budget word), for the "described after a copula" test.
+_MONEY_MENTION_RE = re.compile(
+    r"(?:\b(?:" + _BUDGET_CEIL_WORDS + r"|" + _BUDGET_FLOOR_WORDS + r"|" + _BUDGET_APPROX_WORDS
+    + r") |~ ?)?\$ ?\d|" + _MONEY_RX + _PER_NIGHT_RX + r"\b")
+# "(the / our / new) dates are ..." OPENING a clause restates the stay ("sorry, dates are
+# oct 18-22"); "the offsite dates are ..." does not open on it.
+_DATES_ARE_RE = re.compile(
+    r"^(?:(?:ok|okay|actually|sorry|so|and|oh|also)[ ,]+)?(?:(?:the|our|my|new|updated|revised)"
+    r" )?dates? (?:are|is|should be|will be|would be)(?: now| actually)? ")
+# Money in DIRECTIVE shape (the gate's twin of _parse_budget(followup=True)).
+_REFINE_MONEY_RE = re.compile(
+    r"(?:\b(?:" + _BUDGET_CEIL_WORDS + r"|" + _BUDGET_FLOOR_WORDS + r"|" + _BUDGET_APPROX_WORDS
+    + r"|budget(?: of| is| at| to)?|make it|keep it(?: at| to| around)?|try"
+    r"|(?:change|switch|set|bump|drop|raise|lower|up) (?:the )?budget to)[,:]? |~ ?)\$? ?\d"
+    r"|" + _MONEY_RX + r" ?(?:-|to) ?" + _MONEY_RX + _PER_NIGHT_RX + r"\b"
+)
+# A clause boundary: ; ! ? a comma or a period before a space (never inside "$1,200" or
+# "st. louis"). The delimiter is captured so a clause keeps its question mark.
+_CLAUSE_SPLIT_RE = re.compile(r"([;!?]+|,(?= |$)|(?<!st)\.(?= |$))")
+# An EVALUATIVE clause (a remark on the card, never a refinement by itself). "look" the
+# verb is not ("look for hotels ..."), and "like the one we used" is a comparison.
+_COMMENT_RE = re.compile(
+    _WB + r"(?:looks|looked|look (?:good|great|nice|perfect|amazing|fine|solid|awesome)"
+    r"|looking (?:good|great|nice)|love|loved|liked|like (?:it|that one|this one|them)"
+    r"|(?:i|we) (?:really )?like|too (?:pricey|pricy|expensive|far|small|big|much|fancy)"
+    r"|over budget|overpriced|perfect|works|worked|thanks|thank you|thx|ty|is only|was only"
+    r"|are only|says|said|seems|sounds|good one|nice one|great one|good choice|great choice"
+    r"|nice pick)" + _WE
+)
+# A clause that OPENS on a reference to a posted option ("the second hotel ...", "that
+# one ...", "the first is ...", "it's ..."); "this time oct 17-21" / "the scottsdale area"
+# are not references.
+_CARD_REF_RE = re.compile(
+    r"^(?:(?:ok|okay|so|and|also|oh|wow|hmm|yeah|yes|no|nope|lol|haha|but)[ ,]+)?(?:"
+    r"(?:the|that|this|those|these|your|ur)(?: (?:first|second|third|fourth|fifth|last|1st|2nd"
+    r"|3rd|4th|5th|top|cheapest|nicest|closest|other))? (?:one|ones|option|options|listing"
+    r"|listings|pick|choice|place|places|hotel|hotels|motel|motels|inn|inns|resort|resorts"
+    r"|airbnb|airbnbs|rental|rentals|vrbo|vrbos|condo|condos|house|home|property|properties"
+    r"|suite|suites|room|rooms)"
+    r"|(?:the|that|this|those|these|your) (?:first|second|third|fourth|fifth|last|1st|2nd|3rd"
+    r"|4th|5th|top|cheapest|nicest|closest)"
+    r"|it|it's|its|they|they're|both|either|neither|which)(?![a-z0-9'])"
+)
+# An area in a refinement SLOT: the whole clause is [filler] [slot word] <area list> [tail].
+# A bare area list needs a slot word, a tail word, a question mark, or to be the whole
+# turn -- "thanks, gilbert" addresses a person named Gilbert.
+_SLOT_LEAD_RE = re.compile(
+    r"(?:(?:ok|okay|actually|hmm|so|and|or|also|maybe|then|well)[ ,]+)?"
+    r"(?P<word>(?:what|how) about |prefer(?:ably)? |add |include |same (?:thing )?but "
+    r"|look at |(?:(?:can|could|would|will) (?:you|we|u) (?:please )?)?(?:check|try|do|search) "
+    r"|just |only |maybe |or )?")
+_SLOT_TAIL_RE = re.compile(r"(?P<tail>(?: (?:too|instead|then|please|pls|maybe|as well|area|metro"
+                           r"|only|again))*)[ .]*(?P<q>\?)?$")
 _REFINE_START_RE = re.compile(
     r"^(?:(?:ok|okay|actually|or|and|maybe|hmm|now|so)[ ,]+)?(?:" + _MONTH_WORD
     + r"\.? \d{1,2}|\d{1,2}/\d{1,2}|(?P<loc>(?:in|near|around|closer to) (?:the )?"
@@ -2435,14 +2593,113 @@ def _refine_opener(t: str) -> bool:
     return bool(lm.alias_re is not None and lm.alias_re.match(t, m.end()))
 
 
-def _is_refinement(text: Any) -> bool:
-    t = _norm(_clean(text))
-    if _OFF_TOPIC_RE.search(t) and not _LODGING_NOUN_RE.search(t):
-        return False
+def _clauses(text: Any) -> list[str]:
+    """The turn's clauses: cleaned like every predicate (capped, Slack tokens out),
+    case kept, whitespace collapsed, split on ; ! ? a line break, a comma or a period
+    before a space ('$1,200' and 'st. louis' stay whole). A clause ended by a question
+    mark keeps it."""
+    body = " ; ".join(_clean(text).splitlines())
+    parts = _CLAUSE_SPLIT_RE.split(body)
+    out = []
+    for i in range(0, len(parts), 2):
+        c = " ".join(parts[i].split())
+        if c:
+            delim = parts[i + 1] if i + 1 < len(parts) else ""
+            out.append(c + ("?" if "?" in delim else ""))
+    return out
+
+
+def _refine_money(c: str) -> bool:
+    return any(not _described(c, m.start()) for m in _REFINE_MONEY_RE.finditer(c))
+
+
+def _refine_party(c: str) -> bool:
+    return any(not _described(c, m.start()) for m in _PARTY_DIRECTIVE_RE.finditer(c))
+
+
+def _describes_a_listing(c: str) -> bool:
+    """A price after a copula ("is $329/night", "cost $329", "is under $300") or a
+    listing fact ("sleeps 6") -- a description of a posted option, not a request."""
+    return bool(_LISTING_FACT_RE.search(c)) or any(
+        _described(c, m.start()) for m in _MONEY_MENTION_RE.finditer(c))
+
+
+def _slot_areas(clauses: list[str], *, sole: bool) -> tuple[str, ...]:
+    """Areas named in a refinement SLOT ("what about mesa", "prefer mesa", "mesa or
+    gilbert?", "tempe too", "can you check mesa"): the WHOLE clause is the slot. A bare
+    area list needs a slot word, a tail word, a question mark or *sole* (it is the
+    whole turn)."""
+    lm = _load_map()
+    if lm.alias_re is None:
+        return ()
+    out: list[str] = []
+    for clause in clauses:
+        c = clause.lower()
+        lead = _SLOT_LEAD_RE.match(c)
+        at = _AREA_PREFIX_RE.match(c, lead.end()).end()
+        keys: list[str] = []
+        end = -1
+        while len(keys) < MAX_AREAS:
+            a = lm.alias_re.match(c, at)
+            if not a or c.startswith("'s", a.end()):
+                break
+            keys.append(lm.alias_to_key[a.group(0)])
+            end = a.end()
+            sep = _LIST_SEP_RE.match(c, end)
+            if not sep:
+                break
+            at = sep.end()
+        tail = _SLOT_TAIL_RE.match(c, end) if keys else None
+        if tail and (sole or lead.group("word") or tail.group("tail") or tail.group("q")):
+            out.extend(k for k in keys if k not in out)
+    return tuple(out[:MAX_AREAS])
+
+
+def _refine_verb(c: str, *, sole: bool) -> bool:
+    """A refinement VERB / shape in lowercased text *c* -- everything but a bare field
+    mention."""
     # an explicit arrive/check-in ... leave/check-out phrase is a stay by itself (P6);
     # a bare "check in" is not ("what time is check in on oct 20-22?")
-    return bool(_REFINE_RE.search(t) or _refine_opener(t)
-                or _DATE_P6.search(_ORDINAL_RE.sub(r"\1", t))) or is_lodging_shaped(text)
+    return bool(_REFINE_RE.search(c) or _refine_money(c) or _refine_party(c)
+                or _refine_opener(c) or _DATES_ARE_RE.match(c)
+                or _DATE_P6.search(_ORDINAL_RE.sub(r"\1", c)) or _slot_areas([c], sole=sole))
+
+
+def _refine_directive(c: str, *, sole: bool) -> bool:
+    """A refinement verb / shape, or a bare field leg ("two queens", "3 bedrooms")."""
+    return bool(_REFINE_FIELD_RE.search(c) or _PARTY_RE_1.search(c)
+                or _refine_verb(c, sole=sole))
+
+
+def _refinement_clauses(text: Any) -> tuple[list[str], bool]:
+    """(kept clauses, sole): every clause but a COMMENT on the card -- evaluative,
+    opening on a card reference, or describing a listing ("is $329/night", "sleeps
+    6") -- with no refinement VERB (a bare field mention never rescues it); *sole* =
+    the turn is one clause."""
+    clauses = _clauses(text)
+    sole = len(clauses) == 1
+    kept = []
+    for clause in clauses:
+        c = clause.lower()
+        if ((_COMMENT_RE.search(c) or _CARD_REF_RE.search(c) or _describes_a_listing(c))
+                and not _refine_verb(c, sole=sole)):
+            continue
+        kept.append(clause)
+    return kept, sole
+
+
+def _is_refinement(text: Any) -> bool:
+    kept, sole = _refinement_clauses(text)
+    if not kept:
+        return False
+    joined = ", ".join(kept)
+    t = joined.lower()
+    if _OFF_TOPIC_RE.search(t) and not _LODGING_NOUN_RE.search(t):
+        return False
+    dropped = len(kept) != len(_clauses(text))
+    return (any(_refine_directive(c.lower(), sole=sole) for c in kept)
+            or _refine_directive(t, sole=False)
+            or is_lodging_shaped(joined if dropped else text))
 
 
 def route_turn(text: Any, *, user_id: str, channel_id: str, channel_name: str = "",
