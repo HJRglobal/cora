@@ -643,17 +643,32 @@ def _holder_gone(held: dict) -> bool:
     return not _pid_alive(pid)
 
 
-def acquire_scan_lock(*, now: float | None = None) -> str | None:
-    """A token when this process now holds the scan lock; None when another live
-    scan holds it. A lock older than 30 minutes, unreadable, or left by a process
-    that is no longer running is stale."""
+#: Why acquire_scan_lock_why returned no token (D-051 r4 harness-isolation#0): a LIVE
+#: scan holds the lock -- the ONLY case a caller may report as "a scan is running" --
+#: or the lock could not be taken at all (an unwritable path, a stale lock that cannot
+#: be removed), where NO scan is running and the failure must stay loud (A28).
+SCAN_LOCK_HELD = "held"
+SCAN_LOCK_FAULT = "fault"
+
+
+def acquire_scan_lock_why(*, now: float | None = None) -> tuple[str | None, str]:
+    """(token, "") when this process now holds the scan lock; (None, SCAN_LOCK_HELD)
+    when another live scan holds it; (None, SCAN_LOCK_FAULT) when the lock cannot be
+    taken for an I/O reason. A lock older than 30 minutes, unreadable, or left by a
+    process that is no longer running is stale."""
     now = time.time() if now is None else float(now)
     p = scan_lock_path()
     token = secrets.token_hex(8)
     body = json.dumps({"pid": os.getpid(), "nonce": _PROCESS_NONCE, "ts": now, "token": token})
     for _attempt in range(2):
         try:
+            # its own step: a FILE where the lock's directory should be raises
+            # FileExistsError here, which must never read as "the lock exists"
             p.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            log.error("channel_archive: scan lock unwritable", exc_info=True)
+            return None, SCAN_LOCK_FAULT
+        try:
             fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             try:
@@ -663,19 +678,30 @@ def acquire_scan_lock(*, now: float | None = None) -> str | None:
             except Exception:  # noqa: BLE001 -- unreadable lock = stale
                 stale = True
             if not stale:
-                return None
+                return None, SCAN_LOCK_HELD
             try:
                 p.unlink()
+            except FileNotFoundError:
+                continue                      # another process removed it first: retry
             except OSError:
-                return None
+                log.error("channel_archive: stale scan lock cannot be removed", exc_info=True)
+                return None, SCAN_LOCK_FAULT
             continue
         except OSError:
             log.error("channel_archive: scan lock unwritable", exc_info=True)
-            return None
+            return None, SCAN_LOCK_FAULT
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(body)
-        return token
-    return None
+        return token, ""
+    # two attempts, each saw a stale lock and no live holder -- never "a scan is running"
+    log.error("channel_archive: scan lock could not be taken (stale lock kept reappearing)")
+    return None, SCAN_LOCK_FAULT
+
+
+def acquire_scan_lock(*, now: float | None = None) -> str | None:
+    """A token when this process now holds the scan lock, else None (a live holder OR a
+    fault -- ``acquire_scan_lock_why`` says which)."""
+    return acquire_scan_lock_why(now=now)[0]
 
 
 def release_scan_lock(token: str | None) -> None:

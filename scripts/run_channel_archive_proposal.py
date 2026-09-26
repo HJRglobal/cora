@@ -23,9 +23,10 @@ Usage (from the repo root, main's tree checked out):
     # out this calendar month -- and, once a monthly attempt FAILED this month, on every
     # later Monday too until a full, sighted card (any trigger) lands; else skips.
     # Writes the run marker (ok delivered / ok skipped / FAILED month_undelivered |
-    # month_blind | month_partial + exit 1). A fire that finds ANOTHER scan running is
-    # ok skipped:scan_running -- that scan's card decides the month (a full, sighted
-    # one settles it; with none, the next Monday retries).
+    # month_blind | month_partial + exit 1). A fire that finds ANOTHER scan running (a
+    # live holder of the scan lock) is ok skipped:scan_running -- that scan's card
+    # decides the month (a full, sighted one settles it; with none, the next Monday
+    # retries); a scan lock that cannot be taken at all is FAILED month_undelivered.
     .venv\\Scripts\\python.exe scripts\\run_channel_archive_proposal.py --apply --monthly
 
     # Harrison only: show / clear the automatic demotion (clearing appends an
@@ -361,6 +362,9 @@ def main(argv: list[str] | None = None, *, now: float | None = None) -> int:
             # D-051 r3 registry-ops#0: another scan (an ask, a manual run) holds the lock
             # and is about to deliver ITS card -- not a failed month. Skip green; the next
             # Monday's monthly_due lets that scan's own card decide (settled, or due again).
+            # ONLY a live holder is scan_running (r4 harness-isolation#0): a lock that
+            # cannot be taken at all is scan_lock_error -- no scan runs, so it falls through
+            # to the FAILED month_undelivered marker + exit 1 below (A28), every Monday.
             run_marker.write(TASK_NAME, script=SCRIPT, ok=True, outputs=0, outcome=DEFERRED_OUTCOME,
                              detail="another dead-channel scan was running; its card decides this "
                                     "month (a full card settles it, else next Monday retries)",

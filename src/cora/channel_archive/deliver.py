@@ -88,9 +88,13 @@ def deliver_proposal(*, trigger: str, now: float | None = None,
                            ((gates.SCOPE_PUBLIC, False), (gates.SCOPE_PRIVATE, True))},
                    acting_tier=policy.acting_tier(), registry_t1=gates.registry_allows_t1())
         return out
-    token = st.acquire_scan_lock(now=now)
+    token, why = st.acquire_scan_lock_why(now=now)
     if token is None:
-        out["reason"] = "scan_running"
+        # D-051 r4 harness-isolation#0: only a lock HELD by a live scan is "scan_running"
+        # (the monthly fire defers to that scan's card). A lock that cannot be taken at all
+        # means NO scan is running: its own reason, an undelivered month (A28) and the
+        # ask's "scan stopped" line -- never "a scan is already running".
+        out["reason"] = "scan_running" if why == st.SCAN_LOCK_HELD else "scan_lock_error"
         return out
     try:
         scan_id = secrets.token_hex(6)
