@@ -186,7 +186,9 @@ _BY_OTHER_RE = re.compile(
 #: 2026-09-25): "in june", "last summer", "since june", "in 2025", "last year", the
 #: June sprawl. A relative "last week" / "today" / "yet" is lane time. The month /
 #: season is resolved against the CLOCK (its most recent occurrence), so "in june"
-#: is pre-lane in 2026 and lane time in 2027.
+#: is pre-lane in 2026 and lane time in 2027. A DAY after the month ("since sept 28",
+#: "from the sep 28 card") makes the start that full date -- one on/after the birth is
+#: lane time -- and "after" starts the NEXT day / month (D-051 r3 c1-intents-copy#1).
 _MONTH_NUM = {"january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3, "april": 4,
               "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7, "august": 8, "aug": 8,
               "september": 9, "sept": 9, "sep": 9, "october": 10, "oct": 10, "november": 11,
@@ -195,7 +197,7 @@ _SEASON_START = {"spring": 3, "summer": 6, "fall": 9, "autumn": 9, "winter": 12}
 _PERIOD_RE = re.compile(
     r"\b(?:(in|during|over|throughout|back in|since|from|after|last|this past)(?: the)?"
     r"(?: (?:early|mid|late))?[ -](" + "|".join(sorted(_MONTH_NUM, key=len, reverse=True))
-    + r")(?:,? ((?:19|20)\d\d))?"
+    + r")(?: (\d{1,2})(?!\d)(?:st|nd|rd|th)?)?(?:,? ((?:19|20)\d\d))?"
     r"|(?:in|during|over|throughout|back in|since|from) ((?:19|20)\d\d)"
     r"|(last|this past|this|over the|during the|in the|since) (spring|summer|fall|autumn|winter)"
     r"|(last year)|(sprawl))\b")
@@ -203,7 +205,7 @@ _AZ = timezone(timedelta(hours=-7))      # Arizona, no DST -- monitor.LANE_EPOCH
 
 
 def _period_start(m: re.Match, today: date) -> date:
-    prep, mon, yr, yr2, sprep, season, last_year, sprawl = m.groups()
+    prep, mon, day, yr, yr2, sprep, season, last_year, sprawl = m.groups()
     if sprawl:
         return date.min
     if last_year:
@@ -213,10 +215,19 @@ def _period_start(m: re.Match, today: date) -> date:
     if mon:
         mi = _MONTH_NUM[mon]
         if yr:
-            return date(int(yr), mi, 1)
-        y = today.year if mi <= today.month else today.year - 1
-        if prep in ("last", "this past") and mi == today.month:
-            y -= 1                                   # "last september" asked in September
+            y = int(yr)
+        else:
+            y = today.year if mi <= today.month else today.year - 1
+            if prep in ("last", "this past") and mi == today.month:
+                y -= 1                               # "last september" asked in September
+        if day:
+            try:
+                start = date(y, mi, int(day))
+            except ValueError:
+                return date(y, mi, 1)                # not a real date ("sep 31"): the month
+            return start + timedelta(days=1) if prep == "after" else start
+        if prep == "after":                          # "after september" = from October 1
+            return date(y + 1, 1, 1) if mi == 12 else date(y, mi + 1, 1)
         return date(y, mi, 1)
     sm = _SEASON_START[season]
     y = today.year if date(today.year, sm, 1) <= today else today.year - 1

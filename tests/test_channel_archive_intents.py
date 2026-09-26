@@ -774,3 +774,68 @@ class TestStatusCoordinationR3:
             it.looks_like_archive_status("did you archive the a and" + " " * 40000 + "channels", now=NOW)
             best = min(best, time.perf_counter() - t0)
         assert best < 0.05
+
+
+def _az_noon(y, m, d):
+    from datetime import datetime, timedelta, timezone
+    return datetime(y, m, d, 12, 0, tzinfo=timezone(timedelta(hours=-7))).timestamp()
+
+
+#: r3:c1-intents-copy#1 -- a DAY-precise frame is compared as a full date against the
+#: lane's birth (2026-09-25 AZ): one that starts on/after it is lane time, never a
+#: pre-lane frame. "after <month>" (no day) starts the NEXT month; "after <date>" the
+#: next day.
+STATUS_FIRE_R3_DAY = [
+    "which channels were archived since sept 28?", "did you archive the channels from the sep 28 card?",
+    "did you archive the channels from sep 28?", "did you archive the channels after sept 25?",
+    "which channels were archived since sep 28th?", "which channels were archived since sept 28, 2026?",
+    "which channels were archived since sep 25?", "which channels were archived after sep 24?",
+]
+#: ... while a frame that starts BEFORE the birth -- a day-precise one included -- is
+#: still not the lane's question (the month-level overlap trade-off is unchanged).
+STATUS_NOT_R3_DAY = [
+    "which channels were archived since sept 3?", "which channels were archived since sep 24?",
+    "which channels did cora archive after august?", "which channels were archived in september?",
+    "which channels were archived since sept 2026?", "which channels have been archived since june?",
+    "were the channels archived in june, 2026?", "which channels were archived since sep 31?",
+    "did you archive any channels since sept 3, 2026?",
+]
+
+
+class TestDayPreciseFramesR3:
+    @pytest.mark.parametrize("clock", [(2026, 9, 29), (2026, 10, 6), (2026, 12, 2), (2027, 3, 1)],
+                             ids=["0929", "1006", "1202", "2027-03"])
+    @pytest.mark.parametrize("text", STATUS_FIRE_R3_DAY)
+    def test_a_frame_that_starts_after_the_birth_is_lane_time(self, text, clock):
+        assert it.looks_like_archive_status(text, now=_az_noon(*clock)), text
+
+    @pytest.mark.parametrize("clock", [(2026, 9, 29), (2026, 10, 6), (2026, 12, 2), (2027, 3, 1)],
+                             ids=["0929", "1006", "1202", "2027-03"])
+    @pytest.mark.parametrize("text", STATUS_NOT_R3_DAY)
+    def test_a_frame_that_starts_before_the_birth_is_still_not(self, text, clock):
+        assert not it.looks_like_archive_status(text, now=_az_noon(*clock)), text
+
+    def test_after_a_month_means_the_next_month(self):
+        q = "which channels did cora archive after september?"
+        assert it.looks_like_archive_status(q, now=_az_noon(2026, 10, 6))
+        assert it.looks_like_archive_status(q, now=_az_noon(2026, 12, 2))
+        assert not it.looks_like_archive_status("which channels did cora archive after august?",
+                                                now=_az_noon(2026, 10, 6))
+        assert it.looks_like_archive_status("which channels did cora archive after june?",
+                                            now=_az_noon(2027, 7, 10))
+        assert it.looks_like_archive_status("which channels did cora archive after december?",
+                                            now=_az_noon(2027, 1, 10))
+
+    @pytest.mark.parametrize("shape", ["did you archive the channels " + "since sep 28 " * 23,
+                                       "did you archive the channels since sep" + " 2" * 120,
+                                       "did you archive the channels " + "after sep 28th, 2026 " * 14])
+    def test_the_day_parse_is_fast_on_capped_worst_cases(self, shape):
+        best = float("inf")
+        for _ in range(3):
+            t0 = time.perf_counter()
+            it.looks_like_archive_status(shape, now=NOW)
+            it.looks_like_archive_status(" " * 40000, now=NOW)
+            it.looks_like_archive_status("did you archive the channels since sep" + " " * 40000 + "28",
+                                         now=NOW)
+            best = min(best, time.perf_counter() - t0)
+        assert best < 0.05
