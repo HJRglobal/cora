@@ -29,9 +29,14 @@ dm_user_handles:
 # Area allowlist: canonical `name` + `state` (rendered "Name, State") and lowercase
 # `aliases` (matched as whole words, and only in locative context -- "in X",
 # "near X", "the X area", or a slash/comma list that is -- so a surname or a
-# possessive "X's" is never read as a place). `key` is the stable id stored in the
-# lane's thread store. A locative alias hit is also one of the CUES that lets a weak
-# lodging noun ("condos in Scottsdale") withhold web on the normal Q&A path (B1).
+# possessive "X's" is never read as a place). Two more slots, both closed (D-051 r3):
+# right after a fresh ask's lodging noun, a date or a bed/price phrase ("find hotels
+# scottsdale oct 17-21") -- never after "for" (a person) and never the everyday-word
+# aliases surprise / page / carefree -- and, in a lane-thread follow-up, a clause that
+# IS the refinement ("what about X?", "X or Y?", "X too", "prefer X"). `key` is the
+# stable id stored in the lane's thread store. A locative alias hit is also one of the
+# CUES that lets a weak lodging noun ("condos in Scottsdale") withhold web on the
+# normal Q&A path (B1).
 areas:
   # --- Phoenix metro + Arizona ---
   - {key: phoenix, name: Phoenix, state: Arizona, aliases: [phoenix, downtown phoenix, phx]}
