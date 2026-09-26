@@ -1401,6 +1401,102 @@ def parse_constraints(text: Any, *, today: date | None = None) -> ParseResult:
     return ParseResult(c)
 
 
+# D-051 r4 (c2-trigger#1, adjudicated): in a multi-clause follow-up a kept clause that is
+# ONLY a field fragment -- "6 people", "$250/night", "mesa", "mesa or gilbert" -- is a
+# LIST ITEM ("oct 20-22, 6 people", "mesa, oct 20-22"): it is read when another kept
+# clause carries a field. A listed field the lane cannot read -- "$250" with no per-night
+# marker, "40 people", or a party / price joined by and / & / plus onto another field
+# ("oct 20-22 and 6 people") -- gets the help line, never a silent partial re-search. A
+# lone fragment keeps today's help line; "thanks, gilbert" (no other field) stays a comment.
+_FRAG_LEAD = r"(?:(?:and|also|plus|with|or|oh|ok|okay|actually|so|but|&) )?"
+_FRAG_TAIL = r"(?: (?:too|then|please|pls|now|instead|total|in total|this time|again|as well))*\??"
+_PARTY_FRAG_RE = re.compile(r"^" + _FRAG_LEAD + r"(?:(?:about|around|roughly|maybe|like) |~ ?)?"
+                            + _NUM_RX + r" " + _PARTY_WORD + _FRAG_TAIL + r"$")
+_PRICE_FRAG_RE = re.compile(r"^" + _FRAG_LEAD + _MONEY_RX + _PER_NIGHT_RX + _FRAG_TAIL + r"$")
+# any other money-only clause ("$250", "under $250", "250 bucks") -- read only if the
+# turn's directive reading already took a budget
+_MONEY_FRAG_RE = re.compile(
+    r"^" + _FRAG_LEAD + r"(?:(?:" + _BUDGET_CEIL_WORDS + r"|" + _BUDGET_FLOOR_WORDS + r"|"
+    + _BUDGET_APPROX_WORDS + r"|budget) |~ ?)?(?:\$ ?\d{1,6}(?:,\d{3})*(?:\.\d{2})?"
+    r"|\d{1,6} (?:dollars|bucks|usd))(?:" + _PER_NIGHT_RX + r")?" + _FRAG_TAIL + r"$")
+_LIST_JOINED_RE = re.compile(
+    r",? (?:and|&|plus) (?:(?:about|around|roughly|maybe|like) |~ ?)?(?:(?P<party>\d{1,2}|one|two"
+    r"|three|four|five|six|seven|eight|nine|ten|eleven|twelve) " + _PARTY_WORD
+    + r"|(?P<price>\$ ?\d))[^,;]{0,40}$")
+
+
+def _list_items(clauses: list[str], f: dict, base_areas: tuple, *,
+                today: date | None = None) -> tuple[int | None, tuple | None, tuple] | None:
+    """(party, (lo, hi), areas) read from the turn's LIST ITEMS, or None when a listed
+    field cannot be read (the caller answers with the help line). *base_areas* = the
+    areas the turn's clauses already give."""
+    party: int | None = None
+    budget: tuple | None = None
+    areas: list[str] = []
+    f_budget = f["budget_min"] is not None or f["budget_max"] is not None
+    for clause in clauses:                       # a party / price joined onto another field
+        m = _LIST_JOINED_RE.search(_norm(clause))
+        if m and ((m.group("party") and f["party_size"] is None)
+                  or (m.group("price") and not f_budget)):
+            return None
+    if len(clauses) < 2:
+        return party, budget, ()
+    items: list[tuple[int, str, Any]] = []
+    for i, clause in enumerate(clauses):
+        c = _norm(clause)
+        m = _PARTY_FRAG_RE.match(c)
+        if m:
+            n = _num(next(g for g in m.groups() if g))
+            items.append((i, "party", n if 1 <= n <= 20 else None))
+            continue
+        m = _PRICE_FRAG_RE.match(c)
+        if m:
+            v = _money(m.group(1))
+            items.append((i, "price", v if 20 <= v <= 20000 else None))
+            continue
+        if _MONEY_FRAG_RE.match(c):
+            if not f_budget:
+                return None                      # "$250", "under $250", "250 bucks"
+            continue
+        keys = _slot_areas([clause], sole=True)
+        if keys:
+            items.append((i, "areas", keys))
+    if not items:
+        return party, budget, ()
+    carriers = {i for i, clause in enumerate(clauses)
+                if _carries_field(clause, today) or _slot_areas([clause], sole=False)}
+    for i, kind, value in items:
+        if not carriers - {i}:
+            continue                             # a lone fragment: today's reading
+        if value is None:
+            return None                          # "40 people", "$5/night"
+        if kind == "party":
+            if f["party_size"] not in (None, value) or party not in (None, value):
+                return None
+            party = value
+        elif kind == "price":
+            if (f_budget and (f["budget_min"], f["budget_max"]) != (value, value)) or (
+                    budget not in (None, (value, value))):
+                return None
+            budget = (value, value)
+        else:
+            areas.extend(k for k in value if k not in areas)
+    have = set(base_areas) | set(areas)
+    if ((party is not None and f["party_size"] is None) or (budget is not None and not f_budget)
+            or not set(areas) <= set(base_areas)) and len(have) < MAX_AREAS:
+        # a list read never leaves one of its areas behind ("... options -- Mesa,
+        # Gilbert, Scottsdale, oct 17-21": Mesa sits in a clause that is no fragment);
+        # an area past the MAX_AREAS cap is dropped by the cap, not left unread
+        lm = _load_map()
+        for clause in (clauses if lm.alias_re is not None else ()):
+            c = _norm(clause)
+            for a in lm.alias_re.finditer(c):
+                if (not c.startswith("'s", a.end()) and a.group(0) not in _SLOT_WORD_ALIASES
+                        and lm.alias_to_key[a.group(0)] not in have):
+                    return None
+    return party, budget, tuple(areas)
+
+
 def merge_followup(stored: TravelConstraints, text: Any, *,
                    today: date | None = None) -> tuple[TravelConstraints | None, bool, bool]:
     """(merged, changed, malformed) -- a lane-thread follow-up's NEW fields override
@@ -1419,6 +1515,16 @@ def merge_followup(stored: TravelConstraints, text: Any, *,
     if f["dates_malformed"]:
         return None, False, True
     areas = f["areas"] or _slot_areas(clauses, sole=sole)
+    listed = _list_items(clauses, f, tuple(areas), today=today)   # D-051 r4 c2-trigger#1
+    if listed is None:
+        return stored, False, False                        # a field it cannot read: help
+    l_party, l_budget, l_areas = listed
+    if l_areas:
+        areas = tuple(dict.fromkeys(tuple(areas) + l_areas))[:MAX_AREAS]
+    if f["party_size"] is None and l_party is not None:
+        f["party_size"] = l_party
+    if f["budget_min"] is None and f["budget_max"] is None and l_budget is not None:
+        f["budget_min"], f["budget_max"] = l_budget
     upd: dict[str, Any] = {}
     if f["stay"] is not None:
         upd["check_in"], upd["check_out"] = f["stay"]

@@ -169,3 +169,79 @@ class TestAVerbOnAPostedOptionIsAComment:
             ts._is_refinement(shape)
         assert _best_of_3(regexes) < 0.1
         assert _best_of_3(predicates) < 0.1
+
+
+# ── r4:c2-trigger#1: a listed field is read (or the help line), never silently dropped ──
+
+P6, B250 = {"party_size": 6}, {"budget_min": 250, "budget_max": 250}
+# A kept clause that is ONLY a field fragment is a LIST ITEM when another kept clause
+# carries a field: it is read into the re-run.
+LIST_MUST_RERUN = [
+    ("oct 20-22, 6 people", {**OCT20, **P6}), ("6 people, oct 20-22", {**OCT20, **P6}),
+    ("can we do oct 20-22, 6 people?", {**OCT20, **P6}),
+    ("new dates: oct 20-22, 6 people", {**OCT20, **P6}),
+    ("oct 20-22, $250/night", {**OCT20, **B250}),
+    ("oct 20-22, 6 people, $250/night", {**OCT20, **P6, **B250}),
+    ("oct 20-22 for 6 people, $250/night", {**OCT20, **P6, **B250}),
+    ("mesa, oct 20-22", {**OCT20, "areas": ("mesa",)}),
+    ("gilbert, oct 20-22 please", {**OCT20, "areas": ("gilbert",)}),
+    ("mesa. oct 20-22", {**OCT20, "areas": ("mesa",)}),
+    ("mesa or gilbert, oct 20-22", {**OCT20, "areas": ("mesa", "gilbert")}),
+    # neighbours
+    ("oct 20-22, and 6 people", {**OCT20, **P6}), ("oct 20-22, 6 guests please", {**OCT20, **P6}),
+    ("oct 20-22, about 6 people", {**OCT20, **P6}), ("oct 20-22; 6 people", {**OCT20, **P6}),
+    ("oct 20-22, 6 ppl", {**OCT20, **P6}), ("oct 20-22, twelve people", {**OCT20, "party_size": 12}),
+    ("oct 20-22, 250 a night", {**OCT20, **B250}), ("move it to oct 20-22, 6 people", {**OCT20, **P6}),
+    ("oct 20-22, 6 people total", {**OCT20, **P6}),
+    ("oct 20-22, ~$250/night", {**OCT20, **B250}),
+    ("6 people, mesa?", {**P6, "areas": ("mesa",)}),
+    ("oct 20-22, 6 people, mesa", {**OCT20, **P6, "areas": ("mesa",)}),
+    ("mesa, gilbert, oct 20-22", {**OCT20, "areas": ("mesa", "gilbert")}),
+    ("old town scottsdale, oct 20-22", {**OCT20, "areas": ("scottsdale",)}),
+    ("oct 20-22. jordan, 6 people", {**OCT20, **P6}),
+    ("hotels oct 20-22, mesa", {**OCT20, "areas": ("mesa",), "kind": "hotel"}),
+    ("hotels in mesa oct 17-21, 6 guests, $250/night",            # restated (r3 pinned)
+     {"areas": ("mesa",), **P6, **B250, "kind": "hotel"}),
+    ("try mesa and send this to 2 people", {"areas": ("mesa",)}),  # r3 MIXED (pinned)
+]
+# ...a listed field the lane cannot read gets the help line, never a partial re-search;
+# a lone fragment (or one beside a verb that carries no field) keeps today's help line.
+LIST_MUST_HELP = [
+    "oct 20-22 and 6 people", "oct 20-22 & 6 people", "oct 20-22 plus 6 people",
+    "can we do oct 20-22 and 6 people?", "oct 20-22 and $250/night",
+    "oct 20-22, $250", "oct 20-22, under $250", "oct 20-22, 40 people", "oct 20-22, $5/night",
+    "try mesa, $250", "mesa, oct 20-22, 250 bucks",
+    "6 people", "$250/night", "thanks, gilbert", "search again, 6 people", "try again, gilbert",
+    "6 people, $250/night", "mesa, $250/night",
+]
+
+
+class TestAListedFieldIsReadNeverDropped:
+    @pytest.mark.parametrize("stored_ask", [STORED_S2, STORED_S3], ids=["s2", "s3"])
+    @pytest.mark.parametrize("text,expect", LIST_MUST_RERUN)
+    def test_a_list_item_is_read_into_the_re_run(self, route, text, expect, stored_ask):
+        _assert_search(route(text, stored_ask), text, expect, stored_ask)
+
+    @pytest.mark.parametrize("stored_ask", [STORED_S2, STORED_S3], ids=["s2", "s3"])
+    @pytest.mark.parametrize("text", LIST_MUST_HELP)
+    def test_an_unreadable_or_lone_fragment_gets_the_help_line(self, route, text, stored_ask):
+        _assert_help(route(text, stored_ask), text)
+
+    @pytest.mark.parametrize("shape", [
+        " " * 40000, ", 6 people" * 4000, "oct 20-22, 6 people, " * 1900, "mesa, " * 6600,
+        "oct 20-22 and 6 people " * 1700, ", $250/night" * 3300, "and 6 " * 6600,
+        ", $2" * 10000, "mesa/" * 8000, " and $250/night" * 2600,
+    ], ids=["spaces", "list-party", "oct-list", "mesa-list", "and-people", "dollar-list",
+            "and-six", "bare-dollar", "mesa-slash", "and-dollar"])
+    def test_the_list_item_reader_is_linear(self, shape):
+        stored = ts.parse_constraints(STORED_S3, today=TODAY).constraints
+
+        def regexes():
+            for rx in (ts._PARTY_FRAG_RE, ts._PRICE_FRAG_RE, ts._MONEY_FRAG_RE):
+                rx.match(shape)
+            ts._LIST_JOINED_RE.search(shape)
+
+        def predicates():
+            ts.merge_followup(stored, shape, today=TODAY)
+        assert _best_of_3(regexes) < 0.1
+        assert _best_of_3(predicates) < 0.1
