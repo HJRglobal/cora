@@ -2511,7 +2511,7 @@ _REFINE_RE = re.compile(
     r"|" + _MONTH_WORD + r")(?![a-z0-9])| \d))"
     r"|(?:search|look) (?:again|in|near|around|at)|check again|re-?run|redo|run it again"
     r"|re-?search|same (?:thing|search|again|but)|(?:what's|what is|anything) available"
-    r"|any(?:thing)? (?:in|near|around|closer to)"
+    r"|(?P<any>any(?:thing)? (?:in|near|around|closer to))"
     r"|change (?:the )?(?:dates?|area|city|location|budget) to"
     r"|switch (?:it |the (?:dates?|area|city|location) )?to"
     r"|let's (?:do|try|go with|look at|make it|move it|push it|switch)"
@@ -2575,6 +2575,28 @@ _CARD_REF_RE = re.compile(
     r"|(?:the|that|this|those|these|your) (?:first|second|third|fourth|fifth|last|1st|2nd|3rd"
     r"|4th|5th|top|cheapest|nicest|closest)"
     r"|it|it's|its|they|they're|both|either|neither|which)(?![a-z0-9'])"
+)
+# D-051 r4 (c2-trigger#0, adjudicated): a refinement VERB counts only when its OBJECT is
+# not a posted option. "let's go with the one in gilbert", "look at the second one in
+# scottsdale", "switch it to the one in gilbert", "what about the airbnb in gilbert?" pick
+# or ask about an option on the card -- the "in gilbert" inside "the one in gilbert" is
+# that option's area, never a new one -- so a clause whose verb takes a CARD-REFERENCE
+# object is a comment (the help line; nothing billed). The object is read right after the
+# verb and its own particle (it / to / with / at / than / of ...): the|that|this [up to
+# two words] one|option|listing|pick|choice, the|that|this [ordinal] <singular lodging
+# noun>, the|these|those [..] ones|options|..., these|those [ordinal] <plural lodging
+# noun>. A plural noun after "the" is a category, not a pick ("try the hotels in mesa").
+_CARD_ORD = (r"(?:first|second|third|fourth|fifth|last|1st|2nd|3rd|4th|5th|top|cheapest|nicest"
+             r"|closest|other)")
+_CARD_OBJ_RE = re.compile(
+    r" (?:(?:it|them) )?(?:(?:back|out|up|forward) )?(?:(?:to|with|at|for|than|of) )?(?:"
+    r"(?:the|that|this)(?: [^ ]{1,24}){0,2} (?:one|option|listing|pick|choice)"
+    r"(?! (?:bed|beds|bedroom|br|bdrm|night|nights|nite|week|weekend|more|less)(?![a-z0-9]))"
+    r"|(?:the|that|this)(?: " + _CARD_ORD + r")? (?:hotel|motel|inn|resort|airbnb|air bnb|rental"
+    r"|vrbo|condo|house|home|property|suite|room|place|spot)"
+    r"|(?:the|these|those)(?: [^ ]{1,24}){0,2} (?:ones|options|listings|picks|choices)"
+    r"|(?:these|those)(?: " + _CARD_ORD + r")? (?:hotels|motels|inns|resorts|airbnbs|rentals"
+    r"|vrbos|condos|houses|homes|properties|suites|rooms|places|spots))(?![a-z0-9'&-])"
 )
 # An area in a refinement SLOT: the whole clause is [filler] [slot word] <area list> [tail].
 # A bare area list needs a slot word, a tail word, a question mark, or to be the whole
@@ -2673,6 +2695,52 @@ def _slot_areas(clauses: list[str], *, sole: bool) -> tuple[str, ...]:
     return tuple(out[:MAX_AREAS])
 
 
+def _carries_field(text: str, today: date | None = None) -> bool:
+    """Does *text* carry any field a follow-up reads (directive shape)?"""
+    f = parse_fields(text, today=today, followup=True, field_mode="directive")
+    return bool(f["stay"] or f["dates_malformed"] or f["areas"] or f["party_size"] is not None
+                or f["budget_min"] is not None or f["budget_max"] is not None
+                or f["beds"] != "any" or f["bedrooms"] is not None or f["kind"] or f["styles"])
+
+
+def _verb_takes_card(c: str) -> bool:
+    """A refinement verb whose OBJECT is a posted option ("let's go with the one in
+    gilbert") -- D-051 r4 c2-trigger#0."""
+    return any(_CARD_OBJ_RE.match(c, m.end()) for m in _REFINE_RE.finditer(c))
+
+
+def _any_object_is_field(c: str, end: int) -> bool:
+    """'any(thing) in|near <area list>' followed by nothing, a slot tail ("too?",
+    "please") or another FIELD ("for oct 20-22", "with a pool") -- never a question
+    about the options ("is anything in gilbert pet friendly?")."""
+    lm = _load_map()
+    if lm.alias_re is None or not c.startswith(" ", end):
+        return False
+    at = _AREA_PREFIX_RE.match(c, end + 1).end()
+    a_end = -1
+    for _ in range(10):
+        a = lm.alias_re.match(c, at)
+        if not a or c.startswith("'s", a.end()):
+            break
+        a_end = a.end()
+        sep = _LIST_SEP_RE.match(c, a_end)
+        if not sep:
+            break
+        at = sep.end()
+    if a_end < 0:
+        return False
+    # the tail is read in a bounded window: a field that qualifies the area sits right
+    # after it, and a clause of repeated legs stays linear
+    return bool(_SLOT_TAIL_RE.match(c, a_end)) or _carries_field(c[a_end:a_end + 120])
+
+
+def _asks_about_options(c: str) -> bool:
+    """An 'any(thing) in <area>' clause whose object is not a field -- a question about
+    the posted options, never a re-search (D-051 r4 c2-trigger#0)."""
+    return any(m.group("any") and not _any_object_is_field(c, m.end())
+               for m in _REFINE_RE.finditer(c))
+
+
 def _refine_verb(c: str, *, sole: bool) -> bool:
     """A refinement VERB / shape in lowercased text *c* -- everything but a bare field
     mention."""
@@ -2692,13 +2760,18 @@ def _refine_directive(c: str, *, sole: bool) -> bool:
 def _refinement_clauses(text: Any) -> tuple[list[str], bool]:
     """(kept clauses, sole): every clause but a COMMENT on the card -- evaluative,
     opening on a card reference, or describing a listing ("is $329/night", "sleeps
-    6") -- with no refinement VERB (a bare field mention never rescues it); *sole* =
-    the turn is one clause."""
+    6") -- with no refinement VERB (a bare field mention never rescues it), and every
+    clause whose refinement verb takes a posted option as its object ("let's go with
+    the one in gilbert", "is anything in gilbert pet friendly?"; D-051 r4) even when it
+    has one; *sole* = the turn is one clause."""
     clauses = _clauses(text)
     sole = len(clauses) == 1
     kept = []
     for clause in clauses:
         c = clause.lower()
+        if ((_verb_takes_card(c) or _asks_about_options(c))
+                and not _frame_governs_lodging_noun(clause)):
+            continue
         if ((_COMMENT_RE.search(c) or _CARD_REF_RE.search(c) or _describes_a_listing(c))
                 and not _refine_verb(c, sole=sole)
                 and not _frame_governs_lodging_noun(clause)):   # "find a hotel that looks ..."
