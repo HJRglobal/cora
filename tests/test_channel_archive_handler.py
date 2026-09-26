@@ -977,3 +977,81 @@ def test_the_write_code_screen_is_linear_on_degenerate_input(shape):
         code = handler._write_code(exc)
         best = min(best, _t.perf_counter() - t0)
     assert best < 0.05 and code == "unexpected_response"
+
+
+# ── D-051 round 3 (Code #16) ────────────────────────────────────────────────
+def _row_text(cid, page=1, now=NOW + 20):
+    """The REAL renderer's section text for *cid*'s row."""
+    blocks, _ = cards.render_page(st.fold(now=now), PID, page, now=now)
+    return " ".join(b["text"]["text"] for b in blocks if b.get("type") == "section"
+                    and cid in b["text"]["text"])
+
+
+def _delete_channel(fake, cid):
+    """The channel is gone from Slack (deleted, or Cora lost access to a private one):
+    the fake's conversations_info then raises channel_not_found, as Slack does."""
+    fake.channels[:] = [c for c in fake.channels if c["id"] != cid]
+
+
+class TestChannelGoneAtTapTimeR3:
+    """r3:c1-state-machine#0 (SPLIT -> fix): a row whose channel no longer exists at tap
+    time (conversations.info channel_not_found) resolves TERMINAL with the channel-gone
+    copy -- never 'tap again' on a loop until the card expires, never an Archive-all
+    target again. Other read errors stay retryable (A5)."""
+
+    def test_an_open_row_whose_channel_is_gone_resolves_terminal(self, fake, armed):
+        stage(tier="T1")
+        _delete_channel(fake, A1)
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
+        assert r.outcome == "channel_gone" and "gone from Slack" in r.msg and "tap again" not in r.msg
+        s = st.fold(now=NOW + 20).proposals[PID].row_state[A1]
+        assert s["state"] == st.UNKNOWN and s["code"] == st.CHANNEL_GONE_CODE
+        assert cards.CHANNEL_GONE_LINE in _row_text(A1) and "tap to retry" not in _row_text(A1)
+        assert not fake.posts and "conversations_archive" not in fake.method_names()
+        assert st.read_ledger() == []                       # no intent: nothing was attempted
+        again = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1", now=NOW + 30)
+        assert again.outcome == "already_handled" and fake.method_names().count("conversations_info") == 1
+
+    def test_a_failed_row_whose_channel_is_deleted_later_resolves_terminal(self, fake, armed):
+        stage(tier="T1")
+        fake.post_behaviour = lambda kw: api_error("not_in_channel") if kw["channel"] == A1 else None
+        assert tap(cards.ACTION_ROW, f"{PID}:{A1}:T1").outcome == "failed"
+        assert state(A1) == st.FAILED and "tap to retry" in _row_text(A1)
+        fake.post_behaviour = None
+        _delete_channel(fake, A1)
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1", now=NOW + 30)
+        assert r.outcome == "channel_gone", r.msg
+        assert state(A1, now=NOW + 40) == st.UNKNOWN
+        assert cards.CHANNEL_GONE_LINE in _row_text(A1, now=NOW + 40)
+        assert "tap to retry" not in _row_text(A1, now=NOW + 40)
+
+    def test_archive_all_resolves_the_gone_row_once_and_never_targets_it_again(self, fake, armed):
+        rows = [_row(A1, "fx-dead-one", tier="T1"), _row(A2, "fx-dead-two", tier="T1")]
+        stage(tier="T1", rows=rows)
+        _delete_channel(fake, A1)
+        r = tap(cards.ACTION_ALL, f"{PID}:p1:T1")
+        assert r.counts == {"channel_gone": 1, "archived": 1}, r.counts
+        p = st.fold(now=NOW + 20).proposals[PID]
+        assert cards.undecided_a_on_page(p, 1) == []
+        again = tap(cards.ACTION_ALL, f"{PID}:p1:T1", now=NOW + 30)
+        assert again.outcome == "noop" and fake.method_names().count("conversations_archive") == 1
+
+    @pytest.mark.parametrize("code", ["ratelimited", "internal_error", "not_authed", "fatal_error"])
+    def test_other_read_errors_stay_retryable(self, fake, armed, code):
+        stage(tier="T1")
+        fake.info_override[A1] = api_error(code)
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
+        assert r.outcome == "failed" and f"reverify_{code}" in r.msg and "tap again" in r.msg
+        assert state(A1) == st.OPEN
+
+    def test_a_transport_error_is_never_read_as_gone(self, fake, armed):
+        stage(tier="T1")
+        fake.info_override[A1] = TimeoutError("channel_not_found")      # no Slack response
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
+        assert r.outcome == "failed" and state(A1) == st.OPEN
+
+    def test_the_channel_gone_reply_passes_both_rails(self, fake, armed, monkeypatch, caplog):
+        stage(tier="T1")
+        _delete_channel(fake, A1)
+        r = tap(cards.ACTION_ROW, f"{PID}:{A1}:T1")
+        _assert_rails([r.msg, _row_text(A1)], monkeypatch, caplog)

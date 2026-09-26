@@ -58,6 +58,12 @@ SYSTEMIC_CODES: frozenset = frozenset({
 RERENDER_EVERY = 5
 #: classify.Verdict.extra["unreadable"] -> the retryable re-verify code (A5)
 _UNREADABLE_CODES = {"members": "members_unknown", "users_info": "users_unknown"}
+#: The Slack API answers (a real response, never a transport error) that mean the
+#: channel is not there any more at tap time: the row resolves TERMINAL with the
+#: channel-gone copy instead of a 'tap again' loop (D-051 r3 c1-state-machine#0).
+CHANNEL_GONE_CODES: frozenset = frozenset({"channel_not_found"})
+MSG_CHANNEL_GONE = ("Not archived: {label} is gone from Slack's list (deleted, or I lost access "
+                    "to it), so nothing on this card can check or act on it again.")
 
 _PID_RE = re.compile(r"\Achanarch-[0-9a-f]{12}\Z")
 _CID_RE = re.compile(r"\AC[A-Z0-9]{8,24}\Z")
@@ -320,8 +326,9 @@ def _decide_or_archive(p: st.Proposal, row: dict, actor: str, *, now: float,
 def _reverify(p: st.Proposal, row: dict, read: Any, *, now: float,
               sleep: Callable[[float], None] | None
               ) -> tuple[str, str, cl.Verdict | None, tuple[str, str]]:
-    """("ok"|"stale"|"retry", reason, fresh verdict, (bot_uid, bot_id)) -- the ONE
-    classifier on a FRESH context (A5). The fresh verdict's age is what the notice and
+    """("ok"|"stale"|"retry"|"gone", reason, fresh verdict, (bot_uid, bot_id)) -- the ONE
+    classifier on a FRESH context (A5); "gone" = Slack answered channel_not_found (the
+    row resolves terminal, r3 c1-state-machine#0). The fresh verdict's age is what the notice and
     the ledger carry; the identity is the one this context CONFIRMED (a blind context
     never reaches "ok"), so the archive path never asks auth.test a second time
     (r2:c1-authority-tier#0/#1)."""
@@ -344,7 +351,13 @@ def _reverify_verdict(row: dict, read: Any, ctx: reg.Context, *, now: float,
         info = read.conversations_info(channel=cid, include_num_members=True)
         meta = scan_mod.project_channel(info.get("channel") or {})
     except Exception as exc:  # noqa: BLE001
-        return "retry", f"reverify_{cl._err_code(exc)}", None
+        code = cl._err_code(exc)
+        if getattr(exc, "response", None) is not None and code in CHANNEL_GONE_CODES:
+            # D-051 r3 c1-state-machine#0: Slack itself answered that the channel is not
+            # there (deleted, or my access to a private one is gone) -- nothing on this
+            # card can check or archive it again, so the row resolves TERMINAL
+            return "gone", st.CHANNEL_GONE_CODE, None
+        return "retry", f"reverify_{code}", None
     if not meta.get("id"):
         return "retry", "reverify_shape", None
     if reg.name_fp(str(meta.get("name") or "")) != row.get("name_fp"):
@@ -595,6 +608,12 @@ def _archive_one(p: st.Proposal, row: dict, actor: str, *, now: float,
     if not ok:
         return _refusal(why, pid), None
     status, reason, fresh, ident = _reverify(p, row, read, now=now, sleep=sleep)
+    if status == "gone":
+        # terminal, with the card's channel-gone line (the same UNKNOWN + CHANNEL_GONE_CODE
+        # row the monitor settles to); no ledger row -- nothing was attempted
+        st.append_event(st.UNKNOWN, proposal_id=pid, cid=cid, by=actor, code=st.CHANNEL_GONE_CODE,
+                        ts=time.time())
+        return TapResult("channel_gone", MSG_CHANNEL_GONE.format(label=_label(row)), pid), None
     if status == "stale":
         st.append_event(st.STALE, proposal_id=pid, cid=cid, by=actor, code=reason, ts=time.time())
         return TapResult("stale_refused", f"Not archived: {_label(row)} — {reason}.", pid), None
