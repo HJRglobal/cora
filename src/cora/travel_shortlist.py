@@ -561,27 +561,72 @@ _FRAME_RE = re.compile(r"^" + _POLITE + _FRAME_VERB + r"(?: me| us)?(?: " + _DET
 # restaurants", "hotel conference rooms", "hotel spend", "hotel buyers") is not the thing
 # asked for, so "pull hotel spend from quickbooks" or "suggest hotel restaurants in tempe
 # oct 17-21" reach the model, never a clarify reply or a billed lodging search.
+# D-051 r3 (c2-trigger#1 / integration#0 / c2-trigger#3): the rule reads the WHOLE NOUN
+# GROUP (_noun_group_end) before it judges the continuation. A coordinated or listed
+# conjunct ("hotels and airbnbs", "hotels & airbnbs", "hotels/airbnbs", "hotels +
+# rentals", "hotels (or airbnbs)", "2 hotels & 1 airbnb") must itself be a lodging noun
+# and extends the group, as does a lodging head ("hotel rooms", "hotel room options");
+# a conjunct that is NOT ("hotel and car costs", "hotel/airbnb costs", "hotels and
+# restaurants", "hotel rooms and catering") leaves a bare and / or / & / + / slash, which
+# no longer ends a head. The continuation list also takes a spaced symbol (" - scottsdale",
+# " (preferably ...)"), "that's / that'll", the lane's OWN budget words followed by an
+# amount ("max $400", "up to $400 a night", "budget $300-400" -- the same literals the
+# budget parser reads), a bed spec and an early/mid/late date word. A business purpose
+# right after the group ("to sponsor", "for the ufl partnership", "in our pipeline",
+# "that have ordered f3", "on board") is not a lodging ask (_BUSINESS_TAIL_RE).
+_BUDGET_CEIL_WORDS = r"under|below|less than|up to|max|maximum|no more than|at most|not more than"
+_BUDGET_FLOOR_WORDS = r"over|above|at least|min|minimum|more than|starting at"
+_BUDGET_APPROX_WORDS = r"around|about|roughly|approximately|approx"
+_GROUP_NOUN = (r"(?:" + _STRICT_NOUN + r"|rooms?|suites?|rentals?|condos?|villas?|cabins?|lodges?"
+               r"|casitas?|resorts?|cottages?|bungalows?|apartments?|houses?|homes?|guest ?houses?)")
+_GROUP_EXT_RE = re.compile(
+    r"(?: (?:rooms?|suites?|options|listings|recommendations|suggestions|ideas|availability"
+    r"|accommodations?|lodging|stays?)"
+    r"|(?:,? (?:and/or|and|or|plus|&|\+) | ?[/&+] ?|, | ?\((?:or |and )?)"
+    r"(?:(?:a|an|some|\d{1,2}|one|two|three|four|five) )?" + _GROUP_NOUN + r"\)?)(?![a-z0-9])"
+)
 _HEAD_NEXT_RE = re.compile(
-    r"$|[^a-z0-9 ']| [\d$]| from (?:\$|\d|" + _MONTH_WORD + r")"
+    r"$|[^a-z0-9 '/&+]| [^a-z0-9 '/&+]| [\d$]| from (?:\$|\d|" + _MONTH_WORD + r")"
+    r"| (?:" + _BUDGET_CEIL_WORDS + r"|" + _BUDGET_FLOOR_WORDS + r"|" + _BUDGET_APPROX_WORDS
+    + r"|budget(?: of| is| around| under)?)[,:]? ?\$? ?\d"
     r"| (?:in|near|around|at|for|with|w|by|close|closer|to|on|under|below"
     r"|between|within|inside|outside|over|along|across|off|beside|just|less|during|this|next"
-    r"|tonight|tomorrow|the (?:week|weekend|night|nights)|starting|arriving|checking|walking|or"
-    r"|and|plus|either|only|somewhere|where|available|nearby|downtown|preferably|ideally|please"
-    r"|pls|asap|thanks|thx|if|so|but|rooms?|suites?|options|listings|recommendations|suggestions"
-    r"|ideas|availability|accommodations?|lodging|stays?|" + _MONTH_WORD
-    + r"|(?:that|which) (?:have|has|are|is|allow|allows|accept|accepts|take|takes|offer|offers"
+    r"|tonight|tomorrow|the (?:week|weekend|night|nights)|starting|arriving|checking|walking"
+    r"|or (?:two|three|so|something|anything|similar)|either|only|somewhere|where|available"
+    r"|nearby|downtown|preferably|ideally|please|pls|asap|thanks|thx|if|so|but|" + _MONTH_WORD
+    + r"|(?:mid|early|late)[- ](?:" + _MONTH_WORD + r"|next|this)"
+    r"|(?:king|queen|two queens?|double queens?)(?:[- ]size)? beds?"
+    r"|(?:that|which)'(?:s|ll|d|ve)"
+    r"|(?:that|which) (?:have|has|are|is|allow|allows|accept|accepts|take|takes|offer|offers"
     r"|include|includes|sleep|sleeps|fit|fits|can|could|will|would|welcome|welcomes|let|lets"
     r"|permit|permits))(?![a-z0-9])"
+)
+_BUSINESS_TAIL_RE = re.compile(
+    r" (?:to (?:sponsor|partner|pitch|carry|stock|sell|target|sign|onboard|prospect|approach"
+    r"|contact|reach out|market)"
+    r"|on ?board"
+    r"|that (?:have|has|had) (?:ordered|bought|stocked|carried|signed|purchased|sold)"
+    r"|that (?:are|were) (?:f3|osn|ufl|our|existing|current|past|former|active|potential)"
+    r" (?:customers?|clients?|accounts?|partners?|buyers?|retailers?|stockists?|leads?|prospects?)"
+    r"|for (?:the |our |a |an )?(?:[a-z0-9&-]{1,20} )?(?:sponsorships?|partnerships?|pitch(?:es)?"
+    r"|decks?|outreach|prospecting|distribution)"
+    r"|(?:in|on|from) (?:our|the|my) (?:pipeline|prospect(?:s| list)?|lead list|target list"
+    r"|budget (?:sheet|doc)|sheets?|docs?|drive|inbox))(?![a-z0-9])"
 )
 # "pull (up)" is a DATA verb ("pull hotel spend from quickbooks", "pull up airbnb payouts
 # for q3") -- it frames a lodging ask only when options-shaped or locative (D-051 r2
 # c2-trigger#1): "can you pull hotel options in scottsdale", "pull up hotels in mesa".
+# The locative leg needs an ALLOWLISTED area after it (D-051 r3 c2-trigger#1): "pull up
+# hotels in the budget sheet" is a document pull, never a lodging ask.
 _PULL_RE = re.compile(r"^" + _POLITE + r"pull(?: up)?(?: me| us)?(?: " + _DET + r")?"
                       r"(?: " + _ADJ + r",?(?: and)?){0,2} " + _STRICT_NOUN
                       + r"(?:(?: ?/ ?| and | or | & )" + _STRICT_NOUN + r")?"
                       r"(?: (?:options|listings|recommendations|suggestions|ideas)(?![a-z0-9])"
-                      r"| (?:in|near|around|close to) | (?:for )?(?:" + _MONTH_WORD
+                      r"|(?P<loc> (?:in|near|around|close to) )| (?:for )?(?:" + _MONTH_WORD
                       + r"\.? \d|\d{1,2}/\d))")
+# The modifiers a locative area may carry ("in the scottsdale area", "near north scottsdale").
+_AREA_PREFIX_RE = re.compile(r"(?:(?:the|downtown|north|south|east|west|central|greater|metro"
+                             r"|uptown|midtown) ){0,2}")
 _PLACES_RE = re.compile(r"^" + _POLITE + r"(?:any |some |good |nice )?(?:places|place|somewhere) to stay\b")
 # The words between the noun and "options" are lodging words only (D-051 r2
 # c2-trigger#0): "hotel or airbnb options", "hotel room options" -- never "hotel
@@ -634,15 +679,48 @@ def _first_clause(cleaned: str) -> str:
     return body[:cut].strip()
 
 
+_MAX_GROUP_EXT = 8                          # conjuncts/heads one noun group may chain
+
+
+def _noun_group_end(clause: str, end: int) -> int:
+    """Where the frame's noun GROUP ends: the first lodging noun (ending at *end*)
+    plus every coordinated lodging conjunct and lodging head after it (D-051 r3).
+    Bounded -- each step consumes a closed token."""
+    for _ in range(_MAX_GROUP_EXT):
+        m = _GROUP_EXT_RE.match(clause, end)
+        if not m:
+            break
+        end = m.end()
+    return end
+
+
+def _alias_at(clause: str, pos: int) -> bool:
+    """An allowlisted area starts at *pos* (after closed area modifiers)."""
+    lm = _load_map()
+    if lm.alias_re is None:
+        return False
+    return bool(lm.alias_re.match(clause, _AREA_PREFIX_RE.match(clause, pos).end()))
+
+
 def _head_noun_ends(clause: str, end: int) -> bool:
-    """Does the frame's lodging noun (ending at *end*) head its object? A closed
-    continuation (_HEAD_NEXT_RE) or an allowlisted area ("find hotels scottsdale
-    oct 17-21") -- anything else makes the noun a modifier ("hotel restaurants")."""
+    """Does the frame's lodging noun GROUP (its first noun ending at *end*) head its
+    object? No business purpose right after it, then a closed continuation
+    (_HEAD_NEXT_RE) or an allowlisted area ("find hotels scottsdale oct 17-21") --
+    anything else makes the group a modifier ("hotel restaurants", "hotel and car
+    costs")."""
+    end = _noun_group_end(clause, end)
+    if _BUSINESS_TAIL_RE.match(clause, end):
+        return False
     if _HEAD_NEXT_RE.match(clause, end):
         return True
     lm = _load_map()
     return bool(lm.alias_re is not None and clause.startswith(" ", end)
                 and lm.alias_re.match(clause, end + 1))
+
+
+def _pull_ask(clause: str) -> bool:
+    m = _PULL_RE.match(clause)
+    return bool(m and (m.group("loc") is None or _alias_at(clause, m.end())))
 
 
 def _is_strict_ask(text: Any) -> bool:
@@ -651,7 +729,7 @@ def _is_strict_ask(text: Any) -> bool:
     if not clause:
         return False
     m = _FRAME_RE.match(clause)
-    if not ((m and _head_noun_ends(clause, m.end())) or _PULL_RE.match(clause)
+    if not ((m and _head_noun_ends(clause, m.end())) or _pull_ask(clause)
             or _PLACES_RE.match(clause) or _NOUN_OPTIONS_RE.match(clause)):
         return False
     if _BAIL_RE.search(clause):
@@ -1038,11 +1116,13 @@ _MONEY_RX = r"(?<![\d,.])\$? ?(\d{2,5}|\d{1,2},\d{3})(?:\.\d{2})?"
 _PER_NIGHT_RX = (r"(?: ?/ ?(?:night|nt|nite|nightly)| (?:per|a|an|each) (?:night|nite)"
                  r"| nightly)")
 _BUDGET_RANGE_RE = re.compile(_MONEY_RX + r" ?(?:-|to) ?" + _MONEY_RX + _PER_NIGHT_RX + r"\b")
-_BUDGET_CEIL_RE = re.compile(r"\b(?:under|below|less than|up to|max|maximum|no more than|at most"
-                             r"|not more than) " + _MONEY_RX + _PER_NIGHT_RX + r"\b")
-_BUDGET_FLOOR_RE = re.compile(r"\b(?:over|above|at least|min|minimum|more than|starting at) "
-                              + _MONEY_RX + _PER_NIGHT_RX + r"\b")
-_BUDGET_APPROX_RE = re.compile(r"(?:\b(?:around|about|roughly|approximately|approx) |~ ?)"
+# The budget words are the SAME literals the head-noun rule accepts after the noun
+# (_BUDGET_*_WORDS; D-051 r3 c2-trigger#3) -- the two cannot drift.
+_BUDGET_CEIL_RE = re.compile(r"\b(?:" + _BUDGET_CEIL_WORDS + r") " + _MONEY_RX + _PER_NIGHT_RX
+                             + r"\b")
+_BUDGET_FLOOR_RE = re.compile(r"\b(?:" + _BUDGET_FLOOR_WORDS + r") " + _MONEY_RX + _PER_NIGHT_RX
+                              + r"\b")
+_BUDGET_APPROX_RE = re.compile(r"(?:\b(?:" + _BUDGET_APPROX_WORDS + r") |~ ?)"
                                + _MONEY_RX + _PER_NIGHT_RX + r"\b")
 _BUDGET_SINGLE_RE = re.compile(_MONEY_RX + _PER_NIGHT_RX + r"\b")
 _TWO_QUEENS_RE = re.compile(r"\b(?:two|2|double) ?queens?\b")
